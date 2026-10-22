@@ -35,7 +35,9 @@ physics.
   deck's own geometry. `FILE=job, STEP=n` takes modes or a static solution from another job's
   results, which ccx cannot read: `--run` first converts and runs that job's deck, `job.inp`
   next to the deck, as `<output>_imperfection.inp`, then moves the nodes by its modes (each
-  scaled to a largest displacement component of 1.0, as Abaqus scales them) and runs the deck.
+  scaled to a largest displacement component of 1.0, as Abaqus scales them; the sign of a mode,
+  which neither code fixes, is warned) and runs the deck. A node shifted twice, on one card or
+  two, gets the sum, which Abaqus does not document: reduced physics.
   It does so only for the same mesh and a `*BUCKLE`, `*FREQUENCY` or general `*STATIC` step,
   and not where ccx's buckling factors may not be the lowest; it says why otherwise, and the
   deck runs on its perfect geometry. Without `--run` the card stays commented out and names the
@@ -123,7 +125,10 @@ physics.
   midside nodes lie off the middle of the edges, axisymmetric ones other than parallelograms,
   and under `CENTRIF` on axisymmetric ones, ccx moved part of the load between the nodes
   (0.13–0.38 % of the displacements on 3 × 4 meshes). Such lines now become consistent nodal
-  forces; a set's other elements keep the line, and `CENTRIF` under NLGEOM stays, warned. Mass: an implicit `*DYNAMIC` step in ccx 2.23 runs `CPE4` / `CPS4`
+  forces; a set's other elements keep the line, and `CENTRIF` under NLGEOM stays, warned. So does
+  a load whose forces would share a node DOF with the deck's own `*CLOAD` in a deck of several
+  steps, or with another load on another amplitude (ccx keeps one value and amplitude per node
+  DOF). Mass: an implicit `*DYNAMIC` step in ccx 2.23 runs `CPE4` / `CPS4`
   / `CAX4` / `CPE8R` / `CPS8R` / `CAX8R` with half their mass (vibrating √2 times faster): no
   card gives ccx another mass matrix, so that is now flagged reduced physics. `*FREQUENCY`
   integrates the mass of `CPE8R` / `CPS8R` / `CAX8R` / `CPE6` / `CPS6` / `CAX6` at fewer points
@@ -133,8 +138,8 @@ physics.
   set of the elements of each density (`ABQ2CCX_CENT_…`; a `RECT` beam's ρab, as a beam's `CENT`
   is per unit length), and consistent nodal forces where there is no single constant density
   (axisymmetric elements too) or where ccx would integrate the `CENTRIF` at 2 × 2 points and
-  move its shares (`CAX8R` / `CPE8R` / `CPS8R`, as for their own `CENTRIF`; under NLGEOM the
-  `CENTRIF` stays, warned). `ROTA` (a rotary acceleration α) becomes consistent nodal forces of
+  move its shares (`CAX8R` / `CPE8R` / `CPS8R`, as for their own `CENTRIF`; under NLGEOM, or
+  where the forces would share a node DOF with another load, the `CENTRIF` stays, warned). `ROTA` (a rotary acceleration α) becomes consistent nodal forces of
   the d'Alembert force −ρα n × r over each element's mass: solids, plane elements, shells (at
   their mid-thickness), membranes, beams, trusses and point masses. The nodal forces stay on the
   undeformed geometry, so under NLGEOM they need `--approximate`. Checked against the
@@ -220,6 +225,8 @@ physics.
   largest increment below half that at the largest pressure the steps apply, and `INC=` to
   match: a numerical control, the solution unchanged. NAFEMS creep tests 1(a), 2(a) and 5(a)
   now run their 1000 h and give the published creep strains (they stopped at 6.6 and 168 h).
+  Creep data whose cap passes a float's range (m near -1, a huge q^n) converts; a cap that would
+  take more than 10^6 increments is left off, warned.
   A `*USER MATERIAL` on a material no section uses is now reported as never called (the note
   said ccx would stop on it). `corpus/fetch.py` also fetches the files the decks read with
   `INPUT=` (`--companions`: only those).
@@ -227,13 +234,15 @@ physics.
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the
   case's own, about the same base state, as Abaqus reads them; a `*BOUNDARY, OP=NEW` in any case
-  releases the base-state BCs in every case. A two-case step after a loaded static step now
+  releases the base-state BCs in every case. In a steady-state dynamics step the later cases
+  give an earlier case's BCs again at 0, which ccx would keep acting. A two-case step after a loaded static step now
   matches the hand-written single-case steps exactly (the superposed answer was 0.02 off).
 * **`*BOUNDARY, FIXED` on `*TRANSFORM` translations** — ccx 2.23 holds such a DOF at the
   node's global displacement component, read as the local value (silently wrong). It is now
   written as the value the step finds it at, in the local axes: 0 at rest, else the value of
   the BC that holds it (a midside node's interpolated one too); where that is unknown (moved by
-  loads) FIXED stays, warned. A local axis along the global one keeps FIXED. A FIXED rotation
+  loads) FIXED stays, warned. A local axis along the global one keeps FIXED, also where a static
+  perturbation step gets the base state back (it was flagged). A FIXED rotation
   on an upgraded beam's midside node gets its value too (it was left free). In a linear
   perturbation step a FIXED translation or shell/beam rotation is a zero perturbation (a FIXED
   rotation in a static perturbation step was given twice its base value).
@@ -358,7 +367,9 @@ physics.
   mesh with the midside nodes at a third of each edge; a 2 × 2 thick sphere 0.986–1.054 of Lamé's
   inner displacement). In a deck without NLGEOM such a `*DLOAD` / `*DSLOAD` pressure line now
   becomes its consistent nodal forces (0.993–1.007 there); under NLGEOM, where the pressure
-  follows the deforming faces, it stays, warned. `CAX8`, plane elements and straight edges with
+  follows the deforming faces, it stays, warned, and so it does where its forces would share a
+  node DOF with the deck's own `*CLOAD` in a deck of several steps, or with another load on
+  another amplitude. `CAX8`, plane elements and straight edges with
   the midside node in the middle load exactly in ccx and are unchanged.
 * **`--abaqus-umat`, run on the corpus** — 130 user-material decks run with their own UMATs (31
   builds of ccx 2.23) showed three more interface facts, now in the notes and the user guide:

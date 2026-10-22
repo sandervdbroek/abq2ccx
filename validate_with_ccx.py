@@ -1689,6 +1689,142 @@ def imperfection_checks(ccx, env, tmp):
     return failures
 
 
+# one CAX8R (corners (1, 0) (2, 0) (2.2, 1) (1, 1)) whose bottom and right midside nodes lie off
+# the middle of their edges: ccx's 2-point rule moves a pressure's shares there, its 2 x 2 rule a
+# body load's; amplitudes A1, A2; surface SP its right edge
+CAX8R_CLASH = ("*NODE, NSET=NALL\n1, 1., 0.\n2, 2., 0.\n3, 2.2, 1.\n4, 1., 1.\n5, 1.333333, 0.\n"
+               "6, 2.0666667, 0.3333333\n7, 1.6, 1.\n8, 1., 0.5\n*ELEMENT, TYPE=CAX8R, ELSET=EALL\n"
+               "1, 1, 2, 3, 4, 5, 6, 7, 8\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n1e-3\n"
+               "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*BOUNDARY\n1, 2, 2\n2, 2, 2\n5, 2, 2\n"
+               "*AMPLITUDE, NAME=A1\n0., 0., 1., 1.\n*AMPLITUDE, NAME=A2\n0., 0., 1., 2.\n"
+               "*SURFACE, NAME=SP\nEALL, S2\n")
+# (tag, the loads: (Abaqus line, ccx's own line where the converter keeps it — "": the same —,
+# None where it writes nodal forces), the node DOF of the deck's own *CLOAD in two steps or "")
+CAX8R_CLASH_CASES = (
+    ("pressure_cload", [("*DSLOAD\nSP, P, 1.\n", "*DLOAD\nEALL, P2, 1.\n")], "3, 1"),
+    ("two_pressures", [("*DLOAD, AMPLITUDE=A1\n1, P1, 1.\n", None),
+                       ("*DLOAD, AMPLITUDE=A2\n1, P2, 1.\n", "*DLOAD, AMPLITUDE=A2\n1, P2, 1.\n")], ""),
+    ("grav_cload", [("*DLOAD\nEALL, GRAV, 9810., 0., -1., 0.\n", "")], "3, 2"),
+    ("two_gravs", [("*DLOAD\nEALL, GRAV, 9.81, 0., -1., 0.\n", ""),
+                   ("*DLOAD, AMPLITUDE=A1\nEALL, GRAV, 9.81, 1., 0., 0.\n", "")], ""),
+    ("centrif_cload", [("*DLOAD\nEALL, CENTRIF, 100., 0., 0., 0., 0., 1., 0.\n", "")], "3, 1"),
+    ("cent_cload", [("*DLOAD\nEALL, CENT, 0.1, 0., 0., 0., 0., 1., 0.\n",
+                     "*DLOAD\nEALL, CENTRIF, 100., 0., 0., 0., 0., 1., 0.\n")], "3, 1"))
+
+
+def cax8r_clash_deck(loads, cload=""):
+    """CAX8R_CLASH under ``loads``, with the deck's own *CLOAD on node DOF ``cload`` (0.5, then
+    1. in a second step) where given, its displacements printed in each step."""
+    out = "*NODE PRINT, NSET=NALL\nU\n*END STEP\n"
+    text = CAX8R_CLASH + "*STEP\n*STATIC\n" + "".join(loads) + (f"*CLOAD\n{cload}, 0.5\n" if cload else "") + out
+    return text + (f"*STEP\n*STATIC\n*CLOAD\n{cload}, 1.\n" + out if cload else "")
+
+
+def nodal_clash_checks(ccx, env, tmp):
+    """Code check G1-1: pressures on CAX8R edges and body loads (GRAV, CENTRIF, CENT) on CAX8R
+    elements whose consistent nodal forces would share a node DOF's ccx entry with the deck's
+    own *CLOAD in a two-step deck, or with another such load on another amplitude, keep ccx's
+    line (its 2-point / 2 x 2 rule, warned) rather than being commented out.  Each deck must
+    convert with no reduced physics and solve as the same deck written for ccx by hand with
+    those lines (with a *CLOAD), or as its loads alone superposed — the kept ones as ccx's
+    line, the others converted (their exact consistent forces); the loads must count (the
+    solution without them is far off).  Returns the number of failures."""
+    failures = 0
+
+    def solve(text, tag, raw=False):
+        src, inp = os.path.join(tmp, f"clash_{tag}_src.inp"), os.path.join(tmp, f"clash_{tag}.inp")
+        with open(inp if raw else src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        reduced = [] if raw else convert(src, inp)[1].reduced_physics
+        d, status, out = run_ccx(ccx, env, inp)
+        got = dat_node_blocks(os.path.join(d, "job.dat")) if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+        if not got:
+            print("\n".join(ln for ln in out.splitlines() if "ERROR" in ln)[:400])
+        return got, reduced
+
+    for tag, loads, cload in CAX8R_CLASH_CASES:
+        got, reduced = solve(cax8r_clash_deck([a for a, _ in loads], cload), tag)
+        if cload:                       # (every load kept: the deck by hand, and without them)
+            ref = solve(cax8r_clash_deck([own or a for a, own in loads], cload), f"{tag}_ref", raw=True)[0]
+            bare = solve(cax8r_clash_deck([], cload), f"{tag}_bare", raw=True)[0]
+        else:
+            parts = [solve(cax8r_clash_deck([own or a]), f"{tag}_alone{k}", raw=own is not None)[0]
+                     for k, (a, own) in enumerate(loads)]
+            ref = [{n: [sum(p[0][n][i] for p in parts) for i in range(3)] for n in parts[0][0]}] \
+                if all(len(p) == 1 for p in parts) else []
+            bare = [{n: [0.0, 0.0, 0.0] for n in parts[0][0]}] if ref else []
+        ok = len(got) == len(ref) == len(bare) == (2 if cload else 1)
+        if ok:
+            err = peak = part = 0.0
+            for blk, want, without in zip(got, ref, bare):
+                for n, u in want.items():
+                    err = max(err, max(abs(blk[n][i] - u[i]) for i in range(2)))
+                    peak = max(peak, max(abs(x) for x in u[:2]))
+                    part = max(part, max(abs(u[i] - without[n][i]) for i in range(2)))
+            ok = not reduced and peak > 0.0 and err <= 1e-6 * peak and part >= 0.2 * peak
+            print(f"{'PASS' if ok else 'FAIL'}  nodal_clash_{tag} (a CAX8R with off-centre midside nodes, "
+                  f"{' + '.join(a.split(chr(10))[1].split(',')[1].strip() for a, _ in loads)}"
+                  f"{' + the deck *CLOAD on ' + cload + ' in two steps' if cload else ''}; "
+                  f"{sum(own is not None for _, own in loads)} of {len(loads)} kept as ccx's line): "
+                  f"{err / peak:.1e} of |u| {peak:.4g} off "
+                  + ("the deck written for ccx by hand" if cload else "its loads alone superposed")
+                  + f" (the loads' share of |u|: {part / peak:.2f})" + (f"; reduced: {reduced}" if reduced else ""))
+        else:
+            print(f"FAIL  nodal_clash_{tag}: no results to compare")
+        failures += 0 if ok else 1
+    return failures
+
+
+SSD_CUBE = ("*NODE, NSET=NALL\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+            "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*NSET, NSET=NP\n3, 7\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n*DENSITY\n1e-3\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*BOUNDARY\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"
+            "*STEP\n*FREQUENCY\n3\n*END STEP\n")
+
+
+def ssd_load_case_checks(ccx, env, tmp):
+    """Code check G1-2: a *STEADY STATE DYNAMICS step with two load cases, A a base motion
+    (*BOUNDARY 1, 1, 1, 0.01 on a DOF the base state holds) and B a force, on a C3D8 cube after a
+    *FREQUENCY step: each case's ccx step must give the response of a steady-state dynamics
+    step with that case's load alone (ccx carries a step's BCs into the next, which the
+    converter gives again at 0 in case B).  Returns the number of failures."""
+    def ssd_blocks(text, tag):
+        src, inp = os.path.join(tmp, f"ssd_{tag}_src.inp"), os.path.join(tmp, f"ssd_{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        conv = convert(src, inp)[1]
+        d, status, out = run_ccx(ccx, env, inp)
+        steps = {}
+        if status == "solved":
+            for st, title, _name, _t, rows in A.dat_blocks(os.path.join(d, "job.dat")):
+                if title.startswith("displacements"):
+                    steps.setdefault(st, []).append({int(r[0]): r[1:] for r in rows})
+        else:
+            print("\n".join(ln for ln in out.splitlines() if "ERROR" in ln)[:400])
+        shutil.rmtree(d, ignore_errors=True)
+        return [steps[k] for k in sorted(steps)], conv.reduced_physics
+
+    step = "*STEP\n*STEADY STATE DYNAMICS\n1., 10., 2\n{}*NODE PRINT, NSET=NP\nU\n*END STEP\n"
+    loads = {"A": "*BOUNDARY\n1, 1, 1, 0.01\n", "B": "*CLOAD\n7, 3, 1.\n"}
+    got, reduced = ssd_blocks(SSD_CUBE + step.format("".join(f"*LOAD CASE, NAME={k}\n{v}*END LOAD CASE\n"
+                                                             for k, v in loads.items())), "cases")
+    refs = [ssd_blocks(SSD_CUBE + step.format(v), f"case_{k}")[0] for k, v in loads.items()]
+    ok = len(got) == 2 and all(len(r) == 1 and len(r[0]) == len(g) for r, g in zip(refs, got))
+    errs = []
+    if ok:
+        for g, r in zip(got, refs):
+            peak = max(abs(x) for blk in r[0] for u in blk.values() for x in u)
+            errs.append(max(abs(a - b) for gb, rb in zip(g, r[0]) for n in rb for a, b in zip(gb[n], rb[n]))
+                        / peak if peak else math.inf)
+        ok = not reduced and max(errs) <= 1e-6
+    print(f"{'PASS' if ok else 'FAIL'}  ssd_load_case_bcs (a C3D8 cube's *STEADY STATE DYNAMICS step with "
+          f"load case A a base motion and B a force, one ccx step each): "
+          + (", ".join(f"case {k} {e:.1e} of |u|" for k, e in zip(loads, errs)) if errs else "no results")
+          + " off the step with the case's load alone" + (f"; reduced: {reduced}" if reduced else ""))
+    return 0 if ok else 1
+
+
 def umat_build_checks(tmp):
     """The umat_build checks: --abaqus-umat decks in the ccx CCX_UMAT names, built with
     TEST_UMAT (see there).  Skipped without CCX_UMAT, and for a ccx whose UMAT is another one
@@ -7324,16 +7460,17 @@ def compact_params_deck():
                              "*NODE PRINT, NSET=OUT", "U", "*END STEP"]) + "\n"
 
 
-def norton_creep_deck():
+def norton_creep_deck(creep="3.125E-14, 5."):
     """A C3D8 unit cube (E 200e3, nu 0.3) held on three symmetry faces and pulled by a pressure
     200 on x = 1, Norton creep A 3.125e-14, n 5 (NAFEMS creep test 1(a)): 0.01 per hour at that
-    stress; 100 h of *VISCO stretch it by 1 (200 / 200e3 + 0.01 t) = 1.001 exactly."""
+    stress; 100 h of *VISCO stretch it by 1 (200 / 200e3 + 0.01 t) = 1.001 exactly.  ``creep``:
+    another *CREEP, LAW=TIME data line (A, n, m)."""
     return "\n".join(["*NODE", "1, 0., 0., 0.", "2, 1., 0., 0.", "3, 1., 1., 0.", "4, 0., 1., 0.",
                       "5, 0., 0., 1.", "6, 1., 0., 1.", "7, 1., 1., 1.", "8, 0., 1., 1.",
                       "*ELEMENT, TYPE=C3D8, ELSET=E", "1, 1, 2, 3, 4, 5, 6, 7, 8",
                       "*NSET, NSET=X1", "2, 3, 6, 7",
                       "*SOLID SECTION, ELSET=E, MATERIAL=STEEL", "*MATERIAL, NAME=STEEL",
-                      "*ELASTIC", "200.E3, 0.3", "*CREEP, LAW=TIME", "3.125E-14, 5.",
+                      "*ELASTIC", "200.E3, 0.3", "*CREEP, LAW=TIME", creep,
                       "*BOUNDARY", "1, 1, 3", "2, 2, 3", "4, 1", "4, 3", "5, 1, 2", "6, 2",
                       "8, 1", "*STEP", "*STATIC", "1.E-7, 1.E-6", "*DLOAD", "1, P4, -200.",
                       "*END STEP", "*STEP, INC=40", "*VISCO, CETOL=5.E-3", "1.E-6, 100.",
@@ -11509,6 +11646,10 @@ def main():
     failures += matrix_generate_checks(ccx, env, tmp)
     # --- task 147: *IMPERFECTION, data lines and FILE= (--run's two passes) ---------------------
     failures += imperfection_checks(ccx, env, tmp)
+    # --- code check G1-1: 2-point / 2 x 2 loads whose nodal forces would clash keep their line ----
+    failures += nodal_clash_checks(ccx, env, tmp)
+    # --- code check G1-2: a steady-state dynamics load case's BCs do not act in the later cases --
+    failures += ssd_load_case_checks(ccx, env, tmp)
 
     # --- the --run results digest (abq2ccx.ccx_results_digest) against the references above:
     # the planar beam's frequencies and buckling load (beam theory, Euler), the circular-section
@@ -17555,6 +17696,20 @@ def main():
               f"under 200, NAFEMS creep test 1(a), for 100 h of *VISCO): stretch "
               f"{', '.join(f'{x:.7g}' for x in got)} (1.001 = sigma / E + 0.01 t; before: ccx "
               f"stopped at 4.4 h, 'matrix found to be singular')")
+    failures += 0 if u and ok else 1
+    # code check G5-1: a time-hardening exponent m = -0.99 (valid: -1 < m <= 0) made the cap's
+    # 1 / (m + 1) power overflow, and the conversion stopped (exit 4); its cap in logarithms is
+    # far past the period: the deck as written, which ccx runs, the creep acting
+    u = review_run(norton_creep_deck("2.984E-17, 5., -0.99"), "norton_creep_cap_m", dat_displacements)
+    if u:
+        got = [u.get(n, [math.inf])[0] for n in (2, 3, 6, 7)]
+        text = open(os.path.join(tmp, "norton_creep_cap_m.inp"), encoding="utf-8").read()
+        ok = "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n" in text and min(got) > 1.05 * 200 / 200e3 and \
+            max(got) < 0.01
+        print(f"{'PASS' if ok else 'FAIL'}  norton_creep_cap_m (the cube under *CREEP, LAW=TIME with m = "
+              f"-0.99, 100 h of *VISCO): converted uncapped and solved, stretch "
+              f"{', '.join(f'{x:.7g}' for x in got)} past the elastic {200 / 200e3:g} (before: the "
+              f"conversion failed, OverflowError)")
     failures += 0 if u and ok else 1
 
     # --- task 155: unprobed suspects ---

@@ -6935,6 +6935,7 @@ class EmitState:
         self.nodal_loads: "OrderedDict[tuple, Tuple[Dict[Tuple[int, int], float], Optional[tuple]]]" = \
             OrderedDict()
         self.nodal_fresh: set = set()               # keys (re)defined in the current step
+        self.nodal_kept: set = set()                # keys kept as ccx lines from a clash on (_nodal_fallback)
         self.nodal_reset: set = set()               # cards with OP=NEW in the current step
         self.nodal_emitted: Dict[Tuple[int, int], Tuple[str, Optional[tuple]]] = {}  # in ccx
         self.cload_new = False                      # the deck's *CLOAD, OP=NEW in this step
@@ -7806,7 +7807,7 @@ class BaseStateRestore:
         if kw == "BOUNDARY" and deformed:
             free = [k for k in ks if k not in base[kw]]
             if fixable and v == 0.0 and not b.has("AMPLITUDE") and not b.has("USER"):
-                fix_ks = [k for k in free if self.conv._holdable(*k)]
+                fix_ks = [k for k in free if self.conv._fixed_holds(*k)]
             if len(fix_ks) < len(free):
                 self.inexact.setdefault("prescribes DOFs the base state leaves free (Abaqus: "
                                         "relative to their base-state displacement, which "
@@ -7817,7 +7818,7 @@ class BaseStateRestore:
                                         []).append(f"{s} (*BOUNDARY {rec[0]})")
             if b.has("FIXED"):
                 fix_ks = []                         # (ccx holds those already)
-                on = {k: a for k, a in on.items() if not (fixable and self.conv._holdable(*k))}
+                on = {k: a for k, a in on.items() if not (fixable and self.conv._fixed_holds(*k))}
         if not on and not fix_ks:
             return []
         if on and (b.uparam("AMPLITUDE") not in ("", self.conv.CCX_RAMP) or b.has("FIXED") or
@@ -8006,6 +8007,7 @@ class _Mesh:
                 self._register_orientation(b)
             elif kw == "SURFACE":
                 self._register_surface(b)
+        self.report.card = outer
         if imperfect:
             if self.keep_deck_coords:
                 self.deck_coords = dict(self.geom.nodes)
@@ -8032,35 +8034,41 @@ class _Mesh:
           cannot read: listed in ``imperfection_files`` for --run's first pass
           (imperfection_pass), which runs that job's deck in ccx and hands its normalized
           modes back in ``imperfection_shapes``; without them the card is commented out.
-        A node shifted twice (two lines or cards) gets the sum, which Abaqus does not
-        document: reduced physics.  What each card did is reported where it is written
-        (handle_imperfection)."""
+        A node shifted twice (two lines of a card, or two cards) gets the sum, which Abaqus
+        does not document (2017 *IMPERFECTION and "Introducing a geometric imperfection": the
+        data line is repeated "as often as necessary"; nothing on a node given again): reduced
+        physics.  What each card did is reported where it is written (handle_imperfection);
+        what it warns, at the card."""
         first = next((i for i, b in enumerate(blocks) if b.keyword == "STEP"), len(blocks))
         shifts: Dict[int, List[float]] = {}
-        twice: List[int] = []
+        twice: List[Tuple[int, Block]] = []
         for b in blocks[:first]:
             if b.keyword != "IMPERFECTION":
                 continue
-            got = self._imperfection_modes(b) if b.param("FILE") is not None else \
-                self._imperfection_lines(b)
+            with self.report.about(b):
+                dup: List[int] = []
+                got = self._imperfection_modes(b) if b.param("FILE") is not None else \
+                    self._imperfection_lines(b, dup)
+            twice += [(n, b) for n in dup]
             for n, d in got.items():
                 if n in shifts:
-                    twice.append(n)
+                    twice.append((n, b))
                 acc = shifts.setdefault(n, [0.0, 0.0, 0.0])
                 for k in range(3):
                     acc[k] += d[k]
         if twice:
-            self.report.warn(f"*IMPERFECTION shifts node {twice[0]}"
+            self.report.warn(f"*IMPERFECTION shifts node {twice[0][0]}"
                              + (f" (and {len(twice) - 1} more)" if len(twice) > 1 else "")
                              + " twice: Abaqus does not document whether they add up; added.",
-                             once=True)
+                             once=True, at=twice[0][1])
             self._reduces("*IMPERFECTION shifts of one node added up")
         for n, d in shifts.items():
             x = self.geom.nodes[n]
             self.geom.nodes[n] = (x[0] + d[0], x[1] + d[1], x[2] + d[2])
 
-    def _imperfection_lines(self, b: Block) -> Dict[int, Vec]:
-        """The global shifts of an *IMPERFECTION card's data lines (_apply_imperfections)."""
+    def _imperfection_lines(self, b: Block, twice: List[int]) -> Dict[int, Vec]:
+        """The global shifts of an *IMPERFECTION card's data lines (_apply_imperfections), a
+        node's lines added up; the nodes given again go to ``twice``."""
         system = (b.param("SYSTEM") or "R").strip().upper()[:1]
         if system not in ("R", "C", "S"):
             self._imperfection_notes[id(b)] = (
@@ -8091,8 +8099,10 @@ class _Mesh:
                     (math.hypot(r, p[2]), th, math.degrees(math.atan2(p[2], r)))
                 q = system_point([own[k] + d[k] for k in range(3)], system)
                 d = [q[k] - p[k] for k in range(3)]
+            if n in out:
+                twice.append(n)                 # (_apply_imperfections warns)
             out[n] = (d[0], d[1], d[2]) if n not in out else \
-                tuple(out[n][k] + d[k] for k in range(3))     # (_apply_imperfections warns)
+                tuple(out[n][k] + d[k] for k in range(3))
         if missing:
             self.report.warn(f"*IMPERFECTION names node {missing[0]}"
                              + (f" (and {len(missing) - 1} more)" if len(missing) > 1 else "")
@@ -8159,8 +8169,16 @@ class _Mesh:
             + (f"mode{'s' if len(factors) > 1 else ''} {', '.join(factors)}" if factors else
                "the final displacements")
             + f" of step {step} as ccx solves {os.path.basename(got['source'])} ({name}, --run's first "
-              f"pass)" + (", each normalized as Abaqus normalizes it (its largest displacement "
-                          "component 1.0)." if factors else "."), None)
+              f"pass)" + (", each scaled to a largest displacement component of 1.0, Abaqus' "
+                          "normalization." if factors else "."), None)
+        if factors:
+            self.report.warn(f"*IMPERFECTION, FILE={job}: the sign of each mode is arbitrary (an "
+                             f"eigenvector's sign is the eigensolver's choice, in Abaqus as in ccx; "
+                             f"Abaqus documents only its size, a largest displacement component of "
+                             f"1.0). The converter makes the largest component +1, which may be "
+                             f"Abaqus' mode negated: the imperfection then points the other way. "
+                             f"Where the response depends on its direction, compare the mode with "
+                             f"Abaqus' (.fil / .odb) or run both signs.", once=True)
         for what in got["reduced"]:
             self._reduces(f"*IMPERFECTION shifts from {os.path.basename(got['source'])}, whose ccx "
                           f"model reduces: {what}")
@@ -21208,6 +21226,10 @@ class _Materials:
     # increment back.  _plan_creep_increments keeps below half that.
     _CREEP_PRESSURE = re.compile(r"(P\d?|PNEG|PPOS|TR(VEC|NOR|SHR)\d?)$")
 
+    # the most increments a creep cap may ask of a *VISCO step (_plan_creep_increments): more is
+    # a run no one waits for, and ccx 2.23 reads INC= in 10 digits
+    _CREEP_MAX_INCREMENTS = 1e6
+
     def _plan_creep_increments(self, blocks: List[Block]) -> None:
         """``_creep_caps``: step number -> the largest increment of a *VISCO step (automatic
         incrementation) that keeps each increment's creep strain at most 20 / (n - 3)^1.5
@@ -21262,18 +21284,30 @@ class _Materials:
                                  f"largest increment below that avoids it.", once=True)
                 continue
             t0 = st.t_start or 0.0                  # ccx's Norton law reads the total time
-            caps = []
+            caps = []                               # in logarithms: q^n or 1 / (m + 1) can pass 1e308
             for e, a, n, m in laws:
-                strain = 20.0 / (n - 3.0) ** 1.5 * q / e    # creep strain allowed per increment
-                rate = a * q ** n                           # times t^m
+                if e <= 0.0:
+                    continue
+                strain = math.log(20.0) - 1.5 * math.log(n - 3.0) + math.log(q / e)   # per increment
+                rate = math.log(a) + n * math.log(q)        # times t^m
                 if m > 0.0:                                 # fastest at the step's end
-                    caps.append(strain / (rate * (t0 + st.ccx_period) ** m))
+                    caps.append(strain - rate - m * math.log(t0 + st.ccx_period))
                 elif m < 0.0:       # either bounds an increment's creep: at most dt^(m+1) / (m+1)
-                    caps.append(max((strain * (m + 1.0) / rate) ** (1.0 / (m + 1.0)),
-                                    strain / (rate * t0 ** m) if t0 > 0.0 else 0.0))
+                    caps.append(max((strain + math.log(m + 1.0) - rate) / (m + 1.0),
+                                    strain - rate - m * math.log(t0) if t0 > 0.0 else -math.inf))
                 else:
-                    caps.append(strain / rate)
-            cap = float(f"{min(caps):.3g}")
+                    caps.append(strain - rate)
+            if not caps or min(caps) > math.log(st.ccx_period) + 1.0:
+                continue
+            if math.log(st.ccx_period) - min(caps) > math.log(self._CREEP_MAX_INCREMENTS):
+                self.report.warn(f"*VISCO step {st.no}: the largest increment that keeps ccx 2.23 off "
+                                 f"its 'matrix found to be singular' stop (one increment's creep strain "
+                                 f"below about 45 / (n - 3)^1.5 times the elastic strain, Norton n > 3) "
+                                 f"would take more than {self._CREEP_MAX_INCREMENTS:.0e} increments at "
+                                 f"the largest pressure the steps apply: left uncapped. ccx may stop "
+                                 f"there; check the creep data's units.", once=True, at=card)
+                continue
+            cap = float(f"{math.exp(min(caps)):.3g}")
             if cap < st.ccx_period:
                 self._creep_caps[st.no] = cap
 
@@ -21310,7 +21344,7 @@ class _Materials:
                              once=True)
         if cap is not None:
             f[3] = f"{cap:g}"
-            params["INC"] = str(inc + math.ceil(period / cap))
+            params["INC"] = str(min(inc + math.ceil(period / cap), 999999999))
             self.report.note(f"*VISCO step {self.emit.no}: largest increment {cap:g} and *STEP "
                              f"INC={params['INC']} written: ccx 2.23 stops on 'matrix found to be "
                              f"singular' once one increment's creep strain passes about 45 / (n - "
@@ -33504,6 +33538,12 @@ class _Loads:
             self._reduces("*BOUNDARY, FIXED on *TRANSFORM translations held at the global component "
                           "(ccx 2.23)")
 
+    def _fixed_holds(self, n: int, d: int) -> bool:
+        """Whether ccx 2.23's *BOUNDARY, FIXED holds DOF ``d`` (1-6) of node ``n`` where the
+        previous step left it, as Abaqus does: _holdable, and a translation along a local axis
+        of the node that is the global one (_fixed_misread)."""
+        return self._holdable(n, d) is not None and not self._fixed_misread(n, d)
+
     def _fixed_misread(self, n: int, d: int) -> bool:
         """Whether ccx 2.23's *BOUNDARY, FIXED does not hold DOF ``d`` (1-6) of node ``n``
         where the previous step left it, as Abaqus does (_plan_fixed_values): FIXED cannot
@@ -34691,36 +34731,55 @@ class _Loads:
         forces act (probed: a hanging CAX8R / CPE8R column stretched 25 % moved under GRAV and
         BY as under their 2 x 2 forces, to 3e-8).  The line stays where the family's shift is
         1e-6 or less, and, warned once (_warn_two_by_two_kept), for CENTRIF under NLGEOM (it acts
-        on the deformed positions), GRAV / CENTRIF without one density per element, and CENTRIF
-        on axisymmetric elements about another axis than theirs."""
+        on the deformed positions), GRAV / CENTRIF without one density per element, CENTRIF on
+        axisymmetric elements about another axis than theirs (_two_by_two_why), and where its
+        forces would share a node DOF's ccx entry with another load (_plan_nodal_form_keep,
+        _nodal_fallback)."""
         plan = self._two_by_two[g[0].upper()]
         label = g[1].upper()
         family = "CENTRIF" if label == "CENTRIF" else "BODY"
-        if not plan["shift"].get(family):
+        why = self._two_by_two_why(plan, g)
+        if why == "":
             return [], g
-        why = "CENTRIF under NLGEOM, which acts on the deformed positions" \
-            if label == "CENTRIF" and self._nl_any else None
-        if why is None and label in ("GRAV", "CENTRIF") and isinstance(plan["rho"], str):
-            why = plan["rho"]
-        if why is None and label == "CENTRIF" and any(plan["axi"].values()):
+        key = ("DLOAD", g[0].upper(), label)
+        if why is None and key in self.emit.nodal_kept:     # (since an earlier step's clash)
+            self._nodal_fallback(key, "")
+            return [], g
+        why = why or self._nodal_keep.get(key)
+        clash: List[str] = []
+        if why is None:
+            mass = label in ("GRAV", "CENTRIF")
+            faces = [(list(self.geom.elements[e][1]), "area",
+                      plan["thick"][e] * (plan["rho"][e] if mass else 1.0), plan["axi"][e], True, None,
+                      None) for e in plan["quads"]]
+            side = self._to_nodal_forces(b, "DLOAD", g, faces, None, two_by_two=True, fallback=clash)
+            if side is not None:
+                return side, ([plan["rest"]] + g[1:] if plan["rest"] else None)
+            why = self._nodal_fallback(key, clash[0])
+        self._keep_note(self._two_by_two_kept, g[0], self._two_by_two_shift(plan["quads"], plan["axi"], family),
+                        why)
+        return [], g
+
+    def _two_by_two_why(self, plan: dict, g: List[str]) -> Optional[str]:
+        """Why body load line ``g`` on a set _plan_two_by_two_body_loads planned (``plan``)
+        keeps ccx's line though ccx's 2 x 2 rule moves its shares (_two_by_two_body); "" where
+        it moves none (or the line does not read), None where its nodal forces are exact."""
+        label = g[1].upper()
+        if not plan["shift"].get("CENTRIF" if label == "CENTRIF" else "BODY"):
+            return ""
+        if label == "CENTRIF" and self._nl_any:
+            return "CENTRIF under NLGEOM, which acts on the deformed positions"
+        if label in ("GRAV", "CENTRIF") and isinstance(plan["rho"], str):
+            return plan["rho"]
+        if label == "CENTRIF" and any(plan["axi"].values()):
             try:
                 point = [pf(x) for x in (g[3:6] + ["0."] * 3)[:3]]
                 axis = [pf(x) for x in (g[6:9] + ["0."] * 3)[:3]]
             except ValueError:
-                return [], g
+                return ""
             if point[0] or point[2] or axis[0] or axis[2] or not axis[1]:
-                why = "CENTRIF on axisymmetric elements about another axis than the symmetry axis"
-        if why is not None:
-            old = self._two_by_two_kept.get(g[0], (0.0, ""))
-            shift = self._two_by_two_shift(plan["quads"], plan["axi"], family)
-            self._two_by_two_kept[g[0]] = (max(old[0], shift), old[1] or why)
-            return [], g
-        mass = label in ("GRAV", "CENTRIF")
-        faces = [(list(self.geom.elements[e][1]), "area",
-                  plan["thick"][e] * (plan["rho"][e] if mass else 1.0), plan["axi"][e], True, None, None)
-                 for e in plan["quads"]]
-        side = self._to_nodal_forces(b, "DLOAD", g, faces, None, two_by_two=True)
-        return side, ([plan["rest"]] + g[1:] if plan["rest"] else None)
+                return "CENTRIF on axisymmetric elements about another axis than the symmetry axis"
+        return None
 
     def _warn_two_by_two_kept(self) -> None:
         """One warning for the body loads _two_by_two_body left on CAX8R / CPE8R / CPS8R elements."""
@@ -34729,7 +34788,7 @@ class _Loads:
             return
         names = list(kept)
         shift = max(v[0] for v in kept.values())
-        whys = dedup([v[1] for v in kept.values()])
+        whys = dedup([w for v in kept.values() for w in v[1]])
         self.report.warn(f"Body loads (GRAV / CENTRIF / CENT / BX / BY) on CAX8R / CPE8R / CPS8R elements "
                          f"kept as ccx loads ({', '.join(repr(x) for x in names[:5])}"
                          + (f" and {len(names) - 5} more" if len(names) > 5 else "")
@@ -34741,8 +34800,8 @@ class _Loads:
                            f"here by up to {shift:.2g} of a node's share (probed "
                            f"on 3 x 4 meshes with the midside nodes at a third of each edge: 0.38 % "
                            f"of the largest displacement under CAX8R GRAV, 0.13 % under CENTRIF). "
-                           f"The converter writes them as consistent nodal forces elsewhere, which "
-                           f"would not be exact here: {'; '.join(whys)}. A finer mesh reduces it.")
+                           f"The converter writes them as consistent nodal forces elsewhere, but "
+                           f"not here: {'; '.join(whys)}. A finer mesh reduces it.")
 
     # element types without mass, on which a rotary body load acts on nothing
     _MASSLESS = ("SPRING", "DASHPOT", "CONN", "GAP", "DCOUP", "JOINT")
@@ -34883,6 +34942,9 @@ class _Loads:
             if quads and not plan["why"]:
                 moved = set(self._cent_two_by_two(token, quads, nodal, axes[(key, label)]))
                 plan["items"] += [nodal[e] for e in quads if e in moved]
+                # (_plan_nodal_form_keep may give them CENTRIF again: their items, densities)
+                plan["moved"] = (token, [(e, nodal[e], r) for r, es in groups.items() for e in es
+                                         if e in moved])
                 groups = OrderedDict((r, kept) for r, es in groups.items()
                                      for kept in [[e for e in es if e not in moved]] if kept)
             if not plan["why"]:
@@ -34902,7 +34964,9 @@ class _Loads:
         linear in the coordinates (two_by_two_body_shift beyond 1e-6, the CENTRIF family of
         _plan_two_by_two_body_loads), the deck has no NLGEOM (CENT, as CENTRIF, acts on the
         deformed positions) and every line spins axisymmetric ones about their y axis; else
-        none, warned once beside the body loads kept there (_warn_two_by_two_kept)."""
+        none, warned once beside the body loads kept there (_warn_two_by_two_kept).  Where their
+        forces would share a node DOF's ccx entry with another load, _plan_nodal_form_keep
+        gives them CENTRIF back."""
         axi = {e: items[e][3] for e in quads}
         if self._two_by_two_shift(quads, axi, "CENTRIF", 1e-6) <= 1e-6:
             return []
@@ -34916,10 +34980,186 @@ class _Loads:
             if any(axi.values()) and not about_y else None
         if why is None:
             return list(quads)
-        old = self._two_by_two_kept.get(token, (0.0, ""))
-        self._two_by_two_kept[token] = (max(old[0], self._two_by_two_shift(quads, axi, "CENTRIF")),
-                                        old[1] or why)
+        self._keep_note(self._two_by_two_kept, token, self._two_by_two_shift(quads, axi, "CENTRIF"), why)
         return []
+
+    def _plan_nodal_form_keep(self, blocks: List[Block]) -> None:
+        """The pressures on CAX8R / CAX6 edges and the body loads (GRAV, CENTRIF, BX, BY, CENT)
+        on CAX8R / CPE8R / CPS8R elements that the converter writes as consistent nodal forces
+        (_two_point_pressure, _two_by_two_body, _cent_two_by_two) but that keep ccx's line here
+        (``_nodal_keep``: nodal key -> why; ccx's 2-point or 2 x 2 rule, warned): ccx keeps one
+        value and one amplitude per node DOF (_nodal_load_clash), so their forces cannot share
+        one with the deck's own *CLOAD (in a deck of more than one step, or on another
+        amplitude), with a second line of the load on another amplitude in a step, or with
+        another load written as nodal forces on another amplitude (_amps_clash).  Decided per
+        load over all the steps, so that each step loads it one way (Abaqus replaces a load
+        given again), the loads the deck gives first first, after those that become nodal
+        forces in any case (HP, TRVEC / TRSHR, ROTA, beam line loads; _nodal_candidate).  A
+        CENT kept gets its elements back on CENTRIF sets of their own.  A clash this misses
+        keeps the line from its step on (_nodal_fallback)."""
+        if not self._two_by_two and not any("moved" in p for p in self._rotary.values()) and \
+                (self._nl_any or not any(ccx_type(t) in TWO_POINT_AXI_EDGE_TYPES for t in self._elem_types)):
+            return                              # (no load of the three forms)
+        cands: "OrderedDict[tuple, Tuple[set, bool]]" = OrderedDict()   # key -> (node DOFs, fixed)
+        lines: Dict[tuple, List[Tuple[int, Optional[tuple]]]] = {}     # key -> [(step, amplitude)]
+        for st in self.steps:
+            for b in st.cards:
+                if b.keyword not in ("DLOAD", "DSLOAD"):
+                    continue
+                amp = self._cload_amp(b)
+                for rec in merged_data_records(b):
+                    g = [x.strip() for x in rec]
+                    got = self._nodal_candidate(b, g) if len(g) > 1 and g[1] and \
+                        not _is_user_load(b, g) else None
+                    if got is None or not got[1]:
+                        continue
+                    key, dofs, fixed = got
+                    cands[key] = (dofs | cands[key][0] if key in cands else dofs, fixed)
+                    lines.setdefault(key, []).append((st.no, amp))
+        done = [k for k, (_, fixed) in cands.items() if fixed]
+        for key, (dofs, fixed) in cands.items():
+            if fixed:
+                continue
+            why = self._nodal_clash_why(key, dofs, lines, [(k, cands[k][0]) for k in done])
+            if why:
+                self._nodal_keep[key] = why
+            else:
+                done.append(key)
+        for (tok, label), plan in self._rotary.items():
+            why = self._nodal_keep.get(("DLOAD", tok, label))
+            if label != "CENT" or not why or "moved" not in plan:
+                continue
+            token, moved = plan.pop("moved")             # back on CENTRIF, a set per density
+            taken = {id(item) for _, item, _ in moved}
+            plan["items"] = [x for x in plan["items"] if id(x) not in taken]
+            groups: "OrderedDict[float, List[int]]" = OrderedDict()
+            for e, _, rho in moved:
+                groups.setdefault(rho, []).append(e)
+            for k, (rho, members) in enumerate(groups.items(), 1):
+                name = self._fresh_name("ABQ2CCX_CENT" + ("" if tok == ALL_ELEMENTS_SET else f"_{tok}")
+                                        + (f"_{k}" if len(groups) > 1 else ""))
+                self.geom.elsets[name] = members
+                plan["groups"].append((name, rho))
+            quads = [e for e, _, _ in moved]
+            self._keep_note(self._two_by_two_kept, token, self._two_by_two_shift(
+                quads, {e: item[3] for e, item, _ in moved}, "CENTRIF"), why)
+
+    def _nodal_candidate(self, b: Block, g: List[str]) -> Optional[Tuple[tuple, set, bool]]:
+        """Load line ``g`` of *DLOAD / *DSLOAD ``b`` as _plan_nodal_form_keep weighs it: (its
+        nodal key, as _to_nodal_forces makes it; the node DOFs its forces load, a superset;
+        whether it becomes nodal forces in any case), or None for a load that does not.  Not
+        in any case: a pressure _two_point_pressure converts (on 2-D continuum faces only,
+        without NLGEOM: _two_point_faces), a body load _two_by_two_body converts
+        (_two_by_two_why), a CENT whose CAX8R / CPE8R / CPS8R elements _cent_two_by_two moved."""
+        label = g[1].upper()
+        g = g[:2] + [x or "0." for x in g[2:]]
+        if b.keyword == "DSLOAD":
+            surf = g[0].upper()
+            sd = self.surfaces.get(surf)
+            if not sd or sd[0].startswith("NODE") or not re.fullmatch(r"P[1-6]?|HP|TRVEC|TRSHR", label):
+                return None
+            if label.startswith("P"):
+                faces, shift, plain = self._two_point_faces(
+                    [(t, f) for t, f in sd[1] if not self._only_carriers(t)])
+                return ((b.keyword, surf, label), self._dofs_of({n for f in faces for n in f[0]}, (1, 2)),
+                        False) if shift > 1e-6 and plain and not self._nl_any else None
+            faces, _ = self._surface_faces(surf)
+            return (b.keyword, surf, label), self._dofs_of({n for f in faces for n in f[0]}), True
+        token = g[0] or (ALL_ELEMENTS_SET if ALL_ELEMENTS_SET in self.geom.elsets else "")
+        if not token:
+            return None
+        key = (b.keyword, token.upper(), label)
+        m = re.fullmatch(r"(P|HP|TRVEC|TRSHR)([1-6]?)", label)
+        if label in ("PX", "PY", "PZ", "P1", "P2"):           # beam line loads (handle_dload)
+            beams = [e for e in self._load_elements(token) if self._is_beam(e)]
+            if beams:
+                return key, self._dofs_of({n for e in beams for n in self.geom.elements[e][1]}), True
+        if m and m.group(1) == "P":
+            if not m.group(2) or self._nl_any:
+                return None
+            faces, shift, plain = self._two_point_faces([(token, m.group(2))])
+            return (key, self._dofs_of({n for f in faces for n in f[0]}, (1, 2)), False) \
+                if shift > 1e-6 and plain else None
+        if m:
+            eids = [e for e in self._load_elements(token) if e in self.geom.elements]
+            faces, _ = self._load_faces(eids, m.group(2), shell_reference=not m.group(2)) if eids else ([], None)
+            return key, self._dofs_of({n for f in faces for n in f[0]}), True
+        if label in ("CENT", "ROTA"):
+            plan = self._rotary.get((token.upper(), label))
+            if not plan or plan["why"]:
+                return None
+            nodes = {n for item in plan["items"] for n in item[0]}
+            return key, self._dofs_of(nodes), label == "ROTA" or "moved" not in plan
+        if label not in ("GRAV", "CENTRIF", "BX", "BY", "BR", "BZ"):
+            return None
+        plan = self._two_by_two.get(token.upper())
+        if plan is None:
+            return None
+        if label in ("BR", "BZ"):
+            eids = [e for e in self._load_elements(token) if e in self.geom.elements]
+            if not eids or not all(self.geom.elements[e][0].upper().startswith(AXISYMMETRIC_PREFIXES)
+                                   for e in eids):
+                return None
+            label = "BX" if label == "BR" else "BY"
+            key = key[:2] + (label,)
+        if self._two_by_two_why(plan, [token, label] + g[2:]) is not None:
+            return None
+        nodes = {n for e in plan["quads"] for n in self.geom.elements[e][1]}
+        try:
+            d = [pf(x) for x in (g[3:5] + ["0.", "0."])[:2]]
+        except ValueError:
+            d = [1.0, 1.0]
+        ks = (1,) if label == "BX" else (2,) if label == "BY" else \
+            tuple(k + 1 for k in (0, 1) if d[k]) if label == "GRAV" else (1, 2)
+        return key, self._dofs_of(nodes, ks), False
+
+    def _dofs_of(self, nodes: set, ks: Sequence[int] = (1, 2, 3)) -> set:
+        """The node DOFs ``ks`` of ``nodes`` (all of DOFs 1-3 at a node with a *TRANSFORM, which
+        takes the forces in its local axes) — for _nodal_candidate."""
+        return {(n, k) for n in nodes for k in ((1, 2, 3) if n in self._transformed else ks)}
+
+    def _nodal_clash_why(self, key: tuple, dofs: set, lines: Dict[tuple, List[Tuple[int, Optional[tuple]]]],
+                         done: List[Tuple[tuple, set]]) -> Optional[str]:
+        """Why load ``key`` (its node DOFs ``dofs``, every load's lines [(step, amplitude)]) would
+        meet another load on one node DOF's ccx entry (_nodal_load_clash) if written as nodal
+        forces beside the loads ``done`` [(key, node DOFs)] are written as, or None."""
+        mine = lines[key]
+        if any(len({a for t, a in mine if t == s}) > 1 for s, _ in mine):
+            return ("two of its lines in one step have different amplitudes or TIME DELAYs, which "
+                    "Abaqus applies each on its own and ccx's one amplitude per node DOF cannot")
+        for nd in sorted(dofs):
+            amps = self._deck_cloads.get(nd)
+            if amps is not None and (self._n_steps > 1 or any(amps != {a} for _, a in mine)):
+                return (f"its force on node {nd[0]} DOF {nd[1]} would share the entry of the deck's "
+                        f"own *CLOAD there (ccx keeps one value and amplitude per node DOF, and a "
+                        f"later step's *CLOAD replaces it)")
+        for other, theirs in done:
+            if not theirs.isdisjoint(dofs) and self._amps_clash(mine, lines[other]):
+                return (f"its forces would share nodes with another load written as nodal forces "
+                        f"({other[2]} on {other[1]}) on another amplitude or TIME DELAY (ccx keeps "
+                        f"one amplitude per node DOF)")
+        return None
+
+    def _amps_clash(self, mine: List[Tuple[int, Optional[tuple]]],
+                    theirs: List[Tuple[int, Optional[tuple]]]) -> bool:
+        """Whether two loads' nodal forces, with their lines [(step, amplitude: _cload_amp)],
+        would put two amplitudes on one node DOF (_nodal_load_clash): given in one step on
+        different ones, or one given on another than the other is held on from an earlier
+        step (a step-time amplitude held plain at its end value: _hold_nodal_loads), or on a
+        step-time one there."""
+        for s in sorted({t for t, _ in mine} | {t for t, _ in theirs}):
+            fa, fb = {a for t, a in mine if t == s}, {a for t, a in theirs if t == s}
+            if fa and fb:
+                if len(fa | fb) > 1:
+                    return True
+                continue
+            given, other = (fa, theirs) if fa else (fb, mine)
+            before = [a for t, a in other if t < s]
+            if before:
+                held = None if self._step_amp(before[-1]) else before[-1]
+                if any(a != held or self._step_amp(a) for a in given):
+                    return True
+        return False
 
     def _section_rho(self, b: Block, opts: Dict[str, List[Block]]) -> Tuple[float, str]:
         """The one constant density of section ``b``'s material, or of all its plies (a *BEAM
@@ -35317,8 +35557,31 @@ class _Loads:
         mesh with the midside nodes at a third of each edge (0.998-1.001 on 24 x 32), and a 2 x 2
         CAX8R thick sphere 0.986-1.054 of Lame's u_r where the exact forces give 0.993-1.007.
         None (the pressure stays) where no such edge is loaded; under NLGEOM (the pressure
-        follows the deforming faces, nodal forces would not) and on faces other than 2-D
-        continuum ones, warned once (_warn_two_point_kept)."""
+        follows the deforming faces, nodal forces would not), on faces other than 2-D
+        continuum ones, and where its forces would share a node DOF's ccx entry with another
+        load (_plan_nodal_form_keep, _nodal_fallback), warned once (_warn_two_point_kept)."""
+        faces, shift, plain = self._two_point_faces(pairs)
+        if shift <= 1e-6:
+            return None
+        key = (b.keyword, g[0].upper(), g[1].upper())
+        if key in self.emit.nodal_kept:         # (since an earlier step's clash, noted there)
+            self._nodal_fallback(key, "")
+            return None
+        why = "under NLGEOM the pressure follows the deforming faces" if self._nl_any else \
+            None if plain else "the load also acts on other than 2-D continuum faces"
+        why = why or self._nodal_keep.get(key)
+        clash: List[str] = []
+        side = None if why else self._to_nodal_forces(b, b.keyword, g, faces, None, face_pressure=True,
+                                                      fallback=clash)
+        if side is None:
+            self._keep_note(self._two_point_kept, g[0], shift, why or self._nodal_fallback(key, clash[0]))
+        return side
+
+    def _two_point_faces(self, pairs: Sequence[Tuple[str, str]]) -> Tuple[list, float, bool]:
+        """The edges of a pressure on ``pairs`` ((element / set, face: 1-6 or S1-S6)) as
+        _to_nodal_forces takes them (2-D continuum edges, with their sense), the largest
+        two_point_edge_shift among their CAX8R / CAX6 ones, and whether every face is a 2-D
+        continuum one (_two_point_pressure)."""
         shift = 0.0
         faces: list = []
         plain = True                            # only 2-D continuum faces (nodal forces exact)
@@ -35345,13 +35608,26 @@ class _Loads:
                 fmid = tuple(sum(x[i] for x in xyz) / len(xyz) for i in range(3))
                 sense = -1.0 if vdot(normals[0], vsub(fmid, mid)) > 0.0 else 1.0
                 faces.append((nodes, kind, scale, axi, planar, n1, sense))
-        if shift <= 1e-6:
-            return None
-        if self._nl_any or not plain:           # (warned once: _warn_two_point_kept)
-            old = self._two_point_kept.get(g[0], (0.0, False))
-            self._two_point_kept[g[0]] = (max(old[0], shift), old[1] or self._nl_any)
-            return None
-        return self._to_nodal_forces(b, b.keyword, g, faces, None, face_pressure=True)
+        return faces, shift, plain
+
+    @staticmethod
+    def _keep_note(kept: "OrderedDict[str, Tuple[float, Tuple[str, ...]]]", name: str, shift: float,
+                   why: str) -> None:
+        """Record a load ``name`` kept as ccx's line (_two_point_kept, _two_by_two_kept): its
+        largest shift of a nodal share, and why it is not written as nodal forces."""
+        old = kept.get(name, (0.0, ()))
+        kept[name] = (max(old[0], shift), old[1] + ((why,) if why and why not in old[1] else ()))
+
+    def _nodal_fallback(self, key: tuple, clash: str) -> str:
+        """A load of nodal key ``key`` that _plan_nodal_form_keep left to nodal forces but whose
+        forces cannot join the generated *CLOAD here (``clash``: _nodal_load_clash's why; "" where
+        an earlier step's clash keeps it already): it keeps ccx's line from this step on
+        (EmitState.nodal_kept), and an earlier step's forces of the key go (Abaqus replaces a
+        load given again; in a static perturbation step they stay: the base state's) -> why."""
+        self.emit.nodal_kept.add(key)
+        if key not in self.emit.nodal_fresh and key in self.emit.nodal_loads and not self.emit.sp_adds:
+            self._set_nodal_load(key, {}, None)
+        return clash[:1].lower() + clash[1:]
 
     def _warn_two_point_kept(self) -> None:
         """One warning for the pressures _two_point_pressure left on CAX8R / CAX6 edges."""
@@ -35360,7 +35636,7 @@ class _Loads:
             return
         names = list(kept)
         shift = max(v[0] for v in kept.values())
-        nl = any(v[1] for v in kept.values())
+        whys = dedup([w for v in kept.values() for w in v[1]])
         self.report.warn(f"Pressures on CAX8R / CAX6 edges kept as ccx face pressures ("
                          f"{', '.join(repr(x) for x in names[:5])}"
                          + (f" and {len(names) - 5} more" if len(names) > 5 else "")
@@ -35370,23 +35646,23 @@ class _Loads:
                            f"nodes — here by up to {shift:.2g} of a node's share (each edge's total "
                            f"is exact; probed: 0.95-1.07 of the face displacements on a 3 x 4 mesh "
                            f"with the midside nodes at a third of each edge, 0.998-1.001 on 24 x "
-                           f"32). Their consistent nodal forces, which a deck without NLGEOM gets, "
-                           f"are not exact "
-                         + ("under NLGEOM (the pressure follows the deforming faces)" if nl else
-                            "on a load that also acts on other than 2-D continuum faces")
-                         + ". Midside nodes in the middle of straight edges, or a finer mesh, avoid "
-                           "it.")
+                           f"32). The converter writes them as consistent nodal forces elsewhere, "
+                           f"but not here: {'; '.join(whys)}. Midside nodes in the middle of "
+                           f"straight edges, or a finer mesh, avoid it.")
 
     def _to_nodal_forces(self, b: Block, card: str, g: List[str], faces: list,
                          why: Optional[str], face_pressure: bool = False,
-                         two_by_two: bool = False) -> List[str]:
+                         two_by_two: bool = False, fallback: Optional[List[str]] = None
+                         ) -> Optional[List[str]]:
         """One traction (TRVEC / TRSHR), beam line-load (PX / PY / PZ / P1 / P2), shell body force
         (BX / BY / BZ) or surface-element pressure (P) data line ``g`` -> consistent nodal forces (consistent_nodal_forces over
         ``faces``), registered for the *CLOAD at the end of the step (_flush_nodal_loads).
         ``face_pressure``: ``g`` is a continuum face pressure (P1..P6, a surface's P) that ccx
         would integrate at too few points (_two_point_pressure); ``two_by_two``: a body load
         (GRAV, CENTRIF, BX, BY) on CAX8R / CPE8R / CPS8R faces, whose scale holds the thickness
-        and, for GRAV / CENTRIF, the density (_two_by_two_body).
+        and, for GRAV / CENTRIF, the density (_two_by_two_body).  ``fallback``: where the forces
+        cannot join the generated *CLOAD (_nodal_load_clash), the why is added to it and None
+        returned (the caller keeps ccx's line) rather than the load commented out.
         Returns the comment lines that take the load's place in the deck.  As the Abaqus
         Analysis User's Guide defines them: TRVEC is the magnitude times the normalized
         direction; TRSHR projects the direction onto the face in its undeformed geometry, at
@@ -35524,6 +35800,9 @@ class _Loads:
         amp = self._cload_amp(b)
         key = (card, g[0].upper(), label)
         clash = self._nodal_load_clash(key, forces, amp)
+        if clash and fallback is not None:
+            fallback.append(clash)
+            return None
         if clash:
             return self._drop_load_line(b, g, clash)
         if inexact:
@@ -42612,12 +42891,15 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._u1_taken: set = set()                # names given to U1 sets and materials
         self._u1_pairs: Optional[set] = None       # the U1 elements' end-node pairs (lazy)
         # pressures kept on CAX8R / CAX6 edges ccx integrates at 2 points (_two_point_pressure):
-        # element / set / surface -> the largest shift of a nodal share, whether under NLGEOM
-        self._two_point_kept: "OrderedDict[str, Tuple[float, bool]]" = OrderedDict()
+        # element / set / surface -> (the largest shift of a nodal share, why kept: _keep_note)
+        self._two_point_kept: "OrderedDict[str, Tuple[float, Tuple[str, ...]]]" = OrderedDict()
         # body loads on CAX8R / CPE8R / CPS8R ccx integrates at 2 x 2 (_plan_two_by_two_body_loads):
-        # element set / element (upper case) -> plan; those kept: set -> (largest shift, why)
+        # element set / element (upper case) -> plan; those kept: set -> (largest shift, whys)
         self._two_by_two: Dict[str, dict] = {}
-        self._two_by_two_kept: "OrderedDict[str, Tuple[float, str]]" = OrderedDict()
+        self._two_by_two_kept: "OrderedDict[str, Tuple[float, Tuple[str, ...]]]" = OrderedDict()
+        # those of the two and CENT whose nodal forces would clash (_plan_nodal_form_keep): their
+        # nodal key -> why they keep ccx's line
+        self._nodal_keep: Dict[tuple, str] = {}
 
     # the step model's deck-wide facts, read-only, by the names the planners and handlers read
     # them: ``self.steps``' (before _read_steps the early model's, whose aggregates are the
@@ -43184,6 +43466,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_shell_body_forces(blocks)    # after the density planners' material copies
         self._plan_two_by_two_body_loads(blocks)    # likewise; after _plan_section_thick
         self._plan_rotary_loads(blocks)         # likewise
+        self._plan_nodal_form_keep(blocks)      # after both: their plans
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
         self._note_quadratic_beams(blocks)      # after the planar constraint
@@ -43316,8 +43599,12 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         and the load case's own in its step, in place.  "If any boundary condition is removed
         in a step with load cases, the base state boundary conditions will not be propagated
         to any load case", so then every *BOUNDARY of each step gets OP=NEW (an empty one
-        after the procedure where a step has none).  The base state comes back in each step
-        as after any perturbation step (_plan_base_restore).  The *LOAD CASE card stays as a
+        after the procedure where a step has none).  The base state comes back in each static
+        step as after any perturbation step (_plan_base_restore).  ccx 2.23 carries a steady-
+        state dynamics step's BCs into the next such step (it resets the loads only; probed: a
+        case's base motion acted on in the next case), so there a *BOUNDARY after the procedure
+        gives the earlier cases' own BCs again at 0, the base state's value of a perturbation
+        (Abaqus applies each case's alone).  The *LOAD CASE card stays as a
         comment (``_lc_marks``); a step of another procedure, where Abaqus rejects load cases,
         is left as it is (passthrough: the cases superposed, warned)."""
         if not any(b.keyword == "LOAD CASE" for b in blocks):
@@ -43356,15 +43643,26 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                                  f"one): closed at the next *LOAD CASE or *END STEP.", once=True,
                                  at=open_end)
             release = any(b.keyword == "BOUNDARY" and b.uparam("OP") == "NEW" for b in cards)
+            ssd = proc.keyword == "STEADY STATE DYNAMICS"
+            zeros: List[str] = []                 # the earlier cases' BCs, at 0
             for k in range(len(names)):
                 group = [b if k == 0 else Block(b.keyword, OrderedDict(b.params), list(b.data)).placed(b)
                          for b in cards if b.keyword != "END LOAD CASE" and owner.get(id(b), k) == k]
+                at = next(i for i, b in enumerate(group) if b.keyword in STEP_PROCS)
                 if release:
                     group = [Block(b.keyword, OrderedDict(b.params, OP="NEW"), list(b.data)).placed(b)
                              if b.keyword == "BOUNDARY" and b.uparam("OP") != "NEW" else b for b in group]
                     if not any(b.keyword == "BOUNDARY" for b in group):
-                        at = next(i for i, b in enumerate(group) if b.keyword in STEP_PROCS)
                         group.insert(at + 1, Block("BOUNDARY", OrderedDict(OP="NEW"), []).placed(group[at]))
+                elif ssd and zeros:
+                    group.insert(at + 1, Block("BOUNDARY", OrderedDict(), list(zeros)).placed(group[at]))
+                for b in cards if ssd else ():
+                    if b.keyword != "BOUNDARY" or owner.get(id(b)) != k:
+                        continue
+                    for f in ([x.strip() for x in r] + [""] * 3 for r in merged_data_records(b)):
+                        line = ", ".join(f[:2] + ([f[2] or f[1], "0."] if f[1].isdigit() else []))
+                        if f[0] and f[1] and line not in zeros:
+                            zeros.append(line)
                 self._lc_marks.update((id(b), f"load case {names[k]} of the deck's step {s} "
                                               f"({k + 1} of {len(names)})")
                                       for b in group if b.keyword == "LOAD CASE")
@@ -43373,8 +43671,11 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                              f"steps {s + extra}-{s + extra + len(names) - 1}, one *{proc.keyword} "
                              f"perturbation step each, with the step's own loads, BCs and output "
                              f"requests and those of its load case, about the same base state "
-                             f"(Abaqus: equivalent to consecutive perturbation steps). Later step "
-                             f"numbers in this report count the ccx steps.", at=cards[0])
+                             f"(Abaqus: equivalent to consecutive perturbation steps)"
+                             + ("; a load case's BCs given again at 0 in the later ones, which ccx "
+                                "2.23 would carry them into (it resets the loads only)"
+                                if ssd and zeros and not release else "")
+                             + ". Later step numbers in this report count the ccx steps.", at=cards[0])
             extra += len(names) - 1
         return out
 
@@ -46208,7 +46509,9 @@ def displacement_normalized(mode: Dict[int, Vec]) -> Dict[int, Vec]:
     """A mode shape scaled as Abaqus scales buckling modes and frequency modes of the default
     NORMALIZATION=DISPLACEMENT: "the maximum displacement component is 1.0" (2017
     "Eigenvalue buckling prediction") — the translation of largest size, the first such in node
-    order, made +1; a mode without translations stays as it is (its imperfection is zero)."""
+    order, made +1 (the sign is the converter's choice: Abaqus documents none, and a mode's
+    sign is the eigensolver's); a mode without translations stays as it is (its imperfection
+    is zero)."""
     big = max((c for v in mode.values() for c in v), key=abs, default=0.0)
     return {n: (v[0] / big, v[1] / big, v[2] / big) for n, v in mode.items()} if big else dict(mode)
 

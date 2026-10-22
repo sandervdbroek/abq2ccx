@@ -6636,6 +6636,28 @@ def test_load_cases_split_into_perturbation_steps():
     assert "7, 3, 1." not in _step(body, 2) and "3, 1, 1." not in _step(body, 3)
 
 
+def test_steady_state_load_cases_give_earlier_case_bcs_again_at_zero():
+    # code check G1-2: ccx 2.23 keeps a steady-state dynamics step's BCs in the next one (it
+    # resets the loads only; probed), so a load case's base motion acted on in the later cases;
+    # Abaqus applies each case alone: the later cases' steps give those BCs again at 0, before
+    # their own (a case's own BC on the DOF wins), not where OP=NEW releases the base state's
+    model = MODAL.split("*Step")[0]
+    ssd = ("*Step\n*Frequency\n3\n*End Step\n*Step\n*Steady State Dynamics\n1., 10., 2\n"
+           "*Load Case, name=A\n*Boundary\n1, 1, 1, 0.01\n4, 3\n*End Load Case\n"
+           "*Load Case, name=B\n*Cload\n7, 3, 1.\n*End Load Case\n"
+           "*Load Case, name=C\n*Boundary\n4, 3, 3, 0.02\n*End Load Case\n*End Step\n")
+    body, conv, rep = convert_str(model + ssd)
+    a, b, c = (_step(body, k) for k in (2, 3, 4))
+    assert "*BOUNDARY\n1, 1, 1, 0.01\n" in a and "*BOUNDARY\n" not in a.split("1, 1, 1, 0.01")[1]
+    assert b.startswith("\n*STEADY STATE DYNAMICS\n1., 10., 2\n*BOUNDARY\n1, 1, 1, 0.\n4, 3, 3, 0.\n")
+    assert c.index("*BOUNDARY\n1, 1, 1, 0.\n4, 3, 3, 0.\n") < c.index("*BOUNDARY\n4, 3, 3, 0.02\n")
+    assert "a load case's BCs given again at 0 in the later ones" in rep.text() and not conv.reduced_physics
+    # no BC in a case: nothing given again; the static perturbation step's cases: the base restore
+    body, _, rep = convert_str(model + ssd.replace("*Boundary\n1, 1, 1, 0.01\n4, 3\n", "*Cload\n3, 1, 1.\n")
+                               .replace("*Load Case, name=C\n*Boundary\n4, 3, 3, 0.02\n*End Load Case\n", ""))
+    assert "1, 1, 1, 0." not in body and "given again at 0" not in rep.text()
+
+
 def test_abaqus_output_filter_commented():
     # Abaqus *FILTER (output filter) is not ccx's sensitivity *FILTER, which is an error
     # outside a *SENSITIVITY step
@@ -10071,6 +10093,91 @@ def test_body_loads_on_two_by_two_elements_kept_where_nodal_forces_are_not_exact
     body, conv, rep = convert_str(_quad_body(load="*Dload\nE, CENTRIF, 4., 1., 0., 0., 0., 1., 0.\n"))
     assert "*DLOAD\nE, CENTRIF, 4., 1., 0., 0., 0., 1., 0.\n" in body and _cloads(body) == [{}]
     assert "about another axis than the symmetry axis" in rep.text()
+
+
+# one CAX8R, corners (1, 0) (2, 0) (2.2, 1) (1, 1), its midside nodes off the middle of its
+# bottom and right edges (ccx's 2-point and 2 x 2 rules move the shares of a pressure and a
+# body load there); amplitudes A1 and A2, surface SP its right edge
+CAX8R_CLASH = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2.2, 1.\n4, 1., 1.\n5, 1.333333, 0.\n6, 2.0666667, 0.3333333\n"
+               "7, 1.6, 1.\n8, 1., 0.5\n*Element, type=CAX8R, elset=EALL\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+               "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Solid Section, elset=EALL, "
+               "material=M\n*Boundary\n1, 2, 2\n2, 2, 2\n5, 2, 2\n*Amplitude, name=A1\n0., 0., 1., 1.\n"
+               "*Amplitude, name=A2\n0., 0., 1., 2.\n*Surface, name=SP\nEALL, S2\n")
+# the code check's cases (G1-1): load, the line ccx keeps, the deck's *CLOAD in two steps
+CAX8R_CLASH_CASES = (
+    ("*Dsload\nSP, P, 1.\n", "*DLOAD\nEALL, P2, 1.\n", "3, 1"),
+    ("*Dload, amplitude=A1\n1, P1, 1.\n*Dload, amplitude=A2\n1, P2, 1.\n", "*DLOAD, AMPLITUDE=A2\n1, P2, 1.\n", ""),
+    ("*Dload\nEALL, GRAV, 9.81, 0., -1., 0.\n", "*DLOAD\nEALL, GRAV, 9.81, 0., -1., 0.\n", "3, 2"),
+    ("*Dload\nEALL, GRAV, 9.81, 0., -1., 0.\n*Dload, amplitude=A1\nEALL, GRAV, 9.81, 1., 0., 0.\n",
+     "*DLOAD, AMPLITUDE=A1\nEALL, GRAV, 9.81, 1., 0., 0.\n", ""),
+    ("*Dload\nEALL, CENTRIF, 100., 0., 0., 0., 0., 1., 0.\n", "*DLOAD\nEALL, CENTRIF, 100., 0., 0., 0., 0., 1., 0.\n",
+     "3, 1"),
+    ("*Dload\nEALL, CENT, 0.1, 0., 0., 0., 0., 1., 0.\n",
+     "*DLOAD\nABQ2CCX_CENT_EALL, CENTRIF, 100., 0., 0., 0., 0., 1., 0.\n", "3, 1"))
+
+
+def _cax8r_clash(load, cload):
+    """CAX8R_CLASH under ``load``, with the deck's *CLOAD on node DOF ``cload`` in two steps."""
+    if not cload:
+        return CAX8R_CLASH + f"*Step\n*Static\n{load}*End Step\n"
+    return CAX8R_CLASH + (f"*Step\n*Static\n{load}*Cload\n{cload}, 0.5\n*End Step\n"
+                          f"*Step\n*Static\n*Cload\n{cload}, 1.\n*End Step\n")
+
+
+def test_two_point_and_two_by_two_loads_keep_their_line_where_nodal_forces_clash():
+    # code check G1-1: where the consistent nodal forces of a CAX8R / CAX6 pressure or a CAX8R /
+    # CPE8R / CPS8R body load would share a node DOF's ccx entry (one value and amplitude) with
+    # the deck's own *CLOAD in a deck of two steps, with a line of the load on another amplitude
+    # in the step, or with another such load on another amplitude, ccx's line stays (its 2-point
+    # or 2 x 2 rule, warned), as before those forms — not the load commented out
+    for load, line, cload in CAX8R_CLASH_CASES:
+        body, conv, rep = convert_str(_cax8r_clash(load, cload))
+        assert not conv.reduced_physics, (load, conv.reduced_physics)
+        assert line in _step(body, 1) and "not converted" not in body, (load, _step(body, 1))
+        assert re.search(r"kept as ccx (face pressures|loads) \('(EALL|SP|1)'\).* but not here: "
+                         r"(its force on node 3 DOF \d would share the entry of the deck's own \*CLOAD"
+                         r"|two of its lines in one step have different amplitudes"
+                         r"|its forces would share nodes with another load written as nodal forces "
+                         r"\(P1 on 1\))", rep.text()), (load, rep.text())
+    # the pressure on edge 1 (A1) converts; edge 2 (A2) shares node 2 with it: its line stays
+    body, _, _ = convert_str(_cax8r_clash(CAX8R_CLASH_CASES[1][0], ""))
+    assert set(_cloads(body)[0]) == {(1, 2), (2, 2), (5, 2)}
+    # a load given in a later step on another amplitude than one held from an earlier step
+    body, conv, rep = convert_str(CAX8R_CLASH + "*Step\n*Static\n*Dload\nEALL, GRAV, 9.81, 0., -1., 0.\n"
+                                  "*End Step\n*Step\n*Static\n*Dload, amplitude=A1\nEALL, BY, 0.1\n*End Step\n")
+    assert "*DLOAD, AMPLITUDE=A1\nEALL, BY, 0.1\n" in _step(body, 2) and not conv.reduced_physics
+    assert len(_cloads(body)[0]) == 8 and "(GRAV on EALL) on another amplitude" in rep.text()
+    # without a clash the forms stay: a single-step deck with the *CLOAD on the same amplitude
+    body, conv, rep = convert_str(CAX8R_CLASH + "*Step\n*Static\n*Dsload\nSP, P, 1.\n*Cload\n3, 1, 0.5\n"
+                                  "*End Step\n")
+    assert "*DLOAD" not in body and "kept as ccx" not in rep.text() and not conv.reduced_physics
+
+
+def test_two_point_load_clash_the_planner_misses_keeps_the_line_from_there_on():
+    # a clash _plan_nodal_form_keep does not foresee (switched off here) keeps the line from its
+    # step on, and the load's forces from an earlier step go (Abaqus replaces a load given again)
+    deck = CAX8R_CLASH + ("*Step\n*Static\n*Dload\nEALL, GRAV, 9.81, 0., -1., 0.\nEALL, BY, 0.1\n*End Step\n"
+                          "*Step\n*Static\n*Dload, amplitude=A1\nEALL, GRAV, 9.81, 0., -1., 0.\n*End Step\n"
+                          "*Step\n*Static\n*Dload\nEALL, GRAV, 4., 0., -1., 0.\n*End Step\n")
+    fd, path = tempfile.mkstemp(suffix=".inp")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        rep = A.Report()
+        conv = A.Converter(rep, Opt())
+        conv._plan_nodal_form_keep = lambda blocks: None
+        body = "\n".join(conv.convert(A.read_blocks(path, rep)))
+    finally:
+        os.unlink(path)
+    by = _cloads(convert_str(CAX8R_CLASH + "*Step\n*Static\n*Dload\nEALL, BY, 0.1\n*End Step\n")[0])[0]
+    got = _cloads(body)
+    assert not conv.reduced_physics and len(got[0]) == 8
+    assert "*DLOAD, AMPLITUDE=A1\nEALL, GRAV, 9.81, 0., -1., 0.\n" in _step(body, 2)
+    assert _close(got[1], by, 1e-9), got[1]              # GRAV's forces gone: BY's alone
+    assert "*DLOAD\nEALL, GRAV, 4., 0., -1., 0.\n" in _step(body, 3) and got[2] == {}
+    assert "(GRAV / CENTRIF / CENT / BX / BY)" in rep.text() and "shares nodes with another converted " \
+        "load (BY on EALL)" in rep.text()
 
 
 def test_two_d_mass_flagged_where_ccx_differs_from_abaqus():
@@ -23665,6 +23772,20 @@ FIXED_TR_HEX = VEL_HEX.replace("*DENSITY\n1.\n", "*DENSITY\n1.\n*NSET, NSET=N7\n
     "*Transform, nset=N7\n1., 1., 0.5, -1., 1., 1.\n"
 
 
+def test_base_restore_keeps_fixed_on_transforms_along_the_global_axes():
+    # code check G1-5: a FIXED translation on a node whose *TRANSFORM keeps the global axes stays
+    # FIXED, exact (_fixed_misread); the static perturbation step's base-state restore took it
+    # as one FIXED cannot hold and flagged the step
+    deck = (HEX_MODEL + "*Nset, nset=T\n7\n*Transform, nset=T\n1., 0., 0., 0., 1., 0.\n*Step\n*Static\n"
+            "*Boundary\n7, 1, 1, 0.01\n7, 2, 3\n*End Step\n*Step, perturbation\n*Static\n"
+            "*Boundary, fixed\nT, 1, 3\n*Cload\n3, 1, 1.\n*End Step\n")
+    body, conv, _ = convert_str(deck)
+    assert "*BOUNDARY, FIXED\nT, 1, 3\n" in _step(body, 2)
+    assert "static perturbation step not the base state plus its perturbation" not in conv.reduced_physics
+    _, turned, _ = convert_str(deck.replace("1., 0., 0., 0., 1., 0.", "1., 1., 0., -1., 1., 0."))
+    assert turned.reduced_physics == conv.reduced_physics
+
+
 def test_fixed_transformed_translations_held_at_local_values():
     # ccx 2.23 holds a FIXED translation of a *TRANSFORM node at its global displacement
     # component, read as the local value: the value the step finds it at instead (0 at rest,
@@ -24591,6 +24712,17 @@ def test_visco_increment_capped_for_norton_creep():
         body, _, report = convert_str(deck(**kw))
         assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n" + text + "\n" in body, kw
     assert "no pressure or traction to size its increments" in report.text()
+    # code check G5-1: valid data whose cap overflows a float (m near -1: 1 / (m + 1) = 100; q^n
+    # past 1e308) converts: the cap in logarithms, none past 1e6 increments (warned)
+    body, conv, report = convert_str(deck(creep="1e-20, 5., -0.99", visco="1., 1000."))
+    assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n1., 1000.\n" in body and not conv.reduced_physics
+    body, conv, report = convert_str(deck(creep="1e-300, 20.", load="*Dload\n1, P4, -1e20\n",
+                                          visco="1., 1000."))
+    assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n1., 1000.\n" in body and not conv.reduced_physics
+    assert "would take more than 1e+06 increments" in report.text()
+    # m = -0.9 from t = 0: (7.07e-3 * 0.1 / (2e-15 200^5))^10 = 2.71 h, as the float form gave
+    body, _, _ = convert_str(deck(creep="2e-15, 5., -0.9", visco="0.002, 1000."))
+    assert "*STEP, INC=410\n*VISCO, CETOL=5.E-3\n0.002,1000.,,2.71\n" in body
 
 
 def test_unused_user_material_noted_as_never_called():
@@ -24641,10 +24773,37 @@ def test_imperfection_data_lines_shift_the_nodes():
     assert "*IMPERFECTION names node 99, which the model does not have; skipped." in report.text()
     _, conv, report = convert_str(HEX_MODEL + "*Imperfection, system=Q\n8, 0.1\n" + IMP_STEP)
     assert conv.geom.nodes[8] == (0.0, 1.0, 1.0) and other_reduced(conv) == ["*IMPERFECTION"]
+    # code check G1-3: a node twice on one card is added up too, warned and reduced as documented
+    _, conv, report = convert_str(HEX_MODEL + "*Imperfection\n7, 0.1, 0., 0.\n7, 0.1, 0., 0.\n" + IMP_STEP)
+    assert abs(conv.geom.nodes[7][0] - 1.2) < 1e-12 and "*IMPERFECTION shifts node 7 twice" in report.text()
+    assert other_reduced(conv) == ["*IMPERFECTION shifts of one node added up"]
     # a node-defined orientation reads the shifted nodes (the model's geometry)
     _, conv, _ = convert_str(HEX_MODEL + "*Orientation, name=O, definition=nodes\n2, 4, 1\n"
                              "*Imperfection\n2, 0., 1.\n" + IMP_STEP)
     assert conv.orientations["O"][0] == (1.0, 1.0, 0.0)
+
+
+def test_imperfection_warnings_point_at_their_card():
+    # code check G5-3: what *IMPERFECTION warns is at its card, not at the deck's last one
+    deck = (HEX_MODEL + "*Imperfection, system=C\n999, 0.1, 0.2, 0.3\nabc, 1, 2\n7, 0.1\n"
+            "*Imperfection\n7, 0.1\n" + IMP_STEP)
+    fd, path = tempfile.mkstemp(suffix=".inp")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        rep = A.Report()
+        conv = A.Converter(rep, Opt())
+        conv.convert(A.read_blocks(path, rep))
+    finally:
+        os.unlink(path)
+    first = deck.splitlines().index("*Imperfection, system=C") + 1
+    name = os.path.basename(path)
+    want = {"Skipped a *IMPERFECTION line": first, "*IMPERFECTION names node 999": first,
+            "*IMPERFECTION shifts node 7 twice": first + 4}
+    for start, line in want.items():
+        k = next(i for i, (_, m) in enumerate(rep.entries) if m.startswith(start))
+        assert rep.where.get(k) == f"{name}:{line}", (start, rep.where.get(k), line)
 
 
 def test_imperfection_input_file_and_instance_nodes():
@@ -24701,7 +24860,10 @@ def test_imperfection_file_form_takes_the_first_pass_modes():
     assert max(abs(a - b) for a, b in zip(conv.geom.nodes[5], (-0.002, 0.0, 1.005))) < 1e-12
     assert conv.geom.nodes[1] == (0.0, 0.0, 0.0) and other_reduced(conv) == []
     assert "4 node(s) shifted by modes 1 (factor 2.5), 2 (factor 4) of step 1 as ccx solves job.inp " \
-        "(deck_ccx_imperfection.inp, --run's first pass), each normalized" in rep.text()
+        "(deck_ccx_imperfection.inp, --run's first pass), each scaled to a largest displacement " \
+        "component of 1.0, Abaqus' normalization." in rep.text()
+    # code check G1-4: Abaqus documents the size, not the sign (an eigensolver's choice): warned
+    assert "as Abaqus normalizes" not in rep.text() and "the sign of each mode is arbitrary" in rep.text()
     # what the pass reports carries over: the job deck's reduced physics, a repeated mode, or why
     # there are no modes
     got = dict(_imperfection_shapes(range(1, 9)), reduced=["element S4R (x)"], repeated=[(1, 2)])
@@ -24769,7 +24931,8 @@ IMP_DAT = """
 
 def test_imperfection_dat_reader_and_mode_normalization():
     # the .dat tables of a *BUCKLE step: its base state first (no mode), then each mode's;
-    # Abaqus scales a mode to make its largest displacement component 1.0 (its sign with it)
+    # Abaqus scales a mode to make its largest displacement component 1.0 (its sign: the
+    # converter's choice, +1, as Abaqus documents none)
     fd, path = tempfile.mkstemp(suffix=".dat")
     os.close(fd)
     try:
