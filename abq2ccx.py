@@ -5896,11 +5896,13 @@ def held_factor(curve: Optional[AmplitudeCurve], delay: Optional[str],
     reaches at the end of a step of time ``period``: Abaqus and ccx 2.23 hold a step-time
     amplitude's there, plain, in the steps after it (ccx starts the amplitude over only where
     the line is given again on it; probed); a TIME=TOTAL TIME one's at total time ``at``
-    (None: it goes on through the later steps).  None where the converter cannot evaluate
-    it: an amplitude it does not read (USER, ...), VALUE=ABSOLUTE, an unknown period or time
+    (None: it goes on through the later steps).  A VALUE=ABSOLUTE one's value too: the
+    callers' magnitude x factor is ccx's load (and Abaqus' where every magnitude on it is 1,
+    _unit_abs_amps; elsewhere handle_amplitude flags the deck).  None where the converter
+    cannot evaluate it: an amplitude it does not read (USER, ...), an unknown period or time
     (Riks, a linear perturbation step)."""
     end = at if curve is not None and curve.total else period
-    if curve is None or curve.absolute or end is None:
+    if curve is None or end is None:
         return None
     try:
         return curve.value(end - pf(delay or "0"))
@@ -8973,6 +8975,69 @@ class _Mesh:
         params = OrderedDict((k, v) for k, v in b.params.items() if k != "ORIENTATION")
         return [emit_keyword("DASHPOT", params)] + list(b.data[1:])
 
+    def _warn_dashpot_steps(self, blocks: List[Block]) -> None:
+        """DASHPOTA elements in *DYNAMIC steps where ccx 2.23 does not damp as Abaqus does
+        (probed): an explicit step ignores them entirely (a mass on a dashpot to ground under a
+        constant force moved 2.0, undamped, where the implicit step gives the damped 0.19); a
+        small-strain implicit step damps along the current line of the two nodes, where Abaqus
+        projects the velocities onto the reference axis without NLGEOM (Abaqus 2017
+        'Dashpots'), so the force turns as the ends move across the line (probed: a mass on a
+        dashpot at 45 deg to ground, pushed along x, 4.5 % off where it moved 0.14 across a
+        dashpot 1.41 long, 0.04 % across one 141 long).  Exact there where neither end can move
+        across its line in the step: BCs hold each end's DOFs 1-3 at zero but at most the one
+        along the line (all three at a node with a *TRANSFORM; DOF 3 of a plane model's node
+        does not count), and the converter's DASHPOT1 / DASHPOT2 form, whose equations keep
+        its line (_plan_dashpots).  Warned, reduced physics."""
+        ends = {e: tuple(conn) for e, (typ, conn) in self.geom.elements.items()
+                if typ.upper() == "DASHPOTA" and len(conn) == 2}
+        dyn = [st for st in self.steps if st.proc == "DYNAMIC"]
+        if not ends or not dyn:
+            return
+        expl = [st.no for st in dyn if st.explicit]
+        if expl:
+            self.report.warn(f"{len(ends)} DASHPOTA element(s) (e.g. element {min(ends)}) in explicit "
+                             f"*DYNAMIC step(s) {', '.join(map(str, expl))}: ccx 2.23's explicit "
+                             f"dynamics ignores dashpots entirely (probed: a mass on a dashpot to "
+                             f"ground under a constant force moved 2.0, undamped, where the implicit "
+                             f"step gives the damped 0.19), so their damping is missing there.",
+                             once=True)
+            self._reduces("dashpots in an explicit *DYNAMIC step (ccx ignores them)")
+        small = [st.no for st in dyn if not st.explicit and not st.nlgeom]
+        lined = {row[0][0] for row in self._dashpot_rows}     # the DASHPOT1 / 2 forms' new nodes
+        if not small or all(conn[1] in lined for conn in ends.values()):
+            return
+        states, _ = self._bc_states(blocks, {n for conn in ends.values() for n in conn})
+
+        def across(n: int, axis: Vec, st: dict) -> bool:
+            """End ``n`` of a dashpot along ``axis`` can move across it in BC state ``st``."""
+            free = [d for d in (1, 2, 3) if not (d == 3 and n in self._plane_only) and not (
+                st.get((n, d), (0, None, None, None))[3] == "disp" and st[(n, d)][1] == 0.0)]
+            return bool(free) and (n in self._transformed or len(free) > 1 or
+                                   abs(abs(axis[free[0] - 1]) - 1.0) > 1e-9)
+        hit: List[Tuple[int, int]] = []
+        for e, (a, z) in sorted(ends.items()):
+            axis = vsub(self.geom.nodes[z], self.geom.nodes[a]) \
+                if a in self.geom.nodes and z in self.geom.nodes else (0.0, 0.0, 0.0)
+            if z in lined or vnorm(axis) == 0.0:
+                continue
+            axis = vunit(axis)
+            s = next((s for s in small if across(a, axis, states[s - 1]) or
+                      across(z, axis, states[s - 1])), None)
+            if s:
+                hit.append((e, s))
+        if hit:
+            self.report.warn(f"{len(hit)} DASHPOTA element(s) whose nodes can move across their line "
+                             f"in a small-strain implicit *DYNAMIC step (e.g. element {hit[0][0]}, "
+                             f"step {hit[0][1]}): ccx 2.23 damps along the current line of the two "
+                             f"nodes even without NLGEOM, where Abaqus takes the velocities along the "
+                             f"undeformed axis, so the force turns as the ends move across it, by "
+                             f"about that motion over the dashpot's length (probed: a mass on a "
+                             f"dashpot at 45 deg to ground, pushed along x, 4.5 % off where it moved "
+                             f"0.14 across a dashpot 1.41 long, 0.04 % across one 141 long). Verify "
+                             f"that the ends move little across their line compared with its length.",
+                             once=True)
+            self._reduces("DASHPOTA damping along the current line in a small-strain step")
+
     def handle_spring(self, b: Block) -> List[str]:
         """``*SPRING``: ccx 2.23 tells the card's DOF line from its data lines by a decimal point
         — a line whose first number has none ('100', '1e-3', '-100') is a DOF line to it, and the
@@ -9632,7 +9697,7 @@ class _Mesh:
                 self.geom.elsets[name] = [i for i in ids if i not in found]
         self.report.note(f"{len(found)} surface element(s) ({kinds}) left out of the ccx mesh: they "
                          f"have no stiffness and ccx has no such element. The loads they carry "
-                         f"(TRVEC, TRSHR, P) become consistent nodal forces on their nodes; element "
+                         f"(TRVEC, TRSHR, P, BX / BY / BZ) become consistent nodal forces on their nodes; element "
                          f"sets keep their other members.")
         used = {n for _, conn in self.geom.elements.values() for n in conn}
         free = {n for _, conn in found.values() for n in conn} - used
@@ -20388,7 +20453,8 @@ class _Constraints:
         non-zero rotational BC or moment from a card of that step or an earlier one (ccx's
         mean-rotation MPCs; knots in a *DYNAMIC step), or a model with knots (frame joints and
         folded shell edges ccx makes itself, _ccx_knot; the converter's knot beams), whose
-        RIGID MPCs turn too.  Abaqus keeps rotations linear there.  Probed on 2.23 against the
+        RIGID MPCs turn too, unless BCs hold the knot's rotations at zero throughout.  Abaqus
+        keeps rotations linear there.  Probed on 2.23 against the
         linear *STATIC step: S4 / B31 / B32, a prescribed rotation of theta rad theta^2 / 3 to
         theta^2 of max |u|, a moment theta^2; a B31 frame joint turning 0.009 rad 1.1 %, a knot
         beam on a cantilever turning 0.01 rad 0.35 %; rotations held at zero exact.  No ccx
@@ -20412,6 +20478,13 @@ class _Constraints:
         # (knot beams of _plan_beam_section_axes whose rotations stay held at zero turn nothing)
         knots = (set(self._knots) | {n for n in own if self._ccx_knot(n, sections, at) is True}) - \
             self._still_knots
+        if knots:
+            # (nor does a knot whose DOFs 4-6 displacement BCs hold at zero up to the last such
+            # step: its RIGID MPC only translates; probed exact on a B31 frame joint)
+            states, _ = self._bc_states(blocks, knots)
+            knots -= {n for n in knots if all(
+                st.get((n, d), (0, None, None, None))[3] == "disp" and st[(n, d)][1] == 0.0
+                for st in states[:steps[-1]] for d in (4, 5, 6))}
         if not turned and not knots:
             return
         parts = [f"non-zero rotational BCs or moments on {len(turned)} shell/beam node(s) (e.g. "
@@ -28429,22 +28502,24 @@ class _Loads:
                         continue
                     g = [self._u1_rest[g[0].upper()]] + g[1:]
             # surface elements on the line (no element set: the whole model) are not in the ccx
-            # mesh: a pressure on them becomes nodal forces, a mass-proportional load adds
-            # nothing (they carry no mass unless --approximate dropped it), others are lost
+            # mesh: a pressure or a body force on them (BX / BY / BZ: per unit area there, Abaqus
+            # 2017 general surface element library) becomes nodal forces, a mass-proportional
+            # load adds nothing (they carry no mass unless --approximate dropped it), others are
+            # lost; the set's other elements keep the line (the set without them)
             carriers = [e for e in self._load_elements(g[0]) if e in self._carriers] if g[0] \
                 else list(self._carriers)
             if carriers:
-                if label == "P":
+                if label in ("P", "BX", "BY", "BZ"):
                     faces, why = self._load_faces(carriers, "", shell_reference=True)
                     side += self._to_nodal_forces(b, "DLOAD", g, faces, why)
                 elif label not in ("GRAV", "CENTRIF"):
                     side += self._drop_load_line(b, g, f"it loads surface elements, which are not "
                                                        f"in the ccx mesh, and a {label} load on "
-                                                       f"them is not converted", reduces=label not in ("BX", "BY", "BZ"))
+                                                       f"them is not converted")
                     continue
                 if not (self.geom.elements if not g[0] else
                         any(e not in self._carriers for e in self._load_elements(g[0]))):
-                    if label != "P":
+                    if label in ("GRAV", "CENTRIF"):
                         side.append(f"** abq2ccx: {', '.join(g)} -> no load: it acts only on "
                                     f"surface elements, which carry no mass in ccx")
                     continue
@@ -29513,6 +29588,9 @@ class _Loads:
                           "above it)")
         elif base == "GRAV":
             what, lack = "gravity (GRAV) on U1 beams", "ccx stops on GRAV on U1 elements"
+        elif base in ("BX", "BY", "BZ") and any(f[6] is not None for f in faces):
+            what, lack = "body forces (BX / BY / BZ, per unit area) on surface elements", \
+                "ccx has no surface element"
         elif base in ("BX", "BY", "BZ"):
             what, lack = ("body forces (BX / BY / BZ) on shells without one constant density (times "
                           "the section thickness)", "ccx 2.23 applies BX / BY / BZ on a shell as a "
@@ -29837,8 +29915,7 @@ class _Loads:
         step-time amplitude at its value at the end of the step, plain: Abaqus and ccx 2.23
         hold it there, and ccx starts it over where it is given again on the amplitude, while
         given plain it stays constant, after *CLOAD / *DLOAD, OP=NEW too (probed).  None where
-        the converter cannot evaluate that value (a VALUE=ABSOLUTE or USER amplitude, an
-        unknown step period)."""
+        the converter cannot evaluate that value (a USER amplitude, an unknown step period)."""
         name = amp[0]
         if not name or name in self._total_amps:
             return line, kept, amp
@@ -30586,6 +30663,14 @@ class _Loads:
                                  f"instability may not converge.", once=True)
             else:
                 self.report.note(f"*STATIC parameter {k} dropped (not a ccx parameter).", once=True)
+        why = self._solver_steps[self.emit.no - 1] if 0 < self.emit.no <= len(self._solver_steps) else ""
+        if why and self._stabilized(b):
+            self.report.warn(f"*STATIC, STABILIZE in step {self.emit.no}, which ccx runs through its "
+                             f"nonlinear solver ({why}): Abaqus adds viscous forces there to pass "
+                             f"local instabilities (buckles, wrinkles, softening, contact closing), "
+                             f"ccx solves the unstabilized problem — it may not converge, and where "
+                             f"it does, its path need not be the stabilized one.", once=True)
+            self._reduces("*STATIC automatic stabilization (STABILIZE) dropped in a nonlinear step")
         data = list(b.data)
         freed = self._direct_freed(b, self.emit.step.ccx_period)     # (b: the step's procedure)
         if freed:
@@ -30611,6 +30696,19 @@ class _Loads:
                                         "plain-*STATIC reframing.",
                                      "*STATIC, RIKS step (ccx has no arc-length solver)")
         return [emit_keyword("STATIC", params)] + data
+
+    @staticmethod
+    def _stabilized(b: Block) -> bool:
+        """``*STATIC`` card ``b`` asks for Abaqus' automatic stabilization: STABILIZE (a
+        dissipated energy fraction, 2e-4 without a value) not zero, or its FACTOR (a damping
+        factor, which overrides that fraction) not zero."""
+        if not b.has("STABILIZE"):
+            return False
+        v = (b.param("FACTOR") or b.param("STABILIZE") or "").strip()
+        try:
+            return not v or pf(v) != 0.0
+        except ValueError:
+            return True
 
     def _direct_freed(self, proc: Optional[Block], period: Optional[float]) -> Optional[List[str]]:
         """The data line handle_static writes for a ``*STATIC, DIRECT`` step of a model with
@@ -33903,16 +34001,22 @@ class _Output:
                              linear: bool = False) -> Optional[Tuple[str, str]]:
         """The one output control ccx can give step ``k`` (as FREQUENCY= or TIME POINTS=):
         its .frd requests' (or, without any, its .dat requests'); the .dat requests' when
-        the .frd's cannot be given.  None when the step has no time increments or nothing
-        can be given.  Notes go to the step's first request.  A request without a control
-        of its own (_energy_from_step_one's card) has no say.  ``linear``: ccx solves the
-        step in one increment (probed on 2.23), so output at times of it comes at its end."""
+        the .frd's cannot be given.  Where the .frd requests' is Abaqus' default (the deck
+        names none) and every request asks for output every so many increments, the greatest
+        common divisor of them all, which writes each at least as often as asked (ccx's
+        FREQUENCY serves the .frd and the .dat alike, nodeprints.f / noelfiles.f: the default
+        10 of a *DYNAMIC step printed a *NODE PRINT, FREQUENCY=1 every tenth increment).  None
+        when the step has no time increments or nothing can be given.  Notes go to the step's
+        first request.  A request without a control of its own (_energy_from_step_one's
+        card) has no say.  ``linear``: ccx solves the step in one increment (probed on 2.23),
+        so output at times of it comes at its end."""
         live = [r for r in reqs if r["live"] and r["ctl"]]
         if not live or timing["kind"] == "untimed":
             return None
         frd = [r for r in live if r["frd"]]
         dat = [r for r in live if not r["frd"]]
-        groups = [frd, dat] if frd and dat else [frd or dat]
+        groups = [live] if all(r["ctl"][0] == "F" for r in live) and all(r["default"] for r in frd) else \
+            [frd, dat] if frd and dat else [frd or dat]
         msgs = live[0]["notes"]
         spacing = None
         for group in groups:
@@ -36196,6 +36300,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_beam_section_axes(blocks)        # after them (_untr); may add knot beams
         self._warn_beam_moment_stops(blocks)        # after it: its knot beams
         self._warn_finite_rotations(blocks)         # after every planner adding knot beams
+        self._warn_dashpot_steps(blocks)            # after _plan_dashpots: its rows
         self._plan_circ_explicit_increment(blocks)
         self._plan_rigid_contact_increment(blocks)
         self._complete_temperature_ic()         # after every planner that adds knot nodes

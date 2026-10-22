@@ -4635,7 +4635,26 @@ def test_material_and_procedure_options_ccx_lacks():
     assert "*STATIC\n" in body and "\n*DYNAMIC\n0.1, 1.\n" in body
     assert "*STATIC STABILIZE dropped" in rep.text() and "*RESTART parameter OVERLAY dropped" in rep.text()
     assert conv.reduced_physics == ["*CREEP, LAW=HYPERBOLIC SINE", "*SURFACE BEHAVIOR, NO SEPARATION",
+                                    "*STATIC automatic stabilization (STABILIZE) dropped in a nonlinear step",
                                     "adiabatic heating (*DYNAMIC, ADIABATIC)"]
+
+
+def test_static_stabilization_in_a_nonlinear_step_flagged():
+    # Abaqus' automatic stabilization adds viscous forces to pass local instabilities; ccx has
+    # none.  Where ccx runs the step nonlinearly (NLGEOM, contact, an iterated material) the
+    # deck relies on it: reduced physics (before: a warning only); in a linear step no
+    # instability is there to pass (wjin33_3d_cohesive, an elastic block): warned only
+    step = "*Step{}\n*Static, {}\n0.1, 1.\n*Cload\n7, 3, 1.\n*End Step\n"
+    why = "*STATIC automatic stabilization (STABILIZE) dropped in a nonlinear step"
+    for nl, params in ((", nlgeom", "stabilize"), (", nlgeom", "stabilize=2e-4, allsdtol=0.05, continue=NO"),
+                       (", nlgeom", "stabilize=0., factor=1e-3")):
+        _, conv, rep = convert_str(HEX_MODEL + step.format(nl, params))
+        assert conv.reduced_physics == [why], params
+        assert "*STATIC, STABILIZE in step 1, which ccx runs through its nonlinear solver (a *STATIC " \
+               "step under NLGEOM)" in rep.text()
+    for nl, params in (("", "stabilize"), (", nlgeom", "stabilize=0."), (", nlgeom", "stabilize, factor=0.")):
+        _, conv, rep = convert_str(HEX_MODEL + step.format(nl, params))
+        assert not conv.reduced_physics and "*STATIC STABILIZE dropped" in rep.text(), params
 
 
 def test_step_and_procedure_options_ccx_lacks():
@@ -5115,6 +5134,35 @@ def test_dashpot1_to_a_ground_node_on_its_line():
     # stopped ccx: exit 255)
     body, conv, _ = convert_str(deck.replace("*Dynamic\n0.1, 1.\n", "*Coupled Temperature-displacement\n0.1, 1.\n"))
     assert "*EQUATION\n2\n4, 11, 1, 1, 11, -1\n" in body
+
+
+def test_dashpota_where_ccx_damps_otherwise_warned():
+    # ccx 2.23 ignores dashpots in explicit dynamics, and damps along the current line of a
+    # DASHPOTA's nodes in a small-strain step, where Abaqus takes the undeformed axis (probed;
+    # validate_with_ccx.py dashpot_explicit, dashpot_oblique)
+    deck = ("*Node\n1, 0., 0., 0.\n2, {}, 0.\n*Element, type=MASS, elset=EM\n11, 1\n*Mass, elset=EM\n1.\n"
+            "*Element, type=DASHPOTA, elset=D\n21, 1, 2\n*Dashpot, elset=D\n\n10.\n*Boundary\n{}"
+            "*Step{}\n*Dynamic{}\n{}\n*Cload\n1, 1, 1.\n*End Step\n")
+    expl = "dashpots in an explicit *DYNAMIC step (ccx ignores them)"
+    line = "DASHPOTA damping along the current line in a small-strain step"
+    for geo, bc, nl, ex, why in (("1., 1.", "1, 3, 3\n2, 1, 3\n", "", ", explicit", [expl]),
+                                 ("1., 1.", "1, 3, 3\n2, 1, 3\n", "", "", [line]),
+                                 ("1., 0.", "1, 3, 3\n2, 1, 3\n", "", "", [line]),     # free across
+                                 ("1., 0.", "1, 2, 3\n2, 1, 3\n", "", "", []),         # along it only
+                                 ("1., 1.", "1, 3, 3\n2, 1, 3\n", ", nlgeom", "", [])):  # Abaqus turns too
+        _, conv, rep = convert_str(deck.format(geo, bc, nl, ex, ", 2." if ex else "0.01, 2."))
+        assert conv.reduced_physics == why, (geo, bc, nl, ex)
+    _, _, rep = convert_str(deck.format("1., 1.", "1, 3, 3\n2, 1, 3\n", "", "", "0.01, 2."))
+    assert "1 DASHPOTA element(s) whose nodes can move across their line in a small-strain implicit " \
+           "*DYNAMIC step (e.g. element 21, step 1)" in rep.text()
+    # the DASHPOT1 / DASHPOT2 form keeps its line: only explicit steps
+    d1 = ("*Node\n1, 0., 0., 0.\n*Element, type=MASS, elset=EM\n11, 1\n*Mass, elset=EM\n1.\n"
+          "*Element, type=DASHPOT1, elset=D\n21, 1\n*Dashpot, elset=D\n1\n10.\n*Step\n*Dynamic{}\n{}\n"
+          "*Cload\n1, 1, 1.\n1, 2, 1.\n*End Step\n")
+    _, conv, _ = convert_str(d1.format("", "0.01, 2."))
+    assert conv.reduced_physics == []
+    _, conv, rep = convert_str(d1.format(", explicit", ", 2."))
+    assert conv.reduced_physics == [expl] and "ccx 2.23's explicit dynamics ignores dashpots" in rep.text()
 
 
 def test_anisotropic_point_mass_written_as_ccx_reads_it():
@@ -5699,7 +5747,7 @@ def test_contact_forces_left_out_where_ccx_segfaults():
     body, _, rep = convert_str(model + static.format(cp.format("CFN")) + static.format("") +
                                "*Step\n*Dynamic\n0.01, 0.1\n" + cp.format("CFS") + "*End Step\n")
     assert "SLAVE=A" in _step(body, 1) and "*CONTACT PRINT" not in _step(body, 2)
-    assert "*CONTACT PRINT, SLAVE=A, MASTER=B, FREQUENCY=10\nCFS\n" in _step(body, 3)
+    assert "*CONTACT PRINT, SLAVE=A, MASTER=B\nCFS\n" in _step(body, 3)     # (every increment)
     assert "contact forces" not in rep.text()
 
 
@@ -5919,13 +5967,32 @@ def test_print_frequency_under_preselected_output_noted():
             "0.1, 1.\n*Cload\n7, 3, 1.\n*Node Print, nset=TOP, frequency=100\nU\n{}*End Step\n")
     body, _, rep = convert_str(deck.format(""))
     assert "FREQUENCY=100" not in body and "*NODE PRINT, NSET=TOP\nU\n" in body
-    assert "the .dat (print / history) requests follow the .frd requests'" in rep.text()
+    assert "requests at FREQUENCY=1 / 100 -> FREQUENCY=1, which writes each" in rep.text()
     body, _, rep = convert_str(deck.format("*Node File, nset=TOP, frequency=100\nU\n"))
     assert "requests at FREQUENCY=1 / 100 -> FREQUENCY=1, which writes each" in rep.text()
     assert "follow the .frd requests'" in rep.text()
     body, _, rep = convert_str(deck.format("*Output, field, frequency=100\n*Node Output\nU\n"))
     assert "*NODE PRINT, NSET=TOP, FREQUENCY=100\nU\n*NODE FILE\nU\n" in body
     assert "at one frequency" not in rep.text()
+
+
+def test_print_frequency_in_a_dynamic_step_beside_its_default_field_output():
+    # Abaqus' preselected .frd output of a *DYNAMIC step comes every 10 increments, a *NODE
+    # PRINT's every FREQUENCY=n; ccx has one frequency for both: their greatest common divisor
+    # (before: 10, which printed a tenth of the history, and a second card's 3 was lost)
+    deck = HEX_MODEL.replace("1000., 0.3\n", "1000., 0.3\n*Density\n1.\n") + \
+        "*Nset, nset=TOP\n5, 6, 7, 8\n*Step\n*Dynamic\n0.1, 1.\n*Cload\n7, 3, 1.\n{}*End Step\n"
+    body, _, rep = convert_str(deck.format("*Node Print, nset=TOP, frequency=1\nU\n"
+                                           "*Node Print, nset=TOP, frequency=3\nRF\n"))
+    assert "*NODE PRINT, NSET=TOP\nU\n*NODE PRINT, NSET=TOP\nRF\n*NODE FILE\nU, V, RF\n" in _step(body, 1)
+    assert "requests at FREQUENCY=1 / 3 / 10 -> FREQUENCY=1" in rep.text()
+    body, _, rep = convert_str(deck.format("*Node Print, nset=TOP, frequency=5\nU\n"))
+    assert "*NODE PRINT, NSET=TOP, FREQUENCY=5\nU\n" in _step(body, 1)
+    # a .frd frequency the deck names still serves both (a sparse field output stays sparse)
+    body, _, rep = convert_str(deck.format("*Output, field, frequency=10\n*Node Output\nU\n"
+                                           "*Node Print, nset=TOP, frequency=1\nU\n"))
+    assert "*NODE FILE, FREQUENCY=10\nU\n" in _step(body, 1)
+    assert "the .dat (print / history) requests follow the .frd requests'" in rep.text()
 
 
 def test_output_intervals_to_time_points_or_frequency():
@@ -8369,9 +8436,16 @@ def test_converted_loads_on_step_time_amplitudes_hold_their_end_value():
     # a TIME=TOTAL TIME amplitude goes on: nothing to write
     body, _, _ = convert_str(head + two.format(*[trvec.format(", amplitude=T", "4.")] * 2))
     assert _cloads(body) == [top, {}]
-    # an end value the converter cannot evaluate (VALUE=ABSOLUTE): lost after OP=NEW, warned
+    # VALUE=ABSOLUTE at magnitude 1 (the amplitude itself): given again at B(1) = 4 (before:
+    # lost, its end value unknown)
     body, conv, rep = convert_str(head + two.format(trvec.format(", amplitude=B", "1."),
                                                     "*Cload, op=NEW\n1, 1, 5.\n"))
+    assert _cloads(body)[1] == {(1, 1): 5.0, **top}
+    assert not conv.reduced_physics
+    # an end value the converter cannot evaluate (a USER amplitude): lost after OP=NEW, warned
+    body, conv, rep = convert_str(head.replace("name=B, value=absolute\n0., 0., 1., 4.\n",
+                                               "name=B, definition=USER, variables=1\n") +
+                                  two.format(trvec.format(", amplitude=B", "1."), "*Cload, op=NEW\n1, 1, 5.\n"))
     assert _cloads(body)[1] == {(1, 1): 5.0} and conv.reduced_physics
     assert "Step 2's *CLOAD, OP=NEW also removes in ccx 2.23 the nodal forces converted from " \
            "loads of earlier steps (*DSLOAD TRVEC on TOP)" in rep.text()
@@ -8812,11 +8886,16 @@ def test_load_amplitudes_ccx_cannot_hold_on_one_face_or_node():
     assert "removed them)" not in body and "cannot be given again after it" in rep.text()
     assert "distributed load of an earlier step lost after another card's OP=NEW (amplitudes)" in \
         conv.reduced_physics
-    # on faces the step loads plain: the step-time load given again at its end value; one whose
-    # end value the converter does not know (VALUE=ABSOLUTE) is lost there
+    # on faces the step loads plain: the step-time load given again at its end value, a
+    # VALUE=ABSOLUTE one's at magnitude 1 too (V(1) = 5); one whose end value the converter does
+    # not know (a USER amplitude) is lost there
     body, _, _ = convert_str(two.format("*Dsload, amplitude=R\nTIPA, P, 1.\n", "*Dsload\nTIPB, P, 2.\n"))
     assert REGIVEN + "*DLOAD\n3, P4, 2.\n" in _step(body, 2)
-    _, _, rep = convert_str(two.format("*Dsload, amplitude=V\nTIPA, P, 1.\n", "*Dsload\nTIPB, P, 2.\n"))
+    body, _, rep = convert_str(two.format("*Dsload, amplitude=V\nTIPA, P, 1.\n", "*Dsload\nTIPB, P, 2.\n"))
+    assert REGIVEN + "*DLOAD\n3, P4, 5.\n" in _step(body, 2)
+    _, _, rep = convert_str(two.replace("name=V, value=absolute\n0., 0., 1., 5.\n",
+                                        "name=V, definition=USER, variables=1\n").format(
+        "*Dsload, amplitude=V\nTIPA, P, 1.\n", "*Dsload\nTIPB, P, 2.\n"))
     assert "whose end value the converter cannot evaluate" in rep.text()
 
 
@@ -10751,9 +10830,17 @@ def test_other_loads_on_surface_elements():
     assert reparse(body).elsets["ABQ2CCX_ALL_ELEMENTS"] == [1] and not conv.unloaded_steps
     body, conv, _ = convert_str(deck.format("SKIN, GRAV, 9.81, 0., 0., -1."))
     assert "-> no load: it acts only on surface elements" in body and "\n*DLOAD" not in body
-    # loads this conversion does not apply to surface elements are commented out
+    # a body force (per unit area on surface elements): nodal forces; on a set that mixes them
+    # with others, the line stays for the others (before: dropped whole, unflagged)
     body, conv, rep = convert_str(deck.format("SKIN, BZ, 3."))
-    assert "a BZ load on them is not converted" in rep.text() and conv.unloaded_steps == [1]
+    assert _cloads(body) == [{(n, 3): 0.75 for n in TOP4}] and not conv.reduced_physics
+    assert "(BX / BY / BZ, per unit area) on surface elements" in rep.text()
+    body, conv, rep = convert_str(deck.format("BOTH, BZ, 3.").replace("*Step", "*Elset, elset=BOTH\nEALL, SKIN\n*Step"))
+    assert "*DLOAD\nBOTH, BZ, 3.\n" in body and reparse(body).elsets["BOTH"] == [1]
+    assert _cloads(body) == [{(n, 3): 0.75 for n in TOP4}] and not conv.reduced_physics
+    # loads this conversion does not apply to surface elements are commented out
+    body, conv, rep = convert_str(deck.format("SKIN, TRNOR, 3."))
+    assert "a TRNOR load on them is not converted" in rep.text() and conv.unloaded_steps == [1]
 
 
 def test_surface_elements_with_mass_or_rebar_stay_unless_approximate():
@@ -13085,6 +13172,18 @@ def test_shell_beam_rotations_in_steps_ccx_runs_nonlinear_warned():
         "2, 2, 3\n", "2, 2, 3\n3, 3, 4\n").format("*Cload\n4, 3, 0.1\n")
     body, conv, rep = convert_str(frame)
     assert conv.reduced_physics == [FINITE_ROT] and "1 knot(s) (e.g. node 3;" in rep.text()
+    # ... not where BCs hold its rotations at zero (its RIGID MPC only translates; before:
+    # flagged; validate_with_ccx.py finite_rotation_knot_held), but where one is free or moved
+    held = frame.replace("*Step", "*Boundary\n3, 4, 6\n*Step")
+    body, conv, rep = convert_str(held)
+    assert not conv.reduced_physics and rep.n_warnings == 0
+    for bc in ("3, 4, 5\n", "3, 4, 6, 0.01\n"):
+        _, conv, _ = convert_str(frame.replace("*Step", "*Boundary\n" + bc + "*Step"))
+        assert conv.reduced_physics == [FINITE_ROT], bc
+    # held in the model data, released by a later *BOUNDARY, OP=NEW before the NLGEOM step
+    _, conv, _ = convert_str(held.replace("*End Step\n", "*End Step\n*Step\n*Static\n*Boundary, "
+                                          "op=NEW\n1, 1, 6\n*End Step\n"))
+    assert conv.reduced_physics == [FINITE_ROT]
 
 
 def test_kinematic_coupling_rotation_line_in_a_linear_rigid_deck():

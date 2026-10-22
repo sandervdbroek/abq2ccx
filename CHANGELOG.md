@@ -20,6 +20,19 @@ physics.
   on an upgraded beam's midside node gets its value too (it was left free). In a linear
   perturbation step a FIXED translation or shell/beam rotation is a zero perturbation (a FIXED
   rotation in a static perturbation step was given twice its base value).
+* **Small correctness batch** — ccx 2.23 has one output frequency for the `.frd` and the `.dat`:
+  where the `.frd` requests take Abaqus' default and every request asks for output every so
+  many increments, it is now their greatest common divisor (a `*NODE PRINT, FREQUENCY=1` in a
+  `*DYNAMIC` step beside the default field output every 10 increments was printed every tenth
+  increment; a `.frd` frequency the deck names still wins). A load on a
+  `VALUE=ABSOLUTE` amplitude at magnitude 1 is held at its end value in later steps (it was lost
+  after a `*CLOAD, OP=NEW`). `*DLOAD BX / BY / BZ` on surface elements (a force per unit area)
+  becomes nodal forces, and a set that mixes them with other elements keeps the line for those
+  (it was dropped whole, unflagged). Newly flagged as reduced physics: `*STATIC, STABILIZE` in a
+  step ccx runs nonlinearly; `DASHPOTA` in explicit dynamics (ccx ignores it) and in a
+  small-strain implicit step where its nodes can move across its line (ccx damps along the
+  current line). No longer flagged: a knot whose rotations BCs hold at zero in a step ccx runs
+  nonlinearly without NLGEOM.
 * **Explicit mass scaling on part of the model** — `*FIXED MASS SCALING, FACTOR=f, ELSET=...`
   on part of the model (a local factor overriding the global one) was dropped (ccx ran the true
   mass); each section whose elements share a factor now gets a copy of its materials with the

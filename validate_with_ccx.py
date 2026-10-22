@@ -14182,6 +14182,141 @@ def main():
           f"before: '*ERROR ... step size is negative', step time NaN)")
     failures += 0 if ok else 1
 
+    # --- task 135: output frequency, absolute amplitudes, flags ------------------------------
+    def scb_run(text, tag, read, convert_it=True):
+        """(the converter or None, ``read(.dat path)``) of ``text`` solved by ccx, converted first
+        unless ``convert_it`` is False (a hand-written ccx twin); the result None where ccx did
+        not solve it (printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src if convert_it else inp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        conv = convert(src, inp)[1] if convert_it else None
+        d, status, out = run_ccx(ccx, env, inp)
+        res = read(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if res is None:
+            print(f"      {tag}: ccx {status}: " +
+                  " / ".join(ln.strip() for ln in out.splitlines() if "ERROR" in ln)[:300])
+        return conv, res
+
+    def all_u(dat):
+        return dat_displacements(dat) or None
+    hexc = CUBE8.split("*NSET, NSET=TOP")[0]          # its nodes and element
+
+    # *NODE PRINT, FREQUENCY=1 (and a second card's 3) in a *DYNAMIC step beside Abaqus' default
+    # field output every 10 increments: ccx has one frequency for both, now their greatest common
+    # divisor (before: 10, every tenth increment printed)
+    cube = (hexc + "*NSET, NSET=TOP\n5, 6, 7, 8\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n1000., 0.3\n*DENSITY\n1.\n*BOUNDARY\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n4, 3, 3\n")
+    conv, hist = scb_run(cube + "*STEP, INC=1000\n*DYNAMIC, DIRECT\n0.01, 0.3\n*CLOAD\n7, 3, 1.\n*NODE PRINT, "
+                         "NSET=TOP, FREQUENCY=1\nU\n*NODE PRINT, NSET=TOP, FREQUENCY=3\nRF\n*END STEP\n",
+                         "print_frequency_dynamic", lambda dat: dat_displacement_history(dat, 7) or None)
+    ok = bool(hist) and len(hist) == 30 and abs(hist[-1][2]) > 1e-3
+    print(f"{'PASS' if ok else 'FAIL'}  print_frequency_dynamic (*NODE PRINT, FREQUENCY=1 in a *DYNAMIC "
+          f"step of 30 increments, Abaqus' field output every 10): {len(hist or [])} printed "
+          f"displacements of node 7 (want 30; before 3), last u_z {hist[-1][2] if hist else 0.0:.4g}")
+    failures += 0 if ok else 1
+
+    # a traction on a VALUE=ABSOLUTE amplitude at magnitude 1, held after the deck's *CLOAD, OP=NEW
+    # (ccx's removes the converted nodal forces too): given again at its end value, as with the
+    # same amplitude relative (before: lost, warned)
+    absd = (hexc + "*NSET, NSET=ALLN, GENERATE\n1, 8, 1\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*SOLID "
+            "SECTION, ELSET=EALL, MATERIAL=M\n*SURFACE, NAME=TOP\nEALL, S2\n*AMPLITUDE, NAME=B{}\n0., 0., 1., "
+            "4.\n*BOUNDARY\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*STEP\n*STATIC\n*DSLOAD, AMPLITUDE=B\nTOP, TRVEC, 1., "
+            "0., 0., -1.\n*END STEP\n*STEP\n*STATIC\n0.5, 0.5\n*CLOAD, OP=NEW\n7, 1, 5.\n*NODE PRINT, "
+            "NSET=ALLN\nU\n*END STEP\n")
+    runs = [scb_run(absd.format(v), f"absolute_amplitude_held{t}", all_u)
+            for v, t in ((", VALUE=ABSOLUTE", ""), ("", "_relative"))]
+    ok = all(r[1] for r in runs) and runs[0][1].keys() == runs[1][1].keys()
+    if ok:
+        scale = max(math.hypot(*v) for v in runs[1][1].values())
+        err = ccx_ratio(max(math.dist(runs[0][1][n], runs[1][1][n]) for n in runs[1][1]), scale)
+        ok = err < 1e-12 and scale > 0.1 and not runs[0][0].reduced_physics
+        print(f"{'PASS' if ok else 'FAIL'}  absolute_amplitude_held (TRVEC on a VALUE=ABSOLUTE amplitude "
+              f"at magnitude 1, then a step with *CLOAD, OP=NEW): u {err:.1e} of max |u| ({scale:.4g}) off "
+              f"the same amplitude relative (before: the traction lost in step 2)")
+    else:
+        print("FAIL  absolute_amplitude_held: no displacements to compare")
+    failures += 0 if ok else 1
+
+    # a frame joint ccx knots, its rotations held at zero, in a *STATIC step ccx runs nonlinear:
+    # its RIGID MPC only translates, exact, not flagged (before: flagged as turned finitely)
+    failures += finite_drift(
+        "finite_rotation_knot_held (B31 L frame, ccx's knot at its joint held in DOFs 4-6, a tip "
+        "force, a *STATIC step with a *PLASTIC never reached)",
+        "*Node, nset=ALLN\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 2., 1., 0.\n5, 2., 2., 0.\n"
+        "*Element, type=B31, elset=E\n1, 1, 2\n2, 2, 3\n3, 3, 4\n4, 4, 5\n*Beam Section, elset=E, "
+        "material=M, section=RECT\n0.2, 0.1\n0., 0., -1.\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+        + plastic + "*Boundary\n1, 1, 6\n3, 4, 6\n*Step\n*Static\n*Cload\n5, 3, 1e-3\n*Node Print, "
+        "nset=ALLN\nU\n*End Step\n", 0.0, 1e-9, 0.04)
+
+    # *DLOAD BX on a set of a C3D8 and an SFM3D4 on its top face (BX: per unit area there): the
+    # surface element's share as nodal forces, the line kept for the C3D8 (before: the line
+    # dropped whole, unflagged) -- as the twin with that share as a *CLOAD by hand
+    bx = (hexc + "*ELEMENT, TYPE=SFM3D4, ELSET=ES\n2, 5, 6, 7, 8\n*ELSET, ELSET=BOTH\nEALL, ES\n*NSET, "
+          "NSET=ALLN, GENERATE\n1, 8, 1\n*NSET, NSET=BOT\n1, 2, 3, 4\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n"
+          "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n{}*BOUNDARY\nBOT, 1, 3\n*STEP\n*STATIC\n*DLOAD\n{}, BX, "
+          "2.\n{}*NODE PRINT, NSET=ALLN\nU\n*END STEP\n")
+    conv, got = scb_run(bx.format("*SURFACE SECTION, ELSET=ES\n", "BOTH", ""), "bx_surface_mixed", all_u)
+    _, ref = scb_run(bx.replace("*ELEMENT, TYPE=SFM3D4, ELSET=ES\n2, 5, 6, 7, 8\n*ELSET, ELSET=BOTH\nEALL, "
+                                "ES\n", "").format("", "EALL", "*CLOAD\n5, 1, 0.5\n6, 1, 0.5\n7, 1, 0.5\n"
+                                                   "8, 1, 0.5\n"), "bx_surface_mixed_twin", all_u,
+                     convert_it=False)
+    ok = bool(got) and bool(ref) and got.keys() == ref.keys()
+    if ok:
+        scale = max(math.hypot(*v) for v in ref.values())
+        err = ccx_ratio(max(math.dist(got[n], ref[n]) for n in ref), scale)
+        ok = err < 1e-12 and scale > 1e-3 and not conv.reduced_physics
+        print(f"{'PASS' if ok else 'FAIL'}  bx_surface_mixed (*DLOAD BX on a set of a C3D8 and an SFM3D4 on "
+              f"its top face): u {err:.1e} of max |u| ({scale:.4g}) off the twin with the surface "
+              f"element's 2 per unit area as nodal forces by hand (before: no load at all)")
+    else:
+        print("FAIL  bx_surface_mixed: no displacements to compare")
+    failures += 0 if ok else 1
+
+    # ccx 2.23 ignores DASHPOTA in explicit dynamics: a unit mass on a dashpot (c = 10) to ground
+    # under a unit force moves 2.0 in 2 s, undamped (implicit: the damped 0.19); flagged there
+    dash = ("*NODE, NSET=P\n1, 0., 0., 0.\n2, {L}, 0.\n*ELEMENT, TYPE=MASS, ELSET=EM\n11, 1\n*MASS, "
+            "ELSET=EM\n1.\n*ELEMENT, TYPE=DASHPOTA, ELSET=D\n21, 1, 2\n*DASHPOT, ELSET=D\n\n10.\n*BOUNDARY\n"
+            "{bc}2, 1, 3\n*STEP, INC=10000\n*DYNAMIC{proc}\n*CLOAD\n1, 1, {F}\n*NODE PRINT, NSET=P\nU\n*END STEP\n")
+    damped = 0.1 * 2.0 - 0.01 * (1.0 - math.exp(-20.0))
+    runs = [scb_run(dash.format(L="1., 0.", bc="1, 2, 3\n", proc=p, F="1."), f"dashpot_{t}", all_u)
+            for p, t in ((", EXPLICIT\n, 2.", "explicit"), ("\n0.01, 2.", "implicit"))]
+    ok = all(r[1] and 1 in r[1] for r in runs)
+    if ok:
+        (ce, ue), (ci, ui) = runs
+        ok = abs(ue[1][0] - 2.0) < 1e-6 and abs(ui[1][0] / damped - 1.0) < 1e-3 and \
+            ce.reduced_physics == ["dashpots in an explicit *DYNAMIC step (ccx ignores them)"] and \
+            not ci.reduced_physics
+        print(f"{'PASS' if ok else 'FAIL'}  dashpot_explicit (a unit mass on a DASHPOTA to ground, a unit "
+              f"force for 2 s): explicit x = {ue[1][0]:.6g} (undamped 2.0: ccx ignores the dashpot; "
+              f"{'flagged' if ce.reduced_physics else 'NOT flagged'}), implicit {ui[1][0]:.6g} (damped "
+              f"{damped:.6g}, {'flagged' if ci.reduced_physics else 'not flagged'})")
+    failures += 0 if ok else 1
+
+    # ccx 2.23 damps a DASHPOTA along the current line of its nodes in a small-strain step: the
+    # mass on a dashpot at 45 deg pushed along x moves 0.14 across it; against the small-strain
+    # answer (velocity along the undeformed axis damped, across it free) 4.5 % off for a dashpot
+    # 1.41 long, a hundredth of that for one 141 long; both flagged
+    def oblique_exact(f, m=1.0, c=10.0, t=2.0):
+        fn = f / math.sqrt(2.0)
+        s_ = fn / c * t - fn * m / c ** 2 * (1.0 - math.exp(-c * t / m))
+        q = fn * t * t / (2.0 * m)
+        return ((s_ + q) / math.sqrt(2.0), (s_ - q) / math.sqrt(2.0))
+    want = oblique_exact(0.1)
+    runs = [scb_run(dash.format(L=f"{L}, {L}", bc="1, 3, 3\n", proc=", DIRECT\n0.005, 2.", F="0.1"),
+                    f"dashpot_oblique_{L:g}", all_u) for L in (1.0, 100.0)]
+    ok = all(r[1] and 1 in r[1] for r in runs)
+    if ok:
+        errs = [math.dist(r[1][1][:2], want) / math.hypot(*want) for r in runs]
+        why = "DASHPOTA damping along the current line in a small-strain step"
+        ok = 0.02 < errs[0] < 0.1 and errs[1] < errs[0] / 50 and all(r[0].reduced_physics == [why] for r in runs)
+        print(f"{'PASS' if ok else 'FAIL'}  dashpot_oblique (a unit mass on a DASHPOTA at 45 deg to ground "
+              f"pushed along x, small strain): {errs[0]:.2%} off the small-strain answer for a dashpot 1.41 "
+              f"long, {errs[1]:.3%} for one 141 long (ccx damps along the current line); "
+              f"{'both flagged' if all(r[0].reduced_physics for r in runs) else 'NOT flagged'}")
+    failures += 0 if ok else 1
+
     # --- explicit mass scaling ------------------------------------------------------------
     def explicit_run(text, tag, approximate=False):
         """(tip displacements printed, the increment ccx selected, its output) of ``text``
