@@ -18,6 +18,7 @@ physics.
   the report, the converted deck's header and `--json` (`location` in each of `entries`, null
   for an entry about no one card). Lines count through `*INCLUDE` and `*PARAMETER`, and a card
   the converter makes from another (an instance's copy of its part's cards) points to that card.
+  A file name that is not UTF-8 (Linux) is shown with its bytes escaped, `caf\xe9.inp`.
 * **Field-dependent material data at each element's field values** — material cards with
   `DEPENDENCIES=n` were collapsed to field 0, and `*INITIAL CONDITIONS, TYPE=FIELD` / `*FIELD`
   commented out as reduced physics, since ccx has no field variables. Where the deck sets the
@@ -91,8 +92,11 @@ physics.
   line (JSON Lines), now with the deck's `status` (`converted`, `reduced`, `commented` or
   `failed`) and `reduced_physics`, and a line with `error` for a deck that failed (none was
   printed). `--summary FILE.csv` writes a row per deck: status, counts, reduced physics, and
-  with `--run` ccx's status and the last step's digest line. An internal error (exit 4) writes
-  its traceback into the `.log` (with `--debug` also to stderr) and points to the issues page;
+  with `--run` ccx's status and the last step's digest line; it overwrites no deck, input or
+  other file (`--summary *.inp` is a usage error), replaces `FILE.csv` when the batch ends
+  (`FILE.csv.part` holds the rows meanwhile), and puts `'` before a cell a spreadsheet would
+  read as a formula. An internal error (exit 4) writes its traceback into the `.log` (with
+  `--debug` also to stderr; the home folder written `~`) and points to the issues page;
   it suggested PYTHONFAULTHANDLER, which could not show it. `--run` without a ccx, and its
   version warning, say how to get ccx 2.23: `conda install -c conda-forge calculix=2.23`. The
   `--approximate` help and the user guide now name the same reframings, and the guide all of them.
@@ -281,10 +285,12 @@ physics.
   when ccx ended; ccx 2.23 can print without end (a vanishing pivot in its MPC cascade), and
   that output once filled 13 GB. Now it shows the output as it comes, writes it to
   `<output>.ccx.log` (the first 100 MB, then the last lines) with bounded memory, and ends
-  with ccx's own `*ERROR` and `*WARNING` lines, each once with its count. `--timeout SECONDS`
-  stops ccx and what it started after that much wall-clock time (status `timeout`; no limit
-  by default); `--json`'s `run` gives the log's path. `validate_with_ccx.py` and the corpus
-  test run ccx the same way, stopped after their time limit or 100 MB of output.
+  with ccx's own `*ERROR` and `*WARNING` lines, each once with its count (ccx runs without the
+  log where it cannot be written). `--timeout SECONDS` stops ccx and what it started after
+  that much wall-clock time (status `timeout`; no limit by default), and a process ccx leaves
+  holding its output is killed a few seconds after ccx ends; `--json`'s `run` gives the log's
+  path. `validate_with_ccx.py` and the corpus test run ccx the same way, stopped after their
+  time limit or 100 MB of output.
 * **`*TIE` on conventional shells** — Abaqus ties a shell's nodes, its reference surface; ccx
   2.23 ties the faces of the solids it expands shells to, half the thickness off. A slave
   surface on shells whose nodes lie on solid master faces (a skin on a solid, a shell edge on a

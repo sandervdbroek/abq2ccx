@@ -47,7 +47,8 @@ overwrites a deck abq2ccx did not write.
 
 **Exit codes:** `0` converted · `1` cannot read or write, or `--run` failed · `2` usage
 error · `3` `--strict` findings · `4` internal conversion error, a bug: the traceback goes
-into the `.log` (with `--debug` also to stderr); please report it at
+into the `.log` (with `--debug` also to stderr; the `.log` writes your home folder `~`, but
+check it for private paths before posting); please report it at
 [the issues](https://github.com/sandervdbroek/abq2ccx/issues) with the deck or a cut-down one
 that fails the same way. `--run` fails when ccx
 stops with an `*ERROR`, crashes, writes NaN/Inf results or runs a step that sets up no
@@ -71,8 +72,11 @@ moves the nodes by its modes.
 `--run` also `run` and `results`, and `error` for a deck that failed. `status` is `failed`
 (nothing converted), `reduced` (ccx solves another model; `reduced_physics` says what),
 `commented` (cards commented out, the physics kept) or `converted`. `--summary FILE.csv` writes a
-row per deck as it goes: deck, status, nodes, elements, warnings, commented cards, reduced
-physics, ccx's status and the last step's digest line (`--run`), and the error.
+row per deck: deck, status, nodes, elements, warnings, commented cards, reduced
+physics, ccx's status and the last step's digest line (`--run`), and the error. The rows go to
+`FILE.csv.part` as the batch runs, which replaces `FILE.csv` when it ends; a deck, an input or
+a file that is no summary is never overwritten, and a cell starting with `=`, `+`, `-` or `@`
+gets a `'` before it (spreadsheets read it as a formula).
 
 ```bash
 abq2ccx variants/*.inp --outdir out --run --quiet --summary out/summary.csv

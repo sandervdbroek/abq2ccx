@@ -1672,7 +1672,8 @@ def _safe_eval_param(expr: str, names: Dict[str, object],
 
 
 def apply_parameters(lines: List[str], report: Report, params: Dict[str, object],
-                     card: str = "") -> List[str]:
+                     card: str = "", places: Optional[Dict[int, Tuple[str, int]]] = None,
+                     at: Optional["Block"] = None) -> List[str]:
     """Resolve Abaqus ``*PARAMETER`` input: collect ``name = expr`` definitions, drop
     the ``*PARAMETER`` blocks (ccx has no such card), and substitute every ``<name>``
     token with its value.  Without this, parametric coordinates like ``<l>`` reach the
@@ -1682,8 +1683,11 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
     lines the data of keyword ``card``).  A ``<name>`` no parameter defines is warned
     about, naming the ccx cards whose model data hold one (reduced physics:
     Converter._undefined_parameter_data).  The dropped lines are "**" lines, so that every
-    line keeps its number (Block.line)."""
+    line keeps its number (Block.line).  What is reported about the definitions is at their
+    *PARAMETER card: ``places`` gives a keyword line's (file, line) by its index (read_blocks),
+    else at card ``at``."""
     raw_defs: List[Tuple[str, str]] = []
+    def_card: List[int] = []        # each definition's *PARAMETER keyword line (its index)
     kept: List[str] = []
     n, done = len(lines), 0         # lines before this one are kept (or read as definitions)
     # (only a line with a '*' can be a keyword line: the others are kept a run at a time)
@@ -1704,10 +1708,16 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
             if not s.startswith("**") and s and "=" in s:   # (a comment does NOT end it)
                 name, expr = s.split("=", 1)
                 raw_defs.append((name.strip(), expr.strip()))
+                def_card.append(k)
             j += 1
         kept.extend(["**"] * (j - k))
         done = j
     kept.extend(lines[done:])
+
+    def card_at(i: int) -> Union["Block", str, None]:
+        """Where definition ``i``'s *PARAMETER card is."""
+        name, line = (places or {}).get(def_card[i], ("", 0))
+        return f"{name}:{line}" if line else at
 
     unresolved: set = set()                 # names substituted as written
     if raw_defs:
@@ -1748,7 +1758,7 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
             params[nm] = dict(raw_defs)[nm]     # substituted as written
         bad = sorted(unresolved, key=last.get)
         report.note(f"*PARAMETER: resolved {len(last) - len(bad)} parameter(s) and substituted "
-                    "<name> tokens (ccx has no *PARAMETER).", once=True)
+                    "<name> tokens (ccx has no *PARAMETER).", once=True, at=card_at(0))
         if floored:
             nm, (a, b) = floored[0]
             more = len({n for n, _ in floored}) - 1
@@ -1756,7 +1766,8 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
                         + (f" and {more} more" if more else "") + f": the converter divides as Abaqus "
                         f"2024 and later do (Python 3); Abaqus 2023 and older evaluate parameters in "
                         f"Python 2, which floor-divides integers ({a}//{b} = {a // b}). For a deck "
-                        f"written for those, use '//' or a float operand.", once=True)
+                        f"written for those, use '//' or a float operand.", once=True,
+                        at=card_at(last[nm]))
         # a <name> token in a definition (Abaqus' expressions name parameters bare) is a value
         # the deck expects from outside — a template's placeholder — and so is what uses it
         exprs = dict(raw_defs)
@@ -1777,13 +1788,14 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
                         f"*PARAMETER block defines (a template's placeholder, filled in outside "
                         f"the deck?), so {'it' if len(outside) == 1 else 'they'}{uses} stay "
                         f"unresolved: Abaqus stops on this, and ccx reads the raw text. Give the "
-                        f"value.", once=True)
+                        f"value.", once=True, at=card_at(last[outside[0]]))
             bad = [nm for nm in bad if nm not in follow]
         if bad:
             report.warn(f"*PARAMETER: {', '.join(dedup(bad))} could not be evaluated (the converter "
                         f"reads numbers, quoted strings, arithmetic and math functions, within the "
                         f"float range), so the "
-                        f"expression is substituted as written — verify.", once=True)
+                        f"expression is substituted as written — verify.", once=True,
+                        at=card_at(last[bad[0]]))
 
     out = [_substitute_params(ln, params) for ln in kept] if params else lines
     if unresolved:
@@ -1899,16 +1911,27 @@ def join_keyword_continuations(lines: List[str], pad: bool = False) -> List[str]
 _MAX_INCLUDE_READS = 10000   # files read per deck: bounds a file included many times over
 
 
+def _text_name(name: str) -> str:
+    """File name ``name`` as UTF-8 text holds it: a byte of the name that is no UTF-8 (a
+    Latin-1 name on Linux, which os.fsdecode escapes as a lone surrogate) as Python shows
+    the byte, ``\\xe9``."""
+    try:
+        return name.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+    except UnicodeEncodeError:                  # (a lone surrogate of a Windows name)
+        return name.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _shown_path(path: str, job_dir: str) -> str:
     """How the report names deck file ``path`` (Block.file): relative to the job directory
-    when in it, with "/" on every OS; interned, as every card of the file keeps it."""
+    when in it, with "/" on every OS, as UTF-8 text (_text_name); interned, as every card of
+    the file keeps it."""
     try:
         rel = os.path.relpath(path, job_dir or os.curdir)
     except ValueError:                          # on another drive (Windows)
         rel = path
     if rel == os.pardir or rel.startswith(os.pardir + os.sep):
         rel = path
-    return sys.intern(rel.replace(os.sep, "/"))
+    return sys.intern(_text_name(rel.replace(os.sep, "/")))
 
 
 def _input_path(name: str, job_dir: str, here: str) -> str:
@@ -2015,7 +2038,7 @@ def read_blocks(path: str, report: Report) -> List[Block]:
 
     expand(path)
     values: Dict[str, object] = {}
-    raw_lines = apply_parameters(raw_lines, report, values)
+    raw_lines = apply_parameters(raw_lines, report, values, places=places)
     blocks: List[Block] = []
     current: Optional[Block] = None
     orphans: List[str] = []
@@ -2072,7 +2095,8 @@ def read_blocks(path: str, report: Report) -> List[Block]:
                 src_path = src if os.path.isabs(src) else os.path.join(job_dir, src)
                 try:
                     with open(src_path, "r", encoding="utf-8", errors="replace") as fh:
-                        ext = apply_parameters(fh.read().splitlines(), report, values, keyword)
+                        ext = apply_parameters(fh.read().splitlines(), report, values, keyword,
+                                               at=current)
                 except OSError:
                     report.warn(f"*{keyword}, INPUT={src}: data file not found next to the deck; "
                                 f"the card has no data lines (copy the file alongside and "
@@ -3460,11 +3484,12 @@ def _ngen_curve(kind: str, p1: Vec, p2: Vec, extra: Optional[Vec], normal: Optio
     return lambda t: vadd(vscale(p1, 1 - t), vscale(p2, t))
 
 
-def _skip_unreadable(report: Report, what: str, why: str = "non-numeric data") -> None:
-    """A mesh-generation record or card with a non-numeric field (an undefined <parameter>,
-    say; ``why`` names other unreadable data) is skipped, as *NODE skips such a record: its
-    nodes or elements are missing."""
-    report.warn(f"Skipped a {what} with {why}; verify the deck.", once=True)
+def _skip_unreadable(report: Report, what: str, why: str = "non-numeric data",
+                     at: Optional["Block"] = None) -> None:
+    """A mesh-generation record or card (``at``) with a non-numeric field (an undefined
+    <parameter>, say; ``why`` names other unreadable data) is skipped, as *NODE skips such a
+    record: its nodes or elements are missing."""
+    report.warn(f"Skipped a {what} with {why}; verify the deck.", once=True, at=at)
     report.reduce(f"{what} with {why} skipped")
 
 
@@ -3575,7 +3600,7 @@ def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
             point = system_point(fields_at(g[4:7], 3), system)
             normal = tuple(fields_at(g[7:10], 3))
         except ValueError:
-            _skip_unreadable(report, "*NGEN record")
+            _skip_unreadable(report, "*NGEN record", at=block)
             continue
         if inc == 0:
             inc = 1
@@ -3675,7 +3700,7 @@ def expand_nfill(block: Block, geom: Geometry, report: Report) -> List[int]:
         try:
             nint, ninc = pint(f[2]), pint(f[3]) if f[3] else 1
         except ValueError:
-            _skip_unreadable(report, "*NFILL record")
+            _skip_unreadable(report, "*NFILL record", at=block)
             continue
         if not s1 or not s2:
             report.warn("*NFILL node set is empty; skipped.")
@@ -3715,7 +3740,7 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
         change = pint(block.param("CHANGE NUMBER") or 0)
         multiple = pint(block.param("MULTIPLE") or 1)
     except ValueError:
-        _skip_unreadable(report, "*NCOPY card")
+        _skip_unreadable(report, "*NCOPY card", at=block)
         return []
     if not old:
         report.warn("*NCOPY without OLD SET ignored.")
@@ -3741,7 +3766,7 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
             pid = pint(g[0]) if g[0].strip() else None
             pole = tuple(fields_at(g[1:4], 3)) if pid is None else geom.nodes.get(pid)
         except ValueError:
-            _skip_unreadable(report, "*NCOPY card")
+            _skip_unreadable(report, "*NCOPY card", at=block)
             return []
         if pole is None:
             report.warn(f"*NCOPY, POLE: pole node {pid} is not defined (Abaqus needs it defined "
@@ -3761,7 +3786,7 @@ def expand_ncopy(block: Block, geom: Geometry, report: Report) -> List[int]:
                 report.warn("*NCOPY rotation axis a-b has zero length (Abaqus stops on it); the "
                             "copies are not rotated.", once=True)
     except ValueError:
-        _skip_unreadable(report, "*NCOPY card")
+        _skip_unreadable(report, "*NCOPY card", at=block)
         return []
     # REFLECT data: the points' coordinates may sit on one line (LINE: x1..z2) or
     # several (MIRROR: a, b on the first, c on the second) — take them as a flat list of
@@ -3924,7 +3949,7 @@ def expand_elgen(block: Block, geom: Geometry, report: Report) -> List[int]:
             master = pint(g[0])
             triples = [tuple(pint(x) if x else 1 for x in g[1 + 3 * d:4 + 3 * d]) for d in range(3)]
         except ValueError:
-            _skip_unreadable(report, "*ELGEN record")
+            _skip_unreadable(report, "*ELGEN record", at=block)
             continue
         if master not in geom.elements:
             report.warn(f"*ELGEN master element {master} not defined; skipped.")
@@ -3976,7 +4001,7 @@ def expand_elcopy(block: Block, geom: Geometry, report: Report) -> List[int]:
         eshift = pint(block.param("ELEMENT SHIFT") or 0)
         nshift = pint(block.param("SHIFT NODES") or 0)
     except ValueError:
-        _skip_unreadable(report, "*ELCOPY card")
+        _skip_unreadable(report, "*ELCOPY card", at=block)
         return []
     old = block.param("OLD SET")
     new = block.param("NEW SET")
@@ -8052,7 +8077,7 @@ class _Mesh:
                 n, d = pint(rec[0]), fields_at(rec[1:], 3)
             except ValueError:
                 _skip_unreadable(self.report, "*IMPERFECTION line", "a field that is not a number "
-                                 "(the first one a node number)")
+                                 "(the first one a node number)", at=b)
                 continue
             if n not in self.geom.nodes:
                 missing.append(rec[0])
@@ -8230,7 +8255,7 @@ class _Mesh:
                 try:
                     new, problem = system_frame(b)
                 except ValueError:
-                    _skip_unreadable(self.report, "*SYSTEM card")
+                    _skip_unreadable(self.report, "*SYSTEM card", at=b)
                     new, problem = None, ""
                 if problem:
                     self.report.warn(f"*SYSTEM with {problem}: Abaqus' axes are undefined; read as "
@@ -8537,7 +8562,7 @@ class _Mesh:
                 except ValueError:
                     _skip_unreadable(self.report, f"*{b.keyword}, GENERATE line (set {name})",
                                      "non-numeric data" if len(rec) > 1 and rec[0] and rec[1]
-                                     else "a blank first or last member")
+                                     else "a blank first or last member", at=b)
             else:
                 for tok in f:
                     if _INT_TOKEN(tok):
@@ -18462,10 +18487,10 @@ class _Materials:
                                                 if complex_ else "") + ".")
                     out.update((id(b), why) for b in mine)
                     if complex_:
-                        self.report.warn(why, once=True)
+                        self.report.warn(why, once=True, at=mine[0])
                         self._reduces("modal damping in *COMPLEX FREQUENCY")
                     else:
-                        self.report.note(why, once=True)
+                        self.report.note(why, once=True, at=mine[0])
                 continue
             src = next((t for t in reversed(self.steps.steps[:i]) if t.proc == "FREQUENCY"), None)
             modes = self._frequency_modes(src.procedure) if src is not None else None
@@ -18474,14 +18499,14 @@ class _Materials:
                 if b.uparam("FIELD") == "ACOUSTIC":
                     out[id(b)] = ("*MODAL DAMPING, FIELD=ACOUSTIC left out: it damps acoustic modes "
                                   "only, which the ccx model has none of")
-                    self.report.note(out[id(b)] + ".", once=True)
+                    self.report.note(out[id(b)] + ".", once=True, at=b)
                     continue
                 kind = self._modal_damping_kind(b)
                 if kind in last:
                     out[id(last[kind])] = (f"*MODAL DAMPING left out: a later card of {names[kind]} "
                                            f"damping in the step replaces it (Abaqus)")
                     self.report.note(f"{where}: two *MODAL DAMPING cards of {names[kind]} damping: "
-                                     f"Abaqus uses the last one.", once=True)
+                                     f"Abaqus uses the last one.", once=True, at=b)
                 last[kind] = b
             ratios: List[Tuple[int, int, str]] = []
             pair = [0.0, 0.0]
@@ -18492,7 +18517,7 @@ class _Materials:
                 if what == "lost":
                     out[id(b)] = f"*MODAL DAMPING left out: {val}"
                     self.report.warn(f"{where}: *MODAL DAMPING ({names[kind]}) left out: {val}. The "
-                                     f"step runs without it.", once=True)
+                                     f"step runs without it.", once=True, at=b)
                     self._reduces(label)
                 elif what == "none":
                     out[id(b)] = zero
@@ -18502,7 +18527,8 @@ class _Materials:
                     if b.uparam("DEFINITION").startswith("FREQ"):
                         self.report.note("*MODAL DAMPING, DEFINITION=FREQUENCY RANGE with one damping "
                                          "ratio at every frequency written for modes 1 to the "
-                                         "*FREQUENCY step's count (ccx reads mode numbers).", once=True)
+                                         "*FREQUENCY step's count (ccx reads mode numbers).", once=True,
+                                         at=b)
                 else:
                     pair = [pair[0] + val[0], pair[1] + val[1]]
                     rayleigh_cards.append(b)
@@ -18536,7 +18562,8 @@ class _Materials:
                                     "the material *DAMPING's, projected") +
                                  "): Abaqus adds them, ccx 2.23 applies the Rayleigh damping alone "
                                  "where it has both (probed), so the step is written with its "
-                                 "damping ratios only.", once=True)
+                                 "damping ratios only.", once=True,
+                                 at=rayleigh_cards[0] if rayleigh_cards else kept[s.no][0])
                 self._reduces("modal damping ratios and Rayleigh damping in one step")
                 out.update((id(b), "*MODAL DAMPING left out: ccx 2.23 cannot add Rayleigh modal "
                                    "damping to damping ratios") for b in rayleigh_cards)
@@ -18569,7 +18596,7 @@ class _Materials:
                                      f"modal damping: once ccx 2.23 has read a *MODAL DAMPING, "
                                      f"RAYLEIGH it applies Rayleigh damping in every later step "
                                      f"(probed), so the step runs without its damping ratios.",
-                                     once=True)
+                                     once=True, at=kept[s.no][0] if kept[s.no] else None)
                     self._reduces("modal damping ratios after a Rayleigh *MODAL DAMPING")
                     out.update((id(b), "*MODAL DAMPING left out: ccx 2.23 applies Rayleigh modal "
                                        "damping in every step after a RAYLEIGH card")
@@ -25472,92 +25499,94 @@ class _Constraints:
         mean: List[float] = []                      # the mean element size, once needed
         moved: List[Tuple[float, int]] = []
         for b in cards:
-            what = "*EMBEDDED ELEMENT" + (f", HOST ELSET={b.param('HOST ELSET').strip()}"
-                                          if b.param("HOST ELSET") else "")
-            nodes_kw = b.has("EMBED NODES")
-            lost = [t for t in tokens(b) if not (self._resolve_nodes(t) if nodes_kw else
-                                                 [e for e in self._resolve_elements(t) if e in els])]
-            if lost:
-                self.report.warn(f"{what}: {', '.join(lost[:4])} name(s) no {'node' if nodes_kw else 'element'} "
-                                 f"of the model; left out.", once=True)
-            hname = (b.param("HOST ELSET") or "").strip().upper() or None
-            if hname is not None:
-                given = [e for e in dedup(self.geom.elset(hname)) if e in els]
-                bad = dedup(els[e][0] for e in given if not embed_host_shape(els[e][0]))
-                if bad:
-                    self.report.warn(f"{what}: element type(s) {', '.join(bad)} cannot host embedded "
-                                     f"elements (Abaqus: continuum elements with translations only); "
-                                     f"left out of the hosts.", once=True)
-                if any(e in embedded for e in given):
-                    self.report.warn(f"{what}: host elements that an *EMBEDDED ELEMENT embeds (Abaqus: "
-                                     f"'host elements cannot be embedded themselves'); left out of the "
-                                     f"hosts.", once=True)
-                hosts = [e for e in given if embed_host_shape(els[e][0]) and e not in embedded]
-            else:
-                hosts = [e for e in free if embed_host_shape(els[e][0])]
-            if hname not in grids:
-                grids[hname] = self._embed_grid(hosts)
-            boxes, grid, cell, own = grids[hname]
-            if nodes_kw:
-                cand = [n for t in tokens(b) for n in self._resolve_nodes(t)]
-            else:
-                cand = [n for t in tokens(b) for e in self._resolve_elements(t) if e in els
-                        for n in els[e][1]]
-            cand = [n for n in dedup(cand) if n in pts and n not in own]
-            if cand and not boxes:
-                self.report.warn(f"{what}: no host element (a continuum element with translations "
-                                 f"only) to embed {len(cand)} node(s) in; commented out — the "
-                                 f"constraint is missing.", once=True)
-                self._reduces("*EMBEDDED ELEMENT without a host element")
-            twice = [n for n in cand if n in self._embedded_nodes]
-            if twice:
-                self.report.warn(f"{what}: node(s) {', '.join(map(str, twice[:4]))} also embedded by an "
-                                 f"earlier *EMBEDDED ELEMENT; kept there.", once=True)
-            rows = self._embed_rows.setdefault(id(b), [])
-            out: List[int] = []
-            tol: Optional[float] = None
-            rtol = self._embed_param(b, "ROUNDOFF TOLERANCE", 1e-6)
-            for n in cand:
-                if n in self._embedded_nodes or not boxes:
-                    continue
-                p = pts[n]
-                hit = self._embed_host(p, boxes, grid, cell, 1e-9 * cell, inside=True)
-                if hit is None:
-                    if tol is None:
-                        tol = self._embed_tolerance(b, free, mean)
-                    hit = self._embed_host(p, boxes, grid, cell, tol, inside=False)
-                    if hit is None:
-                        out.append(n)
-                        continue
-                e, xi = hit
-                kind, nn, _, _, _ = boxes[e]
-                conn = els[e][1]
-                w = embed_weights(kind, nn, xi)
-                keep = [(conn[i], w[i]) for i in range(nn) if abs(w[i]) >= rtol]
-                s = sum(x for _, x in keep)
-                if abs(s) < 1e-3:                   # (a tolerance that zeroes them all)
-                    keep, s = [(conn[i], w[i]) for i in range(nn)], 1.0
-                keep = [(m, x / s) for m, x in keep]
-                dim = 3 if kind in ("hex", "tet", "wedge") else 2
-                q = tuple(sum(x * pts[m][k] for m, x in keep) for k in range(dim)) + tuple(p[dim:])
-                if q != p:
-                    d = math.dist(q, p)
-                    if d > 1e-9 * cell:
-                        moved.append((d, n))
-                    pts[n] = q
-                dofs = (1, 2, 3) if dim == 3 else (1, 2)
-                rows.append((n, keep, dofs))
-                self._embedded_nodes[n] = dofs
-            if out:
-                far = f"{len(out)} node(s) (e.g. node {out[0]}) lie farther than the exterior tolerance " \
-                      f"({short_real(tol or 0.0, 4)}) from every host element"
-                if b.uparam("PARTIAL EMBED") == "YES":
-                    self.report.note(f"{what}: {far}; left free, as Abaqus does with PARTIAL EMBED=YES.",
+            with self.report.about(b):              # (what is reported: at its line)
+                what = "*EMBEDDED ELEMENT" + (f", HOST ELSET={b.param('HOST ELSET').strip()}"
+                                              if b.param("HOST ELSET") else "")
+                nodes_kw = b.has("EMBED NODES")
+                lost = [t for t in tokens(b) if not (self._resolve_nodes(t) if nodes_kw else
+                                                     [e for e in self._resolve_elements(t) if e in els])]
+                if lost:
+                    self.report.warn(f"{what}: {', '.join(lost[:4])} name(s) no "
+                                     f"{'node' if nodes_kw else 'element'} of the model; left out.",
                                      once=True)
+                hname = (b.param("HOST ELSET") or "").strip().upper() or None
+                if hname is not None:
+                    given = [e for e in dedup(self.geom.elset(hname)) if e in els]
+                    bad = dedup(els[e][0] for e in given if not embed_host_shape(els[e][0]))
+                    if bad:
+                        self.report.warn(f"{what}: element type(s) {', '.join(bad)} cannot host embedded "
+                                         f"elements (Abaqus: continuum elements with translations only); "
+                                         f"left out of the hosts.", once=True)
+                    if any(e in embedded for e in given):
+                        self.report.warn(f"{what}: host elements that an *EMBEDDED ELEMENT embeds (Abaqus: "
+                                         f"'host elements cannot be embedded themselves'); left out of the "
+                                         f"hosts.", once=True)
+                    hosts = [e for e in given if embed_host_shape(els[e][0]) and e not in embedded]
                 else:
-                    self.report.warn(f"{what}: {far}: Abaqus stops on them (without PARTIAL EMBED=YES); "
-                                     f"left free here.", once=True)
-                    self._reduces("*EMBEDDED ELEMENT nodes outside every host")
+                    hosts = [e for e in free if embed_host_shape(els[e][0])]
+                if hname not in grids:
+                    grids[hname] = self._embed_grid(hosts)
+                boxes, grid, cell, own = grids[hname]
+                if nodes_kw:
+                    cand = [n for t in tokens(b) for n in self._resolve_nodes(t)]
+                else:
+                    cand = [n for t in tokens(b) for e in self._resolve_elements(t) if e in els
+                            for n in els[e][1]]
+                cand = [n for n in dedup(cand) if n in pts and n not in own]
+                if cand and not boxes:
+                    self.report.warn(f"{what}: no host element (a continuum element with translations "
+                                     f"only) to embed {len(cand)} node(s) in; commented out — the "
+                                     f"constraint is missing.", once=True)
+                    self._reduces("*EMBEDDED ELEMENT without a host element")
+                twice = [n for n in cand if n in self._embedded_nodes]
+                if twice:
+                    self.report.warn(f"{what}: node(s) {', '.join(map(str, twice[:4]))} also embedded by an "
+                                     f"earlier *EMBEDDED ELEMENT; kept there.", once=True)
+                rows = self._embed_rows.setdefault(id(b), [])
+                out: List[int] = []
+                tol: Optional[float] = None
+                rtol = self._embed_param(b, "ROUNDOFF TOLERANCE", 1e-6)
+                for n in cand:
+                    if n in self._embedded_nodes or not boxes:
+                        continue
+                    p = pts[n]
+                    hit = self._embed_host(p, boxes, grid, cell, 1e-9 * cell, inside=True)
+                    if hit is None:
+                        if tol is None:
+                            tol = self._embed_tolerance(b, free, mean)
+                        hit = self._embed_host(p, boxes, grid, cell, tol, inside=False)
+                        if hit is None:
+                            out.append(n)
+                            continue
+                    e, xi = hit
+                    kind, nn, _, _, _ = boxes[e]
+                    conn = els[e][1]
+                    w = embed_weights(kind, nn, xi)
+                    keep = [(conn[i], w[i]) for i in range(nn) if abs(w[i]) >= rtol]
+                    s = sum(x for _, x in keep)
+                    if abs(s) < 1e-3:                   # (a tolerance that zeroes them all)
+                        keep, s = [(conn[i], w[i]) for i in range(nn)], 1.0
+                    keep = [(m, x / s) for m, x in keep]
+                    dim = 3 if kind in ("hex", "tet", "wedge") else 2
+                    q = tuple(sum(x * pts[m][k] for m, x in keep) for k in range(dim)) + tuple(p[dim:])
+                    if q != p:
+                        d = math.dist(q, p)
+                        if d > 1e-9 * cell:
+                            moved.append((d, n))
+                        pts[n] = q
+                    dofs = (1, 2, 3) if dim == 3 else (1, 2)
+                    rows.append((n, keep, dofs))
+                    self._embedded_nodes[n] = dofs
+                if out:
+                    far = f"{len(out)} node(s) (e.g. node {out[0]}) lie farther than the exterior tolerance " \
+                          f"({short_real(tol or 0.0, 4)}) from every host element"
+                    if b.uparam("PARTIAL EMBED") == "YES":
+                        self.report.note(f"{what}: {far}; left free, as Abaqus does with PARTIAL EMBED=YES.",
+                                         once=True)
+                    else:
+                        self.report.warn(f"{what}: {far}: Abaqus stops on them (without PARTIAL EMBED=YES); "
+                                         f"left free here.", once=True)
+                        self._reduces("*EMBEDDED ELEMENT nodes outside every host")
         if moved:
             d, n = max(moved)
             self.report.note(f"*EMBEDDED ELEMENT: {len(moved)} embedded node(s) moved onto their host "
@@ -28077,11 +28106,11 @@ class _Constraints:
                                      f"the connector is missing.")
             if beh and not defines:
                 self.report.note(f"*CONNECTOR SECTION, BEHAVIOR={beh}: the behaviour defines nothing "
-                                 f"and is ignored.", once=True)
+                                 f"and is ignored.", once=True, at=b)
             for e in eids:
                 if e in planned:
                     self.report.warn("A connector element belongs to more than one *CONNECTOR "
-                                     "SECTION; the first one is used.", once=True)
+                                     "SECTION; the first one is used.", once=True, at=b)
                     continue
                 planned.add(e)
                 typ, na, nb = self._conn[e]
@@ -28095,7 +28124,7 @@ class _Constraints:
                     it["route"] = "free"
                     self.report.note(f"Connector of type {label}: it constrains no relative "
                                      f"motion and has no behaviour, so it transmits nothing — "
-                                     f"left out.", once=True)
+                                     f"left out.", once=True, at=b)
                     continue
                 if any(n is not None and n not in self.geom.nodes for n in (na, nb)) or na == nb:
                     it["route"], it["reason"] = "skip", ("Connector element on an undefined node, "
@@ -43081,14 +43110,17 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             s += 1
             owner: Dict[int, int] = {}            # id of a card in a load case -> its case
             names: List[str] = []
-            case, open_end = None, False
+            case: Optional[int] = None
+            opened: Optional[Block] = None        # the *LOAD CASE card of the case open
+            open_end: Optional[Block] = None      # the first one no *END LOAD CASE closes
             for b in cards[1:]:
                 if b.keyword == "LOAD CASE":
-                    open_end = open_end or case is not None
-                    case = len(names)
+                    open_end = open_end or (opened if case is not None else None)
+                    case, opened = len(names), b
                     names.append((b.param("NAME") or "").strip() or str(case + 1))
                 elif b.keyword in ("END LOAD CASE", "END STEP"):
-                    open_end = open_end or b.keyword == "END STEP" and case is not None
+                    open_end = open_end or (opened if b.keyword == "END STEP" and case is not None
+                                            else None)
                     case = None
                 if case is not None:
                     owner[id(b)] = case
@@ -43099,7 +43131,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                 continue
             if open_end:
                 self.report.warn(f"Step {s}: *LOAD CASE without *END LOAD CASE (Abaqus requires "
-                                 f"one): closed at the next *LOAD CASE or *END STEP.", once=True)
+                                 f"one): closed at the next *LOAD CASE or *END STEP.", once=True,
+                                 at=open_end)
             release = any(b.keyword == "BOUNDARY" and b.uparam("OP") == "NEW" for b in cards)
             for k in range(len(names)):
                 group = [b if k == 0 else Block(b.keyword, OrderedDict(b.params), list(b.data)).placed(b)
@@ -45442,6 +45475,7 @@ class _CcxStream:
         self.messages: Counter = Counter()
         self.counts = {"*ERROR": 0, "*WARNING": 0}
         self.error: Optional[BaseException] = None
+        self.idle: Optional[float] = None   # since when the reader waits on an empty pipe
 
     def add(self, text: str) -> None:
         self.n += 1
@@ -45488,11 +45522,16 @@ class _CcxStream:
 class _CcxLog:
     """ccx's output, both streams as they come, to ``echo`` (a text stream) and to a file up
     to ``limit`` bytes, then the last lines of each stream when the run ends; ``on_full`` is
-    called when the file reaches the limit."""
+    called when the file reaches the limit.  A file that cannot be opened is no log
+    (``path`` None, ``error`` why)."""
 
     def __init__(self, path: Optional[str], limit: int, echo,
                  on_full: Optional[Callable[[], None]] = None) -> None:
-        self.fh = open(path, "wb") if path else None
+        self.error: Optional[OSError] = None
+        try:
+            self.fh = open(path, "wb") if path else None
+        except OSError as exc:              # (read-only; held open by another program)
+            self.fh, path, self.error = None, None, exc
         self.path, self.limit, self.echo, self.on_full = path, limit, echo, on_full
         self.size, self.full = 0, False
         self.lock = threading.Lock()
@@ -45553,7 +45592,12 @@ def _read_ccx_stream(pipe, stream: _CcxStream, log: _CcxLog) -> None:
     """Read one of ccx's pipes to its end, at most 1 MB at a time (a line may never end), as
     text the way ``text=True`` decodes it (UTF-8, newlines made ``\\n``).  It never stops
     reading before the end: ccx would block on a full pipe."""
-    for raw in iter(lambda: pipe.readline(1 << 20), b""):
+    while True:
+        stream.idle = time.monotonic()
+        raw = pipe.readline(1 << 20)
+        stream.idle = None
+        if not raw:
+            break
         try:
             text = raw.decode("utf-8", "replace")
             if "\r" in text:
@@ -45599,6 +45643,81 @@ def _kill_process_tree(p: "subprocess.Popen") -> None:
         pass
 
 
+def _pipe_holders(pipes: Sequence) -> List[int]:
+    """The processes other than this one that hold the other end of ``pipes`` (ccx's output
+    pipes, read here): ones ccx started and left running after it ended, which the process
+    tree no longer links to it.  Looked for in this process' group, which ccx's stay in, by
+    /proc (Linux) or lsof; none where neither tells (Windows)."""
+    if os.name == "nt":
+        return []
+    try:
+        ps = subprocess.run(["ps", "-A", "-o", "pid=,pgid="], capture_output=True, text=True,
+                            timeout=30).stdout
+        fds = [f.fileno() for f in pipes]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    me, group = os.getpid(), os.getpgrp()
+    pids = [int(f[0]) for f in map(str.split, ps.splitlines()) if len(f) == 2 and
+            f[0].isdigit() and f[1].isdigit() and int(f[1]) == group and int(f[0]) != me]
+    if not pids:
+        return []
+    if os.path.isdir("/proc/self/fd"):          # Linux: a pipe's two ends share an inode
+        names = {f"pipe:[{os.fstat(fd).st_ino}]" for fd in fds}
+        found = []
+        for pid in pids:
+            try:
+                fd_dir = f"/proc/{pid}/fd"
+                if any(os.readlink(os.path.join(fd_dir, f)) in names for f in os.listdir(fd_dir)):
+                    found.append(pid)
+            except OSError:
+                pass
+        return found
+    try:                                        # lsof: each end names the other's address
+        ours = subprocess.run(["lsof", "-a", "-p", str(me), "-d", ",".join(map(str, fds)), "-F",
+                               "d"], capture_output=True, text=True, timeout=30).stdout
+        theirs = subprocess.run(["lsof", "-a", "-p", ",".join(map(str, pids)), "-F", "pn"],
+                                capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    ends = {"n->" + ln[1:] for ln in ours.splitlines() if ln.startswith("d0x")}
+    found, pid = [], 0
+    for ln in theirs.splitlines():
+        if ln.startswith("p") and ln[1:].isdigit():
+            pid = int(ln[1:])
+        elif ln in ends and pid not in found:
+            found.append(pid)
+    return found
+
+
+_CCX_DRAIN = 2.0     # seconds the readers get to empty ccx's pipes once it has ended
+
+
+def _end_ccx_readers(readers: Sequence[threading.Thread], streams: Sequence[_CcxStream],
+                     pipes: Sequence) -> None:
+    """Wait for the threads reading ccx's output once ccx has ended.  A process ccx started
+    and left running may hold a pipe open: after _CCX_DRAIN seconds those processes are
+    killed (_pipe_holders), and the readers are left once each waits on an empty pipe for a
+    second (where none could be found and killed), or after 60 s (a reader still busy: its
+    echo held up)."""
+    end = time.monotonic()
+    for t in readers:
+        t.join(max(0.0, end + _CCX_DRAIN - time.monotonic()))
+    if not any(t.is_alive() for t in readers):
+        return
+    for pid in _pipe_holders(pipes):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    while time.monotonic() < end + 60.0:
+        for t in readers:
+            t.join(0.1)
+        now = time.monotonic()
+        busy = [s for t, s in zip(readers, streams) if t.is_alive()]
+        if all(s.idle is not None and now - s.idle > 1.0 for s in busy):
+            return
+
+
 class CcxRun:
     """How a ccx run ended (run_ccx_job).
 
@@ -45611,6 +45730,7 @@ class CcxRun:
                        were left out;
     * ``log``        - the file holding both streams as they came, up to ``log_limit``
                        bytes (``log_cut``: it reached them), then each stream's last lines;
+                       None when it could not be opened (``log_error``: why);
     * ``messages``   - ccx's distinct *ERROR and *WARNING lines, ``(kind, line)`` (blanks
                        squeezed, 200 characters; the first 100 of each stream) with how
                        often each came, in order; ``counts`` all of them by kind."""
@@ -45622,6 +45742,7 @@ class CcxRun:
         self.seconds = seconds
         self.stdout, self.stderr = (s.text() for s in streams)
         self.log, self.log_cut, self.log_limit = log.path, log.full, log.limit
+        self.log_error = log.error
         self.messages: Counter = Counter()
         for s in streams:
             self.messages.update(s.messages)
@@ -45638,26 +45759,34 @@ class CcxRun:
 def run_ccx_job(cmd: Sequence[str], cwd: Optional[str] = None,
                 env: Optional[Dict[str, str]] = None, log: Optional[str] = None,
                 timeout: Optional[float] = None, echo=None, log_limit: int = CCX_LOG_LIMIT,
-                stop_at_limit: bool = False) -> CcxRun:
+                stop_at_limit: bool = False, fsize: Optional[int] = None) -> CcxRun:
     """Run ccx (``cmd``: the executable and the job name) in ``cwd`` with bounded memory, as
     --run, validate_with_ccx.py and the corpus test do (and probes should): its stdout and
     stderr are read from pipes (ccx's Fortran output comes in the order the solve judge reads,
     as with ``capture_output``), shown on ``echo`` as they come, written to ``log`` up to
     ``log_limit`` bytes and kept in memory only in part (CcxRun).  ccx and every process it
-    started are killed after ``timeout`` seconds of wall-clock time (None: no limit), at the
-    log limit with ``stop_at_limit``, and when the caller is interrupted.  Raises OSError
-    when ccx cannot start."""
+    started are killed after ``timeout`` seconds of wall-clock time (None or inf: no limit),
+    at the log limit with ``stop_at_limit``, and when the caller is interrupted; the run ends
+    a few seconds after ccx has, the processes it left holding its output killed
+    (_end_ccx_readers).  ``fsize`` (POSIX): the bytes each file ccx writes may reach
+    (RLIMIT_FSIZE).  Raises OSError when ccx cannot start."""
     stopped: List[str] = []
 
     def stop() -> None:
         stopped.append("output")
         _kill_process_tree(p)
+    cap: Optional[Callable[[], None]] = None     # (run in the child, before ccx starts)
+    if fsize and os.name == "posix":
+        import resource
+        hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+        limit = (fsize if hard == resource.RLIM_INFINITY else min(fsize, hard), hard)
+        cap = functools.partial(resource.setrlimit, resource.RLIMIT_FSIZE, limit)
     sink = _CcxLog(log, log_limit, echo, stop if stop_at_limit else None)
     streams = (_CcxStream("stdout"), _CcxStream("stderr"))
     t0 = time.monotonic()
     try:
         p = subprocess.Popen(list(cmd), cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=cap)
     except BaseException:
         sink.close(())
         raise
@@ -45665,23 +45794,24 @@ def run_ccx_job(cmd: Sequence[str], cwd: Optional[str] = None,
                for pipe, s in zip((p.stdout, p.stderr), streams)]
     for t in readers:
         t.start()
-    killed = False
+    end = t0 + (math.inf if timeout is None else timeout)
     try:
-        try:
-            p.wait(timeout)
-        except subprocess.TimeoutExpired:
-            stopped.insert(0, "time")
-            killed = True
-            _kill_process_tree(p)
-            p.wait()
+        while True:                         # (in slices: Windows waits < 2^32 ms at a time)
+            try:
+                p.wait(max(0.0, min(end - time.monotonic(), 86400.0)))
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= end:
+                    stopped.insert(0, "time")
+                    _kill_process_tree(p)
+                    p.wait()
+                    break
     except BaseException:                   # Ctrl-C: ccx must not run on
-        killed = True
         _kill_process_tree(p)
         p.wait()
         raise
     finally:
-        for t in readers:                   # a process ccx started may hold a pipe open: then
-            t.join(5 if killed or stopped else 60)    # the run ends with what was read
+        _end_ccx_readers(readers, streams, (p.stdout, p.stderr))
         if not any(t.is_alive() for t in readers):
             p.stdout.close()
             p.stderr.close()
@@ -46427,10 +46557,17 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
     run.update(ccx=exe, ccx_version=version)
     stem = os.path.splitext(os.path.basename(out_path))[0]
     cwd = os.path.dirname(os.path.abspath(out_path))
-    log = os.path.join(cwd, stem + ".ccx.log")
+    log: Optional[str] = os.path.join(cwd, stem + ".ccx.log")
+    try:                                        # (a convenience: ccx runs without it)
+        with open(log, "ab"):
+            pass
+    except OSError as exc:
+        sys.stderr.write(f"abq2ccx: cannot write {log} ({exc.strerror or exc}); ccx runs without "
+                         f"it.\n")
+        log = None
     if not quiet:
         sys.stderr.write(f"abq2ccx: running {exe} {stem}" + (f" (ccx {version})" if version else "")
-                         + f"; its output also goes to {log}\n")
+                         + (f"; its output also goes to {log}" if log else "") + "\n")
     if version:
         _warn_ccx_version(exe, version)
     try:                                        # (it echoes UTF-8 deck lines)
@@ -46439,7 +46576,10 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
         sys.stderr.write(f"abq2ccx: could not run ccx: {exc}\n")
         run["status"] = "failed"
         return run
-    run["log"] = log
+    if log and r.log_error:
+        sys.stderr.write(f"abq2ccx: cannot write {log} ({r.log_error.strerror or r.log_error}); "
+                         f"ccx ran without it.\n")
+    run["log"] = log = r.log
     out = r.stdout + r.stderr
     if not version:                             # the banner of the run: "CalculiX Version 2.23"
         m = re.search(r"CalculiX Version\s+(\d+\.\d+)", r.stdout)
@@ -46457,7 +46597,7 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
                          f"truss node overwrote the BC's index entry, gen3dtruss.f).\n")
     if status == "timeout":
         sys.stderr.write(f"abq2ccx: ccx did not finish within --timeout {timeout:g} s and was "
-                         f"stopped (its output so far: {log}).\n")
+                         f"stopped" + (f" (its output so far: {log})" if log else "") + ".\n")
     elif status == "accepted":
         sys.stderr.write("abq2ccx: ccx accepted the deck, but it has no analysis step — "
                          "nothing was solved.\n")
@@ -46608,10 +46748,11 @@ def _imperfection_run(path: str, args, job: str, step: int, group: List[dict], p
              + body[heads[0]:at] + [f"*NODE PRINT, NSET={IMPERFECTION_NSET}, GLOBAL=YES", "U"]
              + body[at:])
     try:
-        with open(p1, "w", encoding="utf-8", newline="\n") as fh:
+        with open(p1, "w", encoding="utf-8", errors="backslashreplace", newline="\n") as fh:
             fh.write("\n".join(lines) + "\n")
         if not args.no_log:
-            with open(os.path.splitext(p1)[0] + ".log", "w", encoding="utf-8", newline="\n") as fh:
+            with open(os.path.splitext(p1)[0] + ".log", "w", encoding="utf-8",
+                      errors="backslashreplace", newline="\n") as fh:
                 fh.write(rep.text())
     except OSError as exc:
         return f"cannot write {p1}: {exc}"
@@ -46699,9 +46840,21 @@ def _failed(path: str, args, report: Report, code: int, msg: str) -> Tuple[int, 
     return code, _deck_doc(path, args, report, error=msg)
 
 
+def _home_as_tilde(text: str) -> str:
+    """``text`` with the user's home folder written ~ (a crash log meant to be posted)."""
+    home = os.path.expanduser("~").rstrip("\\/")
+    if len(home) < 2 or not os.path.isabs(home):
+        return text
+    for form in dedup([home, home.replace("\\", "\\\\")]):     # (and as a repr shows it)
+        text = re.sub(re.escape(form) + r"(?![\w.-])", "~", text,
+                      flags=re.IGNORECASE if os.name == "nt" else 0)
+    return text
+
+
 def _crashed(path: str, args, report: Report, exc: Exception) -> Tuple[int, dict]:
     """Exit 4: the converter raised ``exc`` on ``path``, a bug.  Its traceback goes into the
-    deck's .log (not with --check or --no-log) and, with --debug, to stderr."""
+    deck's .log (not with --check or --no-log; the home folder written ~) and, with --debug,
+    to stderr."""
     trace = traceback.format_exc()
     log = None
     if not (args.check or args.no_log):
@@ -46709,18 +46862,22 @@ def _crashed(path: str, args, report: Report, exc: Exception) -> Tuple[int, dict
         try:
             if args.outdir and not args.output:
                 os.makedirs(args.outdir, exist_ok=True)
-            with open(log, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(f"abq2ccx {__version__} (Python {sys.version.split()[0]}) failed converting "
-                         f"{path}; no deck was written. "
-                         f"Please report it at {ISSUES_URL} with this traceback and the deck (or "
-                         f"a cut-down one that fails the same way).\n\n{trace}\nThe report up to "
-                         f"the failure:\n{report.text()}")
+            with open(log, "w", encoding="utf-8", errors="backslashreplace", newline="\n") as fh:
+                fh.write(_home_as_tilde(
+                    f"abq2ccx {__version__} (Python {sys.version.split()[0]}) failed converting "
+                    f"{path}; no deck was written. Please report it at {ISSUES_URL} with this "
+                    f"traceback and the deck (or a cut-down one that fails the same way). Before "
+                    f"posting, check it for paths and deck text you would rather keep private "
+                    f"(your home folder is written ~).\n\n{trace}\nThe report up to the "
+                    f"failure:\n{report.text()}"))
         except OSError:
             log = None
     if args.debug:
         sys.stderr.write(trace)
     where = ("the traceback is above" + (f" and in {log}" if log else "") if args.debug else
              f"the traceback is in {log}" if log else "rerun with --debug for the traceback")
+    if log:
+        where += " (check it for private paths before posting)"
     msg = f"conversion failed for {path} ({type(exc).__name__}: {exc})"
     sys.stderr.write(f"abq2ccx: {msg}. This is a bug in abq2ccx: please report it at {ISSUES_URL} "
                      f"with the deck (or a cut-down one that fails the same way); {where}.\n")
@@ -46770,7 +46927,8 @@ def _convert_one(path: str, args) -> Tuple[int, dict]:
     wrote = False
     if not args.check:
         try:
-            with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+            with open(out_path, "w", encoding="utf-8", errors="backslashreplace",
+                      newline="\n") as fh:     # (a file name's lone surrogate as "\\udce9")
                 fh.write(text)
             wrote = True
         except OSError as exc:
@@ -46778,7 +46936,8 @@ def _convert_one(path: str, args) -> Tuple[int, dict]:
         if not args.no_log:
             log_path = os.path.splitext(out_path)[0] + ".log"
             try:
-                with open(log_path, "w", encoding="utf-8", newline="\n") as fh:
+                with open(log_path, "w", encoding="utf-8", errors="backslashreplace",
+                          newline="\n") as fh:
                     fh.write(report.text())
             except OSError as exc:
                 sys.stderr.write(f"abq2ccx: cannot write {log_path}: {exc}\n")
@@ -46817,14 +46976,40 @@ SUMMARY_COLUMNS = ("deck", "status", "nodes", "elements", "warnings", "commented
 
 def _summary_row(doc: dict) -> list:
     """A deck's --summary row (SUMMARY_COLUMNS) from its _deck_doc: ``digest`` is the
-    results digest's line of the last step a solved --run reports."""
+    results digest's line of the last step a solved --run reports.  Its text as UTF-8 holds
+    it (_text_name), a cell starting with = + - @ (a formula to spreadsheets: the
+    "--approximate: ..." of reduced physics) after an apostrophe."""
     results = doc.get("results") or []
     lines = format_results_digest(results[-1:])
-    return [doc["input"], doc["status"], doc["nodes"], doc["elements"], doc["counts"]["warnings"],
-            doc["counts"]["commented_cards"], "; ".join(doc["reduced_physics"]),
-            (doc.get("run") or {}).get("status"),
-            next((ln.strip() for ln in lines if ln.lstrip().startswith("step ")), None),
-            doc.get("error")]
+    row = [doc["input"], doc["status"], doc["nodes"], doc["elements"], doc["counts"]["warnings"],
+           doc["counts"]["commented_cards"], "; ".join(doc["reduced_physics"]),
+           (doc.get("run") or {}).get("status"),
+           next((ln.strip() for ln in lines if ln.lstrip().startswith("step ")), None),
+           doc.get("error")]
+    row = [_text_name(c) if isinstance(c, str) else c for c in row]
+    return ["'" + c if isinstance(c, str) and c[:1] in ("=", "+", "-", "@", "\t", "\r") else c
+            for c in row]
+
+
+def _summary_problem(path: str, inputs: Sequence[str]) -> Optional[str]:
+    """Why --summary ``path`` is not a file to write the CSV to, or None: --summary takes one
+    value, so a glob after it (--summary *.inp) gives it the first deck; no deck, input,
+    folder or file that is no summary abq2ccx wrote is overwritten."""
+    if path.lower().endswith(".inp"):
+        return "ends in .inp: name a .csv file (a glob right after --summary gives it a deck)"
+    here = os.path.normcase(os.path.abspath(path))
+    if any(os.path.normcase(os.path.abspath(p)) == here for p in inputs):
+        return "is one of the inputs"
+    if os.path.isdir(path):
+        return "is a folder"
+    try:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            first = fh.readline(1000).strip()
+    except OSError:                                 # new (or unreadable: said when written)
+        return None
+    if first and first != ",".join(SUMMARY_COLUMNS):
+        return "exists and is no summary abq2ccx wrote; not overwriting it"
+    return None
 
 
 def _tolerant_stdio() -> None:
@@ -46934,17 +47119,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         ap.error("--run needs an -o/--output name ending in .inp (ccx reads <job>.inp)")
     if args.timeout is not None and not (args.run and args.timeout > 0):
         ap.error("--timeout needs --run and a number of seconds above 0")
+    if args.timeout is not None and not math.isfinite(args.timeout):
+        ap.error("--timeout needs a finite number of seconds (leave it out for no limit)")
 
-    summary = None
+    summary = part = None
     if args.summary:
+        # the rows go to <FILE>.part as the batch runs, which replaces FILE when it has ended
+        part = args.summary + ".part"
+        why = _summary_problem(args.summary, inputs) or (
+            f"is beside {part}, which is no summary abq2ccx wrote" if _summary_problem(part, ())
+            else None)
+        if why:
+            ap.error(f"--summary {args.summary} {why}")
         try:
             os.makedirs(os.path.dirname(os.path.abspath(args.summary)), exist_ok=True)
-            summary = open(args.summary, "w", encoding="utf-8", newline="")
+            with open(args.summary, "a"):           # (in use, read-only: said now)
+                pass
+            summary = open(part, "w", encoding="utf-8", errors="backslashreplace", newline="")
         except OSError as exc:
             sys.stderr.write(f"abq2ccx: cannot write --summary {args.summary}: {exc}\n")
             return 1
     codes = []
     rows = csv.writer(summary) if summary else None
+    ended = False
     try:
         if rows:
             rows.writerow(SUMMARY_COLUMNS)
@@ -46956,9 +47153,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             if rows:
                 rows.writerow(_summary_row(doc))
                 summary.flush()                     # (a long batch: the rows so far)
+        ended = True
     finally:
         if summary:
             summary.close()
+            lost: Optional[str] = "the batch did not end"
+            if ended:
+                try:
+                    os.replace(part, args.summary)
+                    lost = None
+                except OSError as exc:
+                    lost = str(exc)
+            if lost:
+                sys.stderr.write(f"abq2ccx: --summary {args.summary} not written ({lost}); the rows "
+                                 f"are in {part}\n")
+                codes.append(1)
     if len(inputs) > 1 and not args.quiet and not args.json_out:
         ok = sum(1 for c in codes if c == 0)
         sys.stderr.write(f"abq2ccx: converted {ok}/{len(inputs)} deck(s)"

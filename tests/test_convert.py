@@ -5752,7 +5752,7 @@ def test_report_says_where_each_card_is():
         assert "[WARNING] model/mesh.inp:16: *INCLUDE without INPUT= ignored.\n" in text
         assert "[NOTE] model/mesh.inp:14: *NGEN increment 0 read as the default 1.\n" in text
         assert "[WARNING] main.inp:10: *FOOBAR has no CalculiX equivalent" in text
-        assert "[NOTE] *PARAMETER: resolved 1 parameter(s)" in text     # (no one card)
+        assert "[NOTE] main.inp:3: *PARAMETER: resolved 1 parameter(s)" in text   # (its card)
         assert "** [WARNING] main.inp:10: *FOOBAR has no CalculiX equivalent" in \
             "\n".join(rep.header_comment_lines())
         out = io.StringIO()
@@ -5761,7 +5761,7 @@ def test_report_says_where_each_card_is():
         entries = json.loads(out.getvalue())["entries"]
         foo = next(e for e in entries if e["message"].startswith("*FOOBAR"))
         par = next(e for e in entries if e["message"].startswith("*PARAMETER"))
-        assert foo["location"] == "main.inp:10" and par["location"] is None
+        assert foo["location"] == "main.inp:10" and par["location"] == "main.inp:3"
     # a card's place does not make it another card
     assert A.Block("NODE", {}, [], "a.inp", 3) == A.Block("NODE", {})
 
@@ -5868,8 +5868,9 @@ def test_crash_writes_its_traceback_to_the_log_and_with_debug_to_stderr():
     for key, (code, err, out) in runs.items():
         assert code == 4 and msg in err and A.ISSUES_URL in err, (key, err)
         assert ("Traceback (most recent call last)" in err) == (key == "--debug"), (key, err)
-    assert runs[""][1].endswith(f"the traceback is in {log}.\n"), runs[""][1]
-    assert runs["--debug"][1].endswith(f"the traceback is above and in {log}.\n"), runs["--debug"][1]
+    check = " (check it for private paths before posting).\n"
+    assert runs[""][1].endswith(f"the traceback is in {log}{check}"), runs[""][1]
+    assert runs["--debug"][1].endswith(f"the traceback is above and in {log}{check}"), runs["--debug"][1]
     assert runs["--check"][1].endswith("rerun with --debug for the traceback.\n"), runs["--check"][1]
     doc = json.loads(runs["--json"][2])
     assert (doc["status"], doc["error"], doc["log"], doc["output"], doc["nodes"], doc["reduced_physics"]) \
@@ -19161,6 +19162,356 @@ def test_ccx_version_is_read_and_checked():
     assert len(lines) == 2 and "/fake/ccx_221 is ccx 2.21; abq2ccx targets ccx 2.22-2.23" in lines[0]
     assert "could not tell which ccx version /fake/ccx_unknown is" in lines[1]
     assert A.run_ccx_job is real
+
+
+# --- the runner, the CLI and the report: code check G4 / G5-4 -----------------------------
+
+def _main_code(argv):
+    """A.main's exit code (a usage error's SystemExit too) and what it wrote to stderr."""
+    import contextlib
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        try:
+            code = A.main(argv)
+        except SystemExit as exc:
+            code = exc.code
+    return code, err.getvalue()
+
+
+def _still_runs(pid):
+    """Whether process ``pid`` still runs (a zombie does not), asked for up to 5 s."""
+    import subprocess
+    import time
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                               text=True).stdout.strip()
+        if not state or state.startswith("Z"):
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def test_summary_never_overwrites_a_deck_and_replaces_its_csv_at_the_end():
+    # --summary takes one value: with a glob after it (--summary *.inp) the first deck became
+    # the CSV, overwritten and left out of the batch (code check G4-1).  A path ending in .inp,
+    # one of the inputs, a folder or a file that is no summary is a usage error, and an earlier
+    # summary stays as it was until the batch has ended
+    import csv
+    d = tempfile.mkdtemp()
+    real = A._convert_one
+    try:
+        a, b, notes = (os.path.join(d, n) for n in ("a.inp", "b.inp", "notes.txt"))
+        for p, text in ((a, HEX_MODEL), (b, HEX_MODEL), (notes, "my notes\n")):
+            with open(p, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+        for argv in (["--summary", a, b], ["--summary", os.path.join(d, "s.INP"), a],
+                     [a, "--summary", notes], [notes, a, "--summary", notes], [a, "--summary", d]):
+            code, err = _main_code(["--quiet"] + argv)
+            assert code == 2 and "--summary" in err, (argv, code, err)
+        for p, text in ((a, HEX_MODEL), (notes, "my notes\n")):
+            with open(p, encoding="utf-8") as fh:
+                assert fh.read() == text, p
+        made = sorted(os.listdir(d))
+        summary, outdir = os.path.join(d, "s.csv"), os.path.join(d, "out")
+        first = _main_code(["--quiet", "--outdir", outdir, "--summary", summary, a])[0]
+        with open(summary, encoding="utf-8") as fh:
+            old = fh.read()
+        seen = []
+
+        def spy(path, args):
+            with open(summary, encoding="utf-8") as fh:
+                seen.append(fh.read())
+            return real(path, args)
+        A._convert_one = spy
+        code = _main_code(["--quiet", "--outdir", outdir, "--summary", summary, a, b])[0]
+        A._convert_one = real
+        with open(summary, newline="", encoding="utf-8") as fh:
+            rows = list(csv.reader(fh))
+        left = sorted(os.listdir(d))
+    finally:
+        A._convert_one = real
+        shutil.rmtree(d, ignore_errors=True)
+    assert made == ["a.inp", "b.inp", "notes.txt"], made
+    assert first == code == 0 and len(old.splitlines()) == 2 and seen == [old, old], (first, code, seen)
+    assert [r[0] for r in rows] == ["deck", a, b] and left == made + ["out", "s.csv"], (rows, left)
+
+
+def test_ccx_runner_ends_with_ccx_not_with_a_process_left_holding_its_output():
+    # a process ccx started (a wrapper script's) and left running with ccx's output pipes: the
+    # runner waited 60 s for each pipe (120 s, with a --timeout too) and left it running (code
+    # check G4-2).  Now it waits a few seconds and kills such a process where it can tell it
+    import signal
+    import time
+    if os.name == "nt" and not (sys.executable + tempfile.gettempdir()).isascii():
+        return                                  # cmd.exe would read the .bat in the OEM code page
+    d = tempfile.mkdtemp()
+    pid_file, child = os.path.join(d, "pid"), os.path.join(d, "child.py")
+    with open(child, "w", encoding="utf-8") as fh:
+        fh.write("import os, sys, time\nwith open(sys.argv[1] + '.new', 'w') as fh:\n"
+                 "    fh.write(str(os.getpid()))\nos.replace(sys.argv[1] + '.new', sys.argv[1])\n"
+                 "time.sleep(300)\n")
+    out = _CCX_START + b" Job finished\n"
+    ccx = _fake_ccx(d, out, f"import os, subprocess, time\nsubprocess.Popen([sys.executable, {child!r}, "
+                            f"{pid_file!r}])\nwhile not os.path.exists({pid_file!r}):\n    time.sleep(0.05)")
+    pids, runs = [], []
+    try:
+        for timeout in (None, 60):
+            if os.path.exists(pid_file):
+                os.remove(pid_file)
+            t0 = time.monotonic()
+            r = A.run_ccx_job([ccx, "job"], d, None, os.path.join(d, "job.ccx.log"), timeout)
+            runs.append((timeout, time.monotonic() - t0, r.stopped, r.status(), r.stdout))
+            with open(pid_file) as fh:
+                pids.append(int(fh.read()))
+            runs[-1] += (os.name == "nt" or not _still_runs(pids[-1]),)
+    finally:
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        shutil.rmtree(d, ignore_errors=True)
+    for timeout, took, stopped, status, text, ended in runs:
+        assert took < 30 and stopped is None and status == "solved" and text == out.decode(), \
+            (timeout, took, stopped, status, text)
+        assert ended, f"the process ccx left ({timeout=}) still runs"
+
+
+def test_run_runs_ccx_when_its_log_cannot_be_written():
+    # <output>.ccx.log is a convenience: when it cannot be opened (a read-only leftover, a file
+    # another program holds open on Windows), ccx still runs, warned (code check G4-3: "could
+    # not run ccx")
+    import contextlib
+    import json
+    if os.name == "nt" and not (sys.executable + tempfile.gettempdir()).isascii():
+        return                                  # cmd.exe would read the .bat in the OEM code page
+    d = tempfile.mkdtemp()
+    try:
+        deck, log = os.path.join(d, "hex.inp"), os.path.join(d, "hex_ccx.ccx.log")
+        with open(deck, "w", encoding="utf-8") as fh:
+            fh.write(HEX + "*STEP\n*STATIC\n*END STEP\n")
+        os.mkdir(log)                           # (no file opens there, on any OS)
+        ccx = _fake_ccx(d, _CCX_START + b" *ERROR in e_c3d: nonpositive jacobian determinant\n")
+        err, js = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(js):
+            code = A.main([deck, "--run", "--ccx", ccx, "--json"])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    run, text = json.loads(js.getvalue())["run"], err.getvalue()
+    assert code == 1 and run["status"] == "failed" and run["log"] is None, (code, run)
+    assert f"abq2ccx: cannot write {log} (" in text and "ccx runs without it" in text, text
+    assert "could not run ccx" not in text and "its output also goes to" not in text, text
+    assert "\n *ERROR in e_c3d: nonpositive jacobian determinant\n" in text, text
+
+
+def test_run_timeout_is_finite_and_waited_for_in_slices():
+    # Windows waits at most 2^32 - 2 ms at a time (Popen.wait: a DWORD of milliseconds), so
+    # --timeout inf or 5e6 raised OverflowError (code check G4-4): --timeout takes a finite
+    # number, and the runner waits for ccx in slices, any limit (or none) alike
+    import subprocess
+    if os.name == "nt" and not (sys.executable + tempfile.gettempdir()).isascii():
+        return                                  # cmd.exe would read the .bat in the OEM code page
+    d = tempfile.mkdtemp()
+    real = subprocess.Popen.wait
+    waits, runs = [], []
+    try:
+        deck = os.path.join(d, "hex.inp")
+        with open(deck, "w", encoding="utf-8") as fh:
+            fh.write(HEX + "*STEP\n*STATIC\n*END STEP\n")
+        bad = [_main_code([deck, "--run", "--timeout", t]) for t in ("inf", "-inf", "nan", "1e400")]
+        ccx = _fake_ccx(d, _CCX_START + b" Job finished\n")
+
+        def wait(self, timeout=None):
+            if self.args[0] == ccx:
+                waits.append(timeout)
+            return real(self, timeout)
+        subprocess.Popen.wait = wait
+        for t in (5e6, math.inf, None):
+            r = A.run_ccx_job([ccx, "job"], d, None, None, t)
+            runs.append((r.stopped, r.status()))
+    finally:
+        subprocess.Popen.wait = real
+        shutil.rmtree(d, ignore_errors=True)
+    assert all(code == 2 and "--timeout" in err for code, err in bad), bad
+    assert runs == [(None, "solved")] * 3, runs
+    assert waits and all(w is not None and w < 4294967 for w in waits), waits
+
+
+def test_validate_excuses_only_ccx_s_own_crash_and_a_ccx_that_cannot_start():
+    # corner_twin SKIPped when ccx crashed on both decks, which a converter regression making
+    # ccx crash on both would hide (code check G4-5).  Excused now: ccx 2.23's crash at a
+    # *DYNAMIC step's start on Windows (tempload; CI runs 39494002953, 39678123103,
+    # 39744773600: no *ERROR, no "Job finished", the step's start its last lines), and ccx
+    # failing to start (the system's: no memory, no process left)
+    import validate_with_ccx as V
+    start = _CCX_START.decode()
+    crash = (start + " STEP            2\n\n Selective mass scaling is activated.\n\n"
+             " Dynamic analysis was selected\n\n Newton-Raphson iterative procedure is active\n\n")
+    assert V.ccx_fault("failed", crash, windows=True)
+    assert V.ccx_fault("failed", "failed to launch ccx: [Errno 12] Cannot allocate memory", windows=False)
+    for status, out, windows in (("failed", crash, False),           # not seen elsewhere: FAIL
+                                 ("solved", crash, True), ("unsolved", crash, True),
+                                 ("failed", crash + " *ERROR in e_c3d: nonpositive jacobian\n", True),
+                                 ("failed", crash + " increment 1 attempt 1\n", True),
+                                 ("failed", start, True),             # a crash elsewhere
+                                 ("timeout", crash, True),
+                                 ("failed", "ccx run failed in validate_with_ccx: ValueError: x", True)):
+        assert not V.ccx_fault(status, out, windows=windows), (status, out[-80:], windows)
+
+
+def test_file_names_that_are_not_utf8_convert():
+    # on Linux a file named in Latin-1 (caf\xe9.inp) reaches Python surrogate-escaped; the
+    # report names a card's file, so writing the deck's header, its .log and the --summary
+    # row raised UnicodeEncodeError (code check G4-6).  They name it as Python shows the byte
+    import csv
+    raw = "caf\udce9.inp"                       # os.fsdecode(b"caf\xe9.inp") on Linux
+    assert A._shown_path(os.path.join(os.sep + "data", raw), os.sep + "data") == "caf\\xe9.inp"
+    assert A._summary_row({"input": raw, "status": "converted", "nodes": 8, "elements": 1,
+                           "counts": {"warnings": 0, "commented_cards": 0},
+                           "reduced_physics": []})[0] == "caf\\xe9.inp"
+    d = tempfile.mkdtemp()
+    try:
+        deck, summary = os.path.join(d, raw), os.path.join(d, "s.csv")
+        try:
+            with open(deck, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(HEX_MODEL + "*Step\n*Static\n*Monitor, node=1, dof=1\n*End Step\n")
+        except (OSError, UnicodeError):
+            return                              # the file system refuses the name (macOS)
+        code, err = _main_code([deck, "--summary", summary])
+        with open(os.path.join(d, "caf\udce9_ccx.inp"), encoding="utf-8") as fh:
+            head = fh.read(3000)
+        with open(os.path.join(d, "caf\udce9_ccx.log"), encoding="utf-8") as fh:
+            log = fh.read()
+        with open(summary, newline="", encoding="utf-8") as fh:
+            rows = list(csv.reader(fh))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert code == 0 and "caf\\xe9.inp:" in head and "caf\\xe9.inp:" in log, (code, err)
+    assert rows[1][0] == os.path.join(d, "caf\\xe9.inp"), rows
+
+
+def test_summary_cells_are_no_spreadsheet_formulas():
+    # a CSV cell starting with = + - @ is a formula to Excel and LibreOffice: a deck's
+    # --approximate reduced physics ("--approximate: ...") showed #NAME? (code check G4-8)
+    import csv
+    row = A._summary_row({"input": "=x.inp", "status": "failed", "nodes": None, "elements": None,
+                          "counts": {"warnings": 1, "commented_cards": 0},
+                          "reduced_physics": ["--approximate: a Riks step", "@b"], "error": "+1"})
+    assert row[0] == "'=x.inp" and row[6] == "'--approximate: a Riks step; @b" and row[9] == "'+1", row
+    d = tempfile.mkdtemp()
+    try:
+        deck, summary = os.path.join(d, "riks.inp"), os.path.join(d, "s.csv")
+        with open(deck, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(HEX_MODEL + "*Step, nlgeom\n*Static, riks\n0.1, 1., , , 1.\n*Cload\n7, 3, 1.\n*End Step\n")
+        code, _ = _main_code([deck, "--approximate", "--quiet", "--summary", summary])
+        with open(summary, newline="", encoding="utf-8") as fh:
+            rows = list(csv.reader(fh))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert code == 0 and rows[1][1] == "reduced" and rows[1][6].startswith("'--approximate: "), rows
+
+
+def test_ccx_runner_caps_the_files_ccx_writes():
+    # validate's t124 checks run ccx on decks that made it loop without end: their files were
+    # capped at 50 MB before the streaming runner (code check G4-9); run_ccx_job's fsize caps
+    # each file ccx writes again (POSIX: RLIMIT_FSIZE)
+    if os.name != "posix":
+        return
+    d = tempfile.mkdtemp()
+    big = os.path.join(d, "job.frd")
+    ccx = _fake_ccx(d, _CCX_START, f"with open({big!r}, 'wb') as fh:\n    for _ in range(64):\n"
+                                   f"        fh.write(b'x' * 65536)\nprint(' Job finished')")
+    try:
+        capped = A.run_ccx_job([ccx, "job"], d, None, None, 60, fsize=1 << 20)
+        size = os.path.getsize(big)
+        free = A.run_ccx_job([ccx, "job"], d, None, None, 60)
+        size_free = os.path.getsize(big)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert size <= 1 << 20 and capped.status() == "failed", (size, capped.status())
+    assert size_free == 64 << 16 and free.status() == "solved", (size_free, free.status())
+
+
+def test_crash_log_shows_the_home_folder_as_a_tilde():
+    # the crash .log asks for its traceback to be posted publicly, and its paths named the
+    # user's home folder (code check G4-10): there it is ~, and the message says to check
+    # the log before posting it
+    import contextlib
+    home = os.path.expanduser("~")
+    if len(home) < 2 or not os.path.isabs(home):
+        return
+    d = tempfile.mkdtemp()
+    deck = os.path.join(d, "a.inp")
+    with open(deck, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(HEX_MODEL)
+    secret = os.path.join(home, "private", "x.inp")
+
+    def boom(self, blocks):
+        self.report.warn(f"Could not read {secret}")
+        raise KeyError(secret)
+    real = A.Converter.convert
+    A.Converter.convert = boom
+    try:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = A.main([deck])
+        with open(os.path.join(d, "a_ccx.log"), encoding="utf-8") as fh:
+            text = fh.read()
+    finally:
+        A.Converter.convert = real
+        shutil.rmtree(d, ignore_errors=True)
+    shown = os.path.join("~", "private", "x.inp")
+    assert code == 4 and home not in text and shown in text, text
+    assert "check it" in text and "before posting" in err.getvalue(), err.getvalue()
+
+
+G54_MODEL = (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+             "*Density\n1e-9\n*Nset, nset=FIX\n1, 4, 5, 8\n*Nset, nset=TIP\n2, 3, 6, 7\n"
+             "*Boundary\nFIX, ENCASTRE\n")
+
+
+def test_report_entries_about_one_card_start_with_its_line():
+    # entries about one card had no file:line (code check G5-4): *EMBEDDED ELEMENT's, an
+    # unclosed *LOAD CASE, a step's *MODAL DAMPING, an undefined connector behaviour, a
+    # skipped *SYSTEM card and the *PARAMETER note
+    static = "*Step\n*Static\n*Cload\nTIP, 1, 1.\n*End Step\n"
+    cases = (
+        (G54_MODEL + "*Node\n101, 0.5, 0.5, 0.1\n102, 0.5, 0.5, 0.9\n*Element, type=T3D2, elset=BAR\n"
+         "101, 101, 102\n*Solid Section, elset=BAR, material=M\n0.01\n*Embedded Element, host "
+         "elset=NOSUCH, roundoff tolerance=abc\nNOSUCH2\n" + static,
+         [("*EMBEDDED ELEMENT, HOST ELSET=NOSUCH: NOSUCH2 name(s)", "*Embedded Element"),
+          ("*EMBEDDED ELEMENT, ROUNDOFF TOLERANCE=abc", "*Embedded Element")]),
+        (G54_MODEL + "*Step, perturbation\n*Static\n*Load Case, name=LC1\n*Cload\nTIP, 1, 1.\n"
+         "*Load Case, name=LC2\n*Cload\nTIP, 2, 1.\n*End Step\n",
+         [("Step 1: *LOAD CASE without *END LOAD CASE", "*Load Case, name=LC1")]),
+        (G54_MODEL + "*Step\n*Frequency\n5\n*End Step\n*Step\n*Modal Dynamic\n0.1, 1.\n*Modal Damping\n"
+         "*Modal Damping, viscous=RAYLEIGH\n,\n*Modal Damping, foo=2\n5, 1, 0.02\nabc, 2, 0.1\n"
+         "*Cload\nTIP, 1, 1.\n*End Step\n",
+         [("Step 2 (*MODAL DYNAMIC): two *MODAL DAMPING cards", "*Modal Damping, foo=2"),
+          ("Step 2 (*MODAL DYNAMIC): *MODAL DAMPING (damping ratios) left out", "*Modal Damping, foo=2"),
+          ("Step 2 (*MODAL DYNAMIC): *MODAL DAMPING (Rayleigh) left out", "*Modal Damping, viscous=RAYLEIGH")]),
+        (G54_MODEL + "*Node\n201, 3., 0., 0.\n*Element, type=CONN3D2, elset=CON\n301, 2, 201\n"
+         "*Connector Section, elset=CON, behavior=NOSUCH\nBUSHING\n" + static,
+         [("*CONNECTOR SECTION, BEHAVIOR=NOSUCH: the behaviour defines nothing", "*Connector Section"),
+          ("Connector of type BUSHING: it constrains no relative motion", "*Connector Section")]),
+        ("*Heading\n*System, foo=1\n,,, abc, 1\n" + G54_MODEL + static,
+         [("Skipped a *SYSTEM card with non-numeric data", "*System, foo=1")]),
+        ("*Parameter\nload = 2.\n" + G54_MODEL + static.replace("1.", "<load>"),
+         [("*PARAMETER: resolved 1 parameter(s)", "*Parameter")]))
+    for text, wanted in cases:
+        _, _, rep = convert_str(text)
+        lines = text.splitlines()
+        for start, card in wanted:
+            k = next((k for k, (_, m) in enumerate(rep.entries) if m.startswith(start)), None)
+            line = next(i for i, ln in enumerate(lines, 1) if ln.startswith(card))
+            assert k is not None and (rep.where.get(k) or "").endswith(f".inp:{line}"), \
+                (start, line, rep.where.get(k), rep.text())
+
+
 # --- composite shells: S4R -> S8R and continuum shells -> one solid per ply ---------------
 
 COMPOSITE_MAT = ("*Material, name=CFRP\n*Elastic, type=ENGINEERING CONSTANTS\n"

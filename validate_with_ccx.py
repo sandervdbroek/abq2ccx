@@ -156,8 +156,9 @@ def convert(path, out_inp, approximate=False, abaqus_umat=False):
 CCX_TIMEOUT = 600      # seconds of wall-clock time a ccx run gets
 SKIPPED = []           # the checks that printed SKIP
 # The SKIPs that hide no regression: umat_build without CCX_UMAT, and corner_twin's checks when
-# ccx crashed on the twin at every try (ccx 2.23's random crash at a *DYNAMIC step's start,
-# 5f03246).  Any other SKIP fails validate: a SKIP can hide a regression.
+# ccx failed on the twin at every try for no fault of the decks (ccx_fault: ccx 2.23's random
+# crash at a *DYNAMIC step's start on Windows, 5f03246; ccx could not start).  Any other SKIP
+# fails validate: a SKIP can hide a regression.
 EXPECTED_SKIPS = ("umat_build", "transform_shell_corner_plate", "transform_shell_corner_panel",
                   "transform_knot_dynamic")
 
@@ -174,12 +175,13 @@ def closing_lines(failures):
     return 1 if result else 0
 
 
-def ccx_job(ccx, env, d, timeout=CCX_TIMEOUT):
+def ccx_job(ccx, env, d, timeout=CCX_TIMEOUT, fsize=None):
     """ccx run on ``d``/job.inp by abq2ccx.run_ccx_job (an abq2ccx.CcxRun): its output streamed
     to ``d``/job.ccx.log and kept in memory only in part, ccx stopped after ``timeout`` seconds
-    or 100 MB of output (it can print without end)."""
+    or 100 MB of output (it can print without end); ``fsize``: the bytes each file ccx writes
+    may reach (POSIX)."""
     return A.run_ccx_job([ccx, "job"], d, {**os.environ, **env}, os.path.join(d, "job.ccx.log"),
-                         timeout, stop_at_limit=True)
+                         timeout, stop_at_limit=True, fsize=fsize)
 
 
 def run_ccx(ccx, env, inp_path, timeout=CCX_TIMEOUT):
@@ -200,8 +202,27 @@ def run_ccx(ccx, env, inp_path, timeout=CCX_TIMEOUT):
                 f"no end within {timeout:g} s\n" if r.timed_out else
                 f"it printed {r.log_limit:,} bytes\n")
         return d, status, out
-    except Exception as exc:  # noqa: BLE001
+    except OSError as exc:              # ccx could not start (ccx_fault: the system's)
         return d, "failed", f"failed to launch ccx: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return d, "failed", f"ccx run failed in validate_with_ccx: {type(exc).__name__}: {exc}"
+
+
+def ccx_fault(status, out, windows=os.name == "nt"):
+    """Why a ccx run (run_ccx's ``status`` and ``out``) that did not solve is no fault of its
+    deck, or None: ccx could not start (run_ccx's "failed to launch ccx": the system's), or,
+    on Windows, ccx 2.23's random crash at the start of a *DYNAMIC step after a *STATIC one
+    (tempload; CI runs 39494002953, 39678123103, 39744773600: no *ERROR, no "Job finished",
+    the step's start its last lines; 1 run in 12 on the macOS build, never 5 in a row).  Any
+    other crash, which a converter regression can cause, is the deck's (code check G4-5)."""
+    if status != "failed" or "*ERROR" in out or "Job finished" in out:
+        return None
+    if out.startswith("failed to launch ccx: "):
+        return "ccx could not start"
+    last = [ln.strip() for ln in out.splitlines() if ln.strip()][-2:]
+    if windows and last == ["Dynamic analysis was selected", "Newton-Raphson iterative procedure is active"]:
+        return "ccx crashed at the *DYNAMIC step's start"
+    return None
 
 
 def frd_stress(frd_path, node):
@@ -10097,7 +10118,7 @@ def main():
     # under a tilted one must match the plate in global components, the half panel with a
     # cylindrical *TRANSFORM on all nodes the whole panel without (before: 2.1 % / 1.3 % off).
     def corner_twin(label, text, twin, tol=1e-9, moved=0.0):
-        u, notes, why, crashed = [], [], [], []
+        u, notes, why, excused = [], [], [], []
         for i, t in enumerate((text, twin)):
             src, inp = os.path.join(tmp, f"tc{i}_src.inp"), os.path.join(tmp, f"tc{i}.inp")
             with open(src, "w", encoding="utf-8", newline="\n") as fh:
@@ -10110,18 +10131,19 @@ def main():
                     break
                 shutil.rmtree(d, ignore_errors=True)
             u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
-            crashed.append(status == "failed" and "*ERROR" not in out and "Job finished" not in out)
+            excused.append(ccx_fault(status, out))
             if status != "solved":                  # say how ccx ended (the last lines it printed)
                 tail = [ln.strip() for ln in out.splitlines() if ln.strip()][-3:]
                 why.append(f"{('the deck', 'its twin')[i]} {status}: {' | '.join(tail)}")
             shutil.rmtree(d, ignore_errors=True)
-        if crashed[1] and (u[0] or crashed[0]):
-            # ccx crashed on the hand-written twin at every try (ccx 2.23's random tempload
-            # crash at a *DYNAMIC step's start; Windows' build in every try of some CI runs),
-            # and the deck solved or crashed alike: nothing to compare, which is ccx's fault,
-            # not the deck's (a crash on the deck alone, a time limit or an *ERROR still FAIL)
-            print(f"SKIP  {label}: ccx crashed on the twin{' and the deck' if crashed[0] else ''} "
-                  f"at every try ({'; '.join(why)})")
+        if excused[1] and (u[0] or excused[0]):
+            # ccx failed on the hand-written twin at every try for no fault of it (ccx_fault:
+            # ccx 2.23's random tempload crash at a *DYNAMIC step's start, Windows' build in
+            # every try of some CI runs), and the deck solved or failed alike: nothing to
+            # compare, which is ccx's fault, not the deck's (a failure on the deck alone, any
+            # other crash, a time limit or an *ERROR still FAIL)
+            print(f"SKIP  {label}: {excused[1]} on the twin"
+                  f"{' and the deck' if excused[0] else ''} at every try ({'; '.join(why)})")
             SKIPPED.append(label)
             return 0
         if not u[0] or u[0].keys() != u[1].keys():
@@ -16846,15 +16868,15 @@ def main():
     def t124_run(tag, kind, reduced=(), deck=None):
         """(the .dat path's displacement blocks, buckling factor tables, frequency tables, the
         report text) of avoidable_stops_deck(kind) (or ``deck``) converted and solved with
-        exactly the ``reduced`` physics, or None (FAIL printed).  ccx gets 120 s: some of these
-        decks made it loop without end."""
+        exactly the ``reduced`` physics, or None (FAIL printed).  ccx gets 120 s and files of at
+        most 50 MB (POSIX): some of these decks made it loop without end."""
         src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(avoidable_stops_deck(kind) if deck is None else deck)
         rep, conv = convert(src, inp)
         d = tempfile.mkdtemp(prefix="ccxval_")
         shutil.copy(inp, os.path.join(d, "job.inp"))
-        r = ccx_job(ccx, env, d, 120)
+        r = ccx_job(ccx, env, d, 120, fsize=50 << 20)
         rc, out = r.stopped or r.returncode, r.stdout + r.stderr
         # (the checks below show the solve)
         status = "solved" if rc == 0 and "Job finished" in out and "*ERROR" not in out and \
