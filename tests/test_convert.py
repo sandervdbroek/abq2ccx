@@ -8029,6 +8029,58 @@ def test_midside_temperatures_follow_every_card():
     assert "\n1, 50.\n4, 35\n" in _step(body, 2)
 
 
+
+def test_midside_bcs_follow_a_card_that_moves_one_end():
+    # a midside node the converter adds (here S4R -> S8R under --approximate) between ends a
+    # card gives on its own: the interpolation with the other end's BC in force (before: none,
+    # so the node kept an earlier step's value, or stayed free where two cards held the ends;
+    # probed: the edge kinked, 0 for -0.05, and juliafem_shell_box's box walls)
+    strip = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+             "6, 2., 1., 0.\n*Element, type=S4R, elset=E\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*Nset, nset=FAR\n"
+             "3, 6\n*Material, name=M\n*Elastic\n1000., 0.3\n*Shell Section, elset=E, material=M\n0.05\n"
+             "*Amplitude, name=A\n0., 0., 1., 1.\n*Amplitude, name=T, time=total time\n0., 0., 2., 1.\n"
+             "*Boundary\n1, 1, 6\n4, 1, 6\n")
+    held = "*Step\n*Static\n*Boundary\nFAR, 1, 6\n3, 3, 3, 0.2\n*End Step\n"
+    loose = "BCs of nodes the converter added between nodes whose ends vary on different amplitudes or are unknown"
+
+    def run(steps):
+        body, conv, rep = convert_str(strip + steps, approximate=True)
+        m = next(m for a, c, m, _ in conv._between() if {a, c} == {3, 6})
+        return body, conv, rep, m
+    body, conv, rep, m = run(held + "*Step\n*Static\n*Boundary\n6, 3, 3, -0.1\n*End Step\n")
+    assert f"\n3, 3, 3, 0.2\n{m}, 3, 3, 0.1\n" in _step(body, 1)
+    assert f"\n6, 3, 3, -0.1\n{m}, 3, 3, 0.05\n" in _step(body, 2) and _step(body, 2).count(f"\n{m}, ") == 1
+    assert "whose other end has a BC in force" in rep.text() and loose not in conv.reduced_physics
+    # two cards of one step: the second gets the first's value at the other end
+    body, conv, rep, m = run("*Step\n*Static\n*Boundary\n3, 1, 6\n*Boundary\n6, 1, 6\n*End Step\n")
+    assert f"*BOUNDARY\n6, 1, 6\n{m}, 1, 6, 0\n" in body
+    # one end without a BC: nothing, as before; OP=NEW frees the other end
+    body, conv, rep, m = run("*Step\n*Static\n*Boundary\n6, 3, 3, -0.1\n*End Step\n")
+    assert f"\n{m}, " not in _step(body, 1) and "whose other end" not in rep.text()
+    body, conv, rep, m = run(held + "*Step\n*Static\n*Boundary, op=NEW\n1, 1, 6\n4, 1, 6\n6, 3, 3, -0.1\n"
+                             "*End Step\n")
+    assert f"\n{m}, " not in _step(body, 2)
+    # the other end on another amplitude (or held under one) and the card's: approximate, warned;
+    # a zero value there, the same amplitude, or the same total-time amplitude: exact
+    for steps, mean, bad in (
+            (held + "*Step\n*Static\n*Boundary, amplitude=A\n6, 3, 3, -0.1\n*End Step\n", 0.05, True),
+            ("*Step\n*Static\n*Boundary\nFAR, 1, 6\n*End Step\n*Step\n*Static\n*Boundary, amplitude=A\n"
+             "6, 3, 3, -0.1\n*End Step\n", -0.05, False),
+            ("*Step\n*Static\n*Boundary, amplitude=A\nFAR, 1, 6\n3, 3, 3, 0.2\n*Boundary, amplitude=A\n"
+             "6, 3, 3, -0.1\n*End Step\n", 0.05, False),
+            (held.replace("Boundary\n", "Boundary, amplitude=T\n") + "*Step\n*Static\n*Boundary, "
+             "amplitude=T\n6, 3, 3, -0.1\n*End Step\n", 0.05, False)):
+        body, conv, rep, m = run(steps)
+        assert f"\n6, 3, 3, -0.1\n{m}, 3, 3, {mean}\n" in body and (loose in conv.reduced_physics) == bad, steps
+    # an end held by FIXED: its value unknown here, so the node keeps its BC, warned
+    body, conv, rep, m = run("*Step\n*Static\n*Boundary\nFAR, 1, 6\n*End Step\n*Step\n*Static\n"
+                             "*Boundary, fixed\n3, 1, 6\n*Boundary\n6, 3, 3, -0.1\n*End Step\n")
+    assert f"\n{m}, " not in _step(body, 2) and loose in conv.reduced_physics
+    # a linear perturbation step: the other end's base-state BC is a zero change (the restore
+    # then adds the base state's 0.1 to the midside node's -0.05)
+    body, conv, rep, m = run(held + "*Step, perturbation\n*Static\n*Boundary\n6, 3, 3, -0.1\n*End Step\n")
+    assert f"\n6, 3, 3, -0.1\n{m}, 3, 3, 0.05\n" in _step(body, 2) and loose not in conv.reduced_physics
+
 def test_rigid_surface_lines_survive_the_ply_split():
     # _plan_rigid's surface lines are keyed by the record's text: the ply split turns an
     # earlier line into two (code review 3: the ply line was lost, 'RIG, SPOS' kept raw)
@@ -14374,7 +14426,9 @@ def test_transformed_rotations_on_an_upgraded_beams_midside_node():
         "3, 4, 4, 0.02\n", "2, 3, 3\n3, 4, 4, 0.02\n"))
     one = _step(body, 1)
     assert f"*BOUNDARY\n2, 3, 3\n{RAMP}\n3, 4, 4, " in one and one.count("\n5, ") == 2
-    assert one.split(RAMP)[2].count("\n5, 4, 4, 0.00799") == 1
+    # (node 4, between the clamped node 1 and node 2, follows them too: _plan_held_bcs)
+    assert one.count("\n5, 4, 4, 0.00799") == 1 and f"{RAMP}\n4, 4, 4, 0.00183" in one
+    assert one.split(RAMP)[3].count("\n5, 4, 4, 0.00799") == 1
     # one local rotation on a node ccx makes no knot (a PIPE section): kept, ends and midside
     pipe = deck.replace("section=CIRC\n0.05", "section=PIPE\n0.05, 0.01").replace(
         "2, 4, 5, 0.01\n3, 4, 4, 0.02\n3, 5, 5, 0.01\n", "2, 4, 4, 0.01\n3, 4, 4, 0.02\n")
@@ -14438,7 +14492,8 @@ def test_midside_node_bcs_on_a_curved_transformed_edge():
     body, conv, rep = convert_str(arc.replace("*Boundary\n2, 1, 1, 0.01\n2, 2, 2, 0.005\n2, 3, 3, 0.003\n"
                                               "3, 1, 1, 0.02\n3, 2, 2\n3, 3, 3, 0.006\n",
                                               "*Boundary\n2, 4, 6, 0.01\n3, 4, 4, 0.02\n3, 5, 6\n"))
-    assert conv._rot_mode == {2: "global", 3: "global", 5: "global"}
+    # (node 4, between the clamped node 1 and node 2, follows them too: _plan_held_bcs)
+    assert conv._rot_mode == {2: "global", 3: "global", 4: "sect", 5: "global"}
     g = [0.5 * sum(v[j] * e[j][k] for v, e in zip(((0.01,) * 3, (0.02, 0., 0.)), ends) for j in range(3))
          for k in range(3)]
     assert _close(mid(body), {4 + k: g[k] for k in range(3)}, 1e-11)
@@ -14477,12 +14532,15 @@ def test_transformed_midside_node_bcs_ramp_by_their_own_state():
     deck = _transformed(CIRC_BEAM + "*Boundary\n1, 1, 6\n" + step.format(0.01, 0.02) + step.format(0.03, 0.05),
                         "2, 3", "1., 1., 0., -1., 1., 0.")
     body, conv, rep = convert_str(deck)
+    # (node 4, between the clamped node 1 and node 2, follows them too: _plan_held_bcs)
     assert (f"*BOUNDARY, AMPLITUDE={A.Converter.CCX_RAMP}\n2, 1, 1, 0.03\n2, 2, 2, 0.005\n3, 1, 1, 0.05\n"
-            f"3, 2, 2\n5, 1, 1, 0.04\n5, 2, 2, 0.0025\n") in body.split("*STEP")[2]
+            f"3, 2, 2\n4, 1, 1, 0.00883883476483\n4, 2, 2, 0.0123743686708\n5, 1, 1, 0.04\n"
+            f"5, 2, 2, 0.0025\n") in body.split("*STEP")[2]
     assert not any("stepped where Abaqus ramps" in r for r in conv.reduced_physics)
     # DOF 2 without a BC before the step: ccx would ramp it from 0, so the lines still step
     body, conv, rep = convert_str(deck.replace("2, 2, 2, 0.005\n3, 1, 1, 0.02\n3, 2, 2\n", "3, 1, 1, 0.02\n"))
-    assert "*BOUNDARY\n2, 1, 1, 0.03\n2, 2, 2, 0.005\n3, 1, 1, 0.05\n3, 2, 2\n5, 1, 1, 0.04\n" in body
+    assert "*BOUNDARY\n2, 1, 1, 0.03\n2, 2, 2, 0.005\n3, 1, 1, 0.05\n3, 2, 2\n" in body
+    assert "*BOUNDARY\n5, 1, 1, 0.04\n" in body          # (node 4, untransformed, ramps)
     assert any("stepped where Abaqus ramps" in r for r in conv.reduced_physics)
 
 

@@ -4875,6 +4875,25 @@ def midside_temperature_deck(ic_cards, step_cards):
             "".join(f"*TEMPERATURE\n{c}\n" for c in step_cards) + "*NODE PRINT, NSET=B\nU\n*END STEP\n")
 
 
+def midside_bc_deck(kind, twin=False):
+    """A strip of two S4R (--approximate: S8R, a node at the middle of every edge; node 12
+    between 3 and 6), E 1000, nu 0.3, t 0.05, clamped at x = 0, its far edge's nodes 3 and 6
+    held and moved along z by 0.2 and -0.1: ``kind`` "steps", node 3 in step 1 and node 6
+    in step 2, on a card of its own; "cards", in one step on a card each.  ``twin``: the
+    last card gives both nodes.  Prints every node (the set takes the midside nodes)."""
+    head = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n6, 2., 1., 0.\n"
+            "*ELEMENT, TYPE=S4R, ELSET=E\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*NSET, NSET=ALLN, GENERATE\n1, 6, 1\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*SHELL SECTION, ELSET=E, MATERIAL=M\n0.05\n"
+            "*BOUNDARY\n1, 1, 6\n4, 1, 6\n")
+    last = "3, 1, 6\n3, 3, 3, 0.2\n6, 1, 6\n6, 3, 3, -0.1\n" if twin else "6, 1, 6\n6, 3, 3, -0.1\n"
+    if kind == "steps":
+        steps = ("*STEP\n*STATIC\n*BOUNDARY\n3, 1, 6\n6, 1, 6\n3, 3, 3, 0.2\n*END STEP\n"
+                 "*STEP\n*STATIC\n*BOUNDARY\n" + last)
+    else:
+        steps = "*STEP\n*STATIC\n" + ("" if twin else "*BOUNDARY\n3, 1, 6\n3, 3, 3, 0.2\n") + "*BOUNDARY\n" + last
+    return head + steps + "*NODE PRINT, NSET=ALLN\nU\n*END STEP\n"
+
+
 def ramped_rotation_deck(step, twin=False):
     """pert_frame_deck("bc") without its *FREQUENCY step: the frame's joint 9 (a ccx knot, its
     *TRANSFORM about z: local 1 = y) turned about local 1 and 3 by 0.01, then about local 1 to
@@ -15291,6 +15310,27 @@ def main():
             print(f"{'PASS' if ok else 'FAIL'}  t129_{kind}_{typ} ({what}): the free nodes as the "
                   f"{'knotted nodes tied' if kind == 'offset' else 'merged mesh'} ({err:.1e} apart; |u| "
                   f"{moved:.6g}; before: {before})")
+        failures += 0 if ok else 1
+
+    # --- a card that moves one end of an edge the converter put a node on: the node takes the
+    # interpolation with the other end's BC in force (before: only a card giving both ends
+    # reached it, so it kept step 1's value, or stayed free where two cards held the ends)
+    for kind, what, before in (("steps", "node 3 lifted by 0.2 in step 1, node 6 lowered by 0.1 "
+                                "in step 2 on a card of its own", "0.1, step 1's, the nodes 0.05 off"),
+                               ("cards", "nodes 3 and 6 held and moved by 0.2 and -0.1 on a card "
+                                "each in one step", "free, the nodes 0.03 off")):
+        runs = [review_run(midside_bc_deck(kind, twin), f"midside_bc_{kind}" + ("_twin" if twin else ""),
+                           dat_displacements, approximate=True) for twin in (False, True)]
+        ok = all(runs) and set(runs[0]) == set(runs[1]) and 12 in runs[0]
+        if ok:
+            moved = max(abs(x) for n, v in runs[1].items() if n not in (1, 3, 4, 6, 12) for x in v)
+            err = max(abs(a - b) for n in runs[1] for a, b in zip(runs[0][n], runs[1][n]))
+            mid = runs[0][12][2]
+            ok = abs(mid - 0.05) < 1e-12 and err <= 1e-9 * moved and moved > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  midside_bc_{kind} (an S4R strip under --approximate, "
+                  f"S8R, its far edge's {what}): the edge's midside node at {mid:.7g} (0.05, the "
+                  f"mean; before: {before}), every node as the twin's whose card gives both ends "
+                  f"({err:.1e} apart; free nodes moved up to {moved:.4g})")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

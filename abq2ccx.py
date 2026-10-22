@@ -5510,7 +5510,8 @@ class StepModel:
                keywords: Tuple[str, ...] = ("BOUNDARY",),
                restore: Union[bool, set, frozenset, Sequence[int]] = True,
                skip: Union[set, frozenset] = frozenset(), model: bool = False, *,
-               blocks: Sequence[Block]) -> Iterator[dict]:
+               blocks: Sequence[Block],
+               at: Optional[Callable[[Block, dict], None]] = None) -> Iterator[dict]:
         """The entries of the ``keywords`` cards in force in each step, {key: value} from
         ``entries(card)``, the card's (key, value) pairs (asked once per card, in deck order,
         as the iteration reaches it), as ccx 2.23 applies *BOUNDARY: model data first, a step
@@ -5528,7 +5529,9 @@ class StepModel:
           other step left: True, the linear perturbation steps (``pert``), which
           _restore_base_states makes ccx undo; or a set of numbers; () or False: none;
         * ``skip``: ids of cards left out, also where OP=NEW acts (``lc2``);
-        * ``model``: yield the model data's state first (a copy).
+        * ``model``: yield the model data's state first (a copy);
+        * ``at``: called with each card folded and what is in force before its entries (after
+          an OP=NEW it acts on; not to be changed).
 
         A *STEP before the open step's *END STEP (a caller's cards: bc_steps over a ccx deck;
         not the converter's, close_open_steps) starts that step again from where it started,
@@ -5542,6 +5545,8 @@ class StepModel:
                 if b.keyword in keywords and id(b) not in skip:
                     if id(b) in acts:
                         active = {}
+                    if at is not None:
+                        at(b, active)
                     active.update(entries(b))
             return active
         active: dict = {}
@@ -10517,8 +10522,86 @@ class _Mesh:
             self._between_cache = (key, out)
         return self._between_cache[1]
 
+    def _plan_held_bcs(self, blocks: List[Block]) -> None:
+        """The displacement BCs in force before each *BOUNDARY card on the end nodes of the
+        nodes the converter put between two (_between), for _midside_records: where a card
+        gives one end of such a segment a value, the node gets the interpolation with the other
+        end's value in force, which is what the Abaqus element sees between its nodes.
+        ``_bc_held``: id(card) -> {node: {DOF: (value, law)}} on the card's DOFs, for the ends
+        it gives and their partners, as StepModel.states folds the deck: model data first, a
+        step keeps what is in force, OP=NEW removes it, a linear perturbation step's BCs end
+        with it.  The value: an earlier step's BC (or model data's) is held plain at its
+        amplitude's end value (held_factor), law "", or follows its TIME=TOTAL TIME amplitude,
+        law its name; a BC of the card's own step varies on its card's AMPLITUDE, law its name
+        ("" for none).  In a linear perturbation step a BC from before it is a zero change of
+        the base state.  law None: the value is unknown (FIXED, USER, SUBMODEL, a velocity or
+        acceleration, an amplitude the converter does not evaluate, an explicit step's line
+        without AMPLITUDE, whose value Abaqus ignores)."""
+        self._bc_held = {}
+        partners: Dict[int, set] = {}
+        for a, c, _m, _s in self._between():
+            partners.setdefault(a, set()).add(c)
+            partners.setdefault(c, set()).add(a)
+        if not partners:
+            return
+        curves = {b.uparam("NAME"): amplitude_curve(b) for b in blocks
+                  if b.keyword == "AMPLITUDE" and b.param("NAME")}
+        step_of = {id(b): step for step in self.steps for b in step.cards}
+        read: Dict[int, list] = {}                  # id(card) -> its _bc_records, read once
+
+        def plain(b: Block) -> bool:
+            return self._bc_type(b) == "DISPLACEMENT" and \
+                not any(b.has(k) for k in ("FIXED", "USER", "SUBMODEL"))
+
+        def entries(b: Block) -> list:
+            recs = read.pop(id(b), None) or self._bc_records(b)
+            src = (b.uparam("AMPLITUDE"), b.param("TIME DELAY"), step_of.get(id(b))) if plain(b) else None
+            return [((n, d), None if src is None or mag != mag else (mag,) + src)
+                    for nodes, dofs, mag in recs for n in nodes if n in partners for d in dofs]
+
+        def in_force(e: Optional[tuple], step: Optional[Step]) -> Tuple[Optional[float], Optional[str]]:
+            if step is not None and step.perturbation and (e is None or e[3] is not step):
+                return 0.0, ""
+            if e is None:
+                return None, None
+            mag, amp, delay, src = e
+            if src is step:                         # (both model data, or the card's step)
+                return (None, None) if src is not None and src.explicit and not amp else (mag, amp)
+            if not amp:
+                return (None, None) if src is not None and src.explicit else (mag, "")
+            curve = curves.get(amp)
+            if curve is not None and curve.total:
+                return mag, amp
+            factor = held_factor(curve, delay, src.period if src is not None else None)
+            return (None, None) if factor is None else (mag * factor, "")
+
+        def at(b: Block, active: dict) -> None:
+            if not plain(b):
+                return
+            recs = read[id(b)] = self._bc_records(b)
+            mine = {n for nodes, _, _ in recs for n in nodes if n in partners}
+            dofs = {d for _, ds, _ in recs for d in ds}
+            step = step_of.get(id(b))
+            held: Dict[int, Dict[int, Tuple[Optional[float], Optional[str]]]] = {}
+            for n in mine.union(*(partners[n] for n in mine)):
+                for d in dofs:
+                    if (n, d) in active:
+                        held.setdefault(n, {})[d] = in_force(active[(n, d)], step)
+            if held:
+                self._bc_held[id(b)] = held
+        cards = [*model_data(blocks), *(b for step in self.steps for b in step.cards)]
+        for _ in self.steps.states(entries, skip=self.steps.lc2, blocks=cards, at=at):
+            pass
+
+    def _bc_midside_lines(self, b: Block, only: Optional[set] = None, note: bool = True) -> List[str]:
+        """The lines of *BOUNDARY card ``b`` for the nodes the converter put between two
+        (_midside_records), with the BCs in force before it (_plan_held_bcs)."""
+        return self._midside_records(b, "boundary", only=only, note=note,
+                                     bc_held=self._bc_held.get(id(b)))
+
     def _midside_records(self, b: Block, layout: str, only: Optional[set] = None,
-                         note: bool = True, held: Optional[Dict[int, Tuple[float, ...]]] = None
+                         note: bool = True, held: Optional[Dict[int, Tuple[float, ...]]] = None,
+                         bc_held: Optional[Dict[int, Dict[int, Tuple[Optional[float], Optional[str]]]]] = None
                          ) -> List[str]:
         """Extra data lines that carry a per-node card onto the nodes the converter put
         between two nodes (_between: midside nodes of upgraded beams and shells, ply interface
@@ -10532,8 +10615,11 @@ class _Mesh:
         cylindrical or spherical system along a curved edge) is interpolated in global
         components (_turned_midside_runs).  ``held`` ("field"): the values in force before the
         card (a node in none: 0), which an end the card does not give keeps, so that the new
-        node follows a card that gives one end (temperatures over several cards).  ``note``:
-        say so in the report (not when planning)."""
+        node follows a card that gives one end (temperatures over several cards).  ``bc_held``
+        ("boundary", a displacement *BOUNDARY: _bc_midside_lines): the BCs in force before the
+        card on the ends (_plan_held_bcs), which an end the card does not give a DOF keeps (none
+        there: no line), warned where that end varies on another amplitude or its value is
+        unknown (_warn_loose_midside_bcs).  ``note``: say so in the report (not when planning)."""
         if not self._midside and not self._edge_nodes and not self._tied_nodes:
             return []
         recs: Dict[int, Dict[int, object]] = {}
@@ -10564,10 +10650,23 @@ class _Mesh:
         kinds: set = set()
         beam_mids = {m for _, _, m in self._midside.values()}
         turn = layout == "boundary" and b.keyword == "BOUNDARY" and bool(self._transformed)
+        loose = False
         for a, c, m, s in self._between() + (self._tied_nodes if layout != "boundary" else []):
+            via_held = False
             if held is not None and layout == "field" and (a in recs or c in recs) and \
                     (only is None or m in only):
                 ra, rc = ({0: list(recs[x][0]) if x in recs else list(held.get(x, ()))} for x in (a, c))
+            elif bc_held is not None and (a in recs or c in recs) and (only is None or m in only):
+                # a DOF the card gives at one end only: the other end's BC in force, if any
+                given = set(recs.get(a, ())) | set(recs.get(c, ()))
+                ra, rc = dict(recs.get(a, {})), dict(recs.get(c, {}))
+                for x, rx in ((a, ra), (c, rc)):
+                    for d in given - set(rx):
+                        if d in bc_held.get(x, {}):
+                            v, law = bc_held[x][d]
+                            loose = loose or law is None or (law != b.uparam("AMPLITUDE") and v != 0.0)
+                            if law is not None:
+                                rx[d], via_held = v, True
             elif a not in recs or c not in recs or (only is not None and m not in only):
                 continue
             else:
@@ -10602,8 +10701,12 @@ class _Mesh:
                 out.append(", ".join(head + ([] if v is None else ["%.12g" % v])))
             if len(out) > n_out:
                 kinds.add("beam" if m in beam_mids else "edge")
+                if via_held:
+                    kinds.add("held")
         if out and note:
             self._note_midside_lines(b.keyword, kinds)
+        if loose and note:
+            self._warn_loose_midside_bcs()
         return out
 
     def _turned_midside_runs(self, ra: Dict[int, object], rc: Dict[int, object],
@@ -10666,6 +10769,11 @@ class _Mesh:
             self.report.note(f"*{keyword} lines given for both ends of an edge the converter put "
                              f"nodes on (a shell midside node, ply interface nodes) were extended "
                              f"to those nodes (values interpolated linearly).", once=True)
+        if "held" in kinds:
+            self.report.note(f"*{keyword} lines given for one end of an edge or beam the converter "
+                             f"put nodes on, whose other end has a BC in force from an earlier card, "
+                             f"were extended to those nodes too (interpolated with that end's value), "
+                             f"so that they move with the ends as in Abaqus.", once=True)
         if "turned" in kinds or "turned~" in kinds:
             self.report.note("*BOUNDARY lines on both ends of an edge the converter put a node on, "
                              "where the node's *TRANSFORM axes differ from theirs (a cylindrical or "
@@ -10680,6 +10788,22 @@ class _Mesh:
                              "(approximate) — verify.", once=True)
             self._reduces("BC of a node the converter added on a curved edge approximated "
                           "(some local DOFs of its ends left free)")
+
+    def _warn_loose_midside_bcs(self) -> None:
+        """A *BOUNDARY that moves one end of a segment the converter put nodes on whose other
+        end's BC in force varies on another amplitude, or has a value the converter does not
+        know (_midside_records, _plan_held_bcs)."""
+        self.report.warn("A *BOUNDARY card moves one end of an edge or beam the converter put nodes "
+                         "on (midside nodes of upgraded elements, ply interface nodes) while the "
+                         "other end keeps a BC that varies on another amplitude through the step, or "
+                         "one whose value the converter does not know (FIXED, USER, SUBMODEL, a "
+                         "velocity or acceleration, an amplitude it does not evaluate, an explicit "
+                         "step's line without AMPLITUDE): such a node follows the interpolation of "
+                         "the end values on the card's amplitude (an unknown end: it keeps its "
+                         "earlier BC there), where the Abaqus element varies each end on its own.",
+                         once=True)
+        self._reduces("BCs of nodes the converter added between nodes whose ends vary on different "
+                      "amplitudes or are unknown")
 
     # Cards that read a node set node by node — as state, as an output selection, or as the
     # members of a constraint that must stay complete (couplings, rigid bodies, the nodes of a
@@ -21027,8 +21151,8 @@ class _Dofs:
         recs = self._bc_card_records(b)
         if self._piece_src.get(id(b)) not in self._amp_cards and id(b) not in self._vel_mids:
             # (those pieces carry theirs; a rate card's are _plan_velocity_bcs's to note)
-            recs = list(recs) + [ln.split(",") for ln in self._midside_records(
-                b, "boundary", note=self._bc_type(b) not in self._RATE_TYPES)]
+            recs = list(recs) + [ln.split(",") for ln in self._bc_midside_lines(
+                b, note=self._bc_type(b) not in self._RATE_TYPES)]
         for rec in recs:
             g = trimmed_fields(rec)
             if len(g) < 2 or not g[0]:
@@ -27836,7 +27960,7 @@ class _Loads:
         # (the pieces of a card _plan_default_amplitudes splits carry their midside lines, as
         # do most of _plan_velocity_bcs's)
         midside = [] if src in self._amp_cards or id(b) in self._vel_mids else \
-            [ln.split(",") for ln in self._midside_records(b, "boundary")]
+            [ln.split(",") for ln in self._bc_midside_lines(b)]
         # coupled member DOFs whose BC _plan_coupled_bcs removed are already gone here
         recs = self._bc_card_records(b)
         self.emit.rot_hit = []
@@ -29001,8 +29125,7 @@ class _Loads:
                     held_factor(curves.get(amp), b.param("TIME DELAY"), step.period if step else None)
             recs = self._bc_records(b)
             if mids:                                # (the lines handle_boundary adds there)
-                recs += self._bc_records(b, lines=self._midside_records(b, "boundary", only=mids,
-                                                                        note=False))
+                recs += self._bc_records(b, lines=self._bc_midside_lines(b, only=mids, note=False))
             return [((n, d), (None if factor is None or mag != mag else mag * factor, id(b)))
                     for nodes, dofs, mag in recs for n in nodes for d in dofs if (n, d) in query]
         folds = self.steps.states(entries, skip=self.steps.lc2, model=True, blocks=[*model, *(
@@ -29122,7 +29245,7 @@ class _Loads:
         its own, a midside node's end nodes for that node."""
         recs = self._bc_card_records(b)
         out: List[dict] = []
-        for rec in list(recs) + [ln.split(",") for ln in self._midside_records(b, "boundary")]:
+        for rec in list(recs) + [ln.split(",") for ln in self._bc_midside_lines(b)]:
             g = trimmed_fields(rec)
             if not g:
                 continue
@@ -29174,7 +29297,7 @@ class _Loads:
             amp = bool((b.param("AMPLITUDE") or "").strip())
             recs = self._bc_records(b)
             if mids and self._bc_type(b) not in self._RATE_TYPES:
-                recs += self._bc_records(b, lines=self._midside_records(b, "boundary", note=False))
+                recs += self._bc_records(b, lines=self._bc_midside_lines(b, note=False))
             return [((n, d), (kind, mag, amp, id(b))) for nodes, dofs, mag in recs
                     for n in nodes for d in dofs if (n, d) in query]
         cards = model + [b for step in self.steps for b in step.cards]
@@ -37172,6 +37295,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # need ccx's own step ramp
         self._amp_cards: Dict[int, List[object]] = {}
         self._ramp_steps: set = set()
+        # id(displacement *BOUNDARY) -> the BCs in force before it on the ends of the nodes the
+        # converter put between two (_plan_held_bcs)
+        self._bc_held: Dict[int, Dict[int, Dict[int, Tuple[Optional[float], Optional[str]]]]] = {}
         # id(*BOUNDARY block of those two planners) -> id(the deck card it comes from) (_bc_pieces)
         self._piece_src: Dict[int, int] = {}
         # rigid elements and analytical rigid surfaces (see _plan_rigid): each rigid element's
@@ -37707,6 +37833,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_explicit_plane_rigid(blocks)     # after the constraint plans, _plan_ref_nodes
         self._warn_explicit_trusses()           # after the mesh planners: the final element types
         self._check_transforms()
+        self._plan_held_bcs(blocks)             # before the first reader of midside BC lines
         self._plan_default_amplitudes(blocks)   # reads the ROT NODE axes (_plan_rot_axes)
         self._plan_fixed_values(blocks)         # after it: the cards it leaves
         self._plan_material_facts(blocks)       # after the mesh planners: the final element types

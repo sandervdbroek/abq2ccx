@@ -868,7 +868,8 @@ def gen_elements():
                          "`BOX` sections only on `B32R`. Each element gets a new midside node at the "
                          "midpoint of its end nodes (ccx's order is end, middle, end); element ids and "
                          "sets are kept, and BCs, temperatures and initial conditions given for both "
-                         "end nodes also reach the midside node. The 3-node beam is a different "
+                         "end nodes (or for one, with the other's in force) also reach the midside "
+                         "node. The 3-node beam is a different "
                          "element than Abaqus' 2-node one, so such a deck counts as reduced physics.\n")
             planar = ", ".join(f"`{t}`" for t in sorted(A.PLANAR_LINE_TYPES))
             parts.append("ccx has no planar beam or truss — it runs `B21` as `B31` and `T2D2` as "

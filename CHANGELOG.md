@@ -25,6 +25,14 @@ physics.
   a rotated instance's `*DISTRIBUTION` rows. A blank first DOF on a `*KINEMATIC`,
   `*DISTRIBUTING` or `*KINEMATIC COUPLING` line couples all DOFs, as Abaqus documents; the last
   DOF alone was coupled, and ccx 2.23 stops on such a `*DISTRIBUTING` line passed through.
+* **Midside nodes follow a BC that moves one end** — a node the converter adds between two
+  (the midside nodes of upgraded shells and beams, ply interface nodes) got a `*BOUNDARY` line
+  only from a card that gave both of its end nodes a value. A card that moves one end now gives
+  it the interpolation with the other end's BC in force, across cards and steps (`OP=NEW` and
+  linear perturbation steps as Abaqus applies them): before, the node kept an earlier step's
+  value, or stayed free where two cards held the ends, and the edge kinked (an S8R strip's
+  midside node at 0.1 for 0.05). Where the other end's BC varies on another amplitude, or its
+  value is unknown (`FIXED`, `USER`, a velocity), it is warned as reduced physics.
 * **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the
