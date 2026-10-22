@@ -6832,6 +6832,22 @@ def compact_params_deck():
                              "*NODE PRINT, NSET=OUT", "U", "*END STEP"]) + "\n"
 
 
+def norton_creep_deck():
+    """A C3D8 unit cube (E 200e3, nu 0.3) held on three symmetry faces and pulled by a pressure
+    200 on x = 1, Norton creep A 3.125e-14, n 5 (NAFEMS creep test 1(a)): 0.01 per hour at that
+    stress; 100 h of *VISCO stretch it by 1 (200 / 200e3 + 0.01 t) = 1.001 exactly."""
+    return "\n".join(["*NODE", "1, 0., 0., 0.", "2, 1., 0., 0.", "3, 1., 1., 0.", "4, 0., 1., 0.",
+                      "5, 0., 0., 1.", "6, 1., 0., 1.", "7, 1., 1., 1.", "8, 0., 1., 1.",
+                      "*ELEMENT, TYPE=C3D8, ELSET=E", "1, 1, 2, 3, 4, 5, 6, 7, 8",
+                      "*NSET, NSET=X1", "2, 3, 6, 7",
+                      "*SOLID SECTION, ELSET=E, MATERIAL=STEEL", "*MATERIAL, NAME=STEEL",
+                      "*ELASTIC", "200.E3, 0.3", "*CREEP, LAW=TIME", "3.125E-14, 5.",
+                      "*BOUNDARY", "1, 1, 3", "2, 2, 3", "4, 1", "4, 3", "5, 1, 2", "6, 2",
+                      "8, 1", "*STEP", "*STATIC", "1.E-7, 1.E-6", "*DLOAD", "1, P4, -200.",
+                      "*END STEP", "*STEP, INC=40", "*VISCO, CETOL=5.E-3", "1.E-6, 100.",
+                      "*NODE PRINT, NSET=X1", "U", "*END STEP"]) + "\n"
+
+
 def include_files_deck():
     """Two T3D2 bars (E 1000, nu 0), parts A and B that *INCLUDE one mesh file; it *INCLUDEs a
     file of node data lines by a job-relative path, and the length 2, the area 0.5 and the
@@ -16682,6 +16698,17 @@ def main():
               f"second of two clamped C3D8 left out in step 2): the first element alone ({err:.1e} "
               f"apart; |u| {moved:.6g}, {both:.6g} with both; before: ccx stopped)")
     failures += 0 if ok else 1
+
+    # --- task 145: Norton creep past ccx's singular-matrix stop (an increment cap) ---
+    u = review_run(norton_creep_deck(), "norton_creep_cap", dat_displacements)
+    if u:
+        got = [u.get(n, [math.inf])[0] for n in (2, 3, 6, 7)]
+        ok = max(abs(x - 1.001) for x in got) < 1e-5
+        print(f"{'PASS' if ok else 'FAIL'}  norton_creep_cap (a C3D8 cube creeping 0.01 per hour "
+              f"under 200, NAFEMS creep test 1(a), for 100 h of *VISCO): stretch "
+              f"{', '.join(f'{x:.7g}' for x in got)} (1.001 = sigma / E + 0.01 t; before: ccx "
+              f"stopped at 4.4 h, 'matrix found to be singular')")
+    failures += 0 if u and ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)

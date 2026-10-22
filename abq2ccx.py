@@ -18405,6 +18405,13 @@ class _Materials:
                              once=True)
         mat = self._card_material.get(id(b))
         used = mat is None or mat.upper() in self._used_materials
+        if not used:
+            # kept: it changes how ccx runs the steps (probed on 2.23: any *USER MATERIAL makes
+            # ccx solve a static step nonlinearly, in increments, as Abaqus increments it)
+            self.report.note("*USER MATERIAL kept on a material no section uses: ccx never calls "
+                             "it, so the deck needs no user subroutine (ccx stops with 'no user "
+                             "material subroutine' only where an element uses one).", once=True)
+            return [emit_keyword("USER MATERIAL", params)] + data
         if thermal:
             self.report.warn(f"*USER MATERIAL, TYPE=THERMAL (material {mat or '?'}): ccx hands every "
                              f"thermal user material to its umatht routine, whatever the name, and "
@@ -18429,8 +18436,7 @@ class _Materials:
                              "ccx's Abaqus-UMAT interface, for a ccx rebuilt with the deck's UMAT "
                              "(see the user guide).", once=True)
             why = "*USER MATERIAL (the Abaqus subroutine does not run in ccx)"
-        if used:
-            self._reduces(why)
+        self._reduces(why)
         return [emit_keyword("USER MATERIAL", params)] + data
 
     def handle_depvar(self, b: Block) -> List[str]:
@@ -20245,6 +20251,125 @@ class _Materials:
         the volume."""
         return {m for m, opts in self._material_options(blocks).items()
                 if any(c.keyword == "PLASTIC" for c in opts[1:])}
+
+    # ccx 2.23's Norton creep (incplas, isotropic *ELASTIC) stops on 'matrix found to be
+    # singular' once one increment's creep strain passes about 45 / (n - 3)^1.5 elastic strains
+    # (probed, C3D8 / C3D20R / CPS8R: n 4 at 40-50, 5 at 15-20, 6 at 8-9, 8 at 4-5, 10 at 2-3;
+    # none up to 120 for n <= 3), where Abaqus integrates on: spooles exits, ccx never cuts the
+    # increment back.  _plan_creep_increments keeps below half that.
+    _CREEP_PRESSURE = re.compile(r"(P\d?|PNEG|PPOS|TR(VEC|NOR|SHR)\d?)$")
+
+    def _plan_creep_increments(self, blocks: List[Block]) -> None:
+        """``_creep_caps``: step number -> the largest increment of a *VISCO step (automatic
+        incrementation) that keeps each increment's creep strain at most 20 / (n - 3)^1.5
+        elastic strains in every Norton material with n > 3, at the largest pressure or
+        traction the steps apply up to it (a solid's stress under it; amplitudes at their
+        peak).  A numerical control: the increments change, the solution does not.  A step
+        with no such load gets none (noted)."""
+        self._creep_caps = {}
+        laws = []                                   # (E, A, n, m) per Norton row with n > 3
+        for opts in self._material_options(blocks).values():
+            creep = [c for c in opts if c.keyword == "CREEP"]
+            el = [c for c in opts if c.keyword == "ELASTIC"]
+            if not creep or len(el) != 1 or el[0].uparam("TYPE") not in ("", "ISOTROPIC") or \
+                    creep[0].uparam("LAW") not in ("", "STRAIN", "TIME"):
+                continue
+            try:
+                e_max = max(pf(r[0]) for r in merged_data_records(el[0]) if r and r[0])
+                rows = [[pf(x) if x else 0.0 for x in (r + ["", "", ""])[:3]]
+                        for r in merged_data_records(creep[0]) if r and r[0]]
+            except ValueError:
+                continue
+            laws += [(e_max, a, n, m) for a, n, m in rows if a > 0.0 and n > 3.0 and -1.0 < m]
+        if not laws:
+            return
+        q = 0.0                                     # the largest pressure applied so far
+        for st in self.steps:
+            for b in st.cards:
+                if b.keyword not in ("DLOAD", "DSLOAD"):
+                    continue
+                amp = 1.0
+                if b.param("AMPLITUDE"):
+                    curve = self._amp_curves.get(b.uparam("AMPLITUDE"))
+                    amp = max((abs(curve.value(t)) for t in curve.breaks), default=1.0) \
+                        if curve is not None else 0.0
+                for rec in merged_data_records(b):
+                    f = [x.strip() for x in rec]
+                    if len(f) > 2 and f[2] and self._CREEP_PRESSURE.match(f[1].upper()) and \
+                            not _is_user_load(b, f):
+                        try:
+                            q = max(q, abs(pf(f[2])) * amp)
+                        except ValueError:
+                            pass
+            card = st.proc_card
+            if st.proc != "VISCO" or card is None or card.has("DIRECT") or direct_added(card) or \
+                    not st.ccx_period:
+                continue
+            if q <= 0.0:
+                self.report.note(f"*VISCO step {st.no}: no pressure or traction to size its "
+                                 f"increments by, left uncapped. ccx 2.23 stops on 'matrix found "
+                                 f"to be singular' once one increment's creep strain passes about "
+                                 f"45 / (n - 3)^1.5 times the elastic strain (Norton n > 3); a "
+                                 f"largest increment below that avoids it.", once=True)
+                continue
+            t0 = st.t_start or 0.0                  # ccx's Norton law reads the total time
+            caps = []
+            for e, a, n, m in laws:
+                strain = 20.0 / (n - 3.0) ** 1.5 * q / e    # creep strain allowed per increment
+                rate = a * q ** n                           # times t^m
+                if m > 0.0:                                 # fastest at the step's end
+                    caps.append(strain / (rate * (t0 + st.ccx_period) ** m))
+                elif m < 0.0:       # either bounds an increment's creep: at most dt^(m+1) / (m+1)
+                    caps.append(max((strain * (m + 1.0) / rate) ** (1.0 / (m + 1.0)),
+                                    strain / (rate * t0 ** m) if t0 > 0.0 else 0.0))
+                else:
+                    caps.append(strain / rate)
+            cap = float(f"{min(caps):.3g}")
+            if cap < st.ccx_period:
+                self._creep_caps[st.no] = cap
+
+    def _creep_visco(self, b: Block, params: "OrderedDict[str, Optional[str]]") -> Block:
+        """The *VISCO card ``b`` of the current step (automatic incrementation) with
+        _plan_creep_increments' cap as its largest (and at most initial) increment, and
+        ``params`` (its *STEP card's) with INC= raised by the step's time period over the cap.
+        An initial increment of at most 1e-6 of the period becomes 1e-5 of it: ccx 2.23 prints
+        '*ERROR in nonlingeo: increment size smaller than one millionth of step size' there and
+        goes on (nonlingeo.c), and a run with an *ERROR line counts as failed.  ``b`` itself
+        where neither applies."""
+        cap = self._creep_caps.get(self.emit.no)
+        rec = (merged_data_records(b) or [[]])[0]
+        if len(rec) < 2 or b.has("DIRECT") or direct_added(b):
+            return b
+        f = [x.strip() for x in (rec + ["", "", ""])[:4]]
+        try:
+            period = pf(f[1])
+            if cap is not None and f[3] and pf(f[3]) <= cap:
+                cap = None
+            tiny = bool(f[0]) and 0.0 < pf(f[0]) <= 1e-6 * period
+            if tiny:
+                f[0] = f"{1e-5 * period:g}"
+            if cap is not None and f[0] and pf(f[0]) > cap:
+                f[0] = f"{cap:g}"
+            inc = int(float(params.get("INC") or 100))
+        except ValueError:
+            return b
+        if tiny:
+            self.report.note(f"*VISCO step {self.emit.no}: initial increment {f[0]} (1e-5 of the "
+                             f"time period) written for the deck's, at most 1e-6 of it, where ccx "
+                             f"2.23 prints '*ERROR in nonlingeo: increment size smaller than one "
+                             f"millionth of step size' (and goes on): a numerical control.",
+                             once=True)
+        if cap is not None:
+            f[3] = f"{cap:g}"
+            params["INC"] = str(inc + math.ceil(period / cap))
+            self.report.note(f"*VISCO step {self.emit.no}: largest increment {cap:g} and *STEP "
+                             f"INC={params['INC']} written: ccx 2.23 stops on 'matrix found to be "
+                             f"singular' once one increment's creep strain passes about 45 / (n - "
+                             f"3)^1.5 times the elastic strain (Norton n > 3), where Abaqus "
+                             f"integrates on. The cap keeps below half that at the largest pressure "
+                             f"the steps apply: a numerical control, the solution is unchanged.",
+                             once=True)
+        return Block(b.keyword, b.params, [",".join(f)]) if tiny or cap is not None else b
 
 
 class _Axes:
@@ -30456,6 +30581,8 @@ class _Loads:
                                  "nonlinearity by default; ccx does not).", once=True)
         if proc == "MODAL DYNAMIC":
             self._modal_increments(proc_block, cur.ccx_period, params)
+        if proc == "VISCO":                         # (handle_visco writes the capped card)
+            self._visco_capped = (proc_block, self._creep_visco(proc_block, params))
         if proc == "DYNAMIC" and proc_block is not None and "AMPLITUDE" not in params and \
                 not explicit and proc_block.uparam("APPLICATION").startswith("QUASI"):
             params["AMPLITUDE"] = "RAMP"
@@ -34904,7 +35031,10 @@ class _Loads:
         """``*VISCO`` without CETOL: Abaqus then takes fixed increments of the initial one
         (Keywords *VISCO), ccx stops ('no strictly positive value for the parameter CETOL').
         DIRECT gives ccx's fixed increments, with a CETOL no creep increment reaches: under
-        DIRECT ccx 2.23 stops once one exceeds it ('solution seems to diverge'; probed)."""
+        DIRECT ccx 2.23 stops once one exceeds it ('solution seems to diverge'; probed).
+        A creep increment cap goes on as handle_step planned it (_creep_visco)."""
+        if b is self._visco_capped[0]:
+            b = self._visco_capped[1]
         if (b.param("CETOL") or "").strip():
             return self.passthrough(b)
         keep = OrderedDict((k, v) for k, v in b.params.items() if k != "CETOL")
@@ -40492,6 +40622,10 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # the amplitudes (_sp_amplitudes, _plan_deck_facts)
         self._amp_curves: Dict[str, Optional[AmplitudeCurve]] = {}
         self._restore_yields = False                # a material yields or creeps (_yield_segfaults)
+        # *VISCO steps' largest increments for Norton creep (_plan_creep_increments), and the
+        # current step's procedure card with it (handle_step -> handle_visco)
+        self._creep_caps: Dict[int, float] = {}
+        self._visco_capped: Tuple[Optional[Block], Optional[Block]] = (None, None)
         # *MODAL DYNAMIC steps ccx starts from a deformed or moving model -> the step whose
         # end state that is, and those of them that keep the earlier loads (_plan_modal_starts)
         self._modal_moving: Dict[int, int] = {}
@@ -41144,6 +41278,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_default_amplitudes(blocks)   # reads the ROT NODE axes (_plan_rot_axes)
         self._plan_fixed_values(blocks)         # after it: the cards it leaves
         self._plan_material_facts(blocks)       # after the mesh planners: the final element types
+        self._plan_creep_increments(blocks)     # after _read_steps: the step model, amplitudes
         self._plan_base_state_facts(blocks)     # after _plan_rigid: the analytical surfaces left
         self._plan_initial_temperatures(blocks)     # after the mesh planners: their new nodes
         self._order_material_cards(blocks)      # after the planners that add material cards

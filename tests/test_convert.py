@@ -23387,6 +23387,53 @@ def test_embedded_element_on_transformed_nodes_ties_global_translations():
     # node 102 has node 2's axes: its rows along them take node 2's local DOFs as they are
     assert 2 in rows[(102, 1)] and twin not in rows[(102, 1)] and not conv.reduced_physics
 
+def test_visco_increment_capped_for_norton_creep():
+    # ccx 2.23's Norton creep stops on 'matrix found to be singular' once one increment's creep
+    # strain passes about 45 / (n - 3)^1.5 elastic strains (NAFEMS ncr1ar8x at 6.6 h of 1000):
+    # the *VISCO step's largest increment is capped at 20 / (n - 3)^1.5 of them at the largest
+    # pressure applied, here 20 / 2^1.5 * (200 / 200e3) / (3.125e-14 * 200^5) = 0.707 h
+    def deck(creep="3.125E-14, 5.", load="*Dload\n1, P4, -200.\n", visco="1.E-6, 1000.", amp=""):
+        return (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n"
+                "200.E3, 0.3\n*Creep, law=TIME\n" + creep + "\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n"
+                + amp + "*Step\n*Static\n1.E-7, 1.E-6\n" + load + "*End Step\n*Step, inc=40\n"
+                "*Visco, cetol=5.E-3\n" + visco + "\n*End Step\n")
+    # (an initial increment of at most 1e-6 of the period, where ccx prints an *ERROR line
+    # and goes on, becomes 1e-5 of it)
+    body, _, report = convert_str(deck())
+    assert "*STEP, INC=1455\n*VISCO, CETOL=5.E-3\n0.01,1000.,,0.707\n" in body
+    assert "largest increment 0.707" in report.text() and "initial increment 0.01" in report.text()
+    # the peak of the load's amplitude counts: twice the pressure, 2^4 times smaller
+    body, _, _ = convert_str(deck(load="*Dload, amplitude=A2\n1, P4, -200.\n",
+                                  amp="*Amplitude, name=A2\n0., 0., 1., 2.\n"))
+    assert "0.01,1000.,,0.0442\n" in body
+    # m = -0.5 from t = 0: the first increment creeps fastest (A q^n dt^0.5 / 0.5 <= 7.07 q / E)
+    body, _, _ = convert_str(deck(creep="3.125E-14, 5., -0.5", visco="0.002, 1000."))
+    assert "0.002,1000.,,0.125\n" in body
+    # no cap: n <= 3, a smaller largest increment of the deck's own, no pressure (noted)
+    for kw, text in ((dict(creep="3.125E-10, 3."), "0.01,1000.,,"),
+                     (dict(visco="0.1, 1000., , 0.5"), "0.1, 1000., , 0.5"),
+                     (dict(load="*Cload\n2, 1, 50.\n", visco="0.1, 1000."), "0.1, 1000.")):
+        body, _, report = convert_str(deck(**kw))
+        assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n" + text + "\n" in body, kw
+    assert "no pressure or traction to size its increments" in report.text()
+
+
+def test_unused_user_material_noted_as_never_called():
+    # cmmai_job_1: its section uses an elastic-plastic material; a second material, which no
+    # section uses, is a *USER MATERIAL.  ccx never calls it, so it is no reduced physics and
+    # the report says so; the card stays (any *USER MATERIAL makes ccx 2.23 solve a static
+    # step nonlinearly, in increments as Abaqus does: probed)
+    umat = "*Material, name=U\n*Depvar\n2,\n*User Material, constants=2\n1., 2.\n"
+    for sec, reduced in (("M", False), ("U", True)):
+        deck = (HEX + f"*Solid Section, elset=EALL, material={sec}\n*Material, name=M\n*Elastic\n"
+                "1000., 0.3\n" + umat + "*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n7, 1, 1.\n"
+                "*End Step\n")
+        body, conv, report = convert_str(deck)
+        assert "*USER MATERIAL, CONSTANTS=2\n1., 2.\n" in body
+        assert any("*USER MATERIAL" in r for r in conv.reduced_physics) == reduced
+        assert ("ccx never calls it" in report.text()) != reduced
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

@@ -203,7 +203,8 @@ assemblies, UMAT/VUMAT and UEL decks, cohesive, explicit and coupled models, mes
 cards, `*Parameter` decks, across composites, geotechnics, biomechanics, fracture, forming,
 thermal analysis, FEA-tool test suites and teaching material. CalculiX-native decks are excluded on purpose: they would just
 pass through. The files are not committed (licenses vary); `corpus/fetch.py` downloads them
-into `corpus/files/` (gitignored), content-deduplicated.
+into `corpus/files/` (gitignored), content-deduplicated, with the files their cards read by
+`INPUT=` (`*INCLUDE`, data cards) from next to them (`--companions` fetches only those).
 
 Each entry has its URL, license, what it exercises, and:
 

@@ -299,6 +299,35 @@ def test_corpus_fidelity():
         assert problem is None, f"{e['name']}: {problem}"
 
 
+def test_fetch_companions():
+    """corpus/fetch.py fetches the files a deck's cards read with INPUT= from next to it (a
+    nested one next to its includer if not next to the deck), never outside the corpus
+    directory, and reports a name two decks need with different contents (offline: a fake
+    download)."""
+    import fetch as F
+    deck = ('*NODE, NSET=N,\n INPUT=nodes.inp\n*INCLUDE, INPUT="sub/mesh.inp"\n'
+            '** *INCLUDE, INPUT=no.inp\n*INCLUDE, INPUT=../up.inp\n')
+    assert F.input_names(deck) == ["nodes.inp", "sub/mesh.inp", "../up.inp"]
+    files = {"https://x/d/nodes.inp": b"1, 0., 0.\n", "https://x/d/sub/mesh.inp":
+             b"*INCLUDE, INPUT=els.inp\n", "https://x/d/sub/els.inp": b"*ELEMENT\n",
+             "https://x/e/nodes.inp": b"2, 0., 0.\n"}
+    real, F.download = F.download, lambda url: files[url]
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            written = {}
+            reserved = {os.path.join(d, "a.inp"), os.path.join(d, "b.inp")}
+            got, miss, clash = F.companions({"name": "a", "url": "https://x/d/a.inp"}, deck, d,
+                                            written, reserved)
+            assert got == ["nodes.inp", os.path.join("sub", "mesh.inp"), os.path.join("sub", "els.inp")]
+            assert len(miss) == 1 and miss[0].startswith("../up.inp") and not clash
+            assert open(os.path.join(d, "sub", "els.inp"), "rb").read() == b"*ELEMENT\n"
+            got, miss, clash = F.companions({"name": "b", "url": "https://x/e/b.inp"},
+                                            "*INCLUDE, INPUT=nodes.inp\n", d, written, reserved)
+            assert not got and clash == [os.path.join(d, "nodes.inp")]
+    finally:
+        F.download = real
+
+
 def test_classify_ccx_run():
     """The solve judge itself (no ccx needed)."""
     ok = (" STEP            1\n\n Static analysis was selected\n\n Determining the structure of "

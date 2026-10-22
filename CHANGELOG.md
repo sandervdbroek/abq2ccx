@@ -123,6 +123,15 @@ physics.
   is no longer read as ccx's own `U1` beam: its elements take the `*USER ELEMENT`'s node count
   (they were read with none) and the report says ccx cannot run it.
 
+* **Norton creep past ccx's singular-matrix stop** — ccx 2.23 stops ('matrix found to be
+  singular') once one `*VISCO` increment's creep strain passes about 45 / (n - 3)^1.5 elastic
+  strains (Norton exponent n > 3), where Abaqus integrates on. A `*VISCO` step now gets a
+  largest increment below half that at the largest pressure the steps apply, and `INC=` to
+  match: a numerical control, the solution unchanged. NAFEMS creep tests 1(a), 2(a) and 5(a)
+  now run their 1000 h and give the published creep strains (they stopped at 6.6 and 168 h).
+  A `*USER MATERIAL` on a material no section uses is now reported as never called (the note
+  said ccx would stop on it). `corpus/fetch.py` also fetches the files the decks read with
+  `INPUT=` (`--companions`: only those).
 * **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the
