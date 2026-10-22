@@ -21735,6 +21735,37 @@ def test_rota_on_plane_shell_beam_and_axisymmetric_elements():
     assert _close(_cloads(body)[0], {(2, 1): 4.0, (3, 1): 8.0}, 1e-9)
 
 
+def test_cent_on_two_by_two_quads_becomes_3x3_nodal_forces():
+    # ccx integrates CENTRIF on CAX8R / CPE8R / CPS8R at 2 x 2 points (Abaqus fully): where that
+    # moves the shares, a CENT there goes out as the 3 x 3 nodal forces of the CENTRIF it equals
+    # (w^2 = CENT / rho), which need no density; under NLGEOM CENTRIF stays (it follows the mesh)
+    ring = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, {x3}, 1.\n4, 1., 1.\n5, 1.5, 0.\n6, {x6}, .5\n7, {x7}, 1.\n"
+            "8, 1., .5\n*Element, type={typ}, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Solid Section, elset=E, material=M\n{t}*Material, name=M\n*Elastic\n1000., 0.3\n{dens}"
+            "*Boundary\n1, 2, 2\n*Step{nl}\n*Static\n*Dload\nE, {load}, 0., 0., 0., {axis}\n*End Step\n")
+
+    def deck(typ="CAX8R", load="CENT, 6.", dens="*Density\n2.\n", nl="", square=True):
+        return ring.format(typ=typ, load=load, dens=dens, nl=nl, t="" if typ.startswith("CAX") else "0.5\n",
+                           axis="0., 1., 0." if typ.startswith("CAX") else "0., 0., 1.",
+                           x3=2. if square else 2.5, x6=2. if square else 2.25, x7=1.5 if square else 1.75)
+    centrif = _cloads(convert_str(deck(load="CENTRIF, 3."))[0])
+    for dens in ("*Density\n2.\n", ""):
+        body, conv, _ = convert_str(deck(dens=dens))
+        assert ", CENTRIF," not in body and _cloads(body) == centrif and not conv.reduced_physics
+    # (over the full circle: 2 pi CENT times the integral of r^2 over the section)
+    assert abs(sum(centrif[0].values()) - 28 * math.pi) < 1e-8
+    # a CPS8R trapezoid moves them too, a square does not (a field linear in x and y)
+    body, conv, _ = convert_str(deck("CPS8R", square=False))
+    assert ", CENTRIF," not in body and _cloads(body) == _cloads(convert_str(
+        deck("CPS8R", load="CENTRIF, 3.", square=False))[0]) and not conv.reduced_physics
+    assert "*DLOAD\nABQ2CCX_CENT_E, CENTRIF, 3., " in convert_str(deck("CPS8R"))[0]
+    # NLGEOM: CENTRIF kept, warned with the other body loads kept there
+    body, conv, rep = convert_str(deck(nl=", nlgeom"))
+    assert "ABQ2CCX_CENT_E, CENTRIF, 3., " in body and "*CLOAD" not in body and not conv.reduced_physics
+    assert "Body loads (GRAV / CENTRIF / CENT / BX / BY) on CAX8R" in rep.text()
+    assert "CENT under NLGEOM, which acts on the deformed positions" in rep.text()
+
+
 def test_consistent_body_forces_integrate_solids():
     # volume and first moment of each solid, straight-edged and curved
     def moments(xyz):

@@ -91,7 +91,7 @@ step), a coupling's INFLUENCE
 RADIUS against the coupling on the nodes within it, rotations coupled in an ORIENTATION's
 axes against the model turned into them, and *DLOAD BX / BY / BZ on shells (a strip against
 its C3D8 twin and the GRAV and pressure forms, also over steps; the Scordelis-Lo roof against
-its published deflection), *DLOAD CENT and ROTA (an annulus and radial beams against the
+its published deflection), *DLOAD CENT and ROTA (an annulus, a CAX8R disc and radial beams against the
 rotating-disc solutions and beam theory), loads ccx keys otherwise than Abaqus (nodal forces on a step-time
 amplitude over steps, gravity per set and direction) against the plain loads Abaqus applies,
 and rigid-body reference nodes: a shell REF NODE with a *TRANSFORM in a dynamic step against
@@ -4229,7 +4229,7 @@ def scordelis_roof_deck(typ, n, rho):
 
 def rotary_disc_deck(typ, rho=7.85e-9, steps=None, nr=4, nt=24, a=50.0, b=100.0, t=2.0):
     """A full annulus r = a..b (50..100), t 2 thick (E 210000, nu 0.3, density ``rho``; None:
-    none), of ``typ`` C3D20 (one layer), CPS8 (plane stress) or S8R: nr x nt quadratic elements
+    none), of ``typ`` C3D20 (one layer), CPS8 / CPS8R (plane stress) or S8R: nr x nt quadratic elements
     with their midside nodes on the arcs.  Its hub r = a is held (a C3D20 layer in x and y, in z
     at mid-thickness only, so that it thins as plane stress does).  ``steps``: the step cards
     (default: CENT rho w^2 = 7.85e-3 about z, then OP=NEW ROTA 1e6 about z), each printing U on
@@ -4258,6 +4258,7 @@ def rotary_disc_deck(typ, rho=7.85e-9, steps=None, nr=4, nt=24, a=50.0, b=100.0,
     lines += ["*NSET, NSET=OUT, GENERATE", f"{nid(0, 2 * nr, 0)}, {nid(0, 2 * nr, 2 * nt - 1)}, 1"]
     lines += {"C3D20": ["*SOLID SECTION, ELSET=DISC, MATERIAL=STEEL"],
               "CPS8": ["*SOLID SECTION, ELSET=DISC, MATERIAL=STEEL", f"{t!r}"],
+              "CPS8R": ["*SOLID SECTION, ELSET=DISC, MATERIAL=STEEL", f"{t!r}"],
               "S8R": ["*SHELL SECTION, ELSET=DISC, MATERIAL=STEEL", f"{t!r}"]}[typ]
     lines += ["*MATERIAL, NAME=STEEL", "*ELASTIC", "210000., 0.3"] + \
         ([] if rho is None else ["*DENSITY", repr(rho)])
@@ -4284,6 +4285,26 @@ def rotary_disc_refs(r, a=50.0, b=100.0, e=210000.0, nu=0.3, rw2=7.85e-3, ra=7.8
     ur = -k * r ** 3 + c1 * r + (k * a ** 4 - c1 * a * a) / r
     ut = ra * r * (1 + nu) / (4 * e) * (r * r - a * a + b ** 4 * (1 / (r * r) - 1 / (a * a)))
     return ur, ut
+
+
+def rotary_axi_disc_deck(load, rho=7.85e-9, nr=4, a=50.0, b=100.0, t=2.0):
+    """A free disc r = a..b (50..100), t 2 thick, as nr CAX8R (E 210000, nu 0.3, density ``rho``;
+    None: none), held only axially (node 1, DOF 2), under the *DLOAD line ``load`` on DISC;
+    prints U at mid-thickness on its inner and outer edges (nodes 1001, 1001 + 2 nr)."""
+    lines = ["*HEADING", "a free spinning disc of CAX8R", "*NODE"]
+    for j, y in enumerate((0.0, t / 2, t)):
+        lines += [f"{1000 * j + i + 1}, {a + (b - a) * i / (2 * nr)!r}, {y!r}"
+                  for i in range(2 * nr + 1) if j != 1 or i % 2 == 0]
+    lines.append("*ELEMENT, TYPE=CAX8R, ELSET=DISC")
+    for k in range(nr):
+        i = 2 * k
+        lines.append(f"{k + 1}, {i + 1}, {i + 3}, {2003 + i}, {2001 + i}, {i + 2}, {1003 + i}, "
+                     f"{2002 + i}, {1001 + i}")
+    lines += ["*SOLID SECTION, ELSET=DISC, MATERIAL=STEEL", "*MATERIAL, NAME=STEEL", "*ELASTIC",
+              "210000., 0.3"] + ([] if rho is None else ["*DENSITY", repr(rho)])
+    lines += ["*NSET, NSET=EDGES", f"1001, {1001 + 2 * nr}", "*BOUNDARY", "1, 2, 2", "*STEP", "*STATIC",
+              "*DLOAD", load, "*NODE PRINT, NSET=EDGES", "U", "*END STEP"]
+    return "\n".join(lines) + "\n"
 
 
 def rotary_members_deck(n=10, length=100.0):
@@ -14931,16 +14952,18 @@ def main():
     # hub under CENT, then (OP=NEW) ROTA: the outer ring's radial and hoop displacements against
     # the plane-stress solutions (before: both loads dropped, the ring at rest).  S8R without a
     # density takes 0.5 %: ccx shares a quadratic shell node's force between its expanded nodes
-    # unlike consistent loads (corner and midside nodes 0.996 / 1.002 of u_r; any nodal force)
+    # unlike consistent loads (corner and midside nodes 0.996 / 1.002 of u_r; any nodal force).
+    # CPS8R takes CENT as nodal forces too: ccx integrates CENTRIF at 2 x 2 points there, which
+    # moves the shares on its curved elements (Abaqus integrates fully)
     ur_b, ut_b = rotary_disc_refs(100.0)
-    for typ in ("C3D20", "CPS8", "S8R"):
+    for typ in ("C3D20", "CPS8", "CPS8R", "S8R"):
         for rho in (7.85e-9, None):
             tag = f"rotary_disc_{typ.lower()}" + ("" if rho else "_no_density")
             got = review_run(rotary_disc_deck(typ, rho, None if rho else [
                 "*DLOAD\nDISC, CENT, 7.85E-3, 0., 0., 0., 0., 0., 1."]), tag, dat_node_blocks)
             centrif = bool(re.search(r"(?m)^ABQ2CCX_CENT_DISC, CENTRIF, ", open(os.path.join(
                 tmp, f"{tag}.inp"), encoding="utf-8").read()))
-            ok = bool(got) and len(got) == (2 if rho else 1) and centrif == bool(rho)
+            ok = bool(got) and len(got) == (2 if rho else 1) and centrif == bool(rho and typ != "CPS8R")
             if not ok:
                 if got:
                     print(f"FAIL  {tag}: {len(got)} printed steps, CENTRIF written: {centrif}")
@@ -14954,11 +14977,37 @@ def main():
             tol = 5e-3 if typ == "S8R" and not rho else 1e-3
             ok = len(got[0]) == 48 and max(errs) < tol
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (annulus 50..100 held at its hub, {typ}, CENT "
-                  f"rho w^2 7.85e-3 as {'CENTRIF of w^2 1e6' if rho else 'nodal forces (no density)'}"
+                  f"rho w^2 7.85e-3 as {'CENTRIF of w^2 1e6' if centrif else 'nodal forces'}"
                   + (", then ROTA 1e6 as nodal forces" if rho else "") + f"): outer ring u_r vs the "
                   f"rotating disc's {ur_b:.6g}" + (f", then u_theta vs {ut_b:.6g}" if rho else "") +
                   f", {', '.join(f'{x:.1e}' for x in errs)} off (tolerance {tol:g})")
             failures += 0 if ok else 1
+
+    # CENT on CAX8R: ccx integrates CENTRIF at 2 x 2 points there (Abaqus fully), which on an
+    # axisymmetric element moves the shares (the load grows with r), so CENT goes out as the 3 x 3
+    # nodal forces of the CENTRIF it equals.  A free disc: its edges against the rotating-disc
+    # solution, and against the deck written with CENTRIF (task 137's forces) and without a density
+    def free_disc(r, a=50.0, b=100.0, nu=0.3):                # rho w^2 = 7.85e-3, E = 210000
+        return 7.85e-3 / (8 * 210000.0) * ((3 + nu) * (1 - nu) * (a * a + b * b) * r
+                                            + (3 + nu) * (1 + nu) * a * a * b * b / r - (1 - nu * nu) * r ** 3)
+    runs = [review_run(rotary_axi_disc_deck(load, rho), tag, dat_displacements) for tag, load, rho in (
+        ("rotary_axi_disc_cax8r", "DISC, CENT, 7.85E-3, 0., 0., 0., 0., 1., 0.", 7.85e-9),
+        ("rotary_axi_disc_cax8r_centrif", "DISC, CENTRIF, 1.E6, 0., 0., 0., 0., 1., 0.", 7.85e-9),
+        ("rotary_axi_disc_cax8r_no_density", "DISC, CENT, 7.85E-3, 0., 0., 0., 0., 1., 0.", None))]
+    form = open(os.path.join(tmp, "rotary_axi_disc_cax8r.inp"), encoding="utf-8").read()
+    ok = all(runs) and all(len(u) == 2 for u in runs) and "*CLOAD" in form and ", CENTRIF," not in form
+    if ok:
+        err = max(abs(runs[0][n][0] / free_disc(r) - 1) for n, r in ((1001, 50.0), (1009, 100.0)))
+        twin = max(ccx_ratio(abs(u[n][0] - runs[0][n][0]), abs(runs[0][n][0])) for u in runs[1:] for n in u)
+        ok = err < 1e-3 and twin < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  rotary_axi_disc_cax8r (free disc 50..100 of 4 CAX8R, CENT rho "
+              f"w^2 7.85e-3 as 3 x 3 nodal forces): u_r {runs[0][1001][0]:.6e} / {runs[0][1009][0]:.6e} at "
+              f"r = 50 / 100 vs the rotating disc's {free_disc(50.0):.6e} / {free_disc(100.0):.6e} "
+              f"({err:.1e} off); the CENTRIF and density-free decks {twin:.1e} apart")
+    elif all(runs):
+        print(f"FAIL  rotary_axi_disc_cax8r: {[len(u) for u in runs]} nodes printed, *CLOAD "
+              f"{'*CLOAD' in form}, CENTRIF line {', CENTRIF,' in form}")
+    failures += 0 if ok else 1
 
     # radial members clamped on the axis: under CENT the beams' (per unit length) and the truss'
     # (per unit volume) tips move q L^3 / 3EA (the RECT beam and the truss as CENTRIF, the general

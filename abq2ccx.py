@@ -31438,7 +31438,7 @@ class _Loads:
         names = list(kept)
         shift = max(v[0] for v in kept.values())
         whys = dedup([v[1] for v in kept.values()])
-        self.report.warn(f"Body loads (GRAV / CENTRIF / BX / BY) on CAX8R / CPE8R / CPS8R elements "
+        self.report.warn(f"Body loads (GRAV / CENTRIF / CENT / BX / BY) on CAX8R / CPE8R / CPS8R elements "
                          f"kept as ccx loads ({', '.join(repr(x) for x in names[:5])}"
                          + (f" and {len(names) - 5} more" if len(names) > 5 else "")
                          + f"): ccx 2.23 integrates them at 2 x 2 points (Abaqus: fully), which on "
@@ -31464,7 +31464,9 @@ class _Loads:
           length): on the elements whose ccx material has one constant density rho (a RECT
           beam: rho a b), ccx's CENTRIF of w^2 = magnitude / rho on a set per density
           (ABQ2CCX_CENT_...), the same body force, which follows the deformation under NLGEOM as
-          Abaqus' does; on the others consistent nodal forces;
+          Abaqus' does — but on CAX8R / CPE8R / CPS8R, where ccx's 2 x 2 rule would move its
+          shares, consistent nodal forces (_cent_two_by_two); on the others consistent nodal
+          forces (axisymmetric ones over the full circle);
         - ROTA, a rotary acceleration alpha: consistent nodal forces of the d'Alembert force
           -alpha n x (x - x0) on each element's mass (rho times its volume, its area times the
           thickness, its length times the section area; a point mass).
@@ -31472,6 +31474,7 @@ class _Loads:
         and Abaqus has no CENT on point masses; rigid elements carry no mass (_rigid_dload).
         An element no form covers gives the reason the line is not converted."""
         tokens: "OrderedDict[Tuple[str, str], str]" = OrderedDict()
+        axes: Dict[Tuple[str, str], List[List[str]]] = {}       # each line's axis point and direction
         for b in blocks:
             for rec in merged_data_records(b) if b.keyword == "DLOAD" else []:
                 g = [x.strip() for x in rec]
@@ -31479,6 +31482,7 @@ class _Loads:
                     token = g[0] or (ALL_ELEMENTS_SET if ALL_ELEMENTS_SET in self.geom.elsets else "")
                     if token:
                         tokens.setdefault((token.upper(), g[1].upper()), token)
+                        axes.setdefault((token.upper(), g[1].upper()), []).append((g[3:9] + [""] * 6)[:6])
         if not tokens:
             return
         section: Dict[int, Block] = {}
@@ -31531,8 +31535,8 @@ class _Loads:
             if cc.startswith(("CPS", "CPE")) and sheet:
                 t = self._section_thick.get(e, 1.0)
                 return (list(conn), "area", t, False, True, None, None), rho, t, rho
-            if cc.startswith("CAX"):
-                return None, rho, None, rho
+            if cc.startswith("CAX") and sheet:
+                return (list(conn), "area", 1.0, True, True, None, None), rho, 1.0, rho
             if (cc in SHEET_SHELLS or cc.startswith("M3D")) and sheet:
                 if b.has("NODAL THICKNESS") or b.has("SHELL THICKNESS") or b.has("MEMBRANE THICKNESS"):
                     return f"the thickness of element {e} varies over it"
@@ -31558,6 +31562,7 @@ class _Loads:
         for (key, label), token in tokens.items():
             plan: dict = {"groups": [], "items": [], "why": "", "reduces": True}
             groups: "OrderedDict[float, List[int]]" = OrderedDict()
+            nodal: Dict[int, tuple] = {}                    # a CENTRIF element's nodal-force item
             eids = dedup(self._load_elements(token))
             if not eids:
                 plan["why"], plan["reduces"] = f"element set '{token}' is empty or undefined", False
@@ -31569,7 +31574,7 @@ class _Loads:
                 if f is None or (label == "CENT" and f[0] is not None and f[0][1] == "point"):
                     continue
                 item, rho, cent, centrif = f
-                if label == "ROTA" and item is None:
+                if label == "ROTA" and item[3]:
                     plan["why"], plan["reduces"] = ("Abaqus applies no rotary acceleration to axisymmetric "
                                                     "elements (Abaqus 2017, Distributed loads)", False)
                     break
@@ -31578,11 +31583,16 @@ class _Loads:
                         plan["items"].append(item[:2] + (item[2] * rho,) + item[3:])
                 elif centrif:
                     groups.setdefault(centrif, []).append(e)
-                elif item is None:
-                    plan["why"] = f"axisymmetric element {e} has no density to write it as CENTRIF"
-                    break
+                    nodal[e] = item[:2] + (cent,) + item[3:]
                 else:
                     plan["items"].append(item[:2] + (cent,) + item[3:])
+            quads = [e for es in groups.values() for e in es if len(self.geom.elements[e][1]) == 8 and
+                     ccx_type(self.geom.elements[e][0]) in TWO_BY_TWO_2D_TYPES]
+            if quads and not plan["why"]:
+                moved = set(self._cent_two_by_two(token, quads, nodal, axes[(key, label)]))
+                plan["items"] += [nodal[e] for e in quads if e in moved]
+                groups = OrderedDict((r, kept) for r, es in groups.items()
+                                     for kept in [[e for e in es if e not in moved]] if kept)
             if not plan["why"]:
                 for k, (rho, members) in enumerate(groups.items(), 1):
                     name = self._fresh_name("ABQ2CCX_CENT" + ("" if key == ALL_ELEMENTS_SET else f"_{key}")
@@ -31590,6 +31600,34 @@ class _Loads:
                     self.geom.elsets[name] = members
                     plan["groups"].append((name, rho))
             self._rotary[(key, label)] = plan
+
+    def _cent_two_by_two(self, token: str, quads: List[int], items: Dict[int, tuple],
+                         axes: List[List[str]]) -> List[int]:
+        """The CAX8R / CPE8R / CPS8R elements ``quads`` of a CENT on ``token`` (``items``: their
+        nodal-force items; ``axes``: its lines' axis fields) that take consistent nodal forces at
+        3 x 3 points rather than ccx's CENTRIF, which ccx 2.23 integrates at 2 x 2 points there
+        (TWO_BY_TWO_2D_TYPES; Abaqus fully): all of them where that moves the shares of a load
+        linear in the coordinates (two_by_two_body_shift beyond 1e-6, the CENTRIF family of
+        _plan_two_by_two_body_loads), the deck has no NLGEOM (CENT, as CENTRIF, acts on the
+        deformed positions) and every line spins axisymmetric ones about their y axis; else
+        none, warned once beside the body loads kept there (_warn_two_by_two_kept)."""
+        axi = {e: items[e][3] for e in quads}
+        if self._two_by_two_shift(quads, axi, "CENTRIF", 1e-6) <= 1e-6:
+            return []
+        try:
+            about_y = all(not (v[0] or v[2] or v[3] or v[5]) and v[4]
+                          for f in axes for v in [[pf(x) if x else 0.0 for x in f]])
+        except ValueError:
+            about_y = False
+        why = "CENT under NLGEOM, which acts on the deformed positions" if self._nl_any else \
+            "CENT on axisymmetric elements about another axis than the symmetry axis" \
+            if any(axi.values()) and not about_y else None
+        if why is None:
+            return list(quads)
+        old = self._two_by_two_kept.get(token, (0.0, ""))
+        self._two_by_two_kept[token] = (max(old[0], self._two_by_two_shift(quads, axi, "CENTRIF")),
+                                        old[1] or why)
+        return []
 
     def _section_rho(self, b: Block, opts: Dict[str, List[Block]]) -> Tuple[float, str]:
         """The one constant density of section ``b``'s material, or of all its plies (a *BEAM
@@ -32231,8 +32269,10 @@ class _Loads:
                           "ccx has no such load")
         elif base == "CENT":
             what, lack = ("centrifugal loads (CENT: rho w^2 times the distance from the axis per unit "
-                          "volume, a beam's per unit length) on beams and on elements without one "
-                          "constant density", "ccx's CENTRIF takes the material's density")
+                          "volume, a beam's per unit length) on beams, on elements without one "
+                          "constant density and on CAX8R / CPE8R / CPS8R elements whose shares ccx's "
+                          "2 x 2 rule would move", "ccx's CENTRIF takes the material's density, and "
+                          "ccx integrates it at 2 x 2 points on those (Abaqus fully)")
         elif base in ("BX", "BY", "BZ") and any(f[6] is not None for f in faces):
             what, lack = "body forces (BX / BY / BZ, per unit area) on surface elements", \
                 "ccx has no surface element"
@@ -32243,8 +32283,9 @@ class _Loads:
         else:
             what, lack = ("beam line loads (PX / PY / PZ / P1 / P2)", "ccx has no such load (it "
                           "reads P1 / P2 on a beam as a pressure on the expanded section face)")
-        where = ("elements (volumes; areas times the thickness, a shell's at its mid-thickness; lengths "
-                 "times the section area; point masses)" if base in ("ROTA", "CENT") else
+        where = ("elements (volumes; areas times the thickness, a shell's at its mid-thickness, over "
+                 "the full circle on axisymmetric ones; lengths times the section area; point masses)"
+                 if base in ("ROTA", "CENT") else
                  "faces / edges (times the section thickness on plane elements, over the full circle on "
                  "axisymmetric ones)")
         self.report.note(f"*{b.keyword} {what} -> consistent nodal forces in a *CLOAD at the end of "
