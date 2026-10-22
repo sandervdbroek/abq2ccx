@@ -2277,14 +2277,14 @@ def material_rows(block: Block, nvals: int) -> Optional[List[List[str]]]:
     return rows
 
 
-CREEP_FLOOR = 1e-20     # ccx 2.23 raises a Norton law's A t^m to at least this (incplas.f)
+CREEP_FLOOR = 1e-20     # ccx 2.23 raises a Norton law's A t^m to at least this (incplas*.f)
 
 
 def creep_floor_factor(a: float, m: float, t0: float, t1: float) -> float:
     """How many times the creep strain of a Norton law A q^n t^m (time hardening, a > 0,
     -1 < m) at a constant stress q from total time t0 to t1 > t0 ccx 2.23 gives, which raises
-    A t^m to at least CREEP_FLOOR (incplas.f: isotropic *ELASTIC): the integral of
-    max(A t^m, CREEP_FLOOR) over that of A t^m.  1.0 where the floor never bites."""
+    A t^m to at least CREEP_FLOOR (incplas_lin.f, incplas.f: isotropic *ELASTIC): the
+    integral of max(A t^m, CREEP_FLOOR) over that of A t^m.  1.0 where the floor never bites."""
     if m == 0.0:
         return max(a, CREEP_FLOOR) / a
 
@@ -21470,14 +21470,15 @@ class _Materials:
 
     def _plan_creep_floor(self, blocks: List[Block]) -> None:
         """Warn where ccx 2.23 creeps faster than a Norton law (*CREEP, LAW=STRAIN / TIME on an
-        isotropic *ELASTIC): incplas.f raises A t^m to at least CREEP_FLOOR, t ccx's total time
-        at an increment's end, without a message (a tiny A in Pa and s: up to 1e24 times too
-        fast).  Each step ccx creeps in (incplas.f: *VISCO, *DYNAMIC, *COUPLED and transient
-        *UNCOUPLED TEMPERATURE-DISPLACEMENT) whose creep strain at a constant stress comes out
-        more than 0.1 % above the law's (creep_floor_factor) makes it reduced physics.  No exact
-        form: units with a larger A rescale every stress, load and time of the deck, and ccx's
-        orthotropic path (ortho_plas.f), which has no floor, ignores CETOL and reads temperature
-        rows otherwise (probed)."""
+        isotropic *ELASTIC): incplas_lin.f (incplas.f under NLGEOM) raises A t^m to at least
+        CREEP_FLOOR, t ccx's total time at an increment's end, without a message (a tiny A in
+        Pa and s: up to 1e24 times too fast; both probed).  Each step ccx creeps in (their
+        ivisco rule: *VISCO, *DYNAMIC, *COUPLED and transient *UNCOUPLED TEMPERATURE-
+        DISPLACEMENT) whose creep strain at a constant stress comes out more than 0.1 % above
+        the law's (creep_floor_factor) makes it reduced physics.  No exact form: units with a
+        larger A rescale every stress, load and time of the deck, and ccx's orthotropic path
+        (ortho_plas.f), which has no floor, ignores CETOL and reads temperature rows otherwise
+        (probed)."""
         spans = []                              # (step, its ccx total time at start and end)
         t: Optional[float] = 0.0
         for st in self.steps:
