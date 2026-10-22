@@ -3541,12 +3541,17 @@ def clearance_deck(roles):
             "*Node Print, nset=UTOP, totals=only\nRF\n*Node Print, nset=LTOP\nU\n*End Step\n")
 
 
-def general_contact_deck(form):
+def general_contact_deck(form, embed="", tie=False):
     """Two elastic blocks (C3D8) touching in z, the lower one 4 x 4 x 1 elements over 1 x 1 x
     0.5 held at its base, the upper one 3 x 3 x 1 elements over 0.8 x 0.8 x 0.5 with its top
     pushed down 0.01: Abaqus general contact (``form`` "general": *CONTACT, ALL EXTERIOR, the
     default hard frictionless property), a hand-written node-to-surface pair of the lower
-    top (slave) on the upper base ("pair", hard), or no contact ("none")."""
+    top (slave) on the upper base ("pair", hard), or no contact ("none").  ``embed``: an S4
+    sheet at mid-height of the lower block, or a C3D8 bar inside it, embedded in it (Abaqus
+    leaves embedded elements out of general contact).  ``tie``: the upper block's first
+    column of elements tied to the lower block's top under it, and only the upper block's
+    far edge pushed down 0.02 (it turns about the tie into the lower block); the pair then
+    leaves the tied faces out (Abaqus leaves the tied surfaces to the tie, not the bodies)."""
     nodes, elems, n, e = [], [], 0, 0
 
     def block(x0, w, z0, m):
@@ -3568,17 +3573,35 @@ def general_contact_deck(form):
     low, up = block(0.0, 1.0, 0.0, 4), block(0.1, 0.8, 0.5, 3)
     base = ", ".join(str(v) for (i, j, k), v in low.items() if k == 0)
     top = ", ".join(str(v) for (i, j, k), v in up.items() if k == 1)
+    push = "PUSH" if tie else "UTOP"
+    tied_up, tied_low = ((17, 20, 23), (1, 2, 5, 6, 9, 10, 13, 14)) if tie else ((), ())
     contact = {"general": "*Contact\n*Contact Inclusions, all exterior\n",
-               "pair": ("*Surface, name=LTOP\n" + "".join(f"{k}, S2\n" for k in range(1, 17)) +
-                        "*Surface, name=UBASE\n" + "".join(f"{k}, S1\n" for k in range(17, 26)) +
+               "pair": ("*Surface, name=LTOP\n" + "".join(f"{k}, S2\n" for k in range(1, 17) if k not in tied_low) +
+                        "*Surface, name=UBASE\n" + "".join(f"{k}, S1\n" for k in range(17, 26) if k not in tied_up) +
                         "*Surface Interaction, name=I\n*Surface Behavior, pressure-overclosure=HARD\n"
                         "*Contact Pair, interaction=I, type=NODE TO SURFACE\nLTOP, UBASE\n"),
                "none": ""}[form]
+    if tie:
+        contact = ("*Surface, name=BT\n" + "".join(f"{k}, S1\n" for k in tied_up) + "*Surface, name=AT\n" +
+                   "".join(f"{k}, S2\n" for k in tied_low) + "*Tie, name=T\nBT, AT\n" + contact +
+                   "*Nset, nset=PUSH\n" + ", ".join(str(v) for (i, j, k), v in up.items() if k == 1 and i == 3) + "\n")
+    extra = {"": "",
+             "S4": ("*Node\n901, 0.05, 0.05, 0.25\n902, 0.95, 0.05, 0.25\n903, 0.95, 0.95, 0.25\n"
+                    "904, 0.05, 0.95, 0.25\n*Element, type=S4, elset=EMB\n901, 901, 902, 903, 904\n"
+                    "*Shell Section, elset=EMB, material=M\n0.01\n"),
+             "C3D8": ("*Node\n" + "".join(f"{900 + 4 * i + 2 * k + j}, {0.05 + 0.1 * i!r}, {0.45 + 0.1 * j!r}, "
+                                          f"{0.2 + 0.1 * k!r}\n" for i in range(10) for k in range(2) for j in range(2)) +
+                      "*Element, type=C3D8, elset=EMB\n" +
+                      "".join(f"{941 + i}, " + ", ".join(str(900 + 4 * (i + di) + 2 * k + j) for k in range(2)
+                                                         for di, j in ((0, 0), (1, 0), (1, 1), (0, 1))) + "\n"
+                              for i in range(9)) + "*Solid Section, elset=EMB, material=M\n")}[embed]
+    if embed:
+        extra += "*Elset, elset=LOWER, generate\n1, 16, 1\n*Embedded Element, host elset=LOWER\nEMB\n"
     return ("*Node\n" + "\n".join(nodes) + "\n*Element, type=C3D8, elset=E\n" + "\n".join(elems) +
-            "\n*Solid Section, elset=E, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "\n*Solid Section, elset=E, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n" + extra +
             f"*Nset, nset=BASE\n{base}\n*Nset, nset=UTOP\n{top}\n" + contact +
             "*Boundary\nBASE, 1, 3\nUTOP, 1, 2\n*Step, nlgeom\n*Static\n0.25, 1.\n*Boundary\n"
-            "UTOP, 3, 3, -0.01\n*Node Print, nset=UTOP, totals=only\nRF\n*End Step\n")
+            f"{push}, 3, 3, {-0.02 if tie else -0.01}\n*Node Print, nset={push}, totals=only\nRF\n*End Step\n")
 
 
 def explicit_coupled_deck(form):
@@ -3611,6 +3634,70 @@ def explicit_coupled_deck(form):
     return (head + "*Step\n*Heat Transfer\n1e-4, 0.01\n*Boundary\nX0, 11, 11, 120.\n"
             "*Node Print, nset=ALL\nNT\n*End Step\n")
 
+
+def shell_tie_fallback_deck(kind):
+    """Shell ties with no exact ccx form (code check G3-3), and their merged twins.  "tee": an S4
+    stiffener (x 0-1, z 0-0.4 in y = 0.5) whose bottom edge (E1) is tied to an S4 plate's SPOS
+    (1 x 1, clamped at x = 0), its far top corner loaded along y and z; "tee_merged": the
+    stiffener on the plate's nodes.  "solid": a C3D8 block (2 x 1 x 1) whose top is tied to an S4
+    skin's SPOS (two elements, a node at x = 1 the block has not), the skin's far corner pushed
+    up; "solid_merged": the block's top corners the skin's nodes (Abaqus ties the block's nodes,
+    which lie on the skin's corner nodes)."""
+    if kind.startswith("tee"):
+        merged = kind == "tee_merged"
+        stif = "5, 4, 5, 104, 103\n6, 5, 6, 105, 104\n" if merged else "5, 100, 101, 104, 103\n6, 101, 102, 105, 104\n"
+        return ("*NODE\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n4, 0., 0.5, 0.\n5, 0.5, 0.5, 0.\n6, 1., 0.5, 0.\n"
+                "7, 0., 1., 0.\n8, 0.5, 1., 0.\n9, 1., 1., 0.\n" +
+                ("" if merged else "100, 0., 0.5, 0.\n101, 0.5, 0.5, 0.\n102, 1., 0.5, 0.\n") +
+                "103, 0., 0.5, 0.4\n104, 0.5, 0.5, 0.4\n105, 1., 0.5, 0.4\n*ELEMENT, TYPE=S4, ELSET=PLATE\n"
+                "1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n3, 4, 5, 8, 7\n4, 5, 6, 9, 8\n*ELEMENT, TYPE=S4, ELSET=STIF\n" + stif +
+                "*MATERIAL, NAME=M\n*ELASTIC\n2.e5, 0.3\n*SHELL SECTION, ELSET=PLATE, MATERIAL=M\n0.05\n"
+                "*SHELL SECTION, ELSET=STIF, MATERIAL=M\n0.05\n*NSET, NSET=CL\n1, 4, 7\n*NSET, NSET=PR\n105, 9\n" +
+                ("" if merged else "*SURFACE, NAME=SE\n5, E1\n6, E1\n*SURFACE, NAME=PT\nPLATE, SPOS\n*TIE, NAME=T\nSE, PT\n") +
+                "*BOUNDARY\nCL, 1, 6\n*STEP\n*STATIC\n*CLOAD\n105, 2, 1.\n105, 3, 1.\n*NODE PRINT, NSET=PR\nU\n"
+                "*END STEP\n")
+    merged = kind == "solid_merged"
+    top = "201, 205, 206, 204" if merged else "5, 6, 8, 7"
+    return ("*NODE\n1, 0., 0., 0.\n2, 2., 0., 0.\n3, 0., 1., 0.\n4, 2., 1., 0.\n" +
+            ("" if merged else "5, 0., 0., 1.\n6, 2., 0., 1.\n7, 0., 1., 1.\n8, 2., 1., 1.\n") +
+            "201, 0., 0., 1.\n202, 1., 0., 1.\n203, 1., 1., 1.\n204, 0., 1., 1.\n205, 2., 0., 1.\n206, 2., 1., 1.\n"
+            f"*ELEMENT, TYPE=C3D8, ELSET=BLK\n1, 1, 2, 4, 3, {top}\n*ELEMENT, TYPE=S4, ELSET=SH\n"
+            "301, 201, 202, 203, 204\n302, 202, 205, 206, 203\n*MATERIAL, NAME=CONC\n*ELASTIC\n30000., 0.2\n"
+            "*MATERIAL, NAME=STEEL\n*ELASTIC\n210000., 0.3\n*SOLID SECTION, ELSET=BLK, MATERIAL=CONC\n"
+            "*SHELL SECTION, ELSET=SH, MATERIAL=STEEL\n0.1\n" +
+            ("" if merged else "*SURFACE, NAME=TOP\nBLK, S2\n*SURFACE, NAME=SK\nSH, SPOS\n*TIE, NAME=T\nTOP, SK\n") +
+            "*NSET, NSET=FIX\n1, 2, 3, 4\n*NSET, NSET=PP\n203, 205, 206\n*BOUNDARY\nFIX, 1, 3\n*STEP\n*STATIC\n"
+            "*CLOAD\n205, 3, 1.\n*NODE PRINT, NSET=PP\nU\n*END STEP\n")
+
+
+def tied_pair_faceless_deck(form):
+    """An S4 skin (two elements, 2 x 1) on a C3D8 block's top, tied by a *CONTACT PAIR, TIED
+    whose slave line gives no face label (``form`` "pair"; a double-sided surface), or by a
+    *TIE of the same surfaces ("tie"); the skin's far corner pushed up (code check G3-6)."""
+    tie = ("*SURFACE INTERACTION, NAME=I\n*CONTACT PAIR, INTERACTION=I, TIED\nSK, TOP\n" if form == "pair" else
+           "*TIE, NAME=T\nSK, TOP\n")
+    return ("*NODE\n1, 0., 0., 0.\n2, 2., 0., 0.\n3, 0., 1., 0.\n4, 2., 1., 0.\n5, 0., 0., 1.\n6, 2., 0., 1.\n"
+            "7, 0., 1., 1.\n8, 2., 1., 1.\n201, 0., 0., 1.\n202, 1., 0., 1.\n203, 1., 1., 1.\n204, 0., 1., 1.\n"
+            "205, 2., 0., 1.\n206, 2., 1., 1.\n*ELEMENT, TYPE=C3D8, ELSET=BLK\n1, 1, 2, 4, 3, 5, 6, 8, 7\n"
+            "*ELEMENT, TYPE=S4, ELSET=SH\n301, 201, 202, 203, 204\n302, 202, 205, 206, 203\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n30000., 0.2\n*SOLID SECTION, ELSET=BLK, MATERIAL=M\n*SHELL SECTION, ELSET=SH, MATERIAL=M\n"
+            "0.1\n*SURFACE, NAME=TOP\nBLK, S2\n*SURFACE, NAME=SK\nSH\n" + tie +
+            "*NSET, NSET=FIX\n1, 2, 3, 4\n*NSET, NSET=PP\n203, 205, 206\n*BOUNDARY\nFIX, 1, 3\n*STEP\n*STATIC\n"
+            "*CLOAD\n205, 3, 1.\n*NODE PRINT, NSET=PP\nU\n*END STEP\n")
+
+
+def connector_load_held_deck(load=True):
+    """A CARTESIAN connector (axes turned 30 degrees about z) from node 1, held, to node 2, a
+    beam's tip: component 1 a spring of 100, component 2 RIGID, node 2's x prescribed 0.01 — so
+    component 1 is fixed, and a *CONNECTOR LOAD of 5 on it (``load``) adds to the reactions only:
+    node 2 at uy = 0.01 tan 30 either way (code check G3-7)."""
+    return ("*NODE, NSET=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 0., -1.\n*ELEMENT, TYPE=B31, ELSET=BM\n"
+            "1, 3, 2\n*BEAM SECTION, ELSET=BM, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n1., 0., 0.\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n2.e5, 0.3\n*ORIENTATION, NAME=OR\n0.866025403784, 0.5, 0., -0.5, 0.866025403784, 0.\n"
+            "*ELEMENT, TYPE=CONN3D2, ELSET=C\n10, 1, 2\n*CONNECTOR SECTION, ELSET=C, BEHAVIOR=B\nCARTESIAN,\nOR,\n"
+            "*CONNECTOR BEHAVIOR, NAME=B\n*CONNECTOR ELASTICITY, COMPONENT=1\n100.\n*CONNECTOR ELASTICITY, RIGID\n2\n"
+            "*BOUNDARY\n1, 1, 6\n3, 1, 6\n*STEP\n*STATIC\n*BOUNDARY\n2, 1, 1, 0.01\n" +
+            ("*CONNECTOR LOAD\n10, 1, 5.\n" if load else "") + "*NODE PRINT, NSET=PROBE\nU\n*END STEP\n")
 
 def follower_turning_deck(form, steps=6, step_deg=15.0):
     """A unit cube (C3D8, ``form`` "3d": *DSLOAD TRVEC on its face x = 1) or square (CPE4,
@@ -15360,6 +15447,70 @@ def main():
               f"under 3 x 3 elements, the upper one pushed down 0.01; *CONTACT, ALL EXTERIOR under "
               f"--approximate): reaction {got:.7g} vs {want:.7g} with a hand-written node-to-surface "
               f"pair ({err:.1e} apart); {plain:.2g} with it commented out (no --approximate)")
+    failures += 0 if ok else 1
+    # embedded elements are no part of Abaqus' all-inclusive surface: an S4 sheet or a C3D8 bar
+    # embedded in the lower block (a body of its own, contacted against its host: the sheet
+    # stopped ccx, 'too many cutbacks'); a tie between the blocks leaves out the tied faces
+    # only, not the pair of blocks (it was dropped: the upper block turned into the lower one)
+    for tag, embed, tie in (("embedded_s4", "S4", False), ("embedded_c3d8", "C3D8", False),
+                            ("tied", "", True)):
+        runs = {form: review_run(general_contact_deck(form, embed, tie), f"general_contact_{tag}_{form}",
+                                 lambda dat: dat_totals(dat)[-1:], approximate=form == "general")
+                for form in ("general", "pair", "none")}
+        ok = all(runs.values())
+        if ok:
+            got, want, none = (runs[k][0][2] for k in ("general", "pair", "none"))
+            err = abs(got / want - 1)
+            ok = err < 1e-6 and abs(want - none) > 0.1 * abs(want)
+            print(f"{'PASS' if ok else 'FAIL'}  general_contact_{tag} (the blocks of general_contact_approx, "
+                  f"{'an embedded ' + embed if embed else 'the upper one partly tied to the lower and turned into it'};"
+                  f" *CONTACT, ALL EXTERIOR under --approximate): force {got:.7g} vs {want:.7g} with a "
+                  f"hand-written pair{' of the untied faces' if tie else ''} ({err:.1e} apart); {none:.4g} "
+                  f"without contact")
+        failures += 0 if ok else 1
+
+    # --- shell ties with no exact ccx form: the deck's surfaces with Abaqus' tolerance plus
+    # the shells' half thickness, which ccx's expanded faces need (with ccx's default it tied
+    # nothing: the T joint's stiffener hung free, 1.84e11); off the merged twins as warned
+    for tag, node, dof, limit in (("tee", 105, 2, 0.30), ("solid", 205, 2, 0.05)):
+        got, want = (review_run(shell_tie_fallback_deck(k), f"shell_tie_fallback_{k}", dat_displacements)
+                     for k in (tag, tag + "_merged"))
+        ok = bool(got and want)
+        if ok:
+            off = [abs(ccx_ratio(got[node][d], want[node][d]) - 1) for d in ((1, 2) if tag == "tee" else (dof,))]
+            ok = max(off) < limit
+            print(f"{'PASS' if ok else 'FAIL'}  shell_tie_fallback_{tag} ({'an S4 stiffener edge tied to an S4 plate' if tag == 'tee' else 'a C3D8 face tied to an S4 master'}"
+                  f": no exact form, the deck's surfaces with Abaqus' tolerance plus the shells' half thickness): "
+                  f"node {node} {', '.join(f'{x:.4g}' for x in got[node])} vs the merged mesh's "
+                  f"{', '.join(f'{x:.4g}' for x in want[node])} ({max(off):.1%} off; the warning says so)")
+        failures += 0 if ok else 1
+    # a TIED contact pair whose shell slave line has no face label: as the *TIE of the surfaces,
+    # with no reduced physics (the line was left out and flagged)
+    got, want = (review_run(tied_pair_faceless_deck(k), f"tied_pair_faceless_{k}", dat_displacements)
+                 for k in ("pair", "tie"))
+    tp_src = os.path.join(tmp, "tied_pair_faceless_flags.inp")
+    with open(tp_src, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(tied_pair_faceless_deck("pair"))
+    flags = convert(tp_src, tp_src + ".out.inp")[1].reduced_physics
+    ok = bool(got and want)
+    if ok:
+        apart = max(abs(a - b) for n in want for a, b in zip(got.get(n, [math.inf] * 3), want[n]))
+        ok = apart < 1e-12 and abs(want[205][2]) > 1e-6 and not flags
+        print(f"{'PASS' if ok else 'FAIL'}  tied_pair_faceless (an S4 skin on a C3D8 block, *CONTACT PAIR, TIED "
+              f"with a faceless shell slave line): {apart:.1e} off the *TIE of the surfaces (uz {got[205][2]:.6g} "
+              f"at the pushed corner), reduced physics: {'; '.join(flags) or 'none'}")
+    failures += 0 if ok else 1
+    # a *CONNECTOR LOAD on a component BCs and rigid components fix: the load left out, the
+    # connector kept (it was commented out whole: node 2 stayed at uy 0)
+    got, want = (review_run(connector_load_held_deck(k), f"connector_load_held{'' if k else '_ref'}",
+                            dat_displacements) for k in (True, False))
+    ok = bool(got and want)
+    if ok:
+        exact = 0.01 * math.tan(math.radians(30.0))
+        ok = abs(got[2][1] - exact) < 1e-8 and abs(got[2][1] - want[2][1]) < 1e-15
+        print(f"{'PASS' if ok else 'FAIL'}  connector_load_held (a CARTESIAN connector's spring component "
+              f"loaded while its rigid component and a BC fix it): node 2 uy {got[2][1]:.7g} = 0.01 tan 30 "
+              f"{exact:.7g}, as without the load")
     failures += 0 if ok else 1
 
     # --- Abaqus/Explicit's coupled step under --approximate: ccx's *COUPLED TEMPERATURE-

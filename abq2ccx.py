@@ -9534,7 +9534,7 @@ class _Mesh:
             self._reserve_names()
             self._used_names |= self._tie_names
         out: List[str] = []
-        rotation_free = 0                           # lines tying shell nodes to solid faces
+        rotation_free = 0                           # lines tying no rotation, as NO ROTATION
         for i, line in enumerate(lines):
             params = OrderedDict(keep)
             if i:
@@ -9542,6 +9542,7 @@ class _Mesh:
             f = [x.strip() for x in line.split(",")]
             master = f[1] if len(f) > 1 else ""
             plain = bool(f[0]) and not (b.has("CYCLIC SYMMETRY") or b.has("MULTISTAGE"))
+            rotation_free += not (self._surface_turns(f[0]) and self._surface_turns(master))
             if plain and f[0].upper() == master.upper():
                 out += self._comment_out(
                     f"*TIE {params.get('NAME') or ''}: {f[0]} is both its slave and its master "
@@ -9555,9 +9556,11 @@ class _Mesh:
                 if plain else (None, [])
             membrane = name is not None
             shell = self._shell_tie_slave(f[0], master, b, False) if plain and not membrane else None
-            if shell is not None:
+            reach = None
+            if shell is not None and shell[0] is None:
+                reach, shell = shell[2], None   # (the deck's surfaces, with a tolerance ccx reaches)
+            if shell is not None:                   # (a solid master: counted above)
                 name, cards = shell[0], shell[1]
-                rotation_free += 1
             elif plain and not membrane:
                 name, cards = self._shared_tie_slave(f[0], master)
             if name == "?":
@@ -9583,6 +9586,8 @@ class _Mesh:
                 params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
                     b.param("POSITION TOLERANCE"), f[0], master, b, False), 6)
                 line = ", ".join([name] + f[1:])
+            if reach is not None:
+                params["POSITION TOLERANCE"] = short_real(reach, 6)
             out += cards + [emit_keyword("TIE", params), line]
         if b.has("NO ROTATION") and rotation_free < len(lines):
             self.report.warn("*TIE, NO ROTATION dropped: ccx ties the surfaces' expanded faces, "
@@ -9590,6 +9595,23 @@ class _Mesh:
                              once=True)
             self._reduces("*TIE, NO ROTATION")
         return out + comments
+
+    def _surface_turns(self, surf: str) -> bool:
+        """Whether surface ``surf`` lies on elements with rotations (conventional shells,
+        beams) — a tie's NO ROTATION acts only where both its surfaces do (Abaqus ties
+        rotations 'if both slave and master surfaces have them'); True for a surface the
+        deck does not define."""
+        sd = self.surfaces.get(surf.strip().upper())
+        if sd is None:
+            return True
+        if sd[0].startswith("NODE"):
+            held = {n for tok, _f in sd[1] for n in self._resolve_nodes(tok)}
+            es = [e for e, (_t, c) in self.geom.elements.items() if held.intersection(c)]
+        else:
+            es = self._surface_elements(surf)
+        return any(ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS or
+                   (ccx_type(self.geom.elements[e][0]) in BEAM_TYPES and
+                    not self.geom.elements[e][0].upper().startswith(("T2D", "T3D"))) for e in es)
 
     def _shared_tie_slave(self, slave: str, master: str) -> Tuple[Optional[str], List[str]]:
         """A *TIE slave surface ``slave`` that shares nodes with the faces of ``master``: ccx
@@ -9694,7 +9716,7 @@ class _Mesh:
         return name, [f"*SURFACE, NAME={name}, TYPE=NODE"] + [str(n) for n in keep]  # ccx: one per line
 
     def _shell_tie_slave(self, slave: str, master: str, b: Block, pair: bool) -> \
-            Optional[Tuple[str, List[str], float]]:
+            Optional[Tuple[Optional[str], List[str], float]]:
         """A tie ``b`` (a *TIE; with ``pair`` a TIED *CONTACT PAIR) of surfaces on conventional
         shells (SHEET_SHELLS).  Abaqus ties the slave nodes — a shell's nodes, its reference
         surface — to the master's reference surface, through a rigid offset where they lie
@@ -9713,11 +9735,15 @@ class _Mesh:
           master's own nodes stay out, as for membranes);
         * shell edges on shell edges in one plane, of one section: ccx's edge faces are the
           merged mesh exactly (noted; None: the line stays);
-        * no ccx form is exact (warned, reduced physics; None: the deck's own form stays):
-          slave shell nodes off the master surface (the face touching it 0.2-2.6 % off the rigid
-          offset, the node surface 4-8 %), another OFFSET, a master on shells, shell edges at
-          an angle or of other sections, a slave on shells and other elements, a step solving
-          for temperatures (ccx's shell node carries none: the tied skin kept its own).
+        * no ccx form is exact (warned, reduced physics; (None, [], tolerance): the deck's own
+          form stays): slave shell nodes off the master surface (the face touching it 0.2-2.6 %
+          off the rigid offset, the node surface 4-8 %), another OFFSET, a master on shells,
+          shell edges at an angle or of other sections, a slave on shells and other elements, a
+          step solving for temperatures (ccx's shell node carries none: the tied skin kept its
+          own).  The tolerance is Abaqus' (_membrane_tie_tolerance) plus how far ccx's expanded
+          faces lie off the reference surfaces, master and slave: ccx's default tolerance
+          reaches no face half a thickness off and ties nothing ('no tied MPC ... too far
+          away'; probed).
         None also where no conventional shell takes part, or the master is not on solids or
         shells (membranes: _membrane_node_surface)."""
         sd, md = self.surfaces.get(slave.upper()), self.surfaces.get(master.upper())
@@ -9798,11 +9824,17 @@ class _Mesh:
                          f"surface, through a rigid offset where they lie apart, the rotations too "
                          f"where both have them; ccx ties the faces of the solids it expands shells "
                          f"to, half the thickness off, or the midsurface of a node surface. No ccx "
-                         f"form is exact for {why}: the deck's surfaces are kept (probed on 2.23: "
-                         f"0.2-8 % off for a shell face on a solid, more for shells on shells).",
-                         once=True)
+                         f"form is exact for {why}: the deck's surfaces are kept, with Abaqus' position "
+                         f"tolerance plus the shells' half thickness (ccx's default reaches no face "
+                         f"half a thickness off: it ties nothing). Probed on 2.23: a shell face on a "
+                         f"solid 0.2-2.6 % off, a solid face on a shell master 4 %, a shell T joint "
+                         f"20-24 %.", once=True)
         self._reduces(f"*TIE on conventional shells: {why}")
-        return None
+
+        def half(es: Sequence[int]) -> float:      # (how far ccx's expanded faces lie off)
+            return max([sec[e][0] * (0.5 + abs(sec[e][1])) for e in es if e in sec] or [0.0])
+        return None, [], tol + half(on_master) + (half([e for es in shells.values() for e in es])
+                                                  if sf is not None else 0.0)
 
     def _shell_tie_form(self, slave: str, master: str, near: List[int], off: float,
                         sf: Optional[List[Tuple[int, List[int], int]]], what: str,
@@ -10825,7 +10857,8 @@ class _Mesh:
             g1, g2 = group(s1) if s1 else None, group(s2)
             if g2 is None or (s1 and g1 is None):
                 continue
-            if everything and not any(g["node_based"] or not g["elems"] for g in (g1, g2) if g):
+            if everything and not any(g["node_based"] or not g["elems"] or g["elems"] & self._embedded_elems
+                                      for g in (g1, g2) if g):
                 continue                        # (the all-inclusive surface has them)
             if not s1:
                 cand += [(a, g2) for a in bodies if not (a["elems"] & g2["elems"]) and
@@ -10848,28 +10881,48 @@ class _Mesh:
         def hits(a: dict, b: dict, x1: str, x2: str) -> bool:
             return (covers(a, x1) and covers(b, x2)) or (covers(a, x2) and covers(b, x1))
 
-        joined = []                       # the deck's own pairs and ties: Abaqus leaves them out
+        # the deck's own pairs and ties: 'interactions between these surfaces are modeled only
+        # with the contact pair algorithm' (Interactions Guide, general contact in Abaqus/
+        # Standard) — the rest of their bodies stays in general contact, so a pair of bodies
+        # leaves only those faces out (_gc_joined_faces; a named surface's pair: all of it)
+        joined = []
         for b in blocks:
             if b.keyword in ("CONTACT PAIR", "TIE"):
                 for rec in merged_data_records(b):
                     f = [x.strip().upper() for x in rec[:2] if x.strip()]
                     if len(f) == 2 and f[0] != f[1]:
                         joined.append((f[0], f[1]))
-        skipped_self = 0
+        skipped_self = n_excl = n_far = n_joined = 0
         pairs: List[Tuple[dict, dict]] = []
+        cut: Dict[Tuple[int, int], Tuple[set, set]] = {}     # (id a, id b) -> faces a, b leave out
         seen: set = set()
         for a, b in cand:
             key = (id(a), id(b)) if id(a) <= id(b) else (id(b), id(a))
-            if key in seen or any(hits(a, b, x1, x2) for x1, x2 in excl):
+            if key in seen:
                 continue
             seen.add(key)
+            if any(hits(a, b, x1, x2) for x1, x2 in excl):
+                n_excl += a is not b
+                continue
             if a is b:
                 skipped_self += not (a["rigid"] or a["node_based"])
                 continue
-            elif (a["node_based"] and b["node_based"]) or \
-                    any(hits(a, b, x1, x2) for x1, x2 in joined):
+            elif a["node_based"] and b["node_based"]:
                 continue
-            elif self._gc_distance(a, b) > reach:
+            js = [(xa, xb) for x1, x2 in joined for xa, xb in ((x1, x2), (x2, x1))
+                  if covers(a, xa) and covers(b, xb)]
+            if js:
+                if "faces" not in a or "faces" not in b:
+                    n_joined += 1
+                    continue                    # (a named surface: the joined one itself)
+                fa = set().union(*(self._gc_joined_faces(xa, a) for xa, _xb in js))
+                fb = set().union(*(self._gc_joined_faces(xb, b) for _xa, xb in js))
+                if fa >= self._gc_face_set(a) or fb >= self._gc_face_set(b):
+                    n_joined += 1
+                    continue                    # (one body joined over all its faces)
+                cut[(id(a), id(b))], cut[(id(b), id(a))] = (fa, fb), (fb, fa)
+            if self._gc_distance(a, b) > reach:
+                n_far += 1
                 continue
             pairs.append((a, b))
         pairs.sort(key=lambda ab: self._gc_distance(*ab))
@@ -10929,13 +10982,16 @@ class _Mesh:
             prop = prop_of.setdefault(id(slave), prop)
             masters.setdefault((id(slave), prop), (slave, []))[1].append(master)
         self._gc_adjust = set()
+        none: Tuple[set, set] = (set(), set())
         for (_, prop), (slave, ms) in masters.items():
             lines_of.setdefault(prop, []).append((slave, ms))
-            if self._gc_overclosed(slave, ms):
+            own = set().union(*(cut.get((id(slave), id(m)), none)[0] for m in ms))
+            if self._gc_overclosed(self._gc_trimmed(slave, own),
+                                   [self._gc_trimmed(m, cut.get((id(slave), id(m)), none)[1]) for m in ms]):
                 self._gc_adjust.add(prop)
-        self._gc_write(blocks, bodies, lines_of)
+        n_lines, gone = self._gc_write(blocks, bodies, lines_of, cut)
+        n_joined += gone
         new = self._gc_blocks
-        n_lines = sum(len(v) for v in lines_of.values())
         form = "two-way (balanced) weighting" if self._explicit_deck else "surface-to-surface formulation"
         where = (f"bounding boxes within {short_real(reach, 4)}: four times the largest travel "
                  f"the deck prescribes, plus 0.05 of the model's span — a heuristic: a lever or a "
@@ -10981,13 +11037,27 @@ class _Mesh:
         if (excl or any(x1 or x2 for x1, x2, _p in props)) and everything:
             self.report.note("*CONTACT (--approximate): exclusions and property assignments act on "
                              "the whole bodies their surfaces touch.", once=True)
+        if cut:
+            self.report.note("*CONTACT (--approximate): bodies that the deck's own *TIE or *CONTACT "
+                             "PAIR joins stay in general contact but for the faces of those surfaces, "
+                             "which Abaqus leaves to the tie or pair; a slave body's faces so joined "
+                             "are also out of its contact with its other masters (one line per slave "
+                             "body).", once=True)
         if not incl:
             self.report.note("*CONTACT (--approximate): the general contact domain has no "
                              "inclusion, so no contact pair is written.", once=True)
-        elif not n_lines:
+        elif not n_lines and not (n_excl or n_joined or rigid_rigid or clash):
             self.report.note("*CONTACT (--approximate): no two bodies of the general contact domain "
                              "can meet over the analysis (" + where + "), so no contact pair is "
                              "written.", once=True)
+        elif not n_lines:
+            why = [f"{n_excl} pair(s) of bodies the *CONTACT EXCLUSIONS leave out"] * bool(n_excl) + \
+                [f"{n_joined} pair(s) of bodies the deck's own *TIE or *CONTACT PAIR joins over all "
+                 f"the faces of one of them (Abaqus leaves that surface pair to it)"] * bool(n_joined) + \
+                [f"{rigid_rigid + clash} pair(s) left out as warned"] * bool(rigid_rigid or clash) + \
+                [f"{n_far} pair(s) of bodies that cannot meet over the analysis ({where})"] * bool(n_far)
+            self.report.note("*CONTACT (--approximate): no contact pair is written: " + "; ".join(why) +
+                             ".", once=True)
         k = next((i for i, b in enumerate(blocks) if b.keyword == "STEP"), len(blocks))
         return blocks[:k] + new + blocks[k:]
 
@@ -11051,6 +11121,8 @@ class _Mesh:
         continuum element shares (cohesive elements left out: Abaqus generates the surface
         "as if cohesive elements were not present"; an axisymmetric edge on the axis left
         out, as ccx asks), its shells, membranes and rigid facets — its nodes, bounding box,
+        (embedded elements, _embedded_elems, left out: their faces "are not considered part of
+        the all-inclusive surface", Constraints Guide, 'Embedded elements'),
         mean exterior edge length (``size``) and whether it is rigid.  Also what the surface
         leaves out (beams, trusses, axisymmetric shells, surface elements — which leave the
         ccx mesh, _drop_surface_elements), as warnings."""
@@ -11069,6 +11141,8 @@ class _Mesh:
         left: Dict[str, int] = {}
         for e, (t, c) in elems.items():
             u = t.upper()
+            if e in self._embedded_elems:
+                continue                        # (Abaqus leaves embedded elements' faces out)
             if u in self._GC_RIGID_SHEETS:
                 kind[e] = "sheet"
                 rigid_el.add(e)
@@ -11189,6 +11263,50 @@ class _Mesh:
         g["lo"] = tuple(min(p[a] for p in pts) for a in range(3))
         g["hi"] = tuple(max(p[a] for p in pts) for a in range(3))
         return g
+
+    @staticmethod
+    def _gc_face_set(g: dict) -> set:
+        """The exterior faces of general-contact body ``g`` as (element, label): its continuum
+        faces (S1 ...) and both sides of its shells, membranes and rigid facets (SPOS, SNEG)."""
+        return {(e, lab) for lab, ids in g.get("faces", {}).items() for e in ids} | \
+            {(e, side) for e in g.get("sheets", ()) for side in ("SPOS", "SNEG")}
+
+    def _gc_face_corners(self, e: int, lab: str) -> Sequence[int]:
+        """The corner nodes of face ``lab`` of _gc_face_set (a sheet's side: its nodes)."""
+        return self.geom.elements[e][1] if lab in ("SPOS", "SNEG") else \
+            self._continuum_face_corners(e)[int(lab[1:])]
+
+    def _gc_joined_faces(self, name: str, g: dict) -> set:
+        """The faces of body ``g`` (_gc_face_set) that deck surface ``name`` — of a *TIE or
+        *CONTACT PAIR — takes: an element surface's by face label (none: all of the element's),
+        a node surface's those whose corner nodes it all holds."""
+        sd = self.surfaces.get(name)
+        if sd is None:
+            return set()
+        have: Dict[int, List[str]] = {}
+        for e, lab in self._gc_face_set(g):
+            have.setdefault(e, []).append(lab)
+        if sd[0].startswith("NODE"):
+            held = {n for tok, _f in sd[1] for n in self._resolve_nodes(tok)}
+            return {(e, lab) for e, labs in have.items() for lab in labs
+                    if all(n in held for n in self._gc_face_corners(e, lab))}
+        out: set = set()
+        for tok, face in sd[1]:
+            f = (face or "").upper()
+            m = re.fullmatch(r"S?([1-6])", f)
+            want = f"S{m.group(1)}" if m else f
+            out.update((e, lab) for e in self._resolve_elements(tok) for lab in have.get(e, ())
+                       if not f or lab == want)
+        return out
+
+    def _gc_trimmed(self, g: dict, drop: set) -> dict:
+        """Body ``g`` without the faces ``drop`` (_gc_face_set's form), for _gc_overclosed: its
+        continuum faces, and its sheets with a side left."""
+        if not drop or "faces" not in g:
+            return g
+        gone = {(e, tuple(self._gc_face_corners(e, lab))) for e, lab in drop if lab not in ("SPOS", "SNEG")}
+        return dict(g, solid=[(cs, e) for cs, e in g["solid"] if (e, tuple(cs)) not in gone],
+                    sheets=[e for e in g["sheets"] if not {(e, "SPOS"), (e, "SNEG")} <= drop])
 
     def _gc_size_near(self, a: dict, b: dict) -> float:
         """The mean exterior edge length of group ``a`` where it can meet group ``b``: of its
@@ -11325,22 +11443,29 @@ class _Mesh:
         return travel if math.isfinite(travel) else math.inf
 
     def _gc_write(self, blocks: List[Block], bodies: List[dict],
-                  lines_of: "OrderedDict[Optional[str], List[Tuple[dict, List[dict]]]]") -> None:
+                  lines_of: "OrderedDict[Optional[str], List[Tuple[dict, List[dict]]]]",
+                  cut: Dict[Tuple[int, int], Tuple[set, set]]) -> Tuple[int, int]:
         """The cards of _plan_general_contact's pairs (``lines_of``: interaction -> (slave
         group, its master groups)), as ``_gc_blocks``: an element set per body and face label
         (a slave's shells and membranes: both sides, SPOS and SNEG — probed, the same answer
         as the one side that touches; a master's shell, membrane or rigid facet: the side
         facing the nearest body it meets, SPOS where it meets none with a finite box), a
         *SURFACE per body and per union of masters, a hard frictionless *SURFACE INTERACTION
-        where Abaqus' default property applies, and a *CONTACT PAIR per interaction."""
+        where Abaqus' default property applies, and a *CONTACT PAIR per interaction.  The
+        faces a tie or deck pair joins (``cut``: (slave, master) -> their faces) are left out:
+        a slave's from its surface, a master's from that line's.  -> (the lines written, the
+        lines or masters left out with no face left)."""
         self._gc_blocks = []
         if not lines_of:
-            return
+            return 0, 0
         base = self._rigid_set_name("ABQ2CCX_GC")
+        none: Tuple[set, set] = (set(), set())
         partners: Dict[int, List[dict]] = {}
+        drop: Dict[int, set] = {}               # slave -> its faces left out
         for items in lines_of.values():
             for slave, ms in items:
                 for m in ms:
+                    drop.setdefault(id(slave), set()).update(cut.get((id(slave), id(m)), none)[0])
                     if m is not slave:
                         partners.setdefault(id(slave), []).append(m)
                         partners.setdefault(id(m), []).append(slave)
@@ -11348,17 +11473,19 @@ class _Mesh:
         slaves = {id(s) for items in lines_of.values() for s, _ms in items}
         nodes = self.geom.nodes
         surf_lines: Dict[int, List[str]] = {}
+        parts_of: Dict[int, List[Tuple[str, str, List[int]]]] = {}   # body -> (elset, label, elements)
         for k, g in enumerate(bodies, 1):
             if id(g) not in used:
                 continue
             g["name"] = f"{base}B{k}"
-            out: List[str] = []
-            for lab, ids in sorted(g["faces"].items()):
-                self.geom.elsets[f"{base}B{k}{lab}"] = ids
-                out.append(f"{base}B{k}{lab}, {lab}")
+            out = drop.get(id(g), set())
+            parts = [(f"{base}B{k}{lab}", lab, [e for e in ids if (e, lab) not in out])
+                     for lab, ids in sorted(g["faces"].items())]
             if g["sheets"] and id(g) in slaves:      # a slave: both sides (probed: harmless)
-                self.geom.elsets[f"{base}B{k}T"] = list(g["sheets"])
-                out += [f"{base}B{k}T, SPOS", f"{base}B{k}T, SNEG"]
+                pos = [e for e in g["sheets"] if (e, "SPOS") not in out]
+                neg = [e for e in g["sheets"] if (e, "SNEG") not in out]
+                two = ("T", "T") if pos == neg else ("P", "N")
+                parts += [(f"{base}B{k}{two[0]}", "SPOS", pos), (f"{base}B{k}{two[1]}", "SNEG", neg)]
             elif g["sheets"]:
                 near = [m for m in partners.get(id(g), []) if math.isfinite(m["lo"][0])]
                 side: Dict[str, List[int]] = {"SPOS": [], "SNEG": []}
@@ -11371,42 +11498,68 @@ class _Mesh:
                     aim = None if m is None else vscale(vadd(m["lo"], m["hi"]), 0.5)
                     side["SNEG" if aim is not None and
                          vdot(self._gc_sheet_normal(e), vsub(aim, cen)) < 0 else "SPOS"].append(e)
-                for lab, ids in side.items():
-                    if ids:
-                        self.geom.elsets[f"{base}B{k}{lab[1]}"] = ids
-                        out.append(f"{base}B{k}{lab[1]}, {lab}")
-            surf_lines[id(g)] = out
-            self._gc_blocks.append(Block("SURFACE", OrderedDict([("NAME", g["name"]),
-                                                                ("TYPE", "ELEMENT")]), out))
+                parts += [(f"{base}B{k}{lab[1]}", lab, ids) for lab, ids in side.items()]
+            parts = [p for p in parts if p[2]]
+            parts_of[id(g)] = parts
+            for name, _lab, ids in parts:
+                self.geom.elsets[name] = ids
+            surf_lines[id(g)] = [f"{name}, {lab}" for name, lab, _ids in parts]
         for items in lines_of.values():         # a deck's element surface: its own lines
             for _s, ms in items:
                 for m in ms:
                     sd = self.surfaces.get(m.get("name", ""))
                     if id(m) not in surf_lines and sd and sd[0] == "ELEMENT":
                         surf_lines[id(m)] = [", ".join([t] + [f] * bool(f)) for t, f in sd[1]]
+        trims = 0
+
+        def master_lines(slave: dict, m: dict) -> List[str]:
+            """The surface lines of master ``m`` in ``slave``'s line: without the faces they join."""
+            nonlocal trims
+            out = cut.get((id(slave), id(m)), none)[1]
+            if not out or id(m) not in parts_of:
+                return surf_lines[id(m)]
+            lines = []
+            for name, lab, ids in parts_of[id(m)]:
+                keep = [e for e in ids if (e, lab) not in out]
+                if keep and len(keep) < len(ids):
+                    trims += 1
+                    name = f"{name}X{trims}"
+                    self.geom.elsets[name] = keep
+                lines += [f"{name}, {lab}"] * bool(keep)
+            return surf_lines[id(m)] if lines == surf_lines[id(m)] else lines
+        for g in bodies:
+            if id(g) in parts_of and surf_lines[id(g)]:
+                self._gc_blocks.append(Block("SURFACE", OrderedDict([("NAME", g["name"]),
+                                                                    ("TYPE", "ELEMENT")]), surf_lines[id(g)]))
         cards: List[Block] = []
-        unions = twice = 0
+        unions = twice = gone = n_lines = 0
         default = None
         for prop, items in lines_of.items():
             data = []
             for slave, ms in items:
-                if len(ms) == 1:
-                    data.append(f"{slave['name']}, {ms[0]['name']}")
+                if id(slave) in parts_of and not surf_lines[id(slave)]:
+                    gone += 1                   # (every face of the slave joined to its masters)
                     continue
+                n_lines += 1
                 named = [m for m in ms if id(m) not in surf_lines]     # analytical surfaces
                 for m in named:
                     data.append(f"{slave['name']}, {m['name']}")
-                twice += bool(named)
-                rest = [m for m in ms if id(m) in surf_lines]
-                if len(rest) == 1:
-                    data.append(f"{slave['name']}, {rest[0]['name']}")
+                twice += bool(named) and len(ms) > 1
+                rest = [(m, master_lines(slave, m)) for m in ms if id(m) in surf_lines]
+                gone += sum(1 for _m, ln in rest if not ln)
+                rest = [(m, ln) for m, ln in rest if ln]
+                n_lines -= not (rest or named)
+                if len(rest) == 1 and rest[0][1] is surf_lines[id(rest[0][0])]:
+                    data.append(f"{slave['name']}, {rest[0][0]['name']}")
                 elif rest:
                     unions += 1
                     name = f"{base}M{unions}"
                     self._gc_blocks.append(Block("SURFACE", OrderedDict([("NAME", name),
                                                                          ("TYPE", "ELEMENT")]),
-                                                 [x for m in rest for x in surf_lines[id(m)]]))
+                                                 [x for _m, ln in rest for x in ln]))
                     data.append(f"{slave['name']}, {name}")
+            if not data:
+                continue
             if prop is None:
                 default = default or f"{base}HARD"
             params = [("INTERACTION", prop or default), ("TYPE", "NODE TO SURFACE")]
@@ -11429,6 +11582,7 @@ class _Mesh:
             if b.keyword == "SURFACE":
                 self._register_surface(b)
         self._gc_pairs = {id(b) for b in cards}
+        return n_lines, gone
 
     def _gc_overclosed(self, slave: dict, masters: List[dict]) -> bool:
         """Whether a node of ``slave``'s exterior faces starts inside a master body: behind
@@ -11523,6 +11677,7 @@ class _Mesh:
                 if shell is not None:
                     slave, cards = shell[0], shell[1]
                     params["POSITION TOLERANCE"] = short_real(shell[2], 6)
+                    shell = shell if slave is not None else None
                 if slave == "":
                     out.append(f"** abq2ccx: *CONTACT PAIR, TIED: every slave node of {f[0].strip()} is a "
                                f"node of {f[1].strip()}, which joins them already")
@@ -11697,7 +11852,8 @@ class _Mesh:
         stops on such a line ('*ERROR reading *SURFACE').  On shells and membranes such a line
         is a double-sided surface, both faces (SPOS and SNEG): written so where only couplings
         use the surface, which take its nodes (probed: the same as a node surface), and ties
-        on conventional shells (_shell_tie_slave writes the form Abaqus ties).  A blank
+        (also TIED contact pairs) on conventional shells (_shell_tie_slave writes the form
+        Abaqus ties).  A blank
         data line (read_blocks: "") is Abaqus/Explicit's surface of every exterior face of the
         model, of all its elements but cohesive ones (Keywords Reference *SURFACE; not
         documented for Abaqus/Standard): the exterior faces of its continuum elements, the
@@ -11730,6 +11886,10 @@ class _Mesh:
                 faces = [(e, self._continuum_faces(e)) for e in dedup(eids)]
                 family = self._sheet_family(g[0]) if eids and any(f is None for _, f in faces) else None
                 users = self._surface_users(blocks, name) if family else set()
+                if "CONTACT PAIR" in users and all(       # (a tied pair is a tie: _contact_pair_lines)
+                        c.has("TIED") for c in blocks if c.keyword == "CONTACT PAIR" and
+                        any(x.strip().upper() == name.strip().upper() for ln in c.data for x in ln.split(","))):
+                    users = (users - {"CONTACT PAIR"}) | {"TIE"}
                 if family and (users <= {"COUPLING"} or (family == "shell" and users <= {"COUPLING", "TIE"})):
                     data += [f"{g[0]}, SPOS", f"{g[0]}, SNEG"]
                     self.report.note("*SURFACE line without a face label on shells / membranes (a "
@@ -15164,10 +15324,16 @@ class _Mesh:
         kws = {b.keyword for b in blocks}
         hit = [k for k in self._U1_CONSTRAINTS if k in kws]
         # connectors written as *EQUATIONs and springs may join U1 nodes (their rotations are
-        # DOFs 4-6 of their own: probed); BEAM / WELD (a *RIGID BODY) and LINK (*MPC) may not
-        rigid_conn = any(b.keyword == "CONNECTOR SECTION" and {x.strip().upper() for r in merged_data_records(b)[:1]
-                                                               for x in r} & {"BEAM", "WELD", "LINK"}
-                         for b in blocks)
+        # DOFs 4-6 of their own: probed); BEAM / WELD / JOIN, ALIGN (a *RIGID BODY, whose
+        # members get knot beams) and LINK (*MPC) may not — the kinds of _plan_connectors
+        def rigid_conn_card(b: Block) -> bool:
+            recs = merged_data_records(b)
+            words = [x.strip().upper() for x in (recs[0] if recs else []) if x.strip()]
+            pair = CONN_ASSEMBLED[words[0]] if len(words) == 1 and words[0] in CONN_ASSEMBLED else \
+                (next((w for w in words if w in CONN_TRANSLATIONAL), None),
+                 next((w for w in words if w in CONN_ROTATIONAL), None))
+            return words == ["BEAM"] or pair == ("JOIN", "ALIGN") or "LINK" in words
+        rigid_conn = any(b.keyword == "CONNECTOR SECTION" and rigid_conn_card(b) for b in blocks)
         if hit or rigid_conn or self._skins:
             what = f"*{hit[0]}" if hit else "BEAM / WELD / LINK connector" if rigid_conn else "rigid"
             return [], (f"the deck has {what} constraints, which this conversion does not write "
@@ -25484,7 +25650,8 @@ class _Constraints:
         * weights below ROUNDOFF TOLERANCE (default 1e-6) in magnitude are zeroed, the rest
           scaled to sum to 1, and the node moved to match.
         The moved nodes are written so (Abaqus moves them at the start: no strain).  ->
-        _embed_rows, _embedded_nodes; a node in two cards keeps the first (warned)."""
+        _embed_rows, _embedded_nodes, _embedded_elems; a node in two cards keeps the first
+        (warned)."""
         cards = [b for b in blocks if b.keyword == "EMBEDDED ELEMENT"]
         if not cards:
             return
@@ -25562,10 +25729,13 @@ class _Constraints:
                     kind, nn, _, _, _ = boxes[e]
                     conn = els[e][1]
                     w = embed_weights(kind, nn, xi)
-                    keep = [(conn[i], w[i]) for i in range(nn) if abs(w[i]) >= rtol]
+                    per: Dict[int, float] = {}          # (a collapsed host names a node twice)
+                    for i in range(nn):
+                        per[conn[i]] = per.get(conn[i], 0.0) + w[i]
+                    keep = [(m, x) for m, x in per.items() if abs(x) >= rtol]
                     s = sum(x for _, x in keep)
                     if abs(s) < 1e-3:                   # (a tolerance that zeroes them all)
-                        keep, s = [(conn[i], w[i]) for i in range(nn)], 1.0
+                        keep, s = list(per.items()), 1.0
                     keep = [(m, x / s) for m, x in keep]
                     dim = 3 if kind in ("hex", "tet", "wedge") else 2
                     q = tuple(sum(x * pts[m][k] for m, x in keep) for k in range(dim)) + tuple(p[dim:])
@@ -25587,6 +25757,8 @@ class _Constraints:
                         self.report.warn(f"{what}: {far}: Abaqus stops on them (without PARTIAL EMBED=YES); "
                                          f"left free here.", once=True)
                         self._reduces("*EMBEDDED ELEMENT nodes outside every host")
+        self._embedded_elems = embedded | {e for e, (_t, c) in els.items() if e not in embedded and c and
+                                           all(n in self._embedded_nodes for n in c)}
         if moved:
             d, n = max(moved)
             self.report.note(f"*EMBEDDED ELEMENT: {len(moved)} embedded node(s) moved onto their host "
@@ -27847,6 +28019,7 @@ class _Constraints:
                         _t, na, nb = self._conn[e]
                         h = self._conn_act[(e, c)] = max(self.geom.nodes) + 1
                         self.geom.add_node(h, self.geom.nodes.get(na if na is not None else nb, (0.0, 0.0, 0.0)))
+                    self._conn_act_kind.setdefault(h, set()).add(b.keyword)
                     data.append(f"{h}, 1, 1" + (f", {v}" if v else "") if b.keyword == "CONNECTOR MOTION"
                                 else f"{h}, 1, {v or 0.}")
             keep = ("AMPLITUDE", "TYPE", "FIXED", "USER", "LOAD CASE") if b.keyword == "CONNECTOR MOTION" \
@@ -27854,6 +28027,8 @@ class _Constraints:
             params = [(k, v) for k, v in b.params.items() if k in keep]
             nb_ = mkblock("BOUNDARY" if b.keyword == "CONNECTOR MOTION" else "CLOAD", params, data).placed(b)
             out.append(nb_)
+            if b.keyword == "CONNECTOR LOAD":
+                self._conn_load_cards.append(nb_)
             made[b.keyword] = True
         if made["CONNECTOR MOTION"] or made["CONNECTOR LOAD"]:
             self.report.note("History *CONNECTOR MOTION / *CONNECTOR LOAD -> *BOUNDARY / *CLOAD on DOF 1 "
@@ -28009,10 +28184,13 @@ class _Constraints:
         given = {id(b): self._bc_zero_entries(b) for b in blocks
                  if b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2}
         held: Optional[set] = None              # (node, DOF) held at zero in every step
+        every: Optional[set] = None             # (node, DOF) with a BC in every step
         for active in self.steps.states(lambda b: given[id(b)], skip=self.steps.lc2, blocks=blocks):
             now = {k for k, z in active.items() if z}
             held = now if held is None else held & now
+            every = set(active) if every is None else every & set(active)
         self._conn_held = held or set()
+        self._conn_bc_every = every or set()
         self._conn_bc_dofs = {k for es in given.values() for k, _ in es}
         # nodes whose rotation is loaded or prescribed (not just held at zero)
         turned = {n for es in given.values() for (n, d), _ in es
@@ -29127,10 +29305,12 @@ class _Constraints:
 
         def build(it: dict, a_turns: bool) -> Union[str, Tuple[List[Tuple[int, int]],
                                                                 List[List[Tuple[int, int, float]]],
-                                                                bool, List[dict]]]:
+                                                                bool, List[dict], List[Tuple[dict, bool]]]]:
             """The rows of connector ``it`` as (BCs, *EQUATIONs, whether they hold local DOFs,
-            the specs of its components' rows written: _conn_soft), or why it cannot be
-            written."""
+            the specs of its components' rows written: _conn_soft, the specs whose *CONNECTOR
+            LOAD is left out: a component no DOF of which is free for it, and whether BCs in
+            every step and the connector's own rows determine it — then the load only adds to
+            the reactions, as in Abaqus), or why it cannot be written."""
             rows = [native(rw) for rw in rows_of(it, a_turns)]
             soft = [(s, native(rw)) for s, rw in soft_rows(it, a_turns)]
             why = next((rw for rw in rows + [rw for _s, rw in soft] if isinstance(rw, str)), None)
@@ -29242,7 +29422,16 @@ class _Constraints:
             # equation's dependent DOF wrongly, and stops on a BC there; probed): a DOF that no
             # other equation eliminates and no BC takes
             live: List[dict] = []
+            unloaded: List[Tuple[dict, bool]] = []
             deps = {eq[0][:2] for eq in eqs} | taken_deps
+            fixed = set(self._conn_bc_every) | set(bcs)    # (the DOFs BCs and its own rows set)
+            grew = True
+            while grew:
+                grew = False
+                for eq in eqs:
+                    if eq[0][:2] not in fixed and all(t[:2] in fixed for t in eq[1:]):
+                        fixed.add(eq[0][:2])
+                        grew = True
             for s, rw in soft:
                 terms = OrderedDict()
                 for k, v in rw.items():
@@ -29256,20 +29445,28 @@ class _Constraints:
                     cand = [k for k in terms if k != hk and k not in busy and k not in deps and
                             not (k[0] in kin and k[1] >= 4) and not is_local(k) and
                             k not in self._conn_bc_dofs and k not in bc_rot]
-                    if not cand:
+                    if not cand and self._conn_act_kind.get(s["h"]) == {"CONNECTOR LOAD"}:
+                        # a load only: left out, the rest of the connector kept (its springs on
+                        # the component too, on the helper's DOF: the load cannot sit there)
+                        unloaded.append((s, all(k in fixed for k in terms if k != hk)))
+                        if not (s["k"] or s["c"]):
+                            continue
+                        first = hk
+                    elif not cand:
                         return ("Connector with a *CONNECTOR MOTION / LOAD on a component whose DOFs "
                                 "are all eliminated by other constraints, held, or local DOFs of a "
                                 "node with a *TRANSFORM; commented out — the connector is missing.")
-                    top = max(abs(terms[k]) for k in cand)
-                    big_c = [k for k in cand if abs(terms[k]) >= 0.1 * top]
-                    first = next((k for k in big_c if plain(*k)), big_c[0])
+                    else:
+                        top = max(abs(terms[k]) for k in cand)
+                        big_c = [k for k in cand if abs(terms[k]) >= 0.1 * top]
+                        first = next((k for k in big_c if plain(*k)), big_c[0])
                 else:
                     first = hk
                 eqs.append([(first[0], first[1], terms[first])] +
                            [(k[0], k[1], v) for k, v in terms.items() if k != first])
                 deps.add(first)
                 live.append(s)
-            return bcs, eqs, reduced, live
+            return bcs, eqs, reduced, live, unloaded
         for it in rows_items:
             a = it["a"]
             a_turns = it["rot"] is not None or (a is not None and (carrier(a) is not None or
@@ -29296,7 +29493,7 @@ class _Constraints:
             if isinstance(got, str):
                 it["route"], it["reason"] = "skip", got
                 continue
-            bcs, eqs, reduced, live = got
+            bcs, eqs, reduced, live, unloaded = got
             if nl and twin is None and repeats(eqs):
                 it["route"], it["reason"] = "skip", (
                     "Connector under NLGEOM (or explicit dynamics) between nodes with different "
@@ -29351,6 +29548,24 @@ class _Constraints:
                             "rerun with --approximate to write the linear form (not with "
                             "explicit dynamics, which stops on it).")
                         continue
+            for spec, fixed_by_bcs in unloaded:
+                h = spec["h"]
+                for card in self._conn_load_cards:
+                    card.data[:] = [ln for ln in card.data if ln.split(",")[0].strip() != str(h)]
+                comp = "+".join(str(c) for c in spec["w"])
+                if fixed_by_bcs:
+                    self.report.note(f"*CONNECTOR LOAD on component {comp} of connector element "
+                                     f"{it['eid']} left out: BCs in every step and the connector's "
+                                     f"rigid components determine that component, so the load only "
+                                     f"adds to the reactions (as in Abaqus); the connector is kept.",
+                                     once=True)
+                else:
+                    self.report.warn(f"*CONNECTOR LOAD on component {comp} of connector element "
+                                     f"{it['eid']} left out: no DOF of that component is free for it "
+                                     f"(all eliminated by other constraints, held, or local DOFs of a "
+                                     f"node with a *TRANSFORM); the rest of the connector is kept.",
+                                     once=True)
+                    self._reduces("*CONNECTOR LOAD on a component no DOF of which is free for it")
             if twin is not None:
                 self._mpc_twin(twin[0])          # made now, under the id its rows name
             taken_deps.update(eq[0][:2] for eq in eqs)
@@ -42157,6 +42372,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # node, weight)], DOFs), and node -> the DOFs embedding eliminates
         self._embed_rows: Dict[int, List[Tuple[int, List[Tuple[int, float]], Tuple[int, ...]]]] = {}
         self._embedded_nodes: Dict[int, Tuple[int, ...]] = {}
+        # the elements *EMBEDDED ELEMENT embeds (its data lines' elements; with EMBED NODES
+        # those whose nodes it all embeds): no part of general contact's all-inclusive surface
+        self._embedded_elems: set = set()
         self._gen_ties: set = set()                # the rotation ties the converter writes
         # id(*PRE-TENSION SECTION of a truss / beam cut) -> {elem, node (its last node), copy
         # (that node's copy, the element's end now), pt (pre-tension node), normal, line}
@@ -42298,6 +42516,10 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # value) -> the element set of the springs / dashpots written for them, and those sets'
         # cards written so far; the DASHPOTA elements among them
         self._conn_act: Dict[Tuple[int, int], int] = {}
+        # helper node -> the keywords acting on it; the *CLOAD cards made for the loads
+        self._conn_act_kind: Dict[int, set] = {}
+        self._conn_load_cards: List[Block] = []
+        self._conn_bc_every: set = set()           # (node, DOF) with a BC in every step
         self._conn_fixed: Dict[int, set] = {}
         self._conn_fixed_cards: Dict[int, set] = {}     # id(model-data *CONNECTOR MOTION) -> elements
         self._conn_sets: "OrderedDict[Tuple[str, float], str]" = OrderedDict()

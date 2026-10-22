@@ -4533,6 +4533,20 @@ def test_u1_refusals_keep_todays_section_handling():
     assert "SECTION=RECT" in body and "U1 beam, which carries the profile, cannot be used" in rep.text()
 
 
+
+def test_u1_refused_beside_a_join_align_connector():
+    # JOIN, ALIGN is WELD written out: a *RIGID BODY whose members get knot beams, which ccx
+    # 2.23 stops on beside U1 ('gen3delem: first thickness ... is zero'); refused as for WELD
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 0., 0.\n4, 2., 0., 0.\n*Element, type=B31, elset=BM\n"
+            "1, 1, 2\n2, 3, 4\n*Beam General Section, elset=BM, section=GENERAL\n1.e-2, 1.e-5, 0., 1.e-5, 2.e-5\n"
+            "0., 1., 0.\n2.1e11, 8.1e10\n*Element, type=CONN3D2, elset=C\n10, 2, 3\n*Connector Section, "
+            "elset=C\n{TYP}\n*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n4, 2, 100.\n*End Step\n")
+    for typ in ("JOIN, ALIGN", "WELD", "Align, Join"):
+        body, conv, rep = convert_str(deck.format(TYP=typ))
+        assert "TYPE=U1" not in body and "the deck has BEAM / WELD / LINK connector constraints" in rep.text(), typ
+    body, conv, rep = convert_str(deck.format(TYP="HINGE,"))        # (equations: U1 stays)
+    assert conv._u1
+
 def test_u1_beam_on_an_undefined_node():
     # an element on an undefined node (Abaqus stops on it: warned) gives the U1 plan no n1
     # direction, where it raised KeyError; the other beams are U1 still
@@ -8070,6 +8084,80 @@ def test_general_contact_review_cases():
     body, conv, rep = convert_str(gap, approximate=True)
     assert _gc_lines(body)[0] == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1B2")]
 
+
+
+def test_general_contact_leaves_embedded_elements_out():
+    # Abaqus: "The faces of the embedded elements are not considered part of the all-inclusive
+    # surface" (Constraints Guide, 'Embedded elements'); they made a body inside their host,
+    # contacted against it (an S4 sheet: ccx 'too many cutbacks'; a solid: ADJUST moved its
+    # nodes onto the host's skin).  validate_with_ccx general_contact_approx: the hand pair's force
+    import validate_with_ccx as V
+    for embed in ("S4", "C3D8"):
+        body, conv, rep = convert_str(V.general_contact_deck("general", embed), approximate=True)
+        pairs, surfs = _gc_lines(body)
+        assert pairs == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1B2")] and "ADJUST" not in body, embed
+        assert "the model's 2 bodies" in rep.text() and not set(conv._embedded_elems) - set(range(901, 950))
+        assert all(e < 900 for name, ids in conv.geom.elsets.items() if name.startswith("ABQ2CCX_GC")
+                   for e in ids)
+    # a fibre inside a 2-element host (code check G5-2): the host and the lid only
+    g52 = ("*NODE\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,1\n6,1,0,1\n7,1,1,1\n8,0,1,1\n9,2,0,0\n10,2,1,0\n"
+           "11,2,0,1\n12,2,1,1\n101,0.4,0.4,0.4\n102,1.6,0.4,0.4\n103,1.6,0.6,0.4\n104,0.4,0.6,0.4\n"
+           "105,0.4,0.4,0.6\n106,1.6,0.4,0.6\n107,1.6,0.6,0.6\n108,0.4,0.6,0.6\n201,0,0,1.5\n202,2,0,1.5\n"
+           "203,2,1,1.5\n204,0,1,1.5\n205,0,0,2.5\n206,2,0,2.5\n207,2,1,2.5\n208,0,1,2.5\n"
+           "*ELEMENT, TYPE=C3D8, ELSET=HOST\n1,1,2,3,4,5,6,7,8\n2,2,9,10,3,6,11,12,7\n"
+           "*ELEMENT, TYPE=C3D8, ELSET=FIBRE\n101,101,102,103,104,105,106,107,108\n"
+           "*ELEMENT, TYPE=C3D8, ELSET=LID\n201,201,202,203,204,205,206,207,208\n"
+           "*NSET, NSET=FIX\n1,4,5,8,9,10,11,12\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+           "*SOLID SECTION, ELSET=HOST, MATERIAL=M\n*SOLID SECTION, ELSET=FIBRE, MATERIAL=M\n"
+           "*SOLID SECTION, ELSET=LID, MATERIAL=M\n*EMBEDDED ELEMENT, HOST ELSET=HOST\nFIBRE\n{CONTACT}"
+           "*BOUNDARY\nFIX, 1, 3\n*STEP\n*STATIC\n*BOUNDARY\n205, 3, 3, -0.6\n*END STEP\n")
+    body, conv, rep = convert_str(g52.format(CONTACT="*CONTACT\n*CONTACT INCLUSIONS, ALL EXTERIOR\n"),
+                                  approximate=True)
+    pairs, surfs = _gc_lines(body)
+    assert pairs == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1B2")] and "ADJUST" not in body
+    assert conv._embedded_elems == {101} and not any(101 in ids for ids in conv.geom.elsets.values()
+                                                     if ids is not conv.geom.elsets.get("FIBRE"))
+    # a surface on embedded elements, with its faces, that an inclusion names stays in
+    named = ("*SURFACE, NAME=FS\nFIBRE, S2\n*SURFACE, NAME=LS\nLID, S1\n*CONTACT\n*CONTACT INCLUSIONS\n,\n"
+             "FS, LS\n")
+    pairs, _ = _gc_lines(convert_str(g52.format(CONTACT=named), approximate=True)[0])
+    assert any("FS" in p for p in pairs), pairs
+    # embedded trusses (rebar) are no element general contact misses
+    bar = g52.replace("*ELEMENT, TYPE=C3D8, ELSET=FIBRE\n101,101,102,103,104,105,106,107,108\n",
+                      "*ELEMENT, TYPE=T3D2, ELSET=FIBRE\n101,101,102\n").replace(
+        "*SOLID SECTION, ELSET=FIBRE, MATERIAL=M\n", "*SOLID SECTION, ELSET=FIBRE, MATERIAL=M\n0.01\n")
+    body, conv, rep = convert_str(bar.format(CONTACT="*CONTACT\n*CONTACT INCLUSIONS, ALL EXTERIOR\n"),
+                                  approximate=True)
+    assert "T3D2 elements are not in the contact surfaces" not in rep.text() and _gc_lines(body)[0]
+
+
+def test_general_contact_leaves_out_only_the_faces_a_tie_joins():
+    # Abaqus leaves the surfaces a tie or contact pair joins to it, not their bodies: "interactions
+    # between these surfaces are modeled only with the contact pair algorithm" (general contact
+    # in Abaqus/Standard).  The pair of bodies stays, without the tied faces (it was dropped
+    # whole, with a note blaming the reach).  validate_with_ccx general_contact_tied: the force of
+    # the hand pair of the untied faces
+    import validate_with_ccx as V
+    body, conv, rep = convert_str(V.general_contact_deck("general", tie=True), approximate=True)
+    pairs, surfs = _gc_lines(body)
+    assert pairs == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1M1")]
+    assert _card_at(body, "*ELSET, ELSET=ABQ2CCX_GC1B1S2") == ["3, 4, 7, 8, 11, 12, 15, 16"]   # slave
+    assert surfs["ABQ2CCX_GC1M1"][0] == "ABQ2CCX_GC1B2S1X1, S1"                                 # master
+    assert _card_at(body, "*ELSET, ELSET=ABQ2CCX_GC1B2S1X1") == ["18, 19, 21, 22, 24, 25"]
+    assert "stay in general contact but for the faces of those surfaces" in rep.text()
+    assert "can meet over the analysis" not in rep.text()
+    # a tie over all the faces of one body leaves the pair out, and the note says so; so do
+    # exclusions
+    cubes = _cubes([(0, 0, 0), (0, 0, 1)], (
+        "*SURFACE, NAME=S\n1, S2\n*SURFACE, NAME=T\n2\n*TIE, NAME=G\nT, S\n*CONTACT\n*CONTACT INCLUSIONS, "
+        "ALL EXTERIOR\n*BOUNDARY\n1, 1, 3\n*STEP\n*STATIC\n*CLOAD\n13, 3, -1.\n*END STEP\n"))
+    body, conv, rep = convert_str(cubes, approximate=True)
+    assert "\n*CONTACT PAIR" not in body and "no contact pair is written: 1 pair(s) of bodies the deck's " \
+        "own *TIE or *CONTACT PAIR joins over all the faces of one of them" in rep.text()
+    excl = cubes.replace("*TIE, NAME=G\nT, S\n", "").replace("*BOUNDARY\n1, 1, 3\n*STEP",
+                                                               "*CONTACT EXCLUSIONS\nS, T\n*BOUNDARY\n1, 1, 3\n*STEP")
+    body, conv, rep = convert_str(excl, approximate=True)
+    assert "\n*CONTACT PAIR" not in body and "1 pair(s) of bodies the *CONTACT EXCLUSIONS leave out" in rep.text()
 
 def test_general_contact_rigid_and_unwritable():
     # two rigid bodies (R3D4 skins) and a cube between them: the cube the slave of each, the
@@ -12996,6 +13084,40 @@ def test_connector_motion_and_load_on_helper_nodes():
     assert "** *CONNECTOR MOTION, OP=NEW" in body and rep.reduced
 
 
+
+CONN_LOAD_HELD = ("*Node, nset=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 0., -1.\n*Element, type=B31, elset=BM\n"
+                  "1, 3, 2\n*Beam Section, elset=BM, material=M, section=RECT\n0.1, 0.1\n1., 0., 0.\n"
+                  "*Material, name=M\n*Elastic\n2.e5, 0.3\n*Orientation, name=OR\n0.866025403784, 0.5, 0., "
+                  "-0.5, 0.866025403784, 0.\n*Element, type=CONN3D2, elset=C\n10, 1, 2\n"
+                  "*Connector Section, elset=C, behavior=B\nCARTESIAN,\nOR,\n*Connector Behavior, name=B\n"
+                  "*Connector Elasticity, component=1\n100.\n*Connector Elasticity, rigid\n2\n*Boundary\n"
+                  "1, 1, 6\n3, 1, 6\n*Step\n*Static\n*Boundary\n2, 1, 1, 0.01\n{LOAD}*Node Print, nset=PROBE\n"
+                  "U\n*End Step\n")
+
+
+def test_connector_load_on_a_determined_component_drops_only_the_load():
+    # a *CONNECTOR LOAD on a component that BCs and the connector's rigid components fix only
+    # adds to the reactions in Abaqus: the load is left out (noted), the connector — its spring
+    # and rigid component — kept (it was commented out whole).  validate_with_ccx
+    # connector_load_held: node 2 at uy = 0.01 tan 30 as without the load
+    body, conv, rep = convert_str(CONN_LOAD_HELD.format(LOAD="*Connector Load\n10, 1, 5.\n"))
+    plain, _, _ = convert_str(CONN_LOAD_HELD.format(LOAD=""))
+    assert not conv.reduced_physics and "*CONNECTOR LOAD on component 1 of connector element 10 left out: " \
+        "BCs in every step and the connector's rigid components determine" in rep.text()
+    assert _all_equations(body) == _all_equations(plain) and len(_all_equations(body)) == 2
+    assert "*SPRING, ELSET=ABQ2CCX_CONN_SPRINGA_1\n100." in body and _card_at(body, "*CLOAD") == []
+    # a component whose node is a rigid-body member is not fixed by it: warned, reduced physics
+    deck = BUSH.format(typ="Cartesian", beh="*Connector Elasticity, component=1\n100.\n").replace(
+        "*Cload\n2, 1, 1.\n2, 5, 0.1\n", "*Connector Load\n10, 1, 3.\n*Cload\n3, 1, 1.\n").replace(
+        "*Boundary\n1, 1, 6\n", "*Node\n3, 0.5, 0., 0.\n*Nset, nset=RB\n2\n*Rigid Body, ref node=3, tie nset=RB\n"
+        "*Boundary\n1, 1, 6\n3, 2, 6\n")
+    body, conv, rep = convert_str(deck)
+    assert conv.reduced_physics == ["*CONNECTOR LOAD on a component no DOF of which is free for it"]
+    assert len(_all_equations(body)) == 1                   # (the spring's row)
+    # a motion there still leaves the connector out
+    body, conv, rep = convert_str(CONN_LOAD_HELD.format(LOAD="*Connector Motion\n10, 1, 0.001\n"))
+    assert "*CONNECTOR SECTION" in conv.reduced_physics and not _all_equations(body)
+
 def test_connector_components_under_nlgeom_and_not_converted():
     # translations in a frame that cannot turn (node a held) are exact under NLGEOM; rotation
     # components are not: commented out, or written with --approximate ([APPROX])
@@ -17797,7 +17919,7 @@ def test_parameter_names_without_blanks():
     body, conv, _ = got
     assert "*TIE, NAME=GLUE, POSITION TOLERANCE=0.1" in body and "2, 9, 10, 11, 12" in body
     assert "*COUPLING, REF NODE=100, SURFACE=TOPS, CONSTRAINT NAME=PULL" in body
-    assert any("NO ROTATION" in r for r in conv.reduced_physics)
+    assert not any("NO ROTATION" in r for r in conv.reduced_physics)    # (solids: no rotations)
     for card in ("*Hyperelastic, neohooke", "*Hyperelastic,\nneohooke"):      # also continued
         hyper = HEX + f"*Material, name=R\n{card}\n1., 0.01\n"
         assert "*HYPERELASTIC, NEO HOOKE\n1., 0.01" in convert_str(hyper)[0]
@@ -21894,6 +22016,70 @@ def test_tie_of_shell_edges_on_shell_edges():
                                         "an angle or of another section"]
 
 
+
+SHELL_TEE = ("*Node\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n4, 0., 0.5, 0.\n5, 0.5, 0.5, 0.\n6, 1., 0.5, 0.\n"
+             "7, 0., 1., 0.\n8, 0.5, 1., 0.\n9, 1., 1., 0.\n100, 0., 0.5, 0.\n101, 0.5, 0.5, 0.\n102, 1., 0.5, 0.\n"
+             "103, 0., 0.5, 0.4\n104, 0.5, 0.5, 0.4\n105, 1., 0.5, 0.4\n*Element, type=S4, elset=PLATE\n"
+             "1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n3, 4, 5, 8, 7\n4, 5, 6, 9, 8\n*Element, type=S4, elset=STIF\n"
+             "5, 100, 101, 104, 103\n6, 101, 102, 105, 104\n*Material, name=M\n*Elastic\n2.e5, 0.3\n"
+             "*Shell Section, elset=PLATE, material=M\n0.05\n*Shell Section, elset=STIF, material=M\n0.05\n"
+             "*Nset, nset=CL\n1, 4, 7\n*Surface, name=SE\n5, E1\n6, E1\n*Surface, name=PT\nPLATE, SPOS\n"
+             "{TIE}*Boundary\nCL, 1, 6\n*Step\n*Static\n*Cload\n105, 2, 1.\n105, 3, 1.\n*End Step\n")
+
+
+def test_tie_of_shells_with_no_exact_form_reaches_the_expanded_faces():
+    # the deck's surfaces kept, but with Abaqus' tolerance plus the shells' half thickness: ccx's
+    # default reaches no expanded face half a thickness off ('no tied MPC ... too far away', the
+    # stiffener of a T joint hung free: tip 1.84e11).  validate_with_ccx shell_tie_fallback: 20-24 %
+    # off the merged T joint, 4 % for a solid face on a shell master
+    body, conv, rep = convert_str(SHELL_TEE.format(TIE="*Tie, name=T\nSE, PT\n"))
+    assert _card_at(body, "*TIE, NAME=T, POSITION TOLERANCE=0.120711") == ["SE, PT"]   # 0.0707 + 0.025 + 0.025
+    assert "a shell T joint 20-24 %" in rep.text() and "0.2-8 %" not in rep.text()
+    assert conv.reduced_physics == ["*TIE on conventional shells: a master surface on shells (Abaqus ties to "
+                                    "their reference surface, ccx to a face of its expanded shells)"]
+    body, conv, _ = convert_str(SHELL_TEE.format(TIE="*Tie, name=T, position tolerance=0.01\nSE, PT\n"))
+    assert _card_at(body, "*TIE, NAME=T, POSITION TOLERANCE=0.06") == ["SE, PT"]       # the deck's + 0.05
+    pair = "*Surface Interaction, name=I\n*Contact Pair, interaction=I, tied\nSE, PT\n"
+    body, conv, _ = convert_str(SHELL_TEE.format(TIE=pair))
+    assert _card_at(body, "*TIE, NAME=ABQ2CCX_TIED1, POSITION TOLERANCE=0.0625") == ["SE, PT"]
+    # a solid face tied to a shell master: the shells' half thickness only
+    body, conv, _ = convert_str(_skin(tie="*Tie, name=T1\nTOP, SKIN\n"))
+    assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.191421") == ["TOP, SKIN"]
+
+
+def test_tie_no_rotation_acts_where_both_surfaces_turn():
+    # NO ROTATION: Abaqus ties rotations only where both surfaces have them, so it is moot on
+    # solids (it was flagged as reduced physics); shells on shells keep the flag (ccx ties the
+    # expanded faces, which holds the rotations)
+    solids = _cubes([(0, 0, 0), (0, 0, 1)], "*SURFACE, NAME=S\n1, S2\n*SURFACE, NAME=T\n2, S1\n"
+                    "*TIE, NAME=G, ADJUST=YES, NO ROTATION\nT, S\n*BOUNDARY\n1, 1, 3\n*STEP\n*STATIC\n"
+                    "*CLOAD\n13, 3, -1.\n*END STEP\n")
+    body, conv, rep = convert_str(solids)
+    assert not conv.reduced_physics and "NO ROTATION" not in rep.text()
+    assert [ln for ln in body.splitlines() if not ln.startswith("**")] == \
+        [ln for ln in convert_str(solids.replace(", NO ROTATION", ""))[0].splitlines() if not ln.startswith("**")]
+    _, conv, _ = convert_str(SHELL_TEE.format(TIE="*Tie, name=T, no rotation\nSE, PT\n"))
+    assert "*TIE, NO ROTATION" in conv.reduced_physics
+
+
+def test_tied_pair_keeps_a_faceless_shell_slave_line():
+    # a *CONTACT PAIR, TIED is a tie: its faceless shell line becomes SPOS + SNEG (it was left
+    # out, flagged as reduced physics), and the tie its node form
+    deck = ("*Node\n1, 0., 0., 0.\n2, 2., 0., 0.\n3, 0., 1., 0.\n4, 2., 1., 0.\n5, 0., 0., 1.\n6, 2., 0., 1.\n"
+            "7, 0., 1., 1.\n8, 2., 1., 1.\n201, 0., 0., 1.\n202, 1., 0., 1.\n203, 1., 1., 1.\n204, 0., 1., 1.\n"
+            "205, 2., 0., 1.\n206, 2., 1., 1.\n*Element, type=C3D8, elset=BLK\n1, 1, 2, 4, 3, 5, 6, 8, 7\n"
+            "*Element, type=S4, elset=SH\n301, 201, 202, 203, 204\n302, 202, 205, 206, 203\n"
+            "*Material, name=M\n*Elastic\n30000., 0.2\n*Solid Section, elset=BLK, material=M\n"
+            "*Shell Section, elset=SH, material=M\n0.1\n*Surface, name=TOP\nBLK, S2\n*Surface, name=SK\nSH\n"
+            "*Surface Interaction, name=I\n*Contact Pair, interaction=I, tied\nSK, TOP\n*Nset, nset=FIX\n"
+            "1, 2, 3, 4\n*Boundary\nFIX, 1, 3\n*Step\n*Static\n*Cload\n205, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert _card_at(body, "*SURFACE, NAME=SK") == ["SH, SPOS", "SH, SNEG"] and not conv.reduced_physics
+    assert _card_at(body, "*TIE, NAME=ABQ2CCX_TIED1") == ["SK_NODES, TOP"]
+    # an untied pair keeps today's form: the line left out (ccx has no double-sided surface)
+    _, conv, _ = convert_str(deck.replace("interaction=I, tied", "interaction=I"))
+    assert "*SURFACE without face labels on structural elements" in conv.reduced_physics
+
 def test_kinematic_couplings_on_membrane_and_shell_faces_take_their_nodes():
     # ccx would couple the expanded faces: 1.2 % off on M3D4, a crash (SIGBUS) on M3D3 and on the
     # shells the converter knots for the coupling (probed); Abaqus couples the surface's nodes
@@ -24234,6 +24420,22 @@ def test_embedded_element_ties_the_nodes_to_their_host_interpolation():
     body, conv, _ = convert_str(_emb(data="BAR").replace("11, 101, 102", "11, 1, 7"))
     assert "** *EMBEDDED ELEMENT, HOST ELSET=HOST" in body and not conv.reduced_physics
 
+
+
+def test_embedded_element_merges_a_collapsed_hosts_repeated_nodes():
+    # a C3D8 written as a wedge names nodes twice: their weights are summed, so no *EQUATION
+    # holds a DOF twice (ccx 2.23 can mis-assemble one that does)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 0., 1., 0.\n5, 0., 0., 1.\n6, 1., 0., 1.\n7, 0., 1., 1.\n"
+            "11, 0.2, 0.3, 0.4\n12, 0.5, 0.2, 0.6\n*Element, type=C3D8, elset=H\n1, 1, 2, 3, 3, 5, 6, 7, 7\n"
+            "*Element, type=T3D2, elset=BAR\n9, 11, 12\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=H, material=M\n*Solid Section, elset=BAR, material=M\n0.01\n"
+            "*Embedded Element, host elset=H\nBAR\n*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n12, 1, 1.\n"
+            "*End Step\n")
+    body, conv, _ = convert_str(deck)
+    eqs = _all_equations(body)
+    assert len(eqs) == 6 and all(len({(n, d) for n, d, _ in eq}) == len(eq) for eq in eqs)
+    row = {n: -c for n, d, c in eqs[0][1:]}
+    assert eqs[0][0][:2] == (11, 1) and abs(sum(row.values()) - 1.0) < 1e-12 and sorted(row) == [1, 2, 3, 5, 6, 7]
 
 def test_embedded_element_natural_coordinates_of_every_host_family():
     # Newton's inversion (embed_natural) and the nearest point (embed_nearest) on distorted,

@@ -162,7 +162,8 @@ physics.
   `ROUNDOFF TOLERANCE` are zeroed, as Abaqus does; a node farther out is warned unless `PARTIAL
   EMBED=YES`. A BC on an embedded node's translations is taken off, as Abaqus neglects it. Part,
   instance and assembly level. An embedded bar on its own nodes matches the merged mesh exactly;
-  under a prescribed affine field or a 1 rad turn its nodes and stress are exact.
+  under a prescribed affine field or a 1 rad turn its nodes and stress are exact. A host written
+  as a collapsed hex (a node twice) gets each node once in the equations, its weights summed.
 * **Upgraded shells' new nodes on the curved surface** — the linear shells written as `S8R` /
   `S6` (composite sections; coarse `S4R` under `--approximate`) got their new node at the
   middle of the straight edge, so each quadratic element was a flat facet: on a thin curved
@@ -179,10 +180,13 @@ physics.
   (boxes within four times the largest prescribed travel plus 5 % of the model's size, a
   heuristic; any load: all): one line per slave body (the struck, yielding or finer-meshed one)
   against the union of its masters, the assigned property or Abaqus' hard frictionless default,
-  `ADJUST` where a pair starts overclosed. Self-contact, edge-to-edge contact and pairs of two
-  rigid bodies are left out (warned). Two blocks pressed together carry what a hand-written
-  pair carries, to all digits. Without the option the cards stay commented out, and the
-  warning names `--approximate`.
+  `ADJUST` where a pair starts overclosed. Embedded elements are no part of it, as in Abaqus
+  (a sheet or bar embedded in a block was a body of its own, contacted against its host). A
+  `*TIE` or `*CONTACT PAIR` leaves only the faces it joins out of its bodies' pair, not the
+  pair. Self-contact, edge-to-edge contact and pairs of two rigid bodies are left out (warned).
+  Two blocks pressed together carry what a hand-written pair carries, to all digits, also with
+  an embedded sheet or bar, or partly tied. Without the option the cards stay commented out,
+  and the warning names `--approximate`.
 * **Linear connector behaviour and JOINTC** — a connector with a `*CONNECTOR BEHAVIOR` was
   commented out, and a JOINTC element stopped ccx. Linear `*CONNECTOR ELASTICITY` / `DAMPING`
   (uncoupled or coupled) on the components of `CARTESIAN`, `BUSHING`, `CARDAN`, `ROTATION` and
@@ -195,7 +199,9 @@ physics.
   directions cannot turn (rotation components: `--approximate`). A BUSHING under force and
   moment, a coupled bushing, a JOINTC between U1 or B31 beams, motions, loads and a damped mass
   match their closed forms (validate_with_ccx.py `connector_*`, `jointc_*`). U1 beams may now
-  carry such connectors.
+  carry such connectors (not `JOIN, ALIGN`: a rigid body, as `WELD`). A `*CONNECTOR LOAD` on a
+  component that no free DOF carries is left out, the rest of the connector kept: noted where
+  BCs and rigid components fix that component (Abaqus adds the load to the reactions only).
 
 * **Small conversions** — `*SYSTEM` frames are applied: the `*NODE` coordinates and normals and
   the `*NGEN` arc and parabola points after a `*SYSTEM` card are given in its frame, as Abaqus
@@ -302,8 +308,11 @@ physics.
   nodes with the master no longer leaves the tie out. Where no ccx form is exact (shell nodes
   off the master surface, which Abaqus ties through a rigid offset; a master on shells; shell
   faces on shells; shell edges at an angle or of other sections; a step solving for
-  temperatures), the deck's surfaces stay, warned, as reduced physics. Also for `*CONTACT PAIR,
-  TIED`. Shell edges tied to coplanar edges of the same section stay as they were: exact.
+  temperatures), the deck's surfaces stay with Abaqus' tolerance plus the shells' half
+  thickness (ccx's default tied nothing there), warned, as reduced physics: a solid face on a
+  shell master 4 % off, a shell T joint 20–24 %. Also for `*CONTACT PAIR, TIED`. Shell edges
+  tied to coplanar edges of the same section stay as they were: exact. `NO ROTATION` is
+  flagged only where both surfaces have rotations.
 * **Trusses beside held beam / shell rotations** — ccx 2.23 overwrites one entry of its BC index
   per truss node (`gen3dtruss.f`), so a truss anywhere in the model, even an unconnected one held
   at both ends, could free a held beam or shell rotation without a message (a clamped `B31` tip
