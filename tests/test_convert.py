@@ -16339,20 +16339,26 @@ def test_abaqus_umat_writes_user_materials_for_the_abaqus_interface():
     assert "umat_abaqus.f: small strain" in rep.text() and "linear-elastic example" in rep.text()
     for arg in ("STRAN, DSTRAN, STRESS, DROT", "CELENT", "LAYER, KSPT", "PREDEF, DPRED",
                 "SSE, SPD, SCD", "RPL, DDSDDT, DRPLDE, DRPLDT", "TEMP, DTEMP", "NDI, NSHR, NTENS",
-                "DDSDDE", "PNEWDT", "KSTEP", "CMNAME"):
+                "DDSDDE", "PNEWDT", "KSTEP", "CMNAME", "threads: ccx calls the UMAT in worker threads"):
         assert f"Abaqus-UMAT interface, {arg}" in rep.text(), arg
+    assert "plane-stress branch (NDI = 2" in rep.text()      # never taken: ccx runs them 3-D
     assert "NSTATV" not in rep.text() and "U0" not in rep.text() and "COORDS" not in rep.text()
+    assert "DFGRD0" not in rep.text()
     assert conv.reduced_physics == ["*USER MATERIAL (only a ccx rebuilt with the deck's UMAT runs it)"]
     # NLGEOM: the logarithmic-strain interface, whose start-of-increment stress 2.23 gets wrong;
     # its axes turn with the material, yet DROT is the rotation increment (a build with the
     # U0 fix: a stretched cube turned 90 degrees keeps the UMAT's stress, while a copy turned
-    # by DROT ends up turned 90 degrees from it), and COORDS stays where the point started
+    # by DROT ends up turned 90 degrees from it), and COORDS stays where the point started; a
+    # UMAT that builds its stress from DFGRD1 (global axes) is wrong where the material turns
+    # (a neo-Hookean UMAT in simple shear 0.4: 37 % off ccx's own; exact when handed U)
     body, _, rep = convert_str(UMAT_CUBE.format(name="Mat", step=", NLGEOM"), abaqus_umat=True)
     assert "*MATERIAL, NAME=ABAQUSNLMat\n" in body and "never computes U0" in rep.text()
     for arg in ("STRAN, DSTRAN, STRESS: the logarithmic strain", "DROT: the rotation increment",
-                "COORDS: the integration point in the undeformed model"):
+                "COORDS: the integration point in the undeformed model",
+                "DFGRD0, DFGRD1: the deformation gradients in global axes"):
         assert f"Abaqus-UMAT interface, {arg}" in rep.text(), arg
     assert "corotational frame as in Abaqus" not in rep.text()
+    assert "or DFGRD1 (a hyperelastic one) runs right" not in rep.text()
     # ccx reads the name without blanks and would keep quotes; at most 80 characters
     body, _, rep = convert_str(UMAT_CUBE.format(name='"my mat"', step=""), abaqus_umat=True)
     assert "*MATERIAL, NAME=ABAQUSmymat\n" in body and "MATERIAL=ABAQUSmymat\n" in body

@@ -3883,11 +3883,16 @@ UMAT_ARGUMENT_NOTES = (
     "TEMP, DTEMP: the temperature at the end of the increment, and 0 (Abaqus: at its start, and "
     "the increment)",
     "NDI, NSHR, NTENS: always 3, 3, 6 — ccx runs plane, axisymmetric, shell and beam elements as "
-    "3-D elements",
+    "3-D elements, so a UMAT's plane-stress branch (NDI = 2, which Abaqus takes on plane-stress, "
+    "membrane and shell elements) never runs: its 3-D one does",
     "DDSDDE: used as (DDSDDE + DDSDDE^T)/2 (ccx's tangent is symmetric)",
     "PNEWDT: comes in as -1 (Abaqus: a large value); any value above 0 the UMAT sets redoes the "
     "increment, scaled by it, so PNEWDT = MIN(PNEWDT, x) never cuts back and PNEWDT > 1 is a redo",
     "KSTEP: JSTEP(1), (3), (4) as Abaqus, JSTEP(2) is ccx's own procedure number",
+    "threads: ccx calls the UMAT in worker threads with the system's default stack (512 KB on "
+    "macOS), which large local arrays overrun, corrupting ccx's memory: compile the UMAT with "
+    "gfortran -fmax-stack-var-size=4096 and run ccx with OMP_NUM_THREADS=1; ccx calls no other "
+    "Abaqus subroutine (UEXTERNALDB, SDVINI, ...)",
 )
 # Abaqus output / diagnostics requests ccx has no card for: commented out, the solution is
 # unchanged.
@@ -15348,8 +15353,8 @@ class _Materials:
                                  "right stretch tensor at the start of the increment, so the STRESS "
                                  "it passes in is undefined (zero in a test build, where a J2 UMAT's "
                                  "stress then never built up): only a UMAT that computes the stress "
-                                 "from the total strain or DFGRD1 (a hyperelastic one) runs right as "
-                                 "it is. Set U0 in umat_abaqusnl.f (the user guide gives the lines) "
+                                 "from the total strain (STRAN + DSTRAN) runs right as it is. Set "
+                                 "U0 in umat_abaqusnl.f (the user guide gives the lines) "
                                  "or, where strains and rotations stay small, rename the material "
                                  "ABAQUS<name> (small strain).", once=True)
                 notes = ["STRAN, DSTRAN, STRESS: the logarithmic strain, its increment and the "
@@ -15359,7 +15364,12 @@ class _Materials:
                          "material (Abaqus then passes the unit matrix), so a UMAT that turns its "
                          "tensor state variables by DROT (ROTSIG) turns them away from STRESS",
                          "COORDS: the integration point in the undeformed model (Abaqus: its "
-                         "current position under NLGEOM)"]
+                         "current position under NLGEOM)",
+                         "DFGRD0, DFGRD1: the deformation gradients in global axes, so a UMAT that "
+                         "builds the stress from them (a hyperelastic or crystal-plasticity one) "
+                         "returns global components where ccx expects the turning axes: wrong "
+                         "wherever the material turns (simple shear 0.4: 37 %); hand it the right "
+                         "stretch U (DFGRD1 = R U) in their place, as the user guide shows"]
             else:
                 notes = ["STRAN, DSTRAN, STRESS, DROT: the Green-Lagrange strain and its increment, "
                          "the second Piola-Kirchhoff stress and DROT = identity — Abaqus' values "

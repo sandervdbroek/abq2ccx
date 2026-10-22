@@ -1076,9 +1076,9 @@ def umat_cube_deck(name, nlgeom=False):
             f"*STEP{', NLGEOM' if nlgeom else ''}\n*STATIC\n0.25, 1.\n*BOUNDARY\nTOP,3,3,0.001\n"
             "*EL PRINT, ELSET=E\nS\n*END STEP\n")
 
-# The test UMAT of the umat_build checks: a ccx 2.23 built with it as umat.f by the user
-# guide's --abaqus-umat recipe (the U0 fix included) runs them, with CCX_UMAT naming it:
-#   python -c "import validate_with_ccx as v; print(v.TEST_UMAT, end='')" > umat.f
+# The test UMAT of the umat_build checks: a ccx 2.23 built with it as the deck's UMAT by the
+# user guide's --abaqus-umat recipe (the U0 fix included) runs them, with CCX_UMAT naming it:
+#   python -c "import validate_with_ccx as v; print(v.TEST_UMAT, end='')" > umat_deck.for
 #   CCX_UMAT=/path/to/ccx_umat python validate_with_ccx.py
 TEST_UMAT = """C     abq2ccx validate_with_ccx.py test UMAT. CMNAME (the material name
 C     without ABAQUS/ABAQUSNL) picks the law; PROPS = E, NU (, SY0, H):
@@ -1087,6 +1087,8 @@ C     J2...  EL with J2 plasticity, linear isotropic hardening H, radial
 C            return, consistent tangent; STATEV(1) = PEEQ
 C     ROT... EL; STATEV(1-6) = a copy of the stress turned by DROT each
 C            increment (as ROTSIG), STATEV(7-12) = STRESS, 13-15 COORDS
+C     NHF... Abaqus' neo-Hookean, PROPS = C10, D1, from B = F F^T with
+C            F = DFGRD1; NHU... the same from U^2, U the right stretch
       SUBROUTINE UMAT(STRESS,STATEV,DDSDDE,SSE,SPD,SCD,RPL,DDSDDT,
      1 DRPLDE,DRPLDT,STRAN,DSTRAN,TIME,DTIME,TEMP,DTEMP,PREDEF,DPRED,
      2 CMNAME,NDI,NSHR,NTENS,NSTATV,PROPS,NPROPS,COORDS,DROT,PNEWDT,
@@ -1095,7 +1097,63 @@ C            increment (as ROTSIG), STATEV(7-12) = STRESS, 13-15 COORDS
       CHARACTER*80 CMNAME
       DIMENSION STRESS(NTENS),STATEV(*),DDSDDE(NTENS,NTENS),
      1 STRAN(NTENS),DSTRAN(NTENS),PROPS(*),COORDS(3),DROT(3,3),S(6),
-     2 A(3,3),T(3,3)
+     2 A(3,3),T(3,3),DFGRD1(3,3),W(3),WORK(20)
+      IF (CMNAME(1:2).EQ.'NH') THEN
+        DO I=1,3
+          DO J=1,3
+            A(I,J)=DFGRD1(I,J)
+          END DO
+        END DO
+        IF (CMNAME(3:3).EQ.'U') THEN
+C         U = (F^T F)^(1/2) from the eigenvectors of F^T F
+          DO I=1,3
+            DO J=1,3
+              T(I,J)=DFGRD1(1,I)*DFGRD1(1,J)+DFGRD1(2,I)*DFGRD1(2,J)
+     1          +DFGRD1(3,I)*DFGRD1(3,J)
+            END DO
+          END DO
+          CALL DSYEV('V','U',3,T,3,W,WORK,20,INFO)
+          DO I=1,3
+            DO J=1,3
+              A(I,J)=0.D0
+              DO K=1,3
+                A(I,J)=A(I,J)+T(I,K)*SQRT(W(K))*T(J,K)
+              END DO
+            END DO
+          END DO
+        END IF
+        DET=A(1,1)*(A(2,2)*A(3,3)-A(2,3)*A(3,2))
+     1    -A(1,2)*(A(2,1)*A(3,3)-A(2,3)*A(3,1))
+     2    +A(1,3)*(A(2,1)*A(3,2)-A(2,2)*A(3,1))
+        DO I=1,3
+          DO J=1,3
+            T(I,J)=A(I,1)*A(J,1)+A(I,2)*A(J,2)+A(I,3)*A(J,3)
+          END DO
+        END DO
+        SC=DET**(-2.D0/3.D0)
+        TRB=SC*(T(1,1)+T(2,2)+T(3,3))/3.D0
+        G=2.D0*PROPS(1)
+        BK=2.D0/PROPS(2)
+        DO I=1,3
+          STRESS(I)=G/DET*(SC*T(I,I)-TRB)+BK*(DET-1.D0)
+        END DO
+        STRESS(4)=G/DET*SC*T(1,2)
+        STRESS(5)=G/DET*SC*T(1,3)
+        STRESS(6)=G/DET*SC*T(2,3)
+        DO I=1,6
+          DO J=1,6
+            DDSDDE(I,J)=0.D0
+          END DO
+        END DO
+        DO I=1,3
+          DO J=1,3
+            DDSDDE(I,J)=BK-G/3.D0
+          END DO
+          DDSDDE(I,I)=BK+2.D0*G/3.D0
+          DDSDDE(I+3,I+3)=G/2.D0
+        END DO
+        RETURN
+      END IF
       G=PROPS(1)/(2.D0*(1.D0+PROPS(2)))
       BK=PROPS(1)/(3.D0*(1.D0-2.D0*PROPS(2)))
       B=1.D0
@@ -1261,6 +1319,28 @@ def umat_turn_deck(n=30):
     lines += ["*EL PRINT, ELSET=EALL", "S, SDV", "*END STEP"]
     return "\n".join(lines) + "\n"
 
+def umat_shear_deck(gamma=0.4, n=10):
+    """Three unit C3D8 cubes, every node held, sheared u_x = gamma y in ``n`` fixed increments
+    under NLGEOM: ccx's *HYPERELASTIC, NEO HOOKE (element 1) and TEST_UMAT's neo-Hookean built
+    from DFGRD1 (NHF, element 2) and from its right stretch U (NHU, element 3), C10 0.5, D1 0.1."""
+    corners = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+    lines = ["*NODE"] + [f"{10 * c + k + 1}, {x + 2 * c}, {y}, {z}"
+                         for c in range(3) for k, (x, y, z) in enumerate(corners)]
+    for c, name in enumerate(("NatNH", "NHFMat", "NHUMat")):
+        lines += [f"*ELEMENT, TYPE=C3D8, ELSET=E{c + 1}",
+                  f"{c + 1}, " + ", ".join(str(10 * c + k + 1) for k in range(8)),
+                  f"*MATERIAL, NAME={name}"]
+        lines += (["*HYPERELASTIC, NEO HOOKE", "0.5, 0.1"] if c == 0 else
+                  ["*USER MATERIAL, CONSTANTS=2", "0.5, 0.1"])
+        lines += [f"*SOLID SECTION, ELSET=E{c + 1}, MATERIAL={name}"]
+    lines += ["*ELSET, ELSET=EALL", "1, 2, 3", "*STEP, NLGEOM, INC=1000", "*STATIC, DIRECT",
+              f"{1 / n:g}, 1.", "*BOUNDARY"]
+    lines += [f"{10 * c + k + 1}, {d}, {d}, {gamma * y if d == 1 else 0.:g}"
+              for c in range(3) for k, (_, y, _) in enumerate(corners) for d in (1, 2, 3)]
+    lines += ["*EL PRINT, ELSET=EALL", "S", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
 def umat_build_checks(tmp):
     """The umat_build checks: --abaqus-umat decks in the ccx CCX_UMAT names, built with
     TEST_UMAT (see there).  Skipped without CCX_UMAT, and for a ccx whose UMAT is another one
@@ -1333,6 +1413,22 @@ def umat_build_checks(tmp):
           f"syy {f'{s1[1]:.2f}' if s1 else status} ({big:.2f}); STRESS in turning axes "
           f"{f'{sdv[0][8]:.2f}' if sdv else '-'}, its copy turned by DROT {f'{sdv[0][2]:.2f}, {sdv[0][3]:.2f}' if sdv else '-'}; "
           f"COORDS {sdv[0][14:17] if sdv else '-'} (undeformed)")
+    failures += 0 if ok else 1
+    # DFGRD1 is global: a UMAT that builds its Cauchy stress from it is off where the material
+    # turns (simple shear 0.4), while the same law built from the right stretch U is ccx's own
+    d, status = run(umat_shear_deck())
+    s = [dat_el_stress(os.path.join(d, "job.dat"), e) for e in (1, 2, 3)] if status == "solved" else []
+    shutil.rmtree(d, ignore_errors=True)
+    offf = offu = None
+    if len(s) == 3 and all(s):
+        scale = max(abs(x) for x in s[0])
+        offf = max(abs(a - b) for a, b in zip(s[1], s[0])) / scale
+        offu = max(abs(a - b) for a, b in zip(s[2], s[0])) / scale
+    ok = offu is not None and offu < 1e-6 and offf > 0.1
+    print(f"{'PASS' if ok else 'FAIL'}  umat_build_dfgrd: a neo-Hookean UMAT in simple shear 0.4 against "
+          f"*HYPERELASTIC, NEO HOOKE: built from DFGRD1 {f'{offf:.2f}' if offf is not None else status} "
+          f"off, from its stretch U {f'{offu:.1e}' if offu is not None else '-'} off (the notes: hand "
+          f"it U)")
     failures += 0 if ok else 1
     return failures
 

@@ -34,6 +34,15 @@ physics.
   becomes its consistent nodal forces (0.993–1.007 there); under NLGEOM, where the pressure
   follows the deforming faces, it stays, warned. `CAX8`, plane elements and straight edges with
   the midside node in the middle load exactly in ccx and are unchanged.
+* **`--abaqus-umat`, run on the corpus** — 130 user-material decks run with their own UMATs (31
+  builds of ccx 2.23) showed three more interface facts, now in the notes and the user guide:
+  under `ABAQUSNL` DFGRD0 / DFGRD1 are global while the stress comes in turning axes (a UMAT
+  that builds its stress from DFGRD1 is off where the material turns: neo-Hookean simple
+  shear 37 %; exact when handed the right stretch U), a UMAT's plane-stress branch never runs,
+  and ccx's worker threads (512 KB of stack on macOS) need large UMAT arrays out of the stack.
+  The U0 warning no longer says that a DFGRD1-based UMAT runs right; the user guide builds
+  ccx once and links each deck's UMAT, compiled as Abaqus compiles it, ahead of its archive.
+
 * **ccx stops the conversion now avoids** — a `*TIE` line naming one surface as slave and master
   is left out (Abaqus ties nothing there; ccx 2.23 looped without end), and a solid or node slave
   surface that shares nodes with its master becomes a node surface of its other nodes (Abaqus

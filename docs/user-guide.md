@@ -113,11 +113,7 @@ conda activate ccx-umat
 Unpack the ccx 2.23 sources (`ccx_2.23.src.tar.bz2`, <https://www.dhondt.de>) and, in
 `CalculiX/ccx_2.23/src`:
 
-1. Replace `umat.f` with the deck's UMAT (fixed-form Fortran), with the files it `INCLUDE`s
-   beside it; `ABA_PARAM.INC` holds `implicit real*8(a-h,o-z)` and `parameter (nprecd=2)`. ccx
-   calls only `UMAT` and has none of Abaqus' utility routines (`XIT`, `SINV`, `SPRINC`,
-   `ROTSIG`, `GETOUTDIR`, …): add those the link step reports missing.
-2. Set U0 in `umat_abaqusnl.f`, which ccx 2.23 never does
+1. Set U0 in `umat_abaqusnl.f`, which ccx 2.23 never does
    ([#225](https://github.com/Dhondtguido/CalculiX/issues/225)): under `ABAQUSNL` a UMAT that
    adds to the stress it gets (plasticity, damage, any incremental law) goes wrong without it.
 
@@ -133,26 +129,40 @@ Unpack the ccx 2.23 sources (`ccx_2.23.src.tar.bz2`, <https://www.dhondt.de>) an
    open(p, "w").write(s.replace(a, a + u0, 1))
    EOF
    ```
-3. Build `ccx_umat` (the `-Wno-` flags let today's C compilers take ccx 2.23's C; elsewhere
-   name your C and Fortran compilers in `CC`, `FC` and the link line):
+2. Build ccx's objects, once (the `-Wno-` flags let today's C compilers take ccx 2.23's C;
+   elsewhere name your C and Fortran compilers):
 
    ```bash
    make -j4 CalculiX.o CalculiX.a CC=clang FC=gfortran FFLAGS="-O2 -cpp -fallow-argument-mismatch -w" \
      CFLAGS="-O2 -w -I$CONDA_PREFIX/include/spooles -DARCH=\"Linux\" -DSPOOLES -DARPACK -DMATRIXSTORAGE -DNETWORKOUT -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-implicit-function-declaration -Wno-implicit-int -Wno-return-mismatch"
-   gfortran -o ccx_umat CalculiX.o CalculiX.a $CONDA_PREFIX/lib/spooles.a -L$CONDA_PREFIX/lib -larpack -llapack -lblas -lpthread -lm -Wl,-rpath,$CONDA_PREFIX/lib
+   ```
+3. Compile the deck's UMAT as Abaqus does (fixed form to column 132, preprocessed; add
+   `-ffree-form` for free-form source), with the files it `INCLUDE`s and an `ABA_PARAM.INC`
+   (`implicit real*8(a-h,o-z)`, `parameter (nprecd=2)`) beside it, and link it ahead of
+   ccx's archive (ccx's example UMAT then stays out):
+
+   ```bash
+   gfortran -c -O2 -cpp -ffixed-line-length-132 -fmax-stack-var-size=4096 -fallow-argument-mismatch -fcray-pointer -w umat_deck.for -o umat_deck.o
+   gfortran -o ccx_umat umat_deck.o CalculiX.o CalculiX.a $CONDA_PREFIX/lib/spooles.a -L$CONDA_PREFIX/lib -larpack -llapack -lblas -lpthread -lm -Wl,-rpath,$CONDA_PREFIX/lib
    ```
 
-   For another UMAT, replace `umat.f`, then `gfortran -O2 -c umat.f && ar r CalculiX.a umat.o`
-   and link again.
+   ccx calls only `UMAT` (no `UEXTERNALDB`, `SDVINI`, …) and has none of Abaqus' utility
+   routines (`XIT`, `GETOUTDIR`, `SINV`, `SPRINC`, `ROTSIG`, …): add those the link reports
+   missing. ccx calls the UMAT in worker threads with the system's default stack (512 KB on
+   macOS), which large local arrays overrun, corrupting ccx's memory:
+   `-fmax-stack-var-size=4096` puts them in static memory, so run with `OMP_NUM_THREADS=1`.
 
 Then `abq2ccx --abaqus-umat --run --ccx ./ccx_umat model.inp` converts and runs the deck.
 Built this way with an elastic and a J2 UMAT (isotropic hardening, radial return), cantilevers
 of ten element types bent past yield give exactly the reactions, displacements and stresses of
 the same models with `*ELASTIC` and `*PLASTIC`, and with NLGEOM within 4e-5 of ccx's own
-plasticity; without step 2 the NLGEOM J2 cantilever's tip reaction ends 70 % low. Under
-`ABAQUSNL` the strain and stress come in axes that turn with the material, yet DROT is the
-rotation increment (Abaqus passes the unit matrix in such axes): drop a UMAT's turning of its
-tensor state variables by DROT (`ROTSIG`), or it turns them away from STRESS.
+plasticity; without step 1 the NLGEOM J2 cantilever's tip reaction ends 70 % low. Under
+`ABAQUSNL` the strain and stress come in axes that turn with the material, while DFGRD0,
+DFGRD1 and DROT are global: a UMAT that builds its stress from DFGRD1 (hyperelastic, crystal
+plasticity) must use the right stretch U (DFGRD1 = R U) in its place, and one that turns its
+tensor state variables by DROT (`ROTSIG`) must leave them unturned (a neo-Hookean UMAT in
+simple shear 0.4: 37 % off ccx's own law from DFGRD1, exact from U). A UMAT's plane-stress
+branch (NDI = 2) never runs: ccx calls it in 3-D on plane-stress, membrane and shell elements.
 
 A ccx built with `-DCALCULIX_EXTERNAL_BEHAVIOURS_SUPPORT` (`src/Makefile_MFront`) loads the
 UMAT from a shared library instead: rename the material `@ABAQUS_<LIB>_<FUNCTION>` for the
