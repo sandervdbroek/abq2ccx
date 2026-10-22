@@ -1003,7 +1003,8 @@ def gen_output():
              "After a run that solves, `--run` prints a line or two per step, read from the `.frd` "
              "and `.dat` (`ccx_results_digest`), to set beside the Abaqus results; `--json` gives "
              "it under `results`, one object per step, with `run` (the ccx, its version, the "
-             "status). Values are at the step's last increment.\n",
+             "status, `timeout` after `--timeout`, and `log`, the `<output>.ccx.log` its output "
+             "went to). Values are at the step's last increment.\n",
              md_table(["Key", "What"], [
                  ("`time`", "the total time reached, as ccx writes it"),
                  ("`max_u`, `max_mises`", "the largest \\|U\\| and von Mises stress and their node "

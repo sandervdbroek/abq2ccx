@@ -74,7 +74,10 @@ FreeCAD, PrePoMax and bConverged installs, Homebrew/MacPorts) and compares the r
 references that do not come from the converter. It prints one `PASS`/`FAIL` line per check.
 Each check reads something ccx must solve for (a free node's motion, a reaction, a stress, an
 eigenvalue), and a run counts as solved only if the solve judge (below) finds each step
-setting up its system: ccx 2.23 ends a step that sets up none with "Job finished".
+setting up its system: ccx 2.23 ends a step that sets up none with "Job finished". ccx runs
+as `--run` runs it (`run_ccx_job`), its output streamed to `job.ccx.log` in its run folder
+and held in memory only in part (ccx 2.23 can print without end), and is stopped after
+600 s or 100 MB of output.
 
 | Example | Check | Reference | Agreement |
 | --- | --- | --- | --- |
@@ -222,15 +225,15 @@ The tests:
   conversion records reduced physics (`Converter.reduced_physics`): no deck counts as a
   faithful solve while the converter drops its material model or replaces its element;
   `solver_differs` sits only on `expect_solve` decks. Always runs.
-* `test_corpus_solves` — runs every `expect_solve` and `parse_only` deck in ccx (300 s
-  each). The judge, `classify_ccx_run` (shared with `--run` and `validate_with_ccx.py`),
-  calls a run **solved** when ccx exits 0, prints "Job finished" without an `*ERROR` or a
-  crash message on stdout or stderr, runs analysis steps that each show a solve (the
-  structure of the step's matrix or its number of equations), and writes only finite
-  results to the `.dat` print blocks and the `.frd`; **unsolved** when a step shows none
-  (ccx 2.23 runs a step that sets up no equations to "Job finished" and exit 0);
-  **nonfinite** when it finishes with NaN/Inf (likewise for a diverged solution);
-  **accepted** for a mesh-only deck that reads cleanly; **failed** otherwise.
+* `test_corpus_solves` — runs every `expect_solve` and `parse_only` deck in ccx (300 s and
+  100 MB of output each, as validate runs it). The judge, `classify_ccx_run` (shared with
+  `--run` and `validate_with_ccx.py`), calls a run **solved** when ccx exits 0, prints "Job
+  finished" without an `*ERROR` or a crash message on stdout or stderr, runs analysis steps
+  that each show a solve (the structure of the step's matrix or its number of equations),
+  and writes only finite results to the `.dat` print blocks and the `.frd`; **unsolved**
+  when a step shows none (ccx 2.23 runs a step that sets up no equations to "Job finished"
+  and exit 0); **nonfinite** when it finishes with NaN/Inf (likewise for a diverged
+  solution); **accepted** for a mesh-only deck that reads cleanly; **failed** otherwise.
 * `test_classify_ccx_run` — the judge itself, including the "Job finished, then abort" case
   of issue #3, a `*DYNAMIC` step that sets up no equations (kinematic couplings), and
   NaN/Inf results as ccx 2.23 writes them, also as `-NAN(IND)` (a Windows

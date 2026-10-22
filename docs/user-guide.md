@@ -38,6 +38,7 @@ overwrites a deck abq2ccx did not write.
 | `--json` | print a machine-readable report on stdout |
 | `--run` | run CalculiX on the result and print a digest of its results |
 | `--ccx PATH` | the CalculiX executable for `--run` (`$CCX` works too) |
+| `--timeout SECONDS` | stop ccx after `SECONDS` of wall-clock time (`--run`; default: no limit) |
 | `--no-log`, `--quiet` | write no `.log` file; print no report on stderr |
 | `--version`, `-h` | version; help |
 
@@ -49,7 +50,9 @@ same, so `--run` reads the results and names the first NaN/Inf value, or the ste
 
 **Outputs:** `<output>.inp`, the CalculiX deck, with the report as `**` comments at the
 top; `<output>.log`, the same report as text; and a one-line summary plus the report on
-stderr. Run the deck with `ccx <output>` (no `.inp` extension).
+stderr. Run the deck with `ccx <output>` (no `.inp` extension). `--run` streams ccx's output
+to stderr as it comes and to `<output>.ccx.log` (its first 100 MB, then its last lines), and
+ends with ccx's own `*ERROR` and `*WARNING` lines.
 
 ## `--approximate`
 

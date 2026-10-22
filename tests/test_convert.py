@@ -16690,12 +16690,13 @@ def test_run_reads_ccx_output_in_any_encoding():
     assert code == 0
 
 
-def _fake_ccx(bindir, out):
-    """A stand-in ccx in ``bindir`` that writes the bytes ``out`` to stdout: a script, as
-    bConverged's ccx.bat is on Windows (where cmd.exe reads it in the OEM code page)."""
+def _fake_ccx(bindir, out, then="", child=False):
+    """A stand-in ccx in ``bindir`` that writes the bytes ``out`` to stdout and then runs the
+    Python code ``then``: a script, as bConverged's ccx.bat is on Windows (where cmd.exe reads
+    it in the OEM code page, and runs Python as its child, as the shell does with ``child``)."""
     fake = os.path.join(bindir, "fake_ccx.py")
     with open(fake, "w", encoding="utf-8") as fh:
-        fh.write(f"import sys\nsys.stdout.buffer.write({out!r})\n")
+        fh.write(f"import sys\nsys.stdout.buffer.write({out!r})\nsys.stdout.flush()\n{then}\n")
     if os.name == "nt":
         ccx = os.path.join(bindir, "ccx.bat")
         with open(ccx, "w", encoding="ascii") as fh:
@@ -16703,9 +16704,143 @@ def _fake_ccx(bindir, out):
     else:
         ccx = os.path.join(bindir, "ccx")
         with open(ccx, "w", encoding="utf-8") as fh:
-            fh.write(f'#!/bin/sh\nexec "{sys.executable}" "{fake}" "$@"\n')
+            fh.write(f'#!/bin/sh\n{"" if child else "exec "}"{sys.executable}" "{fake}" "$@"\n')
         os.chmod(ccx, 0o755)
     return ccx
+
+
+_CCX_START = (b" CalculiX Version 2.23\n STEP            1\n\n Static analysis was selected\n"
+              b" Determining the structure of the matrix:\n number of equations\n 24\n")
+
+
+def test_ccx_runner_stops_at_its_output_and_time_limits_with_bounded_memory():
+    # ccx 2.23 can print without end (cascade's "zero coefficient on the dependent side"): held
+    # in memory, its output once filled 13 GB.  run_ccx_job streams it to a log, keeps part of
+    # it, and stops ccx at the log's limit (stop_at_limit) or at the time limit
+    if os.name == "nt" and not (sys.executable + tempfile.gettempdir()).isascii():
+        return                                  # cmd.exe would read the .bat in the OEM code page
+    d = tempfile.mkdtemp()
+    head = A._CCX_HEAD
+    A._CCX_HEAD = 10000                         # (4 MB: the text kept whole, then judge lines)
+    try:
+        warn = "*WARNING in cascade: zero coefficient on the dependent side of an equation"
+        ccx = _fake_ccx(d, _CCX_START, "while True:\n    print(' %s\\n dependent node: 5')" % warn)
+        log = os.path.join(d, "job.ccx.log")
+        r = A.run_ccx_job([ccx, "job"], d, None, log, 60, log_limit=2 << 20, stop_at_limit=True)
+        assert r.stopped == "output" and not r.timed_out and r.status() == "failed", r.stopped
+        assert r.log_cut and (2 << 20) <= os.path.getsize(log) < (3 << 20)
+        assert r.counts["*WARNING"] > 20000 and list(r.messages)[0] == ("*WARNING", warn)
+        assert len(r.messages) <= 2             # (and the line cut at the kill)
+        with open(log, "rb") as fh:
+            text = fh.read().decode()
+        assert text.startswith(_CCX_START.decode()) and "past this log's 2,097,152 bytes; the " \
+            "last 200:]\n" in text and text.endswith("\n")
+        # the text kept: the head whole, the judge's lines, the last 200 lines
+        assert len(r.stdout) < 30000 and r.stdout.startswith(_CCX_START.decode()), len(r.stdout)
+        assert re.search(r"\n \[abq2ccx: from here on \d+ lines of ccx's output left out\]\n", r.stdout)
+        assert r.stdout.count(warn) > 100 and A.ccx_unsolved_steps(r.stdout) == []
+        # a line without end: read 1 MB at a time
+        ccx = _fake_ccx(d, _CCX_START, "while True:\n    sys.stdout.write('x' * 65536)")
+        r = A.run_ccx_job([ccx, "job"], d, None, log, 60, log_limit=4 << 20, stop_at_limit=True)
+        assert r.stopped == "output" and len(r.stdout) < 2 << 20 and r.stdout.endswith("x\n")
+        # the time limit: ccx and the process it started are killed (cmd.exe's child on Windows,
+        # the shell's here), and the run says "timeout"
+        pid = os.path.join(d, "pid")
+        ccx = _fake_ccx(d, _CCX_START, f"import os, time\nopen({pid!r}, 'w').write(str(os.getpid()))\n"
+                                       f"time.sleep(120)", child=True)
+        r = A.run_ccx_job([ccx, "job"], d, None, log, 1)
+        assert r.stopped == "time" and r.timed_out and r.status() == "timeout" and r.seconds < 30
+        assert r.stdout == _CCX_START.decode() and not r.log_cut
+        with open(pid) as fh:
+            pid = int(fh.read())
+        for _ in range(50):
+            if os.name == "nt":
+                break                           # (os.kill would end it)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+            import time
+            time.sleep(0.1)
+        else:
+            raise AssertionError(f"ccx's child {pid} still runs")
+    finally:
+        A._CCX_HEAD = head
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_ccx_runner_keeps_what_the_solve_judge_reads():
+    # past its head, a stream keeps only the lines the judge reads: the verdict stays the
+    # full output's, solved or not, also where a judge line's window crosses the head's end
+    head = A._CCX_HEAD
+    A._CCX_HEAD = 300
+    try:
+        noise = "".join(f" increment {i} attempt 1\n" for i in range(2000))
+        step2 = " STEP            2\n Dynamic analysis was selected\n"
+        solve = " Determining the structure of the matrix:\n number of equations\n 12\n"
+        for out in (_CCX_START.decode() + noise + step2 + noise + solve + noise + " Job finished\n",
+                    _CCX_START.decode() + noise + step2 + noise + " Job finished\n",
+                    " STEP            1\n" + " " * 270 + "\n number of equations\n 36\n" + noise
+                    + " Job finished\n",
+                    _CCX_START.decode() + noise + " *ERROR in e_c3d: nonpositive jacobian\n"
+                    " element 5\n" + noise):
+            s = A._CcxStream("stdout")
+            for ln in out.splitlines(keepends=True):
+                s.add(ln)
+            text = s.text()
+            assert len(text) < len(out) / 4 and "lines of ccx's output left out]" in text
+            assert A.classify_ccx_run(0, text, "") == A.classify_ccx_run(0, out, ""), text
+            assert A.ccx_unsolved_steps(text) == A.ccx_unsolved_steps(out)
+            assert [ln for ln in text.splitlines() if "*ERROR" in ln][:3] == \
+                [ln for ln in out.splitlines() if "*ERROR" in ln][:3]
+    finally:
+        A._CCX_HEAD = head
+
+
+def test_run_streams_ccx_output_to_its_log_with_a_timeout():
+    # --run streams ccx's output to <job>.ccx.log and to the terminal, lists ccx's own *ERROR
+    # and *WARNING lines at the end, and stops ccx at --timeout
+    from contextlib import redirect_stderr, redirect_stdout
+    import json
+    if os.name == "nt" and not (sys.executable + tempfile.gettempdir()).isascii():
+        return                                  # cmd.exe would read the .bat in the OEM code page
+    d = tempfile.mkdtemp()
+    try:
+        deck = os.path.join(d, "hex.inp")
+        with open(deck, "w", encoding="utf-8") as fh:
+            fh.write(HEX + "*STEP\n*STATIC\n*END STEP\n")
+        out = _CCX_START + (b" *WARNING in gen3dnor: a node normal\n *WARNING in gen3dnor: a node "
+                            b"normal\n *ERROR in e_c3d: nonpositive jacobian determinant\n")
+        ccx = _fake_ccx(d, out)
+        with redirect_stderr(io.StringIO()) as err:
+            code = A.main([deck, "--run", "--ccx", ccx])
+        log = os.path.join(d, "hex_ccx.ccx.log")
+        with open(log, "rb") as fh:
+            assert fh.read() == out
+        text = err.getvalue()
+        assert code == 1 and f"its output also goes to {log}\n" + out.decode() in text, text
+        assert text.endswith(f"abq2ccx: ccx printed 1 *ERROR line and 2 *WARNING lines (all its "
+                             f"output: {log}):\n  *ERROR in e_c3d: nonpositive jacobian determinant\n"
+                             f"  *WARNING in gen3dnor: a node normal  (2 times)\n"), text
+        ccx = _fake_ccx(d, _CCX_START, "import time\ntime.sleep(120)")
+        with redirect_stderr(io.StringIO()) as err, redirect_stdout(io.StringIO()) as js:
+            code = A.main([deck, "--run", "--ccx", ccx, "--timeout", "1", "--quiet", "--json"])
+        assert code == 1 and json.loads(js.getvalue())["run"]["status"] == "timeout"
+        assert json.loads(js.getvalue())["run"]["log"] == log
+        assert f"ccx did not finish within --timeout 1 s and was stopped (its output so far: " \
+            f"{log})" in err.getvalue(), err.getvalue()
+        with open(log, "rb") as fh:
+            assert fh.read() == _CCX_START
+        for bad in ([deck, "--timeout", "5"], [deck, "--run", "--timeout", "0"]):
+            with redirect_stderr(io.StringIO()) as err:
+                try:
+                    code = A.main(bad)
+                except SystemExit as exc:
+                    code = exc.code
+            assert code == 2 and "--timeout needs --run and a number of seconds above 0" in \
+                err.getvalue()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_run_fails_on_a_step_that_solves_nothing():
@@ -17169,10 +17304,10 @@ def test_json_has_the_instances_and_the_run():
     # --run: what run_ccx returns lands under "run" and "results" (ccx itself: validate_with_ccx)
     seen = {}
 
-    def fake_run(out_path, override, quiet, digest, instances, model, expanded=None):
-        seen.update(digest=digest, instances=instances, model=model)
+    def fake_run(out_path, override, quiet, digest, instances, model, expanded=None, timeout=None):
+        seen.update(digest=digest, instances=instances, model=model, timeout=timeout)
         return {"code": 0, "ccx": "ccx", "ccx_version": "2.23", "status": "solved",
-                "results": [{"step": 1, "time": 1.0}]}
+                "log": "x.ccx.log", "results": [{"step": 1, "time": 1.0}]}
     real = A.run_ccx
     A.run_ccx = fake_run
     try:
@@ -17183,26 +17318,27 @@ def test_json_has_the_instances_and_the_run():
     finally:
         A.run_ccx = real
     doc = json.loads(out.getvalue())
-    assert doc["run"] == {"ccx": "ccx", "ccx_version": "2.23", "status": "solved"}
+    assert doc["run"] == {"ccx": "ccx", "ccx_version": "2.23", "status": "solved", "log": "x.ccx.log"}
     assert doc["results"] == [{"step": 1, "time": 1.0}]
-    assert seen == {"digest": False, "instances": doc["instances"], "model": (16, 2)}
+    assert seen == {"digest": False, "instances": doc["instances"], "model": (16, 2), "timeout": None}
 
 
 def test_ccx_version_is_read_and_checked():
     import contextlib
-    import subprocess
 
     class Done:
         def __init__(self, text):
             self.stdout, self.stderr, self.returncode = text, "", 201
-    real = A.subprocess.run
+    real = A.run_ccx_job
     calls = []
-    A.subprocess.run = lambda cmd, **kw: (calls.append(cmd), Done("\nThis is Version 2.21\n\n"))[1]
+    A.run_ccx_job = lambda cmd, **kw: (calls.append((cmd, kw)), Done("\nThis is Version 2.21\n\n"))[1]
     try:
-        assert A.ccx_version("/fake/ccx_221") == "2.21" and calls == [["/fake/ccx_221", "-v"]]
+        assert A.ccx_version("/fake/ccx_221") == "2.21" and calls == [
+            (["/fake/ccx_221", "-v"], {"env": None, "timeout": 60, "log_limit": 1 << 20,
+                                       "stop_at_limit": True})]
         assert A.ccx_version("/fake/ccx_221") == "2.21" and len(calls) == 1      # asked once
     finally:
-        A.subprocess.run = real
+        A.run_ccx_job = real
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         A._warn_ccx_version("/fake/ccx_221", "2.21")
@@ -17212,7 +17348,7 @@ def test_ccx_version_is_read_and_checked():
     lines = err.getvalue().splitlines()
     assert len(lines) == 2 and "/fake/ccx_221 is ccx 2.21; abq2ccx targets ccx 2.22-2.23" in lines[0]
     assert "could not tell which ccx version /fake/ccx_unknown is" in lines[1]
-    assert subprocess.run is real
+    assert A.run_ccx_job is real
 # --- composite shells: S4R -> S8R and continuum shells -> one solid per ply ---------------
 
 COMPOSITE_MAT = ("*Material, name=CFRP\n*Elastic, type=ENGINEERING CONSTANTS\n"

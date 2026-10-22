@@ -34,7 +34,6 @@ run without network. The bundled ``examples/`` are exercised by ``test_convert.p
 
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 
@@ -42,7 +41,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "corpus"))
 import abq2ccx as A          # noqa: E402
-import validate_with_ccx as V  # noqa: E402  (reuse find_ccx)
+import validate_with_ccx as V  # noqa: E402  (reuse find_ccx, ccx_job)
 from manifest import CORPUS  # noqa: E402
 
 FILES = os.path.join(ROOT, "corpus", "files")
@@ -119,12 +118,8 @@ def run_ccx(ccx, env, text, read=None):
     results do not hold what it reads."""
     d = tempfile.mkdtemp()
     open(os.path.join(d, "job.inp"), "w", encoding="utf-8", newline="\n").write(text)
-    fe = dict(os.environ)
-    fe.update(env)
     try:
-        p = subprocess.run([ccx, "job"], cwd=d, env=fe, capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=300)
-        status = classify_ccx_run(p.returncode, p.stdout, p.stderr, os.path.join(d, "job"))
+        status = V.ccx_job(ccx, env, d, 300).status(os.path.join(d, "job"))   # "timeout" after 300 s
         if read is None:
             return status
         if status != "solved":
@@ -133,8 +128,6 @@ def run_ccx(ccx, env, text, read=None):
             return status, read(os.path.join(d, "job"))
         except (OSError, LookupError, ValueError) as exc:
             return status, exc
-    except subprocess.TimeoutExpired:
-        return "failed" if read is None else ("failed", None)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -481,10 +474,7 @@ def test_hood_hinge_keeps_one_mechanism_mode():
     d = tempfile.mkdtemp()
     try:
         open(os.path.join(d, "job.inp"), "w", encoding="utf-8", newline="\n").write(convert(name)[0])
-        fe = dict(os.environ)
-        fe.update(env)
-        subprocess.run([ccx, "job"], cwd=d, env=fe, capture_output=True, encoding="utf-8",
-                       errors="replace", timeout=300)
+        V.ccx_job(ccx, env, d, 300)
         lam = eigenvalues(os.path.join(d, "job.dat"))
     finally:
         shutil.rmtree(d, ignore_errors=True)

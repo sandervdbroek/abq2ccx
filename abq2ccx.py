@@ -52,9 +52,12 @@ import operator
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
-from collections import Counter, OrderedDict
+import threading
+import time
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
 
@@ -39149,6 +39152,294 @@ def classify_ccx_run(returncode, stdout: str, stderr: str, job: Optional[str] = 
 
 
 # ---------------------------------------------------------------------------
+# Running ccx with bounded memory: its output streamed to a log, an optional time limit
+# ---------------------------------------------------------------------------
+
+# ccx 2.23 can print without end (a vanishing pivot in cascade: "zero coefficient on the
+# dependent side", for ever): held in memory, that output once filled 13 GB.
+CCX_LOG_LIMIT = 100 << 20       # bytes of ccx's output a run's log keeps; then its last lines
+_CCX_HEAD = 4 << 20             # characters of each stream kept whole as text
+_CCX_TAIL = 200                 # lines kept from the end of each stream
+_CCX_KEPT = 20000               # judge lines kept between the two
+# The lines the solve judge reads (classify_ccx_run, ccx_unsolved_steps), the analysis each
+# step selected, and after "number of equations" and "*ERROR" the 3 lines that follow (the
+# count; the card ccx stopped at)
+_CCX_KEEP_RE = re.compile(r"^\s*STEP\s+\d+\s*$|Determining the structure of the matrix"
+                          r"|number of equations|\*ERROR|Job finished|analysis was selected|"
+                          + "|".join(map(re.escape, CCX_ABORT_SIGNS)))
+
+
+class _CcxStream:
+    """What a run keeps of one of ccx's output streams, read line by line: the text whole up
+    to _CCX_HEAD characters, then only the judge lines (_CCX_KEEP_RE, at most _CCX_KEPT) and
+    the last _CCX_TAIL lines, one line where the first are left out saying how many; and
+    ccx's distinct *ERROR and *WARNING lines with their counts."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.head: List[str] = []
+        self.room = _CCX_HEAD
+        self.kept: List[Tuple[int, str]] = []
+        self.tail: deque = deque(maxlen=_CCX_TAIL)
+        self.n = 0                  # lines read
+        self.n_head = 0             # of them in the head once it is full (0: not yet)
+        self.after = 0              # lines still to keep after a judge line
+        self.logged = 0             # lines written to the log
+        self.messages: Counter = Counter()
+        self.counts = {"*ERROR": 0, "*WARNING": 0}
+        self.error: Optional[BaseException] = None
+
+    def add(self, text: str) -> None:
+        self.n += 1
+        keep = self.after > 0 or bool(_CCX_KEEP_RE.search(text))
+        if keep:
+            self.after = (3 if "*ERROR" in text or "number of equations" in text
+                          else max(self.after - 1, 0))
+        short = text if len(text) <= 2000 else text[:2000] + "\n"
+        self.tail.append((self.n, short))
+        if not self.n_head:
+            self.head.append(text)
+            self.room -= len(text)
+            if self.room <= 0:
+                self.n_head = self.n
+        elif keep and len(self.kept) < _CCX_KEPT:
+            self.kept.append((self.n, short))
+        for kind in ("*ERROR", "*WARNING"):
+            if kind in text:
+                self.counts[kind] += 1
+                key = (kind, " ".join(text.split())[:200])
+                if key in self.messages or len(self.messages) < 100:
+                    self.messages[key] += 1
+                break
+
+    def text(self) -> str:
+        head = "".join(self.head)
+        n, n_head = self.n, self.n_head
+        if not n_head or n == n_head:
+            return head
+        tail = [(i, ln) for i, ln in list(self.tail) if i > n_head]   # (a copy: see run_ccx_job)
+        rest = [(i, ln) for i, ln in list(self.kept) if i < tail[0][0]] + tail
+        left = n - n_head - len(rest)
+        lines = [head if head.endswith("\n") else head + "\n"]
+        at = n_head
+        for i, ln in rest:
+            if left and i > at + 1:             # (not between a judge line and its window)
+                lines.append(f" [abq2ccx: from here on {left} lines of ccx's output left out]\n")
+                left = 0
+            lines.append(ln if ln.endswith("\n") else ln + "\n")
+            at = i
+        return "".join(lines)
+
+
+class _CcxLog:
+    """ccx's output, both streams as they come, to ``echo`` (a text stream) and to a file up
+    to ``limit`` bytes, then the last lines of each stream when the run ends; ``on_full`` is
+    called when the file reaches the limit."""
+
+    def __init__(self, path: Optional[str], limit: int, echo,
+                 on_full: Optional[Callable[[], None]] = None) -> None:
+        self.fh = open(path, "wb") if path else None
+        self.path, self.limit, self.echo, self.on_full = path, limit, echo, on_full
+        self.size, self.full = 0, False
+        self.lock = threading.Lock()
+        self.flushed = time.monotonic()
+
+    def _log(self, raw: bytes) -> None:
+        if self.fh:
+            try:
+                self.fh.write(raw)
+            except (OSError, ValueError):   # a full disk: stop logging, keep reading
+                self.fh = None
+
+    def _echo(self, text: str) -> None:
+        if self.echo:
+            try:
+                self.echo.write(text)
+            except (OSError, ValueError):
+                self.echo = None
+
+    def write(self, stream: _CcxStream, raw: bytes, text: str) -> None:
+        with self.lock:
+            self._echo(text)
+            if self.full:
+                return
+            self.size += len(raw)
+            stream.logged = stream.n
+            self._log(raw)
+            if self.fh and time.monotonic() - self.flushed > 1.0:
+                self.fh.flush()             # a log to follow as ccx runs
+                self.flushed = time.monotonic()
+            if self.size >= self.limit:
+                self.full = True
+                if self.path:
+                    self._echo(f"abq2ccx: ccx's output passed {self.limit:,} bytes: {self.path} "
+                               f"keeps only its last lines from here\n")
+                if self.on_full:
+                    self.on_full()
+
+    def close(self, streams: Sequence[_CcxStream]) -> None:
+        with self.lock:
+            for s in streams if self.full else ():
+                rest = [ln if ln.endswith("\n") else ln + "\n" for i, ln in s.tail if i > s.logged]
+                if rest:
+                    self._log(f"\n[abq2ccx: ccx printed {s.n - s.logged} more lines to {s.name} "
+                              f"past this log's {self.limit:,} bytes; the last {len(rest)}:]\n"
+                              .encode("utf-8"))
+                    for text in rest:
+                        self._log(text.encode("utf-8"))
+            if self.fh:
+                try:
+                    self.fh.close()
+                except OSError:
+                    pass
+                self.fh = None
+
+
+def _read_ccx_stream(pipe, stream: _CcxStream, log: _CcxLog) -> None:
+    """Read one of ccx's pipes to its end, at most 1 MB at a time (a line may never end), as
+    text the way ``text=True`` decodes it (UTF-8, newlines made ``\\n``).  It never stops
+    reading before the end: ccx would block on a full pipe."""
+    for raw in iter(lambda: pipe.readline(1 << 20), b""):
+        try:
+            text = raw.decode("utf-8", "replace")
+            if "\r" in text:
+                text = text.replace("\r\n", "\n").replace("\r", "\n")
+            stream.add(text)
+            log.write(stream, raw, text)
+        except Exception as exc:            # noqa: BLE001  (raised when ccx has ended)
+            stream.error = stream.error or exc
+
+
+def _kill_process_tree(p: "subprocess.Popen") -> None:
+    """Kill ``p`` and every process it started that still runs (a ccx.bat's ccx.exe, a
+    wrapper script's binary).  ccx stays in the caller's process group, where memcap-style
+    guards measure and kill it with the caller."""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    else:
+        try:
+            ps = subprocess.run(["ps", "-A", "-o", "pid=,ppid="], capture_output=True,
+                                text=True, timeout=60).stdout
+        except (OSError, subprocess.SubprocessError):
+            ps = ""
+        children: Dict[int, List[int]] = {}
+        for ln in ps.splitlines():
+            f = ln.split()
+            if len(f) == 2 and f[0].isdigit() and f[1].isdigit():
+                children.setdefault(int(f[1]), []).append(int(f[0]))
+        tree = [p.pid]
+        for pid in tree:                    # (grows as it goes: the whole tree)
+            tree.extend(children.get(pid, ()))
+        for pid in tree[1:]:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    try:
+        p.kill()
+    except OSError:
+        pass
+
+
+class CcxRun:
+    """How a ccx run ended (run_ccx_job).
+
+    * ``returncode`` - ccx's exit code (after a kill too);
+    * ``stopped``    - None, or why the runner killed ccx: ``"time"`` (``timeout`` seconds
+                       passed; ``timed_out``) or ``"output"`` (it printed ``log_limit``
+                       bytes); ``seconds`` the run took;
+    * ``stdout``, ``stderr`` - its output as text: whole up to a few MB, beyond that the
+                       lines the solve judge reads and the last 200, a line saying how many
+                       were left out;
+    * ``log``        - the file holding both streams as they came, up to ``log_limit``
+                       bytes (``log_cut``: it reached them), then each stream's last lines;
+    * ``messages``   - ccx's distinct *ERROR and *WARNING lines, ``(kind, line)`` (blanks
+                       squeezed, 200 characters; the first 100 of each stream) with how
+                       often each came, in order; ``counts`` all of them by kind."""
+
+    def __init__(self, returncode: int, stopped: Optional[str], timeout: Optional[float],
+                 seconds: float, streams: Sequence[_CcxStream], log: _CcxLog) -> None:
+        self.returncode, self.stopped, self.timeout = returncode, stopped, timeout
+        self.timed_out = stopped == "time"
+        self.seconds = seconds
+        self.stdout, self.stderr = (s.text() for s in streams)
+        self.log, self.log_cut, self.log_limit = log.path, log.full, log.limit
+        self.messages: Counter = Counter()
+        for s in streams:
+            self.messages.update(s.messages)
+        self.counts = {k: sum(s.counts[k] for s in streams) for k in ("*ERROR", "*WARNING")}
+
+    def status(self, job: Optional[str] = None) -> str:
+        """``"timeout"`` when ccx was stopped at the time limit, else classify_ccx_run's
+        (``"failed"`` when it was stopped at the output limit)."""
+        if self.timed_out:
+            return "timeout"
+        return classify_ccx_run(self.returncode, self.stdout, self.stderr, job)
+
+
+def run_ccx_job(cmd: Sequence[str], cwd: Optional[str] = None,
+                env: Optional[Dict[str, str]] = None, log: Optional[str] = None,
+                timeout: Optional[float] = None, echo=None, log_limit: int = CCX_LOG_LIMIT,
+                stop_at_limit: bool = False) -> CcxRun:
+    """Run ccx (``cmd``: the executable and the job name) in ``cwd`` with bounded memory, as
+    --run, validate_with_ccx.py and the corpus test do (and probes should): its stdout and
+    stderr are read from pipes (ccx's Fortran output comes in the order the solve judge reads,
+    as with ``capture_output``), shown on ``echo`` as they come, written to ``log`` up to
+    ``log_limit`` bytes and kept in memory only in part (CcxRun).  ccx and every process it
+    started are killed after ``timeout`` seconds of wall-clock time (None: no limit), at the
+    log limit with ``stop_at_limit``, and when the caller is interrupted.  Raises OSError
+    when ccx cannot start."""
+    stopped: List[str] = []
+
+    def stop() -> None:
+        stopped.append("output")
+        _kill_process_tree(p)
+    sink = _CcxLog(log, log_limit, echo, stop if stop_at_limit else None)
+    streams = (_CcxStream("stdout"), _CcxStream("stderr"))
+    t0 = time.monotonic()
+    try:
+        p = subprocess.Popen(list(cmd), cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except BaseException:
+        sink.close(())
+        raise
+    readers = [threading.Thread(target=_read_ccx_stream, args=(pipe, s, sink), daemon=True)
+               for pipe, s in zip((p.stdout, p.stderr), streams)]
+    for t in readers:
+        t.start()
+    killed = False
+    try:
+        try:
+            p.wait(timeout)
+        except subprocess.TimeoutExpired:
+            stopped.insert(0, "time")
+            killed = True
+            _kill_process_tree(p)
+            p.wait()
+    except BaseException:                   # Ctrl-C: ccx must not run on
+        killed = True
+        _kill_process_tree(p)
+        p.wait()
+        raise
+    finally:
+        for t in readers:                   # a process ccx started may hold a pipe open: then
+            t.join(5 if killed or stopped else 60)    # the run ends with what was read
+        if not any(t.is_alive() for t in readers):
+            p.stdout.close()
+            p.stderr.close()
+        sink.close(streams)
+    for s in streams:
+        if s.error:
+            raise s.error
+    return CcxRun(p.returncode, stopped[0] if stopped else None, timeout,
+                  time.monotonic() - t0, streams, sink)
+
+
+# ---------------------------------------------------------------------------
 # ccx results: .frd / .dat readers and the --run digest
 # ---------------------------------------------------------------------------
 
@@ -39713,10 +40004,10 @@ _ccx_warned: set = set()
 def ccx_version(exe: str, env: Optional[Dict[str, str]] = None) -> Optional[str]:
     """The version that ``exe -v`` prints (``"2.23"``), or None."""
     if exe not in _ccx_versions:
-        try:
-            p = subprocess.run([exe, "-v"], env=env, capture_output=True, encoding="utf-8",
-                               errors="replace", timeout=60)
-            m = re.search(r"Version\s+(\d+\.\d+)", p.stdout + p.stderr)
+        try:                    # 60 s and 1 MB at most: --ccx may name any program
+            r = run_ccx_job([exe, "-v"], env=env, timeout=60, log_limit=1 << 20,
+                            stop_at_limit=True)
+            m = re.search(r"Version\s+(\d+\.\d+)", r.stdout + r.stderr)
         except (OSError, subprocess.SubprocessError):
             m = None
         _ccx_versions[exe] = m.group(1) if m else None
@@ -39746,16 +40037,34 @@ def _warn_ccx_version(exe: str, version: Optional[str]) -> None:
                      f"stop on or solve some converted cards differently.\n")
 
 
+def _ccx_messages_text(r: CcxRun, show: int = 10) -> List[str]:
+    """ccx's own *ERROR and *WARNING lines of a run, for the end of --run's report: the
+    distinct ones of each kind (``show`` at most) with how often each came."""
+    if not r.messages:
+        return []
+    counts = " and ".join(f"{n} {k} line{'s' if n != 1 else ''}" for k, n in r.counts.items() if n)
+    lines = [f"abq2ccx: ccx printed {counts}" + (f" (all its output: {r.log})" if r.log else "") + ":"]
+    for kind in ("*ERROR", "*WARNING"):
+        seen = [(m, n) for (k, m), n in r.messages.items() if k == kind]
+        lines += [f"  {m}" + (f"  ({n} times)" if n > 1 else "") for m, n in seen[:show]]
+        if len(seen) > show:
+            lines.append(f"  ... and {len(seen) - show} more distinct {kind} lines")
+    return lines
+
+
 def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = True,
             instances: Sequence[dict] = (), model: Optional[Tuple[int, int]] = None,
-            expanded: Optional[Dict[int, int]] = None) -> dict:
+            expanded: Optional[Dict[int, int]] = None, timeout: Optional[float] = None) -> dict:
     """Run CalculiX on a converted deck.  Returns ``{"code", "ccx", "ccx_version", "status",
-    "results"}``: ``code`` 0 if the analysis solves with finite results (or ccx accepts a
-    mesh-only deck that has nothing to solve), else 1; ``status`` as classify_ccx_run (None
-    if no ccx ran); ``results`` a solved run's ccx_results_digest (``instances``, ``model``),
-    which is also printed unless ``quiet`` or not ``digest``.  Warns once per executable when
-    its version is not one the converter targets."""
-    run: dict = {"code": 1, "ccx": None, "ccx_version": None, "status": None, "results": None}
+    "log", "results"}``: ``code`` 0 if the analysis solves with finite results (or ccx accepts
+    a mesh-only deck that has nothing to solve), else 1; ``status`` as CcxRun.status (None
+    if no ccx ran); ``log`` the file ccx's output streams to, <job>.ccx.log (run_ccx_job:
+    shown as it comes unless ``quiet``; stopped after ``timeout`` seconds); ``results`` a
+    solved run's ccx_results_digest (``instances``, ``model``), which is also printed unless
+    ``quiet`` or not ``digest``.  ccx's own *ERROR and *WARNING lines end the report unless
+    ``quiet``.  Warns once per executable when its version is not one the converter targets."""
+    run: dict = {"code": 1, "ccx": None, "ccx_version": None, "status": None, "log": None,
+                 "results": None}
     if not out_path.endswith(".inp"):           # ccx reads <job>.inp: another file
         sys.stderr.write(f"abq2ccx: not running ccx on {out_path}: ccx reads only a deck named "
                          f"<job>.inp.\n")
@@ -39777,33 +40086,35 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
     run.update(ccx=exe, ccx_version=version)
     stem = os.path.splitext(os.path.basename(out_path))[0]
     cwd = os.path.dirname(os.path.abspath(out_path))
+    log = os.path.join(cwd, stem + ".ccx.log")
     if not quiet:
         sys.stderr.write(f"abq2ccx: running {exe} {stem}" + (f" (ccx {version})" if version else "")
-                         + "\n")
+                         + f"; its output also goes to {log}\n")
     if version:
         _warn_ccx_version(exe, version)
-    try:
-        p = subprocess.run([exe, stem], cwd=cwd, env=env, capture_output=True,
-                           encoding="utf-8", errors="replace")   # it echoes UTF-8 deck lines
+    try:                                        # (it echoes UTF-8 deck lines)
+        r = run_ccx_job([exe, stem], cwd, env, log, timeout, None if quiet else sys.stderr)
     except OSError as exc:
         sys.stderr.write(f"abq2ccx: could not run ccx: {exc}\n")
         run["status"] = "failed"
         return run
-    out = p.stdout + p.stderr
-    if not quiet:
-        sys.stderr.write(out)
+    run["log"] = log
+    out = r.stdout + r.stderr
     if not version:                             # the banner of the run: "CalculiX Version 2.23"
-        m = re.search(r"CalculiX Version\s+(\d+\.\d+)", p.stdout)
+        m = re.search(r"CalculiX Version\s+(\d+\.\d+)", r.stdout)
         run["ccx_version"] = version = m.group(1) if m else None
         _warn_ccx_version(exe, version)
     job = os.path.join(cwd, stem)
-    status = run["status"] = classify_ccx_run(p.returncode, p.stdout, p.stderr, job)
-    if status == "accepted":
+    status = run["status"] = r.status(job)
+    if status == "timeout":
+        sys.stderr.write(f"abq2ccx: ccx did not finish within --timeout {timeout:g} s and was "
+                         f"stopped (its output so far: {log}).\n")
+    elif status == "accepted":
         sys.stderr.write("abq2ccx: ccx accepted the deck, but it has no analysis step — "
                          "nothing was solved.\n")
         run["code"] = 0
     elif status == "unsolved":
-        idle = ccx_unsolved_steps(p.stdout)
+        idle = ccx_unsolved_steps(r.stdout)
         sys.stderr.write(f"abq2ccx: ccx finished, but {'steps' if len(idle) > 1 else 'step'} "
                          f"{', '.join(map(str, idle))} set up no system of equations: ccx solved "
                          f"nothing there, and the results are not a solution.\n")
@@ -39814,7 +40125,7 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
         errs = [ln.strip() for ln in out.splitlines() if "*ERROR" in ln][:3]
         aborts = [s.strip() for s in CCX_ABORT_SIGNS if s in out]
         why = (" | ".join(errs) if errs else
-               _exit_code_text(p.returncode) if p.returncode != 0 else
+               _exit_code_text(r.returncode) if r.returncode != 0 else
                f"crash after 'Job finished' ({aborts[0]})" if aborts else
                "no 'Job finished'")
         sys.stderr.write(f"abq2ccx: ccx did NOT finish cleanly: {why}\n")
@@ -39824,8 +40135,7 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
             run["results"] = ccx_results_digest(job, instances, model, expanded)
         except Exception as exc:    # a convenience: never let it fail a solved run
             sys.stderr.write(f"abq2ccx: could not digest the results ({type(exc).__name__}: {exc})\n")
-            return run
-        if digest and not quiet:
+        if digest and not quiet and run["results"] is not None:
             lines = format_results_digest(run["results"])
             named = any("abaqus" in x for e in run["results"] for x in
                         [e.get("max_u", {}), e.get("max_mises", {})] + e.get("rf", []))
@@ -39833,6 +40143,8 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
                 f"; results digest from {stem}.frd and {stem}.dat"
                 + (" (Abaqus Instance.label in brackets)" if named else "") + ":" if lines else ".")
             sys.stderr.write("\n".join([head] + lines) + "\n")
+    if not quiet and r.messages:
+        sys.stderr.write("\n".join(_ccx_messages_text(r)) + "\n")
     return run
 
 
@@ -39897,7 +40209,8 @@ def _convert_one(path: str, args) -> int:
 
     strict = args.strict and (report.n_warnings > 0 or report.n_commented > 0)
     run = run_ccx(out_path, args.ccx, args.quiet, not args.json_out, report.instances,
-                  conv.model_labels, expanded=conv._qmem_copies) if args.run and wrote and not strict else None
+                  conv.model_labels, expanded=conv._qmem_copies,
+                  timeout=args.timeout) if args.run and wrote and not strict else None
     if args.json_out:
         doc = {
             "tool": "abq2ccx", "version": __version__, "input": path,
@@ -39910,7 +40223,7 @@ def _convert_one(path: str, args) -> int:
             "instances": report.instances,
         }
         if run is not None:
-            doc["run"] = {k: run[k] for k in ("ccx", "ccx_version", "status")}
+            doc["run"] = {k: run.get(k) for k in ("ccx", "ccx_version", "status", "log")}
             doc["results"] = run["results"]
         print(json.dumps(doc))
     if strict:
@@ -39986,6 +40299,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--run", action="store_true",
                     help="run CalculiX on the converted output (auto-detected; see --ccx)")
     ap.add_argument("--ccx", help="CalculiX executable to use with --run ($CCX also honoured)")
+    ap.add_argument("--timeout", type=float, metavar="SECONDS",
+                    help="with --run: stop ccx after SECONDS of wall-clock time (default: no "
+                         "limit). ccx's output streams to <output>.ccx.log either way (its "
+                         "first 100 MB, then its last lines)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args(argv)
     if len(args.input) == 2 and not (args.output or args.outdir) and _output_argument(*args.input):
@@ -40008,6 +40325,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         ap.error("-o/--output is only valid with a single input; use --outdir for batches")
     if args.run and args.output and not args.output.endswith(".inp"):
         ap.error("--run needs an -o/--output name ending in .inp (ccx reads <job>.inp)")
+    if args.timeout is not None and not (args.run and args.timeout > 0):
+        ap.error("--timeout needs --run and a number of seconds above 0")
 
     codes = [_convert_one(p, args) for p in inputs]
     if len(inputs) > 1 and not args.quiet and not args.json_out:

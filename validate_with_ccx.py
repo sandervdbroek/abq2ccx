@@ -120,7 +120,6 @@ import math
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 
@@ -150,21 +149,35 @@ def convert(path, out_inp, approximate=False, abaqus_umat=False):
     return rep, conv
 
 
-def run_ccx(ccx, env, inp_path):
+CCX_TIMEOUT = 600      # seconds of wall-clock time a ccx run gets
+SKIPPED = []           # the checks that printed SKIP
+
+
+def ccx_job(ccx, env, d, timeout=CCX_TIMEOUT):
+    """ccx run on ``d``/job.inp by abq2ccx.run_ccx_job (an abq2ccx.CcxRun): its output streamed
+    to ``d``/job.ccx.log and kept in memory only in part, ccx stopped after ``timeout`` seconds
+    or 100 MB of output (it can print without end)."""
+    return A.run_ccx_job([ccx, "job"], d, {**os.environ, **env}, os.path.join(d, "job.ccx.log"),
+                         timeout, stop_at_limit=True)
+
+
+def run_ccx(ccx, env, inp_path, timeout=CCX_TIMEOUT):
     """Run ccx; return (workdir, status, combined output) with status from
-    abq2ccx.classify_ccx_run ("solved" / "unsolved" / "nonfinite" / "accepted" / "failed")."""
+    abq2ccx.CcxRun.status ("solved" / "unsolved" / "nonfinite" / "accepted" / "failed", or
+    "timeout": stopped after ``timeout`` seconds)."""
     d = tempfile.mkdtemp(prefix="ccxval_")
     shutil.copy(inp_path, os.path.join(d, "job.inp"))
-    full_env = dict(os.environ)
-    full_env.update(env)
     try:
-        r = subprocess.run([ccx, "job"], cwd=d, env=full_env, capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=600)
-        status = A.classify_ccx_run(r.returncode, r.stdout, r.stderr, os.path.join(d, "job"))
+        r = ccx_job(ccx, env, d, timeout)
+        status = r.status(os.path.join(d, "job"))
         out = r.stdout + r.stderr
         if status == "unsolved":                # the checks print the *ERROR lines of a failure
             idle = ", ".join(map(str, A.ccx_unsolved_steps(r.stdout)))
             out += f"\n*ERROR (validate_with_ccx): step {idle} set up no system of equations\n"
+        elif r.stopped:
+            out += "\n*ERROR (validate_with_ccx): ccx stopped: " + (
+                f"no end within {timeout:g} s\n" if r.timed_out else
+                f"it printed {r.log_limit:,} bytes\n")
         return d, status, out
     except Exception as exc:  # noqa: BLE001
         return d, "failed", f"failed to launch ccx: {exc}"
@@ -1352,6 +1365,7 @@ def umat_build_checks(tmp):
     if not ccx:
         print("SKIP  umat_build: CCX_UMAT names no ccx built with TEST_UMAT (--abaqus-umat checks "
               "in a UMAT-built ccx)")
+        SKIPPED.append("umat_build")
         return 0
     failures = 0
 
@@ -1372,6 +1386,7 @@ def umat_build_checks(tmp):
         example = s is not None and abs(s[2] / 210. - 1) < 1e-6
         print(f"SKIP  umat_build: {ccx} does not run TEST_UMAT (a cube with its J2 law: S33 "
               f"{f'{s[2]:.4g}' if s else status}, not 100{': ccx' + chr(39) + 's example UMAT' if example else ''})")
+        SKIPPED.append("umat_build")
         return 0
     # J2 cantilevers: the UMAT against *ELASTIC + *PLASTIC, small strain and NLGEOM (ABAQUSNL,
     # which needs the U0 fix: without it the tip reaction ends 70 % low)
@@ -8593,11 +8608,14 @@ def main():
                 tail = [ln.strip() for ln in out.splitlines() if ln.strip()][-3:]
                 why.append(f"{('the deck', 'its twin')[i]} {status}: {' | '.join(tail)}")
             shutil.rmtree(d, ignore_errors=True)
-        if u[0] and not u[1] and crashed[1]:
-            # the deck solved, but ccx crashed on its hand-written twin at every try (ccx 2.23's
-            # random tempload crash at a *DYNAMIC step's start; Windows' build in every try of
-            # some CI runs): nothing to compare against, which is ccx's fault, not the deck's
-            print(f"SKIP  {label}: ccx crashed on the twin at every try ({'; '.join(why)})")
+        if crashed[1] and (u[0] or crashed[0]):
+            # ccx crashed on the hand-written twin at every try (ccx 2.23's random tempload
+            # crash at a *DYNAMIC step's start; Windows' build in every try of some CI runs),
+            # and the deck solved or crashed alike: nothing to compare, which is ccx's fault,
+            # not the deck's (a crash on the deck alone, a time limit or an *ERROR still FAIL)
+            print(f"SKIP  {label}: ccx crashed on the twin{' and the deck' if crashed[0] else ''} "
+                  f"at every try ({'; '.join(why)})")
+            SKIPPED.append(label)
             return 0
         if not u[0] or u[0].keys() != u[1].keys():
             print(f"FAIL  {label}: no displacements to compare" + (f" ({'; '.join(why)})" if why else ""))
@@ -11682,8 +11700,7 @@ def main():
         convert(src, inp)
         d = tempfile.mkdtemp(prefix="ccxval_")
         shutil.copy(inp, os.path.join(d, "job.inp"))
-        r = subprocess.run([ccx, "job"], cwd=d, env={**os.environ, **env}, capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=600)
+        r = ccx_job(ccx, env, d)
         dat = os.path.join(d, "job.dat")
         blocks = dat_node_blocks(dat)            # (one: step 1's, no second static solve)
         moved = max((abs(x) for blk in blocks for v in blk.values() for x in v), default=0.0)
@@ -11714,8 +11731,7 @@ def main():
         convert(src, inp)
         d = tempfile.mkdtemp(prefix="ccxval_")
         shutil.copy(inp, os.path.join(d, "job.inp"))
-        r = subprocess.run([ccx, "job"], cwd=d, env={**os.environ, **env}, capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=600)
+        r = ccx_job(ccx, env, d)
         blocks = dat_node_blocks(os.path.join(d, "job.dat"))
         moved = max((abs(x) for blk in blocks for v in blk.values() for x in v), default=0.0)
         shutil.rmtree(d, ignore_errors=True)
@@ -13726,8 +13742,7 @@ def main():
     convert(src, inp)
     d = tempfile.mkdtemp(prefix="ccxval_")
     shutil.copy(inp, os.path.join(d, "job.inp"))
-    r = subprocess.run([ccx, "job"], cwd=d, env={**os.environ, **env}, capture_output=True,
-                       encoding="utf-8", errors="replace", timeout=600)
+    r = ccx_job(ccx, env, d)
     disp = frd_blocks(os.path.join(d, "job.frd"), "DISP")      # step 1's, then the modes'
     shutil.rmtree(d, ignore_errors=True)
     top = disp[0][1].get(7, [0.0, 0.0, math.nan])[2] if disp else math.nan
@@ -14645,31 +14660,20 @@ def main():
     def t124_run(tag, kind, reduced=()):
         """(the .dat path's displacement blocks, buckling factor tables, frequency tables, the
         report text) of avoidable_stops_deck(kind) converted and solved with exactly the
-        ``reduced`` physics, or None (FAIL printed).  ccx writes its output to a file of at
-        most 50 MB (POSIX) and gets 120 s: some of these decks made it loop without end."""
+        ``reduced`` physics, or None (FAIL printed).  ccx gets 120 s: some of these decks made
+        it loop without end."""
         src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(avoidable_stops_deck(kind))
         rep, conv = convert(src, inp)
         d = tempfile.mkdtemp(prefix="ccxval_")
         shutil.copy(inp, os.path.join(d, "job.inp"))
-        log = os.path.join(d, "ccx.log")
-        def cap():
-            import resource
-            resource.setrlimit(resource.RLIMIT_FSIZE, (50 << 20, 50 << 20))
-        with open(log, "w") as fh:
-            try:
-                rc = subprocess.run([ccx, "job"], cwd=d, env=dict(os.environ, **env), stdout=fh,
-                                    stderr=subprocess.STDOUT, timeout=120,
-                                    preexec_fn=cap if os.name == "posix" else None).returncode
-            except subprocess.TimeoutExpired:
-                rc = "timeout"
-        out = open(log, encoding="utf-8", errors="replace").read() if os.path.getsize(log) < 20 << 20 else ""
-        # (written to a file, ccx's C and Fortran lines come in another order: classify_ccx_run's
-        # step reading does not apply; the checks below show the solve)
+        r = ccx_job(ccx, env, d, 120)
+        rc, out = r.stopped or r.returncode, r.stdout + r.stderr
+        # (the checks below show the solve)
         status = "solved" if rc == 0 and "Job finished" in out and "*ERROR" not in out and \
             not A.ccx_nonfinite_result(os.path.join(d, "job")) else \
-            f"failed (rc {rc}, {os.path.getsize(log) >> 20} MB of output)"
+            f"failed (rc {rc}, {os.path.getsize(r.log) >> 20} MB of output)"
         dat = os.path.join(d, "job.dat")
         res = None
         if status == "solved":
@@ -14908,7 +14912,8 @@ def main():
             failures += 1
 
     shutil.rmtree(tmp, ignore_errors=True)
-    print(f"\n{'All checks passed.' if not failures else str(failures) + ' check(s) failed.'}")
+    skipped = f" ({len(SKIPPED)} skipped: {', '.join(SKIPPED)})" if SKIPPED else ""
+    print(f"\n{'All checks passed' if not failures else str(failures) + ' check(s) failed'}{skipped}.")
     return 1 if failures else 0
 
 

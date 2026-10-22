@@ -71,6 +71,14 @@ physics.
   out too (ccx's explicit solver stops on it), and material damping with a `*MODAL DYNAMIC` /
   `*STEADY STATE DYNAMICS` step is flagged (ccx applies only `*MODAL DAMPING` there).
   `STRUCTURAL` stays per material; a zero one and `COMPOSITE` are not written.
+* **`--run` streams ccx's output** — it held all of ccx's output in memory and showed it only
+  when ccx ended; ccx 2.23 can print without end (a vanishing pivot in its MPC cascade), and
+  that output once filled 13 GB. Now it shows the output as it comes, writes it to
+  `<output>.ccx.log` (the first 100 MB, then the last lines) with bounded memory, and ends
+  with ccx's own `*ERROR` and `*WARNING` lines, each once with its count. `--timeout SECONDS`
+  stops ccx and what it started after that much wall-clock time (status `timeout`; no limit
+  by default); `--json`'s `run` gives the log's path. `validate_with_ccx.py` and the corpus
+  test run ccx the same way, stopped after their time limit or 100 MB of output.
 * **Explicit mass scaling on part of the model** — `*FIXED MASS SCALING, FACTOR=f, ELSET=...`
   on part of the model (a local factor overriding the global one) was dropped (ccx ran the true
   mass); each section whose elements share a factor now gets a copy of its materials with the
