@@ -27771,17 +27771,26 @@ class _Loads:
                              "moves the DOF to that value at once.", once=True)
             self._reduces("explicit-step BC moved where Abaqus/Explicit holds it")
 
-    def _plan_fixed_rotations(self, blocks: List[Block]) -> None:
-        """*BOUNDARY, FIXED lines on rotations FIXED cannot hold in ccx (_holdable False: a
-        shell, beam or coupling node's), on which ccx 2.23 stops ('parameter FIXED cannot be
-        used for rotations', probed).  Abaqus holds the DOF where the step finds it.  Such a
-        rotation is written as that value on a plain line (constant through the step in either
-        ccx default, as the DOF is there already): 0 where it is still at rest (_dofs_at_rest),
-        else the value of the BC in force on it when the step starts, where the converter
-        knows it (a constant one, an amplitude's end value, or a FIXED one planned so; not one
-        an explicit step ignores the value of).  Else the rotation is left out of the card
-        (free in that step), warned, with reduced physics.  The card's other DOFs keep FIXED;
-        its pieces go to _amp_cards (handle_boundary)."""
+    def _plan_fixed_values(self, blocks: List[Block]) -> None:
+        """*BOUNDARY, FIXED lines on DOFs ccx 2.23's FIXED does not hold where the previous
+        step left them (_fixed_misread): the rotations of a shell, beam or coupling node, on
+        which it stops ('parameter FIXED cannot be used for rotations', probed), and the
+        translations of a node with a *TRANSFORM, which it holds at the node's global
+        displacement component read as the local value (bounadd.f: val = vold(i, node);
+        probed: 0.299 for 0.026) - right only along a local axis that is the global one.
+        Abaqus holds the DOF where the step finds it.  Such a DOF is written as that value on
+        a plain line (constant through the step in either ccx default, as the DOF is there
+        already): 0 where it is still at rest (_dofs_at_rest), else the value of the BC in
+        force on it when the step starts, where the converter knows it (a constant one, an
+        amplitude's end value, or a FIXED one planned so; not one an explicit step ignores
+        the value of; a midside node's interpolated line) - in the node's local axes, as the
+        BC holds it.  In a linear perturbation step FIXED holds the base state: a zero
+        perturbation, 0 (*FREQUENCY zeroes BC values, a *BUCKLE would take another as part
+        of its load), which the restore of a static perturbation step after another step
+        (BaseStateRestore._add_base) adds the base value to - where the base state holds the
+        DOF or it is at rest.  Else a rotation is left out of the card (free in that step)
+        and a translation keeps FIXED, warned, with reduced physics.  The card's other DOFs
+        keep FIXED; its pieces go to _amp_cards (handle_boundary)."""
         model = model_data(blocks)
         mid_ends = {m: (a, c) for a, c, m, _s in self._between()}
         todo: List[Tuple[int, Block, List[dict]]] = []
@@ -27793,11 +27802,11 @@ class _Loads:
                         id(b) in self.steps.lc2 or id(b) in self._amp_cards:
                     continue
                 lines = self._amp_lines(b, mid_ends)
-                rots = {(n, d) for ln in lines for n in ln["nodes"] for d in ln["dofs"]
-                        if d >= 4 and self._holdable(n, d) is False}
-                if rots:
+                pairs = {(n, d) for ln in lines for n in ln["nodes"] for d in ln["dofs"]
+                         if self._fixed_misread(n, d)}
+                if pairs:
                     todo.append((s, b, lines))
-                    query |= rots
+                    query |= pairs
         if not todo:
             return
         rest = self._dofs_at_rest(model, query, {s for s, _, _ in todo if s})
@@ -27806,6 +27815,7 @@ class _Loads:
         totals = {b.uparam("NAME") for b in blocks if b.keyword == "AMPLITUDE" and
                   b.uparam("TIME").replace(" ", "") == "TOTALTIME"}
         step_of = {id(b): step for step in self.steps for b in step.cards}
+        mids = set(mid_ends) & {n for n, _ in query}
         planned: Dict[int, Dict[Tuple[int, int], Optional[float]]] = {}    # card -> its values
 
         def entries(b: Block) -> list:
@@ -27819,53 +27829,87 @@ class _Loads:
             elif amp:
                 factor = None if amp in totals else \
                     held_factor(curves.get(amp), b.param("TIME DELAY"), step.period if step else None)
+            recs = self._bc_records(b)
+            if mids:                                # (the lines handle_boundary adds there)
+                recs += self._bc_records(b, lines=self._midside_records(b, "boundary", only=mids,
+                                                                        note=False))
             return [((n, d), (None if factor is None or mag != mag else mag * factor, id(b)))
-                    for nodes, dofs, mag in self._bc_records(b) for n in nodes for d in dofs
-                    if (n, d) in query]
+                    for nodes, dofs, mag in recs for n in nodes for d in dofs if (n, d) in query]
         folds = self.steps.states(entries, skip=self.steps.lc2, model=True, blocks=[*model, *(
             b for step in self.steps for b in step.cards)])
         start = [dict(next(folds))]                 # what holds each pair when step s + 1 starts
         for step in self.steps:
             end = dict(next(folds))
             start.append(start[-1] if step.no in self._pert_idx else end)   # (the base state again)
-        lost: List[str] = []
+        lost: List[str] = []                        # rotations left out
+        misread: List[str] = []                     # translations left to ccx's FIXED
+        what = {True: "translations of nodes with a *TRANSFORM (ccx 2.23 holds the global "
+                      "component there)", False: "shell/beam rotations (ccx's FIXED takes no rotations)"}
         for s, b, lines in todo:
+            step = self.steps.steps[s - 1] if s else None
+            pert = step is not None and step.perturbation
             at_rest = rest[s][0] if s else query
             held = start[s - 1] if s else {}        # (model data: everything at rest)
             mine = planned.setdefault(id(b), {})
             entries_out: List[Tuple[Optional[str], str]] = []
+            kinds: set = set()
             for ln in lines:
-                keep = [d for d in ln["dofs"] if not (d >= 4 and any(
-                    self._holdable(n, d) is False for n in ln["nodes"]))]
                 if not ln["dofs"]:
                     entries_out.append(("FIXED", ln["text"]))
                     continue
+                odd = {(n, d) for n in ln["nodes"] for d in ln["dofs"] if self._fixed_misread(n, d)}
+                keep = [d for d in ln["dofs"] if not any((n, d) in odd for n in ln["nodes"])]
                 for a, c in dof_runs(keep):
                     entries_out.append(("FIXED", f"{ln['spec']}, {a}, {c}"))
                 for n in ln["nodes"]:
+                    # (the line's other nodes on those DOFs: FIXED holds them, node by node)
+                    for a, c in dof_runs([d for d in ln["dofs"] if d not in keep and (n, d) not in odd
+                                          and self._holdable(n, d) is not None]):
+                        entries_out.append(("FIXED", f"{n}, {a}, {c}"))
+                    left: List[int] = []                # (translations kept FIXED)
                     for d in ln["dofs"]:
-                        if d < 4 or self._holdable(n, d) is not False:
+                        if (n, d) not in odd:
                             continue
-                        if (n, d) in at_rest:
-                            v: Optional[float] = 0.0
-                        else:
+                        kinds.add(d <= 3)
+                        v: Optional[float] = 0.0
+                        if pert:            # (static: the restore adds the base state's value)
+                            if step.proc == "STATIC" and (n, d) not in at_rest and (n, d) not in held:
+                                v = None
+                        elif (n, d) not in at_rest:
                             val, src = held.get((n, d), (None, None))
                             v = planned.get(src, {}).get((n, d)) if val is None and src in planned else val
                         mine[(n, d)] = v
-                        if v is None:
+                        if v is not None:
+                            entries_out.append((None, f"{n}, {d}, {d}, {short_real(v, 12)}"))
+                        elif d <= 3:
+                            misread.append(f"node {n} DOF {d} (step {s})")
+                            left.append(d)
+                        else:
                             lost.append(f"node {n} DOF {d} (step {s})")
                             entries_out.append(("#", f"** abq2ccx: FIXED rotation left out (its value "
                                                      f"is unknown): {n}, {d}, {d}"))
-                        else:
-                            entries_out.append((None, f"{n}, {d}, {d}, {short_real(v, 12)}"))
+                    entries_out += [("FIXED", f"{n}, {a}, {c}") for a, c in dof_runs(left)]
+            if all(v is None and d <= 3 for (n, d), v in mine.items()):
+                continue                            # (all left to ccx's FIXED: the card as it is)
+            at = "the base state (a zero perturbation)" if pert else \
+                "their value at the end of the previous step"
             self._amp_cards[id(b)] = self._bc_pieces(b, entries_out, [
-                "** abq2ccx: *BOUNDARY, FIXED on shell/beam rotations (ccx's FIXED takes no "
-                "rotations): held at their value at the end of the previous step"])
-        self.report.note("*BOUNDARY, FIXED on rotations of shell, beam or coupling nodes: ccx 2.23 "
-                         "stops on FIXED there ('parameter FIXED cannot be used for rotations', "
-                         "probed), so each rotation is held at the value the previous step leaves "
-                         "it at, as Abaqus holds it: 0 where it has not moved, else the value of the "
-                         "BC that holds it.", once=True)
+                f"** abq2ccx: *BOUNDARY, FIXED on {' and '.join(what[k] for k in sorted(kinds))}: "
+                f"held at {at}"])
+        if any(d >= 4 for n, d in query):
+            self.report.note("*BOUNDARY, FIXED on rotations of shell, beam or coupling nodes: ccx 2.23 "
+                             "stops on FIXED there ('parameter FIXED cannot be used for rotations', "
+                             "probed), so each rotation is held at the value the previous step leaves "
+                             "it at, as Abaqus holds it: 0 where it has not moved, else the value of the "
+                             "BC that holds it (in a linear perturbation step: 0, no change of the base "
+                             "state).", once=True)
+        if any(d <= 3 for n, d in query):
+            self.report.note("*BOUNDARY, FIXED on translations of nodes with a *TRANSFORM: ccx 2.23 holds "
+                             "such a DOF at the node's global displacement component, read as the local "
+                             "value (probed), so each is held at the value the previous step leaves it "
+                             "at in the local axes, as Abaqus holds it: 0 where it has not moved, else "
+                             "the value of the BC that holds it (in a linear perturbation step: 0, no "
+                             "change of the base state).", once=True)
         if lost:
             self.report.warn(f"*BOUNDARY, FIXED on rotations of shell, beam or coupling nodes whose "
                              f"value at the end of the previous step the converter does not know "
@@ -27875,6 +27919,29 @@ class _Loads:
                              f"rotations (it stops on them). Give the rotation its value as a BC.",
                              once=True)
             self._reduces("*BOUNDARY, FIXED rotations left free (ccx's FIXED takes no rotations)")
+        if misread:
+            self.report.warn(f"*BOUNDARY, FIXED on translations of nodes with a *TRANSFORM whose value "
+                             f"at the end of the previous step the converter does not know (moved by "
+                             f"loads, or held by a BC it cannot evaluate: {', '.join(misread[:4])}"
+                             f"{', ...' if len(misread) > 4 else ''}): kept as FIXED, which ccx 2.23 "
+                             f"holds at the node's global displacement component, read as the local "
+                             f"value (probed), not where Abaqus holds it. Give the DOF its value as a "
+                             f"BC.", once=True)
+            self._reduces("*BOUNDARY, FIXED on *TRANSFORM translations held at the global component "
+                          "(ccx 2.23)")
+
+    def _fixed_misread(self, n: int, d: int) -> bool:
+        """Whether ccx 2.23's *BOUNDARY, FIXED does not hold DOF ``d`` (1-6) of node ``n``
+        where the previous step left it, as Abaqus does (_plan_fixed_values): FIXED cannot
+        hold it (_holdable), but for a translation along a local axis of the node that is
+        the global one (ccx's global component is the local one there)."""
+        if self._holdable(n, d) is not False:
+            return False
+        if d >= 4:
+            return True
+        ax = self._local_axes(n)
+        return not (isinstance(ax, tuple) and ax[d - 1][d - 1] > 0.0 and
+                    all(abs(ax[d - 1][k]) <= 1e-12 for k in range(3) if k != d - 1))
 
     def _amp_lines(self, b: Block, mid_ends: Dict[int, Tuple[int, int]]) -> List[dict]:
         """The data lines of displacement *BOUNDARY ``b`` as handle_boundary reads them (after
@@ -36080,7 +36147,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_explicit_trusses()           # after the mesh planners: the final element types
         self._check_transforms()
         self._plan_default_amplitudes(blocks)   # reads the ROT NODE axes (_plan_rot_axes)
-        self._plan_fixed_rotations(blocks)      # after it: the cards it leaves
+        self._plan_fixed_values(blocks)         # after it: the cards it leaves
         self._plan_material_facts(blocks)       # after the mesh planners: the final element types
         self._plan_base_state_facts(blocks)     # after _plan_rigid: the analytical surfaces left
         self._plan_initial_temperatures(blocks)     # after the mesh planners: their new nodes

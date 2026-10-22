@@ -99,7 +99,8 @@ along direction 1), temperatures at section points (a plate and a RECT cantileve
 and beam theory) and midside nodes between ends heated on two cards (the one-card decks); an
 explicit bar with *FIXED MASS SCALING, FACTOR=100 against the bar with its masses scaled by hand
 (its increment 10 times the true mass's), and a target increment DT as ccx's selective mass
-scaling (--approximate).
+scaling (--approximate); *BOUNDARY, FIXED on *TRANSFORM translations and in a static perturbation
+step against the twins with the values written.
 
 Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
 an eigenvalue), and a run counts as solved only if ccx's output shows each step setting up
@@ -6689,6 +6690,82 @@ def avoidable_stops_deck(kind):
                 "*STEP,INC=100\n*DYNAMIC,DIRECT\n0.02,1.\n*BOUNDARY\nHBOT,1,3\nLBOT,1,3\n15,1,2\n16,2,2\n"
                 "18,1,1\n*CLOAD,AMPLITUDE=RAMP\nLTOP,3,1.\n*NODE PRINT,NSET=LTOP\nU\n*END STEP\n")
     raise ValueError(kind)
+
+
+_T133_A, _T133_B = (1., 1., 0.5), (-1., 1., 1.)        # the oblique rectangular *TRANSFORM
+_T133_CA, _T133_CB = (0., 0., 0.), (0.3, 0.2, 1.)       # the cylindrical one
+
+
+def fixed_transform_deck(kind):
+    """Decks of task 133: *BOUNDARY, FIXED on DOFs ccx 2.23's FIXED does not hold where Abaqus
+    does (a *TRANSFORM node's translations: at the global component read as the local value;
+    in a static perturbation step), and their twins with the values written.
+
+    * obl / obl_ref: a C3D8 cube on its base, node 7 with an oblique rectangular *TRANSFORM:
+      step 1 prescribes its local u1, u2, step 2 (*BOUNDARY, OP=NEW) holds them with FIXED,
+      under other loads;
+    * cyl / cyl_ref: the same with a cylindrical *TRANSFORM, local u1 and u3;
+    * mid / mid_ref: a two-element B31 pipe cantilever (B32R in ccx: midside nodes), the
+      oblique *TRANSFORM on all its nodes, the outer nodes' local u2 prescribed, then held with
+      FIXED (OP=NEW on the clamp) under a tip load;
+    * sp_tr / sp_ref: the cube's node 7 local u2 prescribed in a general step, held with FIXED
+      in a static perturbation step, and that step without it (the base BC holds it);
+    * sp_rot / sp_rot_ref: an S4 plate's edge rotation likewise."""
+    pr = "*NODE PRINT, NSET=ALLN, GLOBAL=YES\nU\n"
+    if kind.startswith("sp_rot"):
+        hold = "" if kind.endswith("_ref") else "*BOUNDARY, FIXED\n2, 5, 5\n"
+        return ("*HEADING\nfixed rotation, static perturbation\n*NODE, NSET=ALLN\n1, 0., 0., 0.\n2, 1., 0., 0.\n"
+                "3, 1., 1., 0.\n4, 0., 1., 0.\n*ELEMENT, TYPE=S4, ELSET=P\n1, 1, 2, 3, 4\n*SHELL SECTION, "
+                "ELSET=P, MATERIAL=M\n0.1\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*BOUNDARY\n1, 1, 6\n"
+                "4, 1, 6\n*STEP\n*STATIC\n*BOUNDARY\n2, 5, 5, 0.01\n3, 5, 5, 0.01\n*CLOAD\n2, 3, 1.e-3\n" + pr +
+                "*END STEP\n*STEP, PERTURBATION\n*STATIC\n" + hold + "*CLOAD\n3, 3, 1.e-3\n" + pr + "*END STEP\n")
+    if kind.startswith("mid"):
+        hold = "*BOUNDARY\n2, 2, 2, 0.01\n3, 2, 2, 0.02\n" if kind.endswith("_ref") else \
+            "*BOUNDARY, FIXED\n2, 2, 2\n3, 2, 2\n"
+        return ("*HEADING\nfixed midside\n*NODE, NSET=ALLN\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n"
+                "*ELEMENT, TYPE=B31, ELSET=B\n1, 1, 2\n2, 2, 3\n*BEAM SECTION, ELSET=B, MATERIAL=M, "
+                "SECTION=PIPE\n0.1, 0.01\n0., 0., -1.\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+                "*TRANSFORM, NSET=ALLN\n%g, %g, %g, %g, %g, %g\n*BOUNDARY\n1, 1, 6\n" % (_T133_A + _T133_B) +
+                "*STEP\n*STATIC\n*BOUNDARY\n2, 2, 2, 0.01\n3, 2, 2, 0.02\n" + pr + "*END STEP\n*STEP\n*STATIC\n"
+                "*BOUNDARY, OP=NEW\n1, 1, 6\n" + hold + "*CLOAD\n3, 1, 0.1\n3, 3, 1.e-3\n" + pr + "*END STEP\n")
+    cube = ("*NODE, NSET=ALLN\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+            "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*ELEMENT, TYPE=C3D8, ELSET=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*NSET, NSET=BOT\n1, 2, 3, 4\n*NSET, NSET=N7\n7\n*SOLID SECTION, ELSET=E, MATERIAL=M\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*BOUNDARY\nBOT, 1, 3\n")
+    if kind.startswith("sp_"):
+        hold = "" if kind.endswith("_ref") else "*BOUNDARY, FIXED\n7, 2, 2\n"
+        return ("*HEADING\nfixed transform, static perturbation\n" + cube +
+                "*TRANSFORM, NSET=N7\n%g, %g, %g, %g, %g, %g\n" % (_T133_A + _T133_B) +
+                "*STEP\n*STATIC\n*BOUNDARY\n7, 2, 2, 0.01\n*CLOAD\n6, 1, 5.\n" + pr + "*END STEP\n"
+                "*STEP, PERTURBATION\n*STATIC\n" + hold + "*CLOAD\n8, 3, -5.\n" + pr + "*END STEP\n")
+    cyl = kind.startswith("cyl")
+    dofs = (1, 3) if cyl else (1, 2)
+    vals = dict(zip(dofs, (0.01, -0.005) if cyl else (0.01, -0.02)))
+    tr = ("*TRANSFORM, NSET=N7, TYPE=C\n%g, %g, %g, %g, %g, %g\n" % (_T133_CA + _T133_CB) if cyl else
+          "*TRANSFORM, NSET=N7\n%g, %g, %g, %g, %g, %g\n" % (_T133_A + _T133_B))
+    given = "".join(f"7, {d}, {d}, {vals[d]}\n" for d in dofs)
+    hold = "*BOUNDARY\n" + given if kind.endswith("_ref") else \
+        "*BOUNDARY, FIXED\n" + "".join(f"7, {d}, {d}\n" for d in dofs)
+    return ("*HEADING\nfixed transform\n" + cube + tr + "*STEP\n*STATIC\n*BOUNDARY\n" + given +
+            "*CLOAD\n6, 1, 5.\n8, 2, 5.\n" + pr + "*END STEP\n*STEP\n*STATIC\n*BOUNDARY, OP=NEW\nBOT, 1, 3\n" +
+            hold + "*CLOAD, OP=NEW\n5, 1, 10.\n6, 3, -5.\n" + pr + "*END STEP\n")
+
+
+def _t133_axes(kind, p):
+    """The local axes 1, 2, 3 of fixed_transform_deck(kind)'s *TRANSFORM at point ``p``."""
+    def unit(v):
+        n = math.sqrt(sum(x * x for x in v))
+        return tuple(x / n for x in v)
+
+    def cross(a, b):
+        return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+    if kind.startswith("cyl"):
+        e3 = unit(tuple(b - a for a, b in zip(_T133_CA, _T133_CB)))
+        q = tuple(x - a for x, a in zip(p, _T133_CA))
+        e1 = unit(tuple(x - e * sum(y * f for y, f in zip(q, e3)) for x, e in zip(q, e3)))
+        return e1, cross(e3, e1), e3
+    e1, e3 = unit(_T133_A), unit(cross(_T133_A, _T133_B))
+    return e1, cross(e3, e1), e3
 
 
 def main():
@@ -14301,6 +14378,79 @@ def main():
               f"one of density 1, initial temperatures, *DYNAMIC): {len(runs[0][0])} increments as with "
               f"*DENSITY 0 ({err:.1e} apart; top u_z {moved:.6g}; before: the other cube's density)")
     failures += 0 if ok else 1
+
+    # --- task 133: *BOUNDARY, FIXED on *TRANSFORM translations (ccx 2.23 holds the global
+    # component, read as the local value) and in a static perturbation step: the values ---
+    def t133_run(tag, kind, reduced=()):
+        """(the displacement blocks, the report text) of fixed_transform_deck(kind) converted and
+        solved with exactly the ``reduced`` physics, or None (FAIL printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(fixed_transform_deck(kind))
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        blocks = dat_node_blocks(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if blocks is None or sorted(conv.reduced_physics) != sorted(reduced):
+            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if blocks is None else
+                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return blocks, rep.text()
+
+    def t133_apart(a, b):
+        """The largest difference between two lists of {node: values} blocks, the largest |value|."""
+        if len(a) != len(b) or not b:
+            return math.inf, 0.0
+        err = max(abs(x - y) for p, q in zip(a, b) for n, v in q.items()
+                  for x, y in zip(p.get(n, [math.inf] * len(v)), v))
+        return err, max(abs(x) for q in b for v in q.values() for x in v)
+
+    for kind, what in (("obl", "an oblique rectangular *TRANSFORM, local u1, u2"),
+                       ("cyl", "a cylindrical *TRANSFORM, local u1, u3")):
+        runs = [t133_run(f"t133_{kind}", kind), t133_run(f"t133_{kind}_ref", kind + "_ref")]
+        ok = all(runs)
+        if ok:
+            err, scale = t133_apart(runs[0][0], runs[1][0])
+            ax = _t133_axes(kind, (1., 1., 1.))
+            u1, u2 = runs[1][0][0][7], runs[1][0][1][7]           # node 7, global, steps 1 and 2
+            dofs, vals = ((1, 3), (0.01, -0.005)) if kind == "cyl" else ((1, 2), (0.01, -0.02))
+            held = max(abs(sum(e * u for e, u in zip(ax[d - 1], u2)) - v) for d, v in zip(dofs, vals))
+            # (what ccx 2.23's FIXED held: the global components, step 1's)
+            before = max(abs(u1[d - 1] - v) for d, v in zip(dofs, vals))
+            moved = max(abs(x - y) for n in runs[1][0][1] for x, y in zip(runs[1][0][1][n], runs[1][0][0][n]))
+            ok = err <= 1e-12 * scale and held < 1e-7 and moved > 1e-3 and before > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  t133_{kind} (a C3D8 cube, node 7 with {what} prescribed in "
+                  f"step 1 and held with *BOUNDARY, FIXED in step 2 under other loads): the twin with the "
+                  f"values written ({err:.1e} apart; node 7 at them to {held:.1e}, the rest moved "
+                  f"{moved:.4g}; before: held at step 1's global components, {before:.4g} off)")
+        failures += 0 if ok else 1
+    beam = ["element B31 -> B32R (SECTION=PIPE needs a 3-node beam in ccx)"]
+    runs = [t133_run("t133_mid", "mid", beam), t133_run("t133_mid_ref", "mid_ref", beam)]
+    ok = all(runs)
+    if ok:
+        err, scale = t133_apart(runs[0][0], runs[1][0])
+        moved = max(abs(v[0]) for v in runs[1][0][1].values())
+        ok = err <= 1e-12 * scale and moved > 1e-4 and "midside" in " ".join(runs[0][1].split())
+        print(f"{'PASS' if ok else 'FAIL'}  t133_mid (a two-element B31 pipe cantilever, B32R in ccx, an "
+              f"oblique *TRANSFORM on all nodes, the outer nodes' local u2 held with *BOUNDARY, FIXED "
+              f"after a step prescribing them): the twin with the values written, the midside node's "
+              f"interpolated ({err:.1e} apart; tip u_x {moved:.4g})")
+    failures += 0 if ok else 1
+    sp = ["*STEP, PERTURBATION static step after a general step"]
+    for kind, what in (("sp_tr", "a *TRANSFORM node's local u2"), ("sp_rot", "an S4 plate's edge rotation")):
+        ref = "sp_ref" if kind == "sp_tr" else "sp_rot_ref"
+        runs = [t133_run(f"t133_{kind}", kind, sp), t133_run(f"t133_{ref}", ref, sp)]
+        ok = all(runs)
+        if ok:
+            err, scale = t133_apart(runs[0][0], runs[1][0])
+            moved = max(abs(x - y) for n in runs[1][0][1] for x, y in zip(runs[1][0][1][n], runs[1][0][0][n]))
+            ok = err <= 1e-12 * scale and moved > 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  t133_{kind} ({what} prescribed in a general step, held "
+                  f"with *BOUNDARY, FIXED in a static perturbation step): as without the FIXED card, the "
+                  f"base BC holding it ({err:.1e} apart; the step moves the model {moved:.4g}; before: "
+                  f"{'the global component' if kind == 'sp_tr' else 'twice the base value'})")
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)

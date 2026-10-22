@@ -12,6 +12,14 @@ physics.
   case's own, about the same base state, as Abaqus reads them; a `*BOUNDARY, OP=NEW` in any case
   releases the base-state BCs in every case. A two-case step after a loaded static step now
   matches the hand-written single-case steps exactly (the superposed answer was 0.02 off).
+* **`*BOUNDARY, FIXED` on `*TRANSFORM` translations** — ccx 2.23 holds such a DOF at the
+  node's global displacement component, read as the local value (silently wrong). It is now
+  written as the value the step finds it at, in the local axes: 0 at rest, else the value of
+  the BC that holds it (a midside node's interpolated one too); where that is unknown (moved by
+  loads) FIXED stays, warned. A local axis along the global one keeps FIXED. A FIXED rotation
+  on an upgraded beam's midside node gets its value too (it was left free). In a linear
+  perturbation step a FIXED translation or shell/beam rotation is a zero perturbation (a FIXED
+  rotation in a static perturbation step was given twice its base value).
 * **Explicit mass scaling on part of the model** — `*FIXED MASS SCALING, FACTOR=f, ELSET=...`
   on part of the model (a local factor overriding the global one) was dropped (ccx ran the true
   mass); each section whose elements share a factor now gets a copy of its materials with the

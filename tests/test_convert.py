@@ -20224,6 +20224,80 @@ def test_fixed_rotations_held_at_their_values():
     assert conv.reduced_physics == ["*BOUNDARY, FIXED rotations left free (ccx's FIXED takes no rotations)"]
 
 
+FIXED_TR_HEX = VEL_HEX.replace("*DENSITY\n1.\n", "*DENSITY\n1.\n*NSET, NSET=N7\n7\n") + \
+    "*Transform, nset=N7\n1., 1., 0.5, -1., 1., 1.\n"
+
+
+def test_fixed_transformed_translations_held_at_local_values():
+    # ccx 2.23 holds a FIXED translation of a *TRANSFORM node at its global displacement
+    # component, read as the local value: the value the step finds it at instead (0 at rest,
+    # a BC's value, in the local axes); unknown: FIXED kept, warned
+    s1 = "*Step\n*Static\n*Boundary\n7, 2, 2, 0.01\n*Cload\n7, 1, 1.\n*End Step\n"
+    body, conv, rep = convert_str(FIXED_TR_HEX + s1 + "*Step\n*Static\n*Boundary, op=NEW\nBOT, 1, 3\n"
+                                  "*Boundary, fixed\n7, 1, 3\n*Cload, op=NEW\n6, 2, 1.\n*End Step\n")
+    assert "*BOUNDARY\n7, 2, 2, 0.01\n*BOUNDARY, FIXED\n7, 1, 1\n7, 3, 3\n" in _step(body, 2)
+    assert "node 7 DOF 1 (step 2), node 7 DOF 3 (step 2)): kept as FIXED" in rep.text()
+    assert conv.reduced_physics == ["*BOUNDARY, FIXED on *TRANSFORM translations held at the global "
+                                    "component (ccx 2.23)"]
+    body, conv, _ = convert_str(FIXED_TR_HEX + "*Boundary, fixed\n7, 1, 3\n*Step\n*Static\n*Boundary, "
+                                "fixed\nTOP, 1, 3\n*Cload\n6, 2, 1.\n*End Step\n")
+    assert "*BOUNDARY\n7, 1, 1, 0.\n7, 2, 2, 0.\n7, 3, 3, 0.\n*STEP" in body      # model data: at rest
+    # a set's other nodes keep FIXED, node by node
+    assert "*BOUNDARY, FIXED\n5, 1, 3\n6, 1, 3\n*BOUNDARY\n7, 1, 1, 0.\n7, 2, 2, 0.\n7, 3, 3, 0.\n" \
+           "*BOUNDARY, FIXED\n8, 1, 3\n" in _step(body, 1) and not conv.reduced_physics
+    # all unknown: the card as written; a local axis along the global one: ccx's FIXED is right
+    turned = FIXED_TR_HEX.replace("1., 1., 0.5, -1., 1., 1.", "0., 1., 0., -1., 0., 0.")
+    body, conv, rep = convert_str(turned + "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Static\n"
+                                  "*Boundary, fixed\n7, 1, 3\n*End Step\n")
+    assert "*BOUNDARY, FIXED\n7, 1, 3\n" in body and "held at their value" not in body
+    assert "node 7 DOF 2 (step 2)): kept" in rep.text() and "node 7 DOF 3" not in rep.text()
+    body, conv, rep = convert_str(turned + "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Static\n"
+                                  "*Boundary, fixed\n7, 3, 3\n*End Step\n")
+    assert "*BOUNDARY, FIXED\n7, 3, 3\n" in body and "FIXED on translations" not in rep.text()
+    # cylindrical: the BC values, in its local axes
+    cyl = FIXED_TR_HEX.replace("*Transform, nset=N7\n", "*Transform, nset=N7, type=C\n")
+    body, conv, _ = convert_str(cyl + "*Step\n*Static\n*Boundary\n7, 1, 1, 0.01\n7, 3, 3, -0.005\n*End Step\n"
+                                "*Step\n*Static\n*Boundary, op=NEW\nBOT, 1, 3\n*Boundary, fixed\n7, 1, 1\n"
+                                "7, 3, 3\n*End Step\n")
+    assert "*BOUNDARY\n7, 1, 1, 0.01\n7, 3, 3, -0.005\n" in _step(body, 2) and not conv.reduced_physics
+    # a midside node of an upgraded beam: the value of its interpolated line
+    beam = STOP_BEAM.replace("section=RECT\n0.1, 0.1", "section=PIPE\n0.1, 0.01").replace(
+        "*Boundary\n", "*Nset, nset=ALLN\n1, 2, 3\n*Transform, nset=ALLN\n1., 1., 0.5, -1., 1., 1.\n*Boundary\n")
+    body, conv, _ = convert_str(beam + "*Step\n*Static\n*Boundary\n2, 2, 2, 0.01\n3, 2, 2, 0.02\n*End Step\n"
+                                "*Step\n*Static\n*Boundary, fixed\n2, 2, 2\n3, 2, 2\n*End Step\n")
+    mid = conv._midside[2][2] if 2 in conv._midside else None
+    assert mid is not None and f"*BOUNDARY\n2, 2, 2, 0.01\n3, 2, 2, 0.02\n{mid}, 2, 2, 0.015\n" in _step(body, 2)
+    # (its rotations too: they were left free, unknown)
+    body, conv, _ = convert_str(beam.replace("*Nset, nset=ALLN\n1, 2, 3\n*Transform, nset=ALLN\n1., 1., 0.5, "
+                                             "-1., 1., 1.\n", "") +
+                                "*Step\n*Static\n*Boundary\n2, 6, 6, 0.01\n3, 6, 6, 0.02\n*End Step\n*Step\n"
+                                "*Static\n*Boundary, fixed\n2, 6, 6\n3, 6, 6\n*End Step\n")
+    assert f"*BOUNDARY\n2, 6, 6, 0.01\n3, 6, 6, 0.02\n{mid}, 6, 6, 0.015\n" in _step(body, 2)
+    assert conv.reduced_physics == ["element B31 -> B32R (SECTION=PIPE needs a 3-node beam in ccx)"]
+
+
+def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
+    # FIXED in a linear perturbation step holds the base state: 0, which a static perturbation
+    # step's restore adds the base value to (a rotation was written as that value, then doubled)
+    body, conv, rep = convert_str(FIXED_TR_HEX + "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n*Step\n"
+                                  "*Frequency\n3\n*Boundary, fixed\n7, 1, 3\n*End Step\n")
+    assert "*BOUNDARY\n7, 1, 1, 0.\n7, 2, 2, 0.\n7, 3, 3, 0.\n" in _step(body, 2) and not conv.reduced_physics
+    assert "held at the base state (a zero perturbation)" in body
+    sp = "*Step, perturbation\n*Static\n*Boundary, fixed\n7, 2, 2\n*Cload\n6, 2, 1.\n*End Step\n"
+    body, _, _ = convert_str(FIXED_TR_HEX + "*Step\n*Static\n*Boundary\n7, 2, 2, 0.01\n*End Step\n" + sp)
+    assert "*BOUNDARY\n7, 2, 2, 0.01\n" in _step(body, 2)
+    # (the base state leaves it free and it moved: unknown, FIXED kept)
+    body, conv, _ = convert_str(FIXED_TR_HEX + "*Step\n*Static\n*Cload\n7, 2, 1.\n*End Step\n" + sp)
+    assert "*BOUNDARY, FIXED\n7, 2, 2\n" in _step(body, 2) and \
+        "*BOUNDARY, FIXED on *TRANSFORM translations held at the global component (ccx 2.23)" in conv.reduced_physics
+    shell = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, elset=P\n"
+             "1, 1, 2, 3, 4\n*Shell Section, elset=P, material=M\n0.1\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+             "*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Static\n*Boundary\n2, 5, 5, 0.01\n3, 5, 5, 0.01\n*End Step\n"
+             "*Step, perturbation\n*Static\n*Boundary, fixed\n2, 5, 5\n*Cload\n3, 3, 1.\n*End Step\n")
+    body, _, _ = convert_str(shell)
+    assert "*BOUNDARY\n2, 5, 5, 0.01\n" in _step(body, 2) and "0.02" not in body
+
+
 def test_ccx_stop_warnings_trusses_nodal_distributing():
     # trusses stop ccx's explicit solver; a distributing coupling on a node surface kept as
     # ccx's card (NLGEOM) stops ccx ('a nodal surface is not allowed')
