@@ -4342,6 +4342,107 @@ def axi_two_point_sphere_deck():
             f"*END STEP\n")
 
 
+# 3-point Gauss-Legendre rule on [-1, 1]
+_GL3 = ((-math.sqrt(0.6), 5.0 / 9.0), (0.0, 8.0 / 9.0), (math.sqrt(0.6), 5.0 / 9.0))
+
+
+def q8_body_forces(xy, load, axi):
+    """The consistent nodal forces of body load ``load(x, y)`` -> (bx, by) per unit volume on
+    the 8-node quadrilateral ``xy`` (Abaqus' node order) at 3 x 3 points — the fully integrated
+    element's rule, Abaqus' for the reduced one's distributed loads ("full integration") —
+    over the full circle where ``axi``.  (On two_by_two_body_deck's axisymmetric mesh it is
+    1e-5 of the displacements off the exact integral; on its plane one exact.)"""
+    corners, mids = ((-1, -1), (1, -1), (1, 1), (-1, 1)), ((0, -1), (1, 0), (0, 1), (-1, 0))
+    f = [[0.0, 0.0] for _ in range(8)]
+    for a, wa in _GL3:
+        for b, wb in _GL3:
+            N = [(1 + a * p) * (1 + b * q) * (a * p + b * q - 1) / 4 for p, q in corners] + \
+                [(1 - a * a) * (1 + b * q) / 2 if p == 0 else (1 + a * p) * (1 - b * b) / 2 for p, q in mids]
+            da = [p * (1 + b * q) * (2 * a * p + b * q) / 4 for p, q in corners] + \
+                [-a * (1 + b * q) if p == 0 else p * (1 - b * b) / 2 for p, q in mids]
+            db = [q * (1 + a * p) * (a * p + 2 * b * q) / 4 for p, q in corners] + \
+                [q * (1 - a * a) / 2 if p == 0 else -b * (1 + a * p) for p, q in mids]
+            x = sum(n * c[0] for n, c in zip(N, xy))
+            y = sum(n * c[1] for n, c in zip(N, xy))
+            jac = abs(sum(d * c[0] for d, c in zip(da, xy)) * sum(d * c[1] for d, c in zip(db, xy))
+                      - sum(d * c[0] for d, c in zip(db, xy)) * sum(d * c[1] for d, c in zip(da, xy)))
+            w = wa * wb * jac * (2 * math.pi * x if axi else 1.0)
+            bx, by = load(x, y)
+            for i in range(8):
+                f[i][0] += N[i] * bx * w
+                f[i][1] += N[i] * by * w
+    return f
+
+
+def two_by_two_body_deck(typ, load, forces=False):
+    """A 3 x 4 mesh of ``typ`` (r or x 5-11, z 0-8; plane elements 0.5 thick, density 2) whose
+    midside nodes lie at a third of each edge, nearer its one end on every other row / column
+    (so that no element maps its coordinates one by one), its bottom held axially (CAX8R) or
+    fully, under *DLOAD ``load`` ((ccx line, its body force b(x, y) per unit volume)); with
+    ``forces``, under the consistent nodal forces of b (q8_body_forces) instead.  ccx 2.23
+    integrates such loads on the C3D20R it expands the element into at 2 x 2 points."""
+    nx, ny, axi = 3, 4, typ.startswith("CAX")
+    xs, ys = [5.0 + 2.0 * i for i in range(nx + 1)], [2.0 * j for j in range(ny + 1)]
+    nodes, ids, mid = {}, {}, {}
+
+    def node(p):
+        nodes[len(nodes) + 1] = p
+        return len(nodes)
+    for j, y in enumerate(ys):
+        for i, x in enumerate(xs):
+            ids[i, j] = node((x, y))
+    for j, y in enumerate(ys):                  # horizontal edges of row line j
+        for i in range(nx):
+            f = 1 / 3 if j % 2 == 0 else 2 / 3
+            mid["h", i, j] = node((xs[i] + f * (xs[i + 1] - xs[i]), y))
+    for i, x in enumerate(xs):                  # vertical edges of column line i
+        for j in range(ny):
+            f = 1 / 3 if i % 2 == 0 else 2 / 3
+            mid["v", i, j] = node((x, ys[j] + f * (ys[j + 1] - ys[j])))
+    els, conn = "", []
+    for j in range(ny):
+        for i in range(nx):
+            c = [ids[i, j], ids[i + 1, j], ids[i + 1, j + 1], ids[i, j + 1],
+                 mid["h", i, j], mid["v", i + 1, j], mid["h", i, j + 1], mid["v", i, j]]
+            conn.append(c)
+            els += f"{len(conn)}, " + ", ".join(map(str, c)) + "\n"
+    rho, t = 2.0, 1.0 if axi else 0.5
+    if forces:
+        tot = {}
+        for c in conn:
+            for n, (fx, fy) in zip(c, q8_body_forces([nodes[k] for k in c], load[1], axi)):
+                tot[n] = (tot.get(n, (0.0, 0.0))[0] + fx * t, tot.get(n, (0.0, 0.0))[1] + fy * t)
+        step = "*CLOAD\n" + "".join(f"{n}, {k + 1}, {v[k]:.15g}\n" for n, v in sorted(tot.items())
+                                    for k in (0, 1) if v[k])
+    else:
+        step = f"*DLOAD\nE, {load[0]}\n"
+    bot = ", ".join(str(n) for n, p in nodes.items() if p[1] == 0.0)
+    return ("*NODE, NSET=ALLN\n" + "".join(f"{n}, {p[0]:.15g}, {p[1]:.15g}\n" for n, p in nodes.items())
+            + f"*ELEMENT, TYPE={typ}, ELSET=E\n{els}*NSET, NSET=BOT\n{bot}\n*MATERIAL, NAME=M\n*ELASTIC\n"
+            f"1000., 0.3\n*DENSITY\n{rho}\n*SOLID SECTION, ELSET=E, MATERIAL=M\n" + ("" if axi else f"{t}\n")
+            + f"*BOUNDARY\nBOT, {'2, 2' if axi else '1, 2'}\n*STEP\n*STATIC\n{step}*NODE PRINT, NSET=ALLN\nU\n"
+            f"*END STEP\n")
+
+
+def free_body_dynamic_deck(typ):
+    """A free 2 x 1 block of one ``typ`` element (CPE4, CPE8R, CPE8; thickness 1, density 2:
+    mass 4), held along y only, pushed along x by a total of 8 shared as the element's mass is
+    (CPE4: a quarter per node; the quadratic ones: -1/12 per corner, 1/3 per midside node), so
+    that it moves as a rigid body: x = F t^2 / (2 m) = 1 at t = 1 in Abaqus.  ccx 2.23 runs an
+    implicit *DYNAMIC on CPE4 / CPE8R with half their mass (2 at t = 1)."""
+    quad = typ != "CPE4"
+    nodes = "1, 0., 0.\n2, 2., 0.\n3, 2., 1.\n4, 0., 1.\n" + ("5, 1., 0.\n6, 2., .5\n7, 1., 1.\n8, 0., .5\n"
+                                                             if quad else "")
+    share = [-8.0 / 12] * 4 + [8.0 / 3] * 4 if quad else [2.0] * 4
+    return (f"*NODE, NSET=ALLN\n{nodes}*ELEMENT, TYPE={typ}, ELSET=E\n1, "
+            + ", ".join(str(k) for k in range(1, 9 if quad else 5))
+            + "\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n2.\n*SOLID SECTION, ELSET=E, "
+            "MATERIAL=M\n1.\n*AMPLITUDE, NAME=ONE\n0., 1., 10., 1.\n*BOUNDARY\nALLN, 2, 2\n*STEP\n"
+            "*DYNAMIC, DIRECT\n0.1, 1.\n*CLOAD, AMPLITUDE=ONE\n"
+            + "".join(f"{k + 1}, 1, {v:.15g}\n" for k, v in enumerate(share))
+            + "*NODE PRINT, NSET=ALLN\nU\n*END STEP\n")
+
+
 def free_surface_coupling_deck(pressure=False):
     """A C3D8 block (x 0-2, y 0-1-2.5-4, z 0-1-3; 2 x 3 x 2 elements), its top held, its bottom
     layer's free surface (*SURFACE line without a face label: Abaqus trims the layer's side
@@ -14821,6 +14922,52 @@ def main():
               f"pressure on curved edges): u_r(a) {min(ratio):.4f}-{max(ratio):.4f} of Lame's "
               f"{lame:.6g} (ccx's own pressure: 0.986-1.054)")
     failures += 0 if ok else 1
+
+    # body loads on CAX8R / CPE8R elements whose midside nodes lie off the middle of their
+    # edges: ccx 2.23 integrates them at 2 x 2 points (Abaqus fully); the converted deck against
+    # the same mesh under the loads' consistent nodal forces at 3 x 3 points, and ccx's own load
+    for typ, load in (("CAX8R", ("GRAV, 10., 0., -1., 0.", lambda x, y: (0.0, -20.0))),
+                      ("CAX8R", ("CENTRIF, 4., 0., 0., 0., 0., 1., 0.", lambda x, y: (8.0 * x, 0.0))),
+                      ("CPE8R", ("GRAV, 10., 0., -1., 0.", lambda x, y: (0.0, -20.0)))):
+        tag = f"two_by_two_body_{typ.lower()}_{load[0].split(',')[0].lower()}"
+        got = review_run(two_by_two_body_deck(typ, load), tag, dat_displacements)
+        ref = review_run(two_by_two_body_deck(typ, load, forces=True), tag + "_ref", dat_displacements)
+        own_inp = os.path.join(tmp, f"{tag}_own.inp")
+        with open(own_inp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(two_by_two_body_deck(typ, load))
+        d, status, _ = run_ccx(ccx, env, own_inp)        # (the deck is ccx input as it is)
+        own = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        ok = bool(got and ref and own) and got.keys() == ref.keys() == own.keys()
+        if ok:
+            peak = max(abs(c) for v in ref.values() for c in v)
+            err = max(abs(a - b) for n in ref for a, b in zip(got[n], ref[n])) / peak
+            off = max(abs(a - b) for n in ref for a, b in zip(own[n], ref[n])) / peak
+            ok = peak > 1e-3 and err <= 1e-5 and off > 100 * err
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a 3 x 4 {typ} mesh, midside nodes at a third of "
+                  f"each edge, *DLOAD {load[0].split(',')[0]}): {err:.1e} of |u| {peak:.6g} off the "
+                  f"consistent forces' solution (ccx's own load: {off:.1e})")
+        else:
+            print(f"FAIL  {tag}: no results to compare")
+        failures += 0 if ok else 1
+
+    # an implicit *DYNAMIC on CPE4 / CPE8R: ccx 2.23 runs it with half their mass (the
+    # converter flags it reduced physics); a free block pushed in proportion to its mass moves
+    # as a rigid body, x = F t^2 / (2 m) = 1 at t = 1 (CPE8: integrated whole)
+    for typ, want in (("CPE4", 2.0), ("CPE8R", 2.0), ("CPE8", 1.0)):
+        tag = f"implicit_dynamic_mass_{typ.lower()}"
+        got = review_run(free_body_dynamic_deck(typ), tag, dat_displacements)
+        src = os.path.join(tmp, f"{tag}_src.inp")
+        flagged = any("half their mass" in r for r in convert(src, os.path.join(tmp, f"{tag}_flag.inp"))[1].reduced_physics)
+        ok = bool(got)
+        if ok:
+            xs = [v[0] for v in got.values()]
+            ok = max(abs(x - want) for x in xs) <= 1e-6 and flagged == (want == 2.0)
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a free {typ} block pushed in proportion to its "
+                  f"mass, rigid-body x = 1 at t = 1): x {min(xs):.7g}-{max(xs):.7g}, ccx's mass "
+                  f"{1 / max(xs):.4g} of the element's"
+                  + (" (flagged reduced physics)" if flagged else ""))
+        failures += 0 if ok else 1
 
     # a steady-state step whose period is blank (Abaqus' benchmark radiationfinnedsurf): ccx
     # read it as 0 ('*ERROR ... step size is negative', step time NaN)

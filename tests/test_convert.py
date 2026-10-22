@@ -9096,6 +9096,156 @@ def test_pressure_on_two_point_edges_under_nlgeom_is_kept_and_warned():
     assert "under NLGEOM" in warns[0] and not conv.reduced_physics
 
 
+def _quad_body(t="CAX8R", m=6.0, load="*Dload\nE, GRAV, 10., 0., -1., 0.\n", nl="", rho="2.", mixed=False,
+               proc="*Static\n"):
+    """One quadratic quadrilateral, r (x) 5-8, z 0-1, its bottom midside node at r = ``m`` (6: a
+    third of the edge) — and on a plane element then its right one at z = 0.3 (with the bottom
+    one alone the load is still of degree 3) —, density ``rho``; ``mixed``: a linear
+    quadrilateral beside it (r 8-9) in its set E."""
+    lin = f"*Element, type={t[:3]}4, elset=E\n2, 2, 11, 12, 3\n" if mixed else ""
+    z6 = 0.3 if m != 6.5 and not t.startswith(("CAX", "CGAX")) else 0.5
+    return (f"*Node\n1, 5., 0.\n2, 8., 0.\n3, 8., 1.\n4, 5., 1.\n5, {m}, 0.\n6, 8., {z6}\n7, 6.5, 1.\n"
+            f"8, 5., 0.5\n11, 9., 0.\n12, 9., 1.\n*Element, type={t}, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            f"{lin}*Material, name=M\n*Elastic\n1000., 0.3\n" + (f"*Density\n{rho}\n" if rho else "")
+            + "*Solid Section, elset=E, material=M\n" + ("" if t.startswith(("CAX", "CGAX")) else "0.5\n")
+            + f"*Boundary\n1, 2\n2, 2\n*Step{nl}\n{proc}{load}*End Step\n")
+
+
+def _quad_forces(t, m, load, scale):
+    """{(node, DOF): f} of the consistent forces of body load ``load(p)`` on _quad_body's element."""
+    z6 = 0.3 if m != 6.5 and not t.startswith(("CAX", "CGAX")) else 0.5
+    xyz = [(5., 0., 0.), (8., 0., 0.), (8., 1., 0.), (5., 1., 0.), (m, 0., 0.), (8., z6, 0.), (6.5, 1., 0.),
+           (5., .5, 0.)]
+    f = A.consistent_nodal_forces("area", xyz, lambda p, n, tg: load(p), t.startswith(("CAX", "CGAX")))
+    return {(i + 1, k + 1): scale * v[k] for i, v in enumerate(f) for k in (0, 1) if v[k]}
+
+
+def test_two_by_two_body_shift_marks_the_elements_ccx_misloads():
+    # ccx 2.23 integrates the body loads of CAX8R / CPE8R / CPS8R at 2 x 2 points: exact for N_i b
+    # |J| (2 pi r) of degree 3 in each coordinate
+    rect = [(5., 0., 0.), (8., 0., 0.), (8., 1., 0.), (5., 1., 0.), (6.5, 0., 0.), (8., .5, 0.), (6.5, 1., 0.),
+            (5., .5, 0.)]
+    third = [rect[:4] + [(6., 0., 0.)] + rect[5:]][0]
+    skew = [(x + 0.3 * y, y, z) for x, y, z in rect]                       # a parallelogram
+    lin = lambda p: p[0] + 2 * p[1]                                         # noqa: E731
+    shift = A.two_by_two_body_shift
+    assert shift(rect, True) < 1e-12 and shift(rect, False, lin) < 1e-12
+    assert shift(skew, False) < 1e-12 and shift(skew, False, lin) < 1e-12
+    assert shift(third, True) > 1e-3 and shift(third, False) < 1e-12         # (x(xi) only)
+    third[5] = (8., .3, 0.)
+    assert shift(third, False) > 1e-3
+    assert shift(rect, True, lambda p: p[0]) > 1e-6                         # CENTRIF: degree 4 in r
+    # as the consistent forces at 3 x 3 and 2 x 2 points give it
+    f3 = A.consistent_nodal_forces("area", third, lambda p, n, t: (0., p[0], 0.), True)
+    f2 = A.consistent_nodal_forces("area", third, lambda p, n, t: (0., p[0], 0.), True, rule=A._GAUSS2_QUAD)
+    want = max(abs(a[1] - b[1]) for a, b in zip(f3, f2)) / max(abs(a[1]) for a in f3)
+    assert abs(shift(third, True, lambda p: p[0]) - want) < 1e-12
+
+
+def test_body_loads_on_two_by_two_elements_become_nodal_forces():
+    # ccx 2.23 would integrate them at 2 x 2 points (CAX8R GRAV 0.38 % off on a 3 x 4 mesh with
+    # its midside nodes at a third, probed); Abaqus fully: the consistent forces at 3 x 3 points
+    volume = 39 * math.pi                                     # 2 pi x 1 x (8^2 - 5^2) / 2
+    for t, rho_t, vol in (("CAX8R", 2.0, volume), ("CGAX8R", 2.0, volume), ("CPE8R", 1.0, 1.5),
+                          ("CPS8R", 1.0, 1.5)):
+        for load, want, total in (
+                ("E, GRAV, 10., 0., -1., 0.", lambda p: (0., -10., 0.), -20. * vol),
+                ("E, GRAV, 10., 0., -3., 4.", lambda p: (0., -6., 0.), -12. * vol),   # normalized
+                ("E, BY, 3.", lambda p: (0., 3., 0.), 3. * vol),
+                ("E, BX, 3.", lambda p: (3., 0., 0.), None)):
+            scale = rho_t if "GRAV" in load else rho_t / 2.0   # thickness 0.5 on plane elements
+            body, conv, rep = convert_str(_quad_body(t, load=f"*Dload\n{load}\n"))
+            got = _cloads(body)
+            assert len(got) == 1 and _close(got[0], _quad_forces(t, 6.0, want, scale), 1e-7), (t, load)
+            assert "*DLOAD" not in body and all(r.startswith("element CGAX8R") for r in conv.reduced_physics)
+            if total is not None:
+                assert abs(sum(v for (n, d), v in got[0].items() if d == 2) - total) < 1e-9 * abs(total)
+            assert "on CAX8R / CPE8R / CPS8R elements that are no parallelograms" in rep.text()
+    # BR / BZ: the axisymmetric radial / axial body forces
+    for label, k in (("BR", 1), ("BZ", 2)):
+        got = _cloads(convert_str(_quad_body(load=f"*Dload\nE, {label}, 3.\n"))[0])[0]
+        assert _close(got, _quad_forces("CAX8R", 6.0, lambda p: (3. * (k == 1), 3. * (k == 2), 0.), 1.0), 1e-7)
+    # CENTRIF about the axis of symmetry: rho w^2 r; a plane element's about any axis
+    got = _cloads(convert_str(_quad_body(load="*Dload\nE, CENTRIF, 4., 0., 1., 0., 0., 2., 0.\n"))[0])[0]
+    assert _close(got, _quad_forces("CAX8R", 6.0, lambda p: (8. * p[0], 0., 0.), 1.0), 1e-7)
+    assert abs(sum(got.values()) - 8. * 2 * math.pi * (8 ** 3 - 5 ** 3) / 3) < 1e-3
+    got = _cloads(convert_str(_quad_body("CPE8R", load="*Dload\nE, CENTRIF, 4., 1., 2., 0., 1., 0., 0.\n"))[0])[0]
+    assert _close(got, _quad_forces("CPE8R", 6.0, lambda p: (0., 8. * (p[1] - 2.), 0.), 0.5), 1e-7)
+    # a set with other elements: they keep the line, on a set of their own
+    body, conv, rep = convert_str(_quad_body(mixed=True))
+    assert "*ELSET, ELSET=ABQ2CCX_QUAD_REST_E\n2\n" in body
+    assert "*DLOAD\nABQ2CCX_QUAD_REST_E, GRAV, 10., 0., -1., 0.\n" in body
+    assert _close(_cloads(body)[0], _quad_forces("CAX8R", 6.0, lambda p: (0., -10., 0.), 2.0), 1e-7)
+    # replaced and removed in later steps, as Abaqus does
+    steps = ("*Dload\nE, GRAV, 10., 0., -1., 0.\n*End Step\n*Step\n*Static\n*Dload\nE, GRAV, 20., 0., -1., 0.\n"
+             "*End Step\n*Step\n*Static\n*Dload, op=new\n")
+    got = _cloads(convert_str(_quad_body(load=steps))[0])
+    want = _quad_forces("CAX8R", 6.0, lambda p: (0., -10., 0.), 2.0)
+    assert _close(got[1], {k: 2 * v for k, v in want.items()}, 1e-7) and _close(got[2], {k: 0. for k in want}, 0.)
+
+
+def test_body_loads_stay_where_ccx_integrates_them_exactly():
+    # midside nodes in the middle of straight edges: a constant load, and a plane element's
+    # linear CENTRIF, are of degree 3; the full CAX8 is integrated at 3 x 3 points
+    for t, load in (("CAX8R", "E, GRAV, 10., 0., -1., 0."), ("CPE8R", "E, GRAV, 10., 0., -1., 0."),
+                    ("CPE8R", "E, CENTRIF, 4., 0., 0., 0., 0., 0., 1."), ("CAX8R", "E, BY, 3.")):
+        body, conv, rep = convert_str(_quad_body(t, m=6.5, load=f"*Dload\n{load}\n"))
+        assert f"*DLOAD\n{load}\n" in body and _cloads(body) == [{}], (t, load)
+        assert "CAX8R / CPE8R / CPS8R" not in rep.text()
+    body, conv, rep = convert_str(_quad_body("CAX8", load="*Dload\nE, GRAV, 10., 0., -1., 0.\n"))
+    assert "*DLOAD\nE, GRAV, 10., 0., -1., 0.\n" in body and _cloads(body) == [{}]
+    # CENTRIF on an axisymmetric element: rho w^2 r 2 pi r is of degree 4 even there
+    body, conv, rep = convert_str(_quad_body(m=6.5, load="*Dload\nE, CENTRIF, 4., 0., 0., 0., 0., 1., 0.\n"))
+    assert "*DLOAD" not in body and len(_cloads(body)[0]) == 8
+
+
+def test_body_loads_on_two_by_two_elements_kept_where_nodal_forces_are_not_exact():
+    # CENTRIF under NLGEOM acts on the deformed positions; GRAV / BX / BY stay per undeformed
+    # volume (mass) and fixed in direction, as ccx applies them: converted there too
+    load = "*Dload\nE, CENTRIF, 4., 0., 0., 0., 0., 1., 0.\nE, GRAV, 10., 0., -1., 0.\n"
+    body, conv, rep = convert_str(_quad_body(load=load, nl=", nlgeom"))
+    assert "*DLOAD\nE, CENTRIF, 4., 0., 0., 0., 0., 1., 0.\n" in body
+    assert _close(_cloads(body)[0], _quad_forces("CAX8R", 6.0, lambda p: (0., -10., 0.), 2.0), 1e-9)
+    warns = [m for lv, m in rep.entries if lv == "WARNING" and "kept as ccx loads" in m]
+    assert len(warns) == 1 and "('E')" in warns[0] and "CENTRIF under NLGEOM" in warns[0]
+    assert not conv.reduced_physics and "[APPROX]" not in rep.text()
+    # GRAV without a density (ccx: no load; Abaqus needs one): kept, BY converts
+    body, conv, rep = convert_str(_quad_body(rho="", load="*Dload\nE, GRAV, 10., 0., -1., 0.\nE, BY, 3.\n"))
+    assert "*DLOAD\nE, GRAV, 10., 0., -1., 0.\n" in body and len(_cloads(body)[0]) == 8
+    assert "element 1 has no material with one constant density" in rep.text()
+    # CENTRIF about another axis on an axisymmetric element
+    body, conv, rep = convert_str(_quad_body(load="*Dload\nE, CENTRIF, 4., 1., 0., 0., 0., 1., 0.\n"))
+    assert "*DLOAD\nE, CENTRIF, 4., 1., 0., 0., 0., 1., 0.\n" in body and _cloads(body) == [{}]
+    assert "about another axis than the symmetry axis" in rep.text()
+
+
+def test_two_d_mass_flagged_where_ccx_differs_from_abaqus():
+    # implicit *DYNAMIC: ccx 2.23 runs CPE4 / CPS4 / CAX4 / CPE8R / CPS8R / CAX8R with half their
+    # mass; *FREQUENCY integrates the mass of CPE8R / CPS8R / CAX8R at 2 x 2, of CPE6 / CPS6 / CAX6
+    # at 3 points (Abaqus fully)
+    dyn, freq = "*Dynamic\n0.1, 1.\n", "*Frequency\n4\n"
+    for t, proc, flag in (("CAX8R", dyn, "implicit *DYNAMIC"), ("CPE8R", freq, "*FREQUENCY"),
+                          ("CPS8R", dyn, "implicit *DYNAMIC"), ("CAX8R", freq, "*FREQUENCY")):
+        body, conv, rep = convert_str(_quad_body(t, m=6.5, load="", proc=proc))
+        assert len(conv.reduced_physics) == 1 and flag in conv.reduced_physics[0], (t, proc)
+    body, conv, rep = convert_str(_quad_body("CPE8R", m=6.5, load="", proc=dyn, mixed=True))
+    assert conv.reduced_physics == ["element CPE4/CPE8R in implicit *DYNAMIC (ccx 2.23 runs it with half "
+                                    "their mass)"]
+    assert "vibrates sqrt 2 times faster" in rep.text()
+    tri = ("*Node\n1, 0., 0.\n2, 1., 0.\n3, 0., 1.\n4, .5, 0.\n5, .5, .5\n6, 0., .5\n*Element, type=CPS6, "
+           "elset=E\n1, 1, 2, 3, 4, 5, 6\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n2.\n"
+           "*Solid Section, elset=E, material=M\n1.\n*Boundary\n1, 1, 2\n2, 2\n*Step\n{}*End Step\n")
+    assert "CPS6 in *FREQUENCY" in convert_str(tri.format(freq))[1].reduced_physics[0]
+    assert not convert_str(tri.format(dyn))[1].reduced_physics       # the wedge is integrated whole
+    # not flagged: explicit dynamics, CPE4 frequencies, CAX8, massless elements
+    for t, proc, rho in (("CAX8R", "*Dynamic, explicit\n0.1, 1.\n", "2."), ("CAX8", dyn, "2."),
+                         ("CAX8", freq, "2."), ("CAX8R", dyn, "")):
+        assert not convert_str(_quad_body(t, m=6.5, load="", proc=proc, rho=rho))[1].reduced_physics, (t, proc)
+    body, conv, rep = convert_str(_quad_body("CPE8R", m=6.5, load="", proc=freq, mixed=True))
+    assert conv.reduced_physics == ["element CPE8R in *FREQUENCY (ccx 2.23 integrates their mass at fewer "
+                                    "points than Abaqus)"]
+
+
 def test_traction_under_nlgeom_converts_only_when_exact():
     deck = (HEX + "*Surface, name=TOP\nEALL, S2\n*Step, nlgeom\n*Static\n*Dsload{}\n"
             "TOP, TRVEC, 4., {}\n*End Step\n")

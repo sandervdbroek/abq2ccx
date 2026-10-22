@@ -183,7 +183,8 @@ TRANSLATED = {
         "(NaN displacements); so does one with contact of plane / axisymmetric elements on a rigid "
         "surface, which ccx 2.23 leaves out of its stable increment (the contact bounces): ccx's "
         "contact formula with the slave nodes' masses, times 0.8. A fixed `DIRECT` increment "
-        "above a cap is warned.",
+        "above a cap is warned. Implicit on `CPE4` / `CPS4` / `CAX4` / `CPE8R` / `CPS8R` / `CAX8R` "
+        "flagged reduced physics: ccx 2.23 runs them with half their mass.",
     "*FIXED MASS SCALING / *VARIABLE MASS SCALING": "commented out. `FACTOR=f` on the whole model, "
         "the same in every explicit step → densities, `*MASS` values and rotary inertias f times "
         "larger, specific heats and GRAV magnitudes f times smaller (Abaqus' gravity and thermal "
@@ -197,7 +198,9 @@ TRANSLATED = {
         "with `DT`, `ROLLING`) a numerical control: ccx runs the true mass.",
     "*FREQUENCY": "Abaqus-only params dropped; `EIGENSOLVER=SUBSPACE` max-frequency field blanked "
         "(ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes). "
-        "The step's `*CLOAD` / `*DLOAD` / `*DSLOAD` are commented out: Abaqus ignores them.",
+        "The step's `*CLOAD` / `*DLOAD` / `*DSLOAD` are commented out: Abaqus ignores them. On "
+        "`CPE8R` / `CPS8R` / `CAX8R` / `CPE6` / `CPS6` / `CAX6` flagged reduced physics: ccx 2.23 "
+        "integrates their mass at 2 x 2 / 3 points, Abaqus fully.",
     "*BUCKLE": "`EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads "
         "accuracy/vectors/iterations. A `*BUCKLE` step, or the step after a `*STEP, PERTURBATION` "
         "one, that would hold no body load once an earlier step held one gets a zero `GRAV` line "
@@ -300,7 +303,11 @@ TRANSLATED = {
         "`*DSLOAD`; bare `P` on solids flagged; `P1`..`P4` on `CPS4I`/`CPE4I` "
         "slabs → `P3`..`P6`; a pressure on `CAX8R` / `CAX6` edges whose midside node lies off the "
         "middle or off the chord → consistent nodal forces in a deck without NLGEOM (ccx 2.23 "
-        "integrates it at 2 points along the edge, Abaqus fully; under NLGEOM kept, warned); a line without an element set (Abaqus: the whole model) gets a whole-model set; "
+        "integrates it at 2 points along the edge, Abaqus fully; under NLGEOM kept, warned); "
+        "`GRAV` / `CENTRIF` / `BX` / `BY` on `CAX8R` / `CPE8R` / `CPS8R` elements where ccx's "
+        "2 x 2 rule shifts the nodal shares → consistent nodal forces at 3 x 3 points (the "
+        "set's other elements keep the line on `ABQ2CCX_QUAD_REST_…`; `CENTRIF` under NLGEOM "
+        "kept, warned); a line without an element set (Abaqus: the whole model) gets a whole-model set; "
         "`FOLLOWER=NO` / `CONSTANT RESULTANT` dropped (warned under NLGEOM on edge loads; Abaqus "
         "reads them for tractions and edge loads only). Element tractions "
         "(`TRVECn`/`TRSHRn`) and beam line loads (`PX`/`PY`/`PZ`/`P1`/`P2` — ccx reads `P1`/`P2` "

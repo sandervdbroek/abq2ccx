@@ -4895,20 +4895,21 @@ def ccx_integration_points(typ: str, xyz: Sequence[Vec]) -> Optional[List[Vec]]:
 
 
 def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: bool = False,
-                            rule: Optional[Sequence[Tuple[float, float]]] = None) -> List[Vec]:
+                            rule: Optional[Sequence[tuple]] = None) -> List[Vec]:
     """f_i = integral of N_i t over one edge or face in its undeformed geometry, by Gauss
     quadrature (exact for the constant tractions and line loads of straight or flat
     members, and to quadrature accuracy on curved ones).  ``kind`` is "line" (2/3 nodes) or
     "area" (3/6/4/8 nodes), corner nodes first.  ``load(point, normal, tangent)`` gives
     the traction / line load vector there: an edge passes its in-plane (x-y) normal, a
     face its unit normal; the tangent is the unit edge direction (None on a face).  An
-    axisymmetric edge integrates over the full circle (2 pi r ds, r = x): ccx reads a
-    concentrated load on an axisymmetric node as the total around the circumference
-    (probed on 2.23 against a pressure-loaded twin).  ``rule``: another Gauss rule for an edge,
-    ((point, weight), ...) on [-1, 1] (two_point_edge_shift)."""
+    axisymmetric edge, or the face of an axisymmetric element in its (r, z) plane, integrates
+    over the full circle (2 pi r ds, r = x): ccx reads a concentrated load on an axisymmetric
+    node as the total around the circumference (probed on 2.23 against a pressure-loaded
+    twin).  ``rule``: another Gauss rule, ((point, weight), ...) on [-1, 1] for an edge
+    (two_point_edge_shift), ((a, b, weight), ...) for a face (two_by_two_body_shift)."""
     n = len(xyz)
     points = (((g, 0.0, w) for g, w in rule or _GAUSS_LINE) if kind == "line" else
-              _GAUSS_TRI if n in (3, 6) else _GAUSS_QUAD)
+              rule or (_GAUSS_TRI if n in (3, 6) else _GAUSS_QUAD))
     forces = [[0.0, 0.0, 0.0] for _ in range(n)]
     for a, b, w in points:
         N, da, db = _shape(kind, n, a, b)
@@ -4918,13 +4919,13 @@ def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: b
             jac = vnorm(ga)
             tangent: Optional[Vec] = vunit(ga)
             normal = vunit((ga[1], -ga[0], 0.0))
-            if axisymmetric:
-                jac *= 2.0 * math.pi * p[0]
         else:
             gb = tuple(sum([db[i] * xyz[i][k] for i in range(n)]) for k in range(3))
             cross = vcross(ga, gb)
             jac = vnorm(cross)
             normal, tangent = vunit(cross), None
+        if axisymmetric:
+            jac *= 2.0 * math.pi * p[0]
         t = load(p, normal, tangent)
         for i in range(n):
             s = N[i] * jac * w
@@ -4955,6 +4956,55 @@ def two_point_edge_shift(xyz: Sequence[Vec]) -> float:
     f2 = consistent_nodal_forces("line", xyz, unit, True, rule=_GAUSS2_LINE)
     big = max(vnorm(v) for v in f)
     return max(vnorm(vsub(a, b)) for a, b in zip(f, f2)) / big if big else 0.0
+
+
+# ccx 2.23 expands a CAX8R / CPE8R / CPS8R into a C3D20R ('A' / 'E' / 'S', gen3delem.f) and
+# integrates it at 2 x 2 points in the plane (e_c3d.f: mint3d 4) — its stiffness, as Abaqus'
+# reduced element, but also its mass and its body loads (GRAV, CENTRIF, BX / BY), which Abaqus
+# integrates fully (3 x 3; 2017 "Solid (continuum) elements": "the mass matrix and distributed
+# loadings are still integrated exactly")
+TWO_BY_TWO_2D_TYPES = frozenset({"CAX8R", "CPE8R", "CPS8R"})
+# ... and an implicit *DYNAMIC step runs these with half their mass (Converter._warn_two_d_mass)
+HALF_MASS_2D_TYPES = frozenset({"CPE4", "CPS4", "CAX4"}) | TWO_BY_TWO_2D_TYPES
+_GAUSS2_QUAD = tuple((a, b, 1.0) for b in (-0.5773502691896258, 0.5773502691896258)
+                     for a in (-0.5773502691896258, 0.5773502691896258))
+
+
+def _q8_rule_tables(rule) -> List[Tuple[List[float], List[float], List[float], float]]:
+    """(N, dN/da, dN/db, weight) of the 8-node quadrilateral at the points of ``rule``."""
+    return [tuple(_shape("area", 8, a, b)) + (w,) for a, b, w in rule]
+
+
+_Q8_FULL, _Q8_TWO = _q8_rule_tables(_GAUSS_QUAD), _q8_rule_tables(_GAUSS2_QUAD)
+
+
+def two_by_two_body_shift(xyz: Sequence[Vec], axisymmetric: bool, field=None) -> float:
+    """How far ccx's 2 x 2 rule (TWO_BY_TWO_2D_TYPES) moves the nodal shares of a body load of
+    the density ``field(point)`` (a number; None: 1) in a fixed direction on the 8-node
+    quadrilateral ``xyz`` (Abaqus' node order): max |f2_i - f_i| / max |f_i| over its nodes, f
+    its consistent forces at 3 x 3 points (as consistent_nodal_forces gives them), f2 those at
+    2 x 2.  N_i b |J| (2 pi r) is of degree 3 in each coordinate (0 to round-off) on a
+    parallelogram with its midside nodes in the middle of its edges, for a constant load and,
+    on a plane element, for one linear in x, y — a constant load on a plane element also on
+    any straight-edged quadrilateral with them there; higher elsewhere (a trapezoid's 2 pi r
+    |J|, midside nodes off the middle or the chords), and for CENTRIF on an axisymmetric
+    element (b ~ r: degree 4)."""
+    xs, ys = [p[0] for p in xyz], [p[1] for p in xyz]
+    shares = []
+    for table in (_Q8_FULL, _Q8_TWO):
+        f = [0.0] * 8
+        for N, da, db, w in table:
+            x = sum([n * c for n, c in zip(N, xs)])
+            y = sum([n * c for n, c in zip(N, ys)])
+            jac = abs(sum([d * c for d, c in zip(da, xs)]) * sum([d * c for d, c in zip(db, ys)])
+                      - sum([d * c for d, c in zip(db, xs)]) * sum([d * c for d, c in zip(da, ys)]))
+            s = w * jac * (2.0 * math.pi * x if axisymmetric else 1.0) * \
+                (field((x, y, 0.0)) if field else 1.0)
+            for i in range(8):
+                f[i] += N[i] * s
+        shares.append(f)
+    big = max(abs(v) for v in shares[0])
+    return max(abs(a - b) for a, b in zip(*shares)) / big if big else 0.0
 
 
 def blocks_from_lines(lines: Sequence[str]) -> List[Block]:
@@ -23603,6 +23653,69 @@ class _Constraints:
                          f"crashes (probed). Request at most {max(bound // 5, 1)} eigenvalues, or "
                          f"give the massless elements a small density.", once=True)
 
+    def _warn_two_d_mass(self, blocks: List[Block]) -> None:
+        """Where ccx 2.23's mass matrix of 2-D continuum elements is not Abaqus' (probed against a
+        model of the elements that gives ccx's frequencies to 3e-6 and its *DYNAMIC histories to
+        3e-7, on 3 x 4 meshes):
+        - an implicit *DYNAMIC step runs CPE4 / CPS4 / CAX4 and CPE8R / CPS8R / CAX8R
+          (HALF_MASS_2D_TYPES) with half their mass, also under NLGEOM: ccx integrates the brick
+          it expands them into over one half and mirrors that onto the other only with
+          intscheme 0 (e_c3d.f), while nonlingeo.c builds the step's mass with intscheme 1 — the
+          structure vibrates sqrt 2 times faster.  *FREQUENCY and explicit *DYNAMIC (intscheme
+          0), and CPE8 / CAX8 and the triangles (integrated whole), are right;
+        - *FREQUENCY integrates the mass of CPE8R / CPS8R / CAX8R at 2 x 2 points and that of
+          CPE6 / CPS6 / CAX6 at 3 (Abaqus: fully, at 3 x 3 and 6 points — Theory Guide,
+          triangular elements; its modified CPE6M / CAX6M lump it): the frequencies come out
+          high, the higher modes of a coarse mesh most — up to 0.7 % (2 x 2) and 0.5 % (3
+          points) where the midside nodes lie in the middle of straight edges, 2.7 % and 1.2 %
+          with them at a third of each edge, 0.14 % on a 12 x 16 mesh.
+        No card gives ccx another mass matrix: warned, reduced physics, where such elements have
+        mass (their section's material a positive *DENSITY, or one that does not read)."""
+        dyn = [s.no for s in self.steps if s.proc == "DYNAMIC" and not s.explicit]
+        freq = [s.no for s in self.steps if s.proc == "FREQUENCY"]
+        if not dyn and not freq:
+            return
+        kinds = HALF_MASS_2D_TYPES | {"CPE6", "CPS6", "CAX6"}
+        if not any(ccx_type(typ) in kinds for typ, _ in self.geom.elements.values()):
+            return
+        section = self._section_thickness(blocks, ("SOLID SECTION",))
+        opts = self._material_options(blocks)
+        found: Dict[str, set] = {}
+        for e, (typ, _) in self.geom.elements.items():
+            mat = section.get(e, (None, ""))[1]
+            try:
+                heavy = any(r[0] > 0.0 for r in self._density_rows(opts[mat])) if mat in opts else False
+            except ValueError:
+                heavy = True
+            if heavy:
+                found.setdefault(ccx_type(typ), set()).add(typ.upper())
+        half = sorted(t for c in HALF_MASS_2D_TYPES if c in found for t in found[c]) if dyn else []
+        if half:
+            self.report.warn(f"Implicit *DYNAMIC (step {', '.join(map(str, dyn))}) on "
+                             f"{'/'.join(half)} elements: ccx 2.23 runs it with half their mass (it "
+                             f"integrates the brick it expands such an element into over one half "
+                             f"and builds the dynamic step's mass without mirroring it onto the "
+                             f"other; its *FREQUENCY is right), so the structure vibrates sqrt 2 "
+                             f"times faster than in Abaqus (probed: a 3 x 4 mesh under a ramped "
+                             f"load follows the half-mass response to 3e-7). CPE8 / CPS8 / CAX8 "
+                             f"and the triangles are integrated whole.", once=True)
+            self._reduces(f"element {'/'.join(half)} in implicit *DYNAMIC (ccx 2.23 runs it with "
+                          f"half their mass)")
+        quad = sorted(t for c in TWO_BY_TWO_2D_TYPES if c in found for t in found[c]) if freq else []
+        tri = sorted(t for c in ("CPE6", "CPS6", "CAX6") if c in found for t in found[c]) if freq else []
+        if quad or tri:
+            rules = " and ".join(x for x in ("2 x 2 points" if quad else "", "3 points" if tri else "") if x)
+            self.report.warn(f"*FREQUENCY (step {', '.join(map(str, freq))}) on "
+                             f"{'/'.join(quad + tri)} elements: ccx 2.23 integrates their mass at "
+                             f"{rules}, Abaqus fully (3 x 3, 6 points; the modified triangles' "
+                             f"mass lumped), so the frequencies come out high, the higher modes of "
+                             f"a coarse mesh most (probed on 3 x 4 meshes: up to 0.7 % / 0.5 % "
+                             f"with the midside nodes in the middle of straight edges, 2.7 % / "
+                             f"1.2 % with them at a third of each edge; 0.14 % on 12 x 16). A finer "
+                             f"mesh reduces it.", once=True)
+            self._reduces(f"element {'/'.join(quad + tri)} in *FREQUENCY (ccx 2.23 integrates "
+                          f"their mass at fewer points than Abaqus)")
+
     def _plan_kinematic_holds(self, blocks: List[Block]) -> None:
         """Model-data BCs on the rotations of kinematic-coupling reference nodes that no
         coupled DOF depends on, repeated after *BOUNDARY, OP=NEW (see handle_boundary).  The
@@ -29796,6 +29909,12 @@ class _Loads:
                 if conv is not None:            # (CAX8R / CAX6 edges ccx would load unlike Abaqus)
                     side += conv
                     continue
+            if label in ("GRAV", "CENTRIF", "BX", "BY") and g[0].upper() in self._two_by_two:
+                conv, rest = self._two_by_two_body(b, g)
+                side += conv                    # (CAX8R / CPE8R / CPS8R: ccx's 2 x 2 rule)
+                if rest is None:
+                    continue
+                g = rest
             split = self._sheet_lines(g[0], label, g[2] if len(g) > 2 else "", 1.0) if family else None
             if split is not None:                     # both faces of the expanded element
                 for ln, key, mag in split:
@@ -30311,6 +30430,147 @@ class _Loads:
                          "on its bottom face (probed).", once=True)
         return [((plan["grav"].upper(), label), line, g[2] if len(g) > 2 else "")], []
 
+    def _plan_two_by_two_body_loads(self, blocks: List[Block]) -> None:
+        """Body loads ccx 2.23 integrates at 2 x 2 points on CAX8R / CPE8R / CPS8R elements
+        (TWO_BY_TWO_2D_TYPES; Abaqus fully).  Per element set or element a *DLOAD GRAV, CENTRIF
+        or BX / BY / BR / BZ line names, where that moves the nodal shares of a constant load
+        ("BODY") or of one linear in the coordinates ("CENTRIF": r on axisymmetric elements, 1,
+        x and y on plane ones) on any of its such elements (two_by_two_body_shift beyond 1e-6),
+        a plan for handle_dload (_two_by_two_body): those elements, their thickness (1 on
+        axisymmetric ones), their density (the one constant *DENSITY row of their section's
+        material, or why there is none), whether each family its lines need is shifted, and a
+        set of the other elements, which keep the line (ABQ2CCX_QUAD_REST_...).  Decided per set
+        and family, not per line, so that each step loads a set one way (Abaqus replaces a load
+        given again in a later step; nodal forces would not replace a line there, nor a line the
+        forces)."""
+        tokens: "OrderedDict[str, Tuple[str, set]]" = OrderedDict()
+        for b in blocks:
+            for rec in merged_data_records(b) if b.keyword == "DLOAD" else []:
+                g = [x.strip() for x in rec]
+                if len(g) > 1 and g[1].upper() in ("GRAV", "CENTRIF", "BX", "BY", "BR", "BZ") and \
+                        not _is_user_load(b, g):
+                    token = g[0] or (ALL_ELEMENTS_SET if ALL_ELEMENTS_SET in self.geom.elsets else "")
+                    if token and token.upper() not in self._grav_scale:
+                        tokens.setdefault(token.upper(), (token, set()))[1].add(
+                            "CENTRIF" if g[1].upper() == "CENTRIF" else "BODY")
+        if not tokens:
+            return
+        section = self._section_thickness(blocks, ("SOLID SECTION",))
+        opts = self._material_options(blocks)
+        for key, (token, families) in tokens.items():
+            eids = [e for e in dedup(self._load_elements(token)) if e in self.geom.elements]
+            quads = [e for e in eids if ccx_type(self.geom.elements[e][0]) in TWO_BY_TWO_2D_TYPES and
+                     len(self.geom.elements[e][1]) == 8 and
+                     all(n in self.geom.nodes for n in self.geom.elements[e][1])]
+            if not quads:
+                continue
+            axi = {e: ccx_type(self.geom.elements[e][0]).startswith("CAX") for e in quads}
+            shift = {f: self._two_by_two_shift(quads, axi, f, 1e-6) > 1e-6 for f in families}
+            if not any(shift.values()):
+                continue
+            rho: "Dict[int, float] | str" = {}
+            for e in quads:
+                mat = section.get(e, (None, ""))[1]
+                try:
+                    rows = self._density_rows(opts[mat]) if mat in opts else None
+                except ValueError:
+                    rows = None
+                if not rows or len(rows) != 1 or rows[0][0] < 0.0:
+                    rho = (f"element {e} has no material with one constant density" if rows is None or
+                           not rows else f"the density of element {e}'s material "
+                           f"{'varies' if len(rows) > 1 else 'is negative'}")
+                    break
+                rho[e] = rows[0][0]
+            rest = None
+            if len(quads) < len(eids):
+                self._reserve_names()
+                rest = self._fresh_name(f"ABQ2CCX_QUAD_REST_{key}")
+                self.geom.elsets[rest] = [e for e in eids if e not in set(quads)]
+            self._two_by_two[key] = {"quads": quads, "axi": axi, "rho": rho, "shift": shift, "rest": rest,
+                                     "thick": {e: 1.0 if axi[e] else self._section_thick.get(e, 1.0)
+                                               for e in quads}}
+
+    def _two_by_two_shift(self, quads: Sequence[int], axi: Dict[int, bool], family: str,
+                          stop: float = math.inf) -> float:
+        """The largest two_by_two_body_shift of ``quads`` (``axi``: element -> axisymmetric) for a
+        family of loads: "BODY" a constant one, "CENTRIF" r on axisymmetric elements and 1, x, y
+        on plane ones (any load linear in the coordinates); the first beyond ``stop``."""
+        top = 0.0
+        for e in quads:
+            xyz = [self.geom.nodes[n] for n in self.geom.elements[e][1]]
+            fields = [None] if family == "BODY" else [lambda p: p[0]] if axi[e] else \
+                [None, lambda p: p[0], lambda p: p[1]]
+            for f in fields:
+                top = max(top, two_by_two_body_shift(xyz, axi[e], f))
+                if top > stop:
+                    return top
+        return top
+
+    def _two_by_two_body(self, b: Block, g: List[str]) -> Tuple[List[str], Optional[List[str]]]:
+        """*DLOAD line ``g`` (GRAV, CENTRIF, BX or BY, blank numbers 0.) on a set or element that
+        _plan_two_by_two_body_loads planned -> (the comment lines of its CAX8R / CPE8R / CPS8R
+        elements' consistent nodal forces (_to_nodal_forces at 3 x 3 points: Abaqus' full
+        integration), the line for the other elements, on a set of their own, or None when there
+        are none).  Probed on 2.23 (3 x 4 meshes, midside nodes at a third of each edge): CAX8R
+        GRAV / BY 0.38 %, CENTRIF 0.13 % of the largest displacement off the exact forces', ccx's
+        own load matching the 2 x 2 forces to 1.5e-5.  Under NLGEOM too for GRAV, BX and BY,
+        which ccx applies per unit undeformed volume (mass) and fixed in direction, as nodal
+        forces act (probed: a hanging CAX8R / CPE8R column stretched 25 % moved under GRAV and
+        BY as under their 2 x 2 forces, to 3e-8).  The line stays where the family's shift is
+        1e-6 or less, and, warned once (_warn_two_by_two_kept), for CENTRIF under NLGEOM (it acts
+        on the deformed positions), GRAV / CENTRIF without one density per element, and CENTRIF
+        on axisymmetric elements about another axis than theirs."""
+        plan = self._two_by_two[g[0].upper()]
+        label = g[1].upper()
+        family = "CENTRIF" if label == "CENTRIF" else "BODY"
+        if not plan["shift"].get(family):
+            return [], g
+        why = "CENTRIF under NLGEOM, which acts on the deformed positions" \
+            if label == "CENTRIF" and self._nl_any else None
+        if why is None and label in ("GRAV", "CENTRIF") and isinstance(plan["rho"], str):
+            why = plan["rho"]
+        if why is None and label == "CENTRIF" and any(plan["axi"].values()):
+            try:
+                point = [pf(x) for x in (g[3:6] + ["0."] * 3)[:3]]
+                axis = [pf(x) for x in (g[6:9] + ["0."] * 3)[:3]]
+            except ValueError:
+                return [], g
+            if point[0] or point[2] or axis[0] or axis[2] or not axis[1]:
+                why = "CENTRIF on axisymmetric elements about another axis than the symmetry axis"
+        if why is not None:
+            old = self._two_by_two_kept.get(g[0], (0.0, ""))
+            shift = self._two_by_two_shift(plan["quads"], plan["axi"], family)
+            self._two_by_two_kept[g[0]] = (max(old[0], shift), old[1] or why)
+            return [], g
+        mass = label in ("GRAV", "CENTRIF")
+        faces = [(list(self.geom.elements[e][1]), "area",
+                  plan["thick"][e] * (plan["rho"][e] if mass else 1.0), plan["axi"][e], True, None, None)
+                 for e in plan["quads"]]
+        side = self._to_nodal_forces(b, "DLOAD", g, faces, None, two_by_two=True)
+        return side, ([plan["rest"]] + g[1:] if plan["rest"] else None)
+
+    def _warn_two_by_two_kept(self) -> None:
+        """One warning for the body loads _two_by_two_body left on CAX8R / CPE8R / CPS8R elements."""
+        kept = self._two_by_two_kept
+        if not kept:
+            return
+        names = list(kept)
+        shift = max(v[0] for v in kept.values())
+        whys = dedup([v[1] for v in kept.values()])
+        self.report.warn(f"Body loads (GRAV / CENTRIF / BX / BY) on CAX8R / CPE8R / CPS8R elements "
+                         f"kept as ccx loads ({', '.join(repr(x) for x in names[:5])}"
+                         + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+                         + f"): ccx 2.23 integrates them at 2 x 2 points (Abaqus: fully), which on "
+                           f"an element that is no parallelogram with its midside nodes in the "
+                           f"middle of its edges (a plane one under a constant load: one whose "
+                           f"midside nodes lie off the middle or the chords), and for CENTRIF on "
+                           f"axisymmetric elements, moves part of the load between its nodes — "
+                           f"here by up to {shift:.2g} of a node's share (probed "
+                           f"on 3 x 4 meshes with the midside nodes at a third of each edge: 0.38 % "
+                           f"of the largest displacement under CAX8R GRAV, 0.13 % under CENTRIF). "
+                           f"The converter writes them as consistent nodal forces elsewhere, which "
+                           f"would not be exact here: {'; '.join(whys)}. A finer mesh reduces it.")
+
     @staticmethod
     def _signed(mag: str, sign: float) -> str:
         """``mag`` times ``sign`` (a blank magnitude stays blank)."""
@@ -30663,12 +30923,15 @@ class _Loads:
                            "it.")
 
     def _to_nodal_forces(self, b: Block, card: str, g: List[str], faces: list,
-                         why: Optional[str], face_pressure: bool = False) -> List[str]:
+                         why: Optional[str], face_pressure: bool = False,
+                         two_by_two: bool = False) -> List[str]:
         """One traction (TRVEC / TRSHR), beam line-load (PX / PY / PZ / P1 / P2), shell body force
         (BX / BY / BZ) or surface-element pressure (P) data line ``g`` -> consistent nodal forces (consistent_nodal_forces over
         ``faces``), registered for the *CLOAD at the end of the step (_flush_nodal_loads).
         ``face_pressure``: ``g`` is a continuum face pressure (P1..P6, a surface's P) that ccx
-        would integrate at too few points (_two_point_pressure).
+        would integrate at too few points (_two_point_pressure); ``two_by_two``: a body load
+        (GRAV, CENTRIF, BX, BY) on CAX8R / CPE8R / CPS8R faces, whose scale holds the thickness
+        and, for GRAV / CENTRIF, the density (_two_by_two_body).
         Returns the comment lines that take the load's place in the deck.  As the Abaqus
         Analysis User's Guide defines them: TRVEC is the magnitude times the normalized
         direction; TRSHR projects the direction onto the face in its undeformed geometry, at
@@ -30691,7 +30954,9 @@ class _Loads:
             return self._drop_load_line(b, g, f"its direction is given in the local system "
                                               f"{b.param('ORIENTATION')}, which this conversion "
                                               f"does not apply")
-        inexact = self._nodal_load_inexact(b, base)
+        # (GRAV / BX / BY on 2-D continuum elements: per unit undeformed volume or mass, fixed
+        # in direction, as ccx applies them on its solids; CENTRIF stays under NLGEOM)
+        inexact = None if two_by_two else self._nodal_load_inexact(b, base)
         if inexact and not self._approx:
             return self._drop_load_line(b, g, f"{inexact}; nodal forces from the undeformed "
                                               f"geometry are known to be exact only in small-strain "
@@ -30726,6 +30991,18 @@ class _Loads:
 
             def load(p, normal, tangent):
                 return vscale(down, mag)
+        elif base == "CENTRIF":                 # mag: omega^2; d: a point on the axis; per mass
+            try:
+                axis = tuple(pf(x) if x else 0.0 for x in (g[6:9] + ["", "", ""])[:3])
+            except ValueError:
+                return self._drop_load_line(b, g, "its axis is not a number", reduces=False)
+            if vnorm(axis) == 0.0:
+                return self._drop_load_line(b, g, "its axis direction is zero", reduces=False)
+            spin = vunit(axis)
+
+            def load(p, normal, tangent):
+                q = vsub(p, d)
+                return vscale(vsub(q, vscale(spin, vdot(q, spin))), mag)
         forces: Dict[Tuple[int, int], float] = {}
         flat: set = set()                                   # nodes of a 2-D model (DOFs 1-2)
         for nodes, kind, scale, axi, planar, n1, sense in faces:
@@ -30795,6 +31072,15 @@ class _Loads:
         self._set_nodal_load(key, forces, amp)
         if base.startswith("TR"):
             what, lack = "surface tractions (TRVEC / TRSHR)", "ccx has no such load"
+        elif two_by_two:
+            what, lack = ("body loads (GRAV / CENTRIF / BX / BY) on CAX8R / CPE8R / CPS8R elements "
+                          "that are no parallelograms with their midside nodes in the middle of "
+                          "their edges (plane ones under a constant load: whose midside nodes lie "
+                          "off the middle or the chords), and CENTRIF on axisymmetric ones",
+                          "ccx 2.23 integrates them at 2 x 2 points, which moves part of the load "
+                          "between an element's nodes (Abaqus integrates them fully: these forces, "
+                          "at 3 x 3 points); a set's other elements keep the line, on a set of "
+                          "their own (ABQ2CCX_QUAD_REST_...)")
         elif face_pressure:
             what, lack = ("pressures on CAX8R / CAX6 edges in a deck without NLGEOM, where the "
                           "midside node lies off the middle of the edge or off its chord",
@@ -37353,6 +37639,10 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # pressures kept on CAX8R / CAX6 edges ccx integrates at 2 points (_two_point_pressure):
         # element / set / surface -> the largest shift of a nodal share, whether under NLGEOM
         self._two_point_kept: "OrderedDict[str, Tuple[float, bool]]" = OrderedDict()
+        # body loads on CAX8R / CPE8R / CPS8R ccx integrates at 2 x 2 (_plan_two_by_two_body_loads):
+        # element set / element (upper case) -> plan; those kept: set -> (largest shift, why)
+        self._two_by_two: Dict[str, dict] = {}
+        self._two_by_two_kept: "OrderedDict[str, Tuple[float, str]]" = OrderedDict()
 
     # the step model's deck-wide facts, read-only, by the names the planners and handlers read
     # them: ``self.steps``' (before _read_steps the early model's, whose aggregates are the
@@ -37862,6 +38152,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_partial_couplings_nlgeom(blocks)
         self._plan_member_mass_tets(blocks)     # after _plan_rot_nodes: the *MPC BEAM bodies
         self._warn_massless_frequency(blocks)   # after it: its massless tetrahedra
+        self._warn_two_d_mass(blocks)           # after the mesh planners: the final element types
         self._plan_surface_heat(blocks)
         self._plan_load_cases(blocks)
         self._plan_rigid_planar_holds()             # after _plan_rot_nodes: the bodies' ROT NODEs
@@ -37873,6 +38164,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_ic_axes(blocks)
         self._plan_sheet_pressure(blocks)       # after _plan_distributions resets the used names
         self._plan_shell_body_forces(blocks)    # after the density planners' material copies
+        self._plan_two_by_two_body_loads(blocks)    # likewise; after _plan_section_thick
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
         self._note_quadratic_beams(blocks)      # after the planar constraint
@@ -37922,6 +38214,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                     "depends on (ccx stops on them free)"] + self._kin_hold_bc + self._kin_hold_eq
         out.extend(self.emit_other(blocks))
         self._warn_two_point_kept()
+        self._warn_two_by_two_kept()
         if self._body_copy_of:                  # (_body_copy: before the first *STEP)
             at = next(i for i, ln in enumerate(out) if ln.strip().upper().startswith("*STEP"))
             out[at:at] = ["** abq2ccx: copies of element sets for body loads of one set on two "
