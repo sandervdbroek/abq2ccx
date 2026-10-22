@@ -10652,7 +10652,7 @@ class _Mesh:
         turn = layout == "boundary" and b.keyword == "BOUNDARY" and bool(self._transformed)
         loose = False
         for a, c, m, s in self._between() + (self._tied_nodes if layout != "boundary" else []):
-            via_held = False
+            via_held: set = set()                # DOFs an end's BC in force gives
             if held is not None and layout == "field" and (a in recs or c in recs) and \
                     (only is None or m in only):
                 ra, rc = ({0: list(recs[x][0]) if x in recs else list(held.get(x, ()))} for x in (a, c))
@@ -10666,7 +10666,8 @@ class _Mesh:
                             v, law = bc_held[x][d]
                             loose = loose or law is None or (law != b.uparam("AMPLITUDE") and v != 0.0)
                             if law is not None:
-                                rx[d], via_held = v, True
+                                rx[d] = v
+                                via_held.add(d)
             elif a not in recs or c not in recs or (only is not None and m not in only):
                 continue
             else:
@@ -10700,7 +10701,8 @@ class _Mesh:
                 head = [str(m), str(d1)] if layout == "dof" else [str(m), str(d1), str(d2)]
                 out.append(", ".join(head + ([] if v is None else ["%.12g" % v])))
             if len(out) > n_out:
-                kinds.add("beam" if m in beam_mids else "edge")
+                if (set(ra) & set(rc)) - via_held:
+                    kinds.add("beam" if m in beam_mids else "edge")
                 if via_held:
                     kinds.add("held")
         if out and note:
@@ -10772,8 +10774,8 @@ class _Mesh:
         if "held" in kinds:
             self.report.note(f"*{keyword} lines given for one end of an edge or beam the converter "
                              f"put nodes on, whose other end has a BC in force from an earlier card, "
-                             f"were extended to those nodes too (interpolated with that end's value), "
-                             f"so that they move with the ends as in Abaqus.", once=True)
+                             f"were extended to those nodes (interpolated with that end's value), so "
+                             f"that they move with the ends as in Abaqus.", once=True)
         if "turned" in kinds or "turned~" in kinds:
             self.report.note("*BOUNDARY lines on both ends of an edge the converter put a node on, "
                              "where the node's *TRANSFORM axes differ from theirs (a cylindrical or "
