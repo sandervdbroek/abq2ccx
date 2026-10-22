@@ -2284,18 +2284,25 @@ def creep_floor_factor(a: float, m: float, t0: float, t1: float) -> float:
     """How many times the creep strain of a Norton law A q^n t^m (time hardening, a > 0,
     -1 < m) at a constant stress q from total time t0 to t1 > t0 ccx 2.23 gives, which raises
     A t^m to at least CREEP_FLOOR (incplas_lin.f, incplas.f: isotropic *ELASTIC): the
-    integral of max(A t^m, CREEP_FLOOR) over that of A t^m.  1.0 where the floor never bites."""
+    integral of max(A t^m, CREEP_FLOOR) over that of A t^m.  1.0 where the floor never bites.
+    In u = t / t1, where the floor is g = CREEP_FLOOR / (A t1^m), times m + 1 and in
+    logarithms, so that nothing overflows (an A of 1e-300 included) and a short step late in
+    the analysis (t0 / t1 near 1) keeps its digits."""
+    g = math.exp(max(-700.0, min(700.0, math.log(CREEP_FLOOR) - math.log(a) - m * math.log(t1))))
     if m == 0.0:
-        return max(a, CREEP_FLOOR) / a
+        return max(1.0, g)
+    p, d = m + 1.0, (t1 - t0) / t1          # d = 1 - u0
 
-    def integral(lo: float, hi: float) -> float:
-        return a / (m + 1.0) * (hi ** (m + 1.0) - lo ** (m + 1.0))
-    # A t^m = CREEP_FLOOR at t = tc: below it before tc for m > 0, after it for m < 0
-    tc = math.exp(max(-700.0, min(700.0, (math.log(CREEP_FLOOR) - math.log(a)) / m)))
-    c = min(max(tc, t0), t1)
-    floored = CREEP_FLOOR * (c - t0) + integral(c, t1) if m > 0.0 else \
-        integral(t0, c) + CREEP_FLOOR * (t1 - c)
-    return floored / integral(t0, t1)
+    def rest(lu: float) -> float:           # 1 - u^p, lu = log(u)
+        return -math.expm1(p * lu)
+    lu0 = math.log1p(-d) if t0 > 0.0 else -math.inf
+    luc = max(lu0, min(0.0, math.log(g) / m))       # u^m = g, within [u0, 1]
+    one_c = -math.expm1(luc)                # 1 - uc
+    if m > 0.0:                             # floored before uc
+        floored = g * p * (d - one_c) + rest(luc)
+    else:                                   # after it
+        floored = rest(lu0) - rest(luc) + g * p * one_c
+    return floored / rest(lu0)
 
 
 # a row of a field-dependent material table (field_table_at): its property values as written,
