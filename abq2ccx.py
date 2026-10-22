@@ -3860,9 +3860,9 @@ PROC_KW = {"STATIC", "FREQUENCY", "BUCKLE", "DYNAMIC", "MODAL DYNAMIC", "HEAT TR
 # The Abaqus procedures ccx 2.23 has no counterpart for, and what each computes.  A step without
 # a procedure card makes ccx run it as the previous step's procedure (probed: a load-controlled
 # *STATIC after a static step), or stop as step 1, so handle_step stops ccx at such a step
-# (_no_procedure).  *GEOSTATIC is no *STATIC either: it equilibrates the initial geostatic
-# stresses (and pore pressures) with the loads, under UTOL changing them to keep the
-# displacements small, and the converter has neither those stresses nor pore pressure elements.
+# (_no_procedure).  A linear *GEOSTATIC step without pore pressure is a *STATIC step
+# (Converter._geostatic_steps); the others equilibrate the initial stresses and pore pressures
+# with the loads, under UTOL changing them to keep the displacements small, which ccx cannot.
 ABAQUS_ONLY_PROCS = {
     "GEOSTATIC": "geostatic stress field (the initial stresses and pore pressures equilibrated "
                  "with the loads)",
@@ -35285,6 +35285,16 @@ class _Loads:
                              "fixed increment, and under DIRECT ccx then stops ('solution seems to "
                              "diverge'). Where ccx converges, the increments are the deck's.",
                              once=True)
+        if id(b) in self._geostatic:
+            orig = self._geostatic[id(b)]
+            self.report.note("*GEOSTATIC -> *STATIC: a linear geostatic step without pore pressure "
+                             "is the static solution from the initial stresses (Abaqus applies them "
+                             "in full at time zero and finds the equilibrium with the step's loads and "
+                             "boundary conditions; the displacements stay, as after any step). A zero "
+                             "or blank initial increment is the step's period (Abaqus' default).",
+                             once=True)
+            return [f"** abq2ccx: Abaqus' {emit_keyword(orig.keyword, orig.params)}",
+                    emit_keyword("STATIC", params)] + data
         if "RIKS" in params:
             if self._approx:
                 del params["RIKS"]
@@ -35590,10 +35600,11 @@ class _Loads:
                 return turned
         if typ not in ("STRESS", "PLASTIC STRAIN", "SOLUTION"):
             return self.passthrough(b) + midside
+        if b.has("GEOSTATIC") and typ == "STRESS":
+            return self._geostatic_stresses(b)
         if b.has("GEOSTATIC"):
-            return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ}, GEOSTATIC (stress varying "
-                                      f"with elevation) has no ccx equivalent; compute per-element "
-                                      f"stresses and list them explicitly.")
+            return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ}, GEOSTATIC: Abaqus reads "
+                                      f"GEOSTATIC with TYPE=STRESS only.")
         if b.has("USER"):
             return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ}, USER needs the "
                                       f"sigini/sdvini user subroutine — port it to ccx and re-add.")
@@ -35683,6 +35694,109 @@ class _Loads:
             self._reduces(f"*INITIAL CONDITIONS, TYPE={typ} on shells / beams dropped")
         if len(out) == 1:
             return self._commented(b, f"*INITIAL CONDITIONS TYPE={typ} had no expandable records.")
+        return out
+
+    def _geostatic_stresses(self, b: Block) -> List[str]:
+        """*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC ``b`` as ccx's stresses at each integration
+        point (Abaqus 2017: Keywords *INITIAL CONDITIONS; Analysis "Defining elevation-dependent
+        (geostatic) initial stresses").  A record holds an element or element set, two (vertical
+        stress, elevation) pairs and the lateral coefficients K1, K2 (K1 where omitted).  The
+        vertical stress is linear in the elevation through the two pairs, extrapolated outside
+        them — z in 3-D, y on plane and axisymmetric elements — at each of ccx's integration
+        points (ccx_integration_points: ccx 2.23 reads a value per point and none per element);
+        the lateral direct stresses are K1 times it along x, K2 times it along y (3-D) or
+        through the thickness / around the hoop (plane strain, axisymmetric: ccx's zz); a
+        plane-stress element has no thickness stress (ccx zz 0: _ic_rows); no shear.  Abaqus
+        allows continuum elements only.  Reduced physics: an element with an orientation or a
+        continuum shell's axes where the stress is not the same in its axes as in global ones
+        (Abaqus does not say which axes the coefficients take; written in global ones), and an
+        axisymmetric element with K2 other than K1 (the Analysis Guide says such models use
+        one coefficient, the Keywords Reference gives K2 the hoop stress; written as K2)."""
+        out: List[str] = [emit_keyword("INITIAL CONDITIONS", OrderedDict([("TYPE", "STRESS")]))]
+        ctypes: Dict[str, str] = {}
+        skipped = unknown = hoop = 0
+        unmatched = False
+        for f in merged_data_records(b):
+            g = trimmed_fields(f)
+            if not g:
+                continue
+            tok = g[0]
+            try:
+                s1, z1, s2, z2, k1 = (pf(x) if x else 0.0 for x in (g[1:6] + [""] * 5)[:5])
+                k2 = pf(g[6]) if len(g) > 6 and g[6] else k1
+            except ValueError:
+                self.report.warn(f"*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC: record '{', '.join(g)}' "
+                                 f"has a field that is no number; record dropped.", once=True)
+                self._reduces("*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC record unread")
+                continue
+            if z1 == z2 and s1 != s2:
+                self.report.warn(f"*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC: record '{', '.join(g)}' "
+                                 f"gives two vertical stresses at one elevation, so no stress varies "
+                                 f"linearly through both; record dropped.", once=True)
+                self._reduces("*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC record unread")
+                continue
+            eids = self._ply_ids.get(int(tok), [int(tok)]) if re.fullmatch(r"[-+]?\d+", tok) else \
+                self.geom.elset(tok)
+            if not eids:
+                self.report.warn(f"*INITIAL CONDITIONS TYPE=STRESS: '{tok}' matches no element or "
+                                 f"elset; record dropped.", once=True)
+                unmatched = True
+                continue
+            for eid in eids:
+                info = self.geom.elements.get(eid)
+                if info and info[0] not in ctypes:
+                    ctypes[info[0]] = ccx_element_type(info[0], self.report)
+                ctype = ctypes[info[0]] if info else ""
+                pts = ccx_integration_points(ctype, [self.geom.nodes[x] for x in info[1]]) \
+                    if info and all(x in self.geom.nodes for x in info[1]) else None
+                if pts is None:
+                    skipped += 1
+                    continue
+                family = ctype[:3] if ctype[:3] in ("CPS", "CPE", "CAX") else "C3D"
+                unit = {"C3D": [k1, k2, 1.0], "CPS": [k1, 1.0, 0.0]}.get(family, [k1, 1.0, k2]) + [0.0] * 3
+                if family == "CAX" and k2 != k1:
+                    hoop += 1
+                if (eid in self._ic_shell or eid in self._ic_ori) and \
+                        not (unit[0] == unit[1] == unit[2] if family != "CPS" else unit[0] == unit[1]):
+                    frames, _why = self._ic_frames(eid, ctype, family != "C3D")
+                    if frames is None or any(abs(x - y) > 1e-12 * max(map(abs, unit))
+                                             for fr in frames for x, y in zip(tensor_to_global(fr, unit), unit)):
+                        unknown += 1
+                h = 2 if family == "C3D" else 1
+                for k, p in enumerate(pts, 1):
+                    sv = s1 if z1 == z2 else s1 + (s2 - s1) * (p[h] - z1) / (z2 - z1)
+                    out.extend(reflow([str(eid), str(k)] + [short_real(sv * u + 0.0, 12) for u in unit],
+                                      MAX_ENTRIES_PER_LINE))
+        if len(out) > 1:
+            self.report.note("*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC -> ccx's stresses at each "
+                             "integration point: the vertical one linear in the elevation (z in 3-D, y "
+                             "in plane and axisymmetric models) through the record's two points, "
+                             "extrapolated outside them, the lateral ones K1 and K2 times it (Abaqus "
+                             "Keywords, *INITIAL CONDITIONS).", once=True)
+        if skipped:
+            self.report.warn(f"*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC: {skipped} element(s) are "
+                             f"no continuum elements whose integration points the converter knows "
+                             f"(Abaqus takes geostatic stresses on continuum elements only); left out.",
+                             once=True)
+            self._reduces("*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC on elements without known "
+                          "integration points")
+        if unknown:
+            self.report.warn(f"*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC: {unknown} element(s) have an "
+                             f"orientation or continuum shell axes, and Abaqus does not say whether the "
+                             f"lateral coefficients act along those or the global axes; written along "
+                             f"the global ones — verify.", once=True)
+            self._reduces("*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC lateral stresses in local axes")
+        if hoop:
+            self.report.warn(f"*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC: {hoop} axisymmetric "
+                             f"element(s) have two different lateral coefficients. The Keywords "
+                             f"Reference gives the second to the hoop stress, the Analysis Guide says "
+                             f"axisymmetric cases use only one; written as the Keywords Reference reads "
+                             f"it — verify.", once=True)
+            self._reduces("*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC hoop coefficient on "
+                          "axisymmetric elements")
+        if len(out) == 1:                   # (the other records left out are flagged above)
+            return self._commented(b, "*INITIAL CONDITIONS TYPE=STRESS, GEOSTATIC had no expandable "
+                                      "records.", reduces=unmatched)
         return out
 
     def _temperature_ic_fill(self, params: "OrderedDict[str, Optional[str]]") -> List[str]:
@@ -40463,6 +40577,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._dp_unused: Dict[int, str] = {}       # cards of an unused one -> why commented out
         self._lc_marks: Dict[int, str] = {}        # *LOAD CASE of a step split per case -> its case
         self._matrix_steps: Dict[int, Block] = {}  # MATRIXSTORAGE *FREQUENCY -> its *MATRIX GENERATE
+        self._geostatic: Dict[int, Block] = {}     # *STATIC -> the *GEOSTATIC it stands for
         self._ic_ori: Dict[int, Tuple[str, str]] = {}  # element -> its section, orientation (_plan_ic_axes)
         self._ic_shell: Dict[int, tuple] = {}      # continuum shell / ply solid -> how its axes form (ditto)
         # (id(split composite section), ply group's set) -> ply solid -> its axes (_ply_group_axes)
@@ -41207,6 +41322,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         blocks = self._move_between_cards(blocks)     # before anything splits the deck into steps
         blocks = self._split_load_cases(blocks)       # after it: its moved cards are the step's
         blocks = self._matrix_generate_steps(blocks)  # before anything reads the procedures
+        blocks = self._geostatic_steps(blocks)        # likewise
         blocks = self._sp_amplitudes(blocks)          # before anything reads load amplitudes
         blocks = self._blank_periods(blocks)          # before the step model reads the periods
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
@@ -41751,6 +41867,95 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             new = Block("FREQUENCY", OrderedDict(SOLVER="MATRIXSTORAGE"), [])
             self._matrix_steps[id(new)] = b
             swap[id(b)] = new
+        return [swap.get(id(b), b) for b in blocks] if swap else blocks
+
+    # the material cards that make a static step nonlinear in Abaqus (_geostatic_steps):
+    # inelasticity, nonlinear elasticity, damage, and properties that depend on the solution
+    _NONLINEAR_MATERIAL_CARDS = INELASTIC_MATERIAL_CARDS | U1_NONLINEAR_CARDS | frozenset({
+        "PLASTIC", "HYPOELASTIC", "DRUCKER PRAGER", "CAP PLASTICITY", "CLAY PLASTICITY",
+        "CAST IRON PLASTICITY", "CONCRETE", "CONCRETE DAMAGED PLASTICITY", "BRITTLE CRACKING",
+        "CRUSHABLE FOAM", "POROUS METAL PLASTICITY", "POROUS ELASTIC", "SOFT ROCK PLASTICITY",
+        "PAPERBOARD PLASTICITY", "JOINTED MATERIAL", "SUPERELASTIC", "VISCOELASTIC",
+        "MULLINS EFFECT", "DAMAGE INITIATION", "SWELLING", "MOISTURE SWELLING",
+        "USER DEFINED FIELD", "NO COMPRESSION", "NO TENSION", "NONLINEAR BH"})
+    _NONLINEAR_CONNECTOR_CARDS = frozenset({
+        "CONNECTOR STOP", "CONNECTOR LOCK", "CONNECTOR PLASTICITY", "CONNECTOR FRICTION",
+        "CONNECTOR HARDENING", "CONNECTOR DAMAGE INITIATION", "CONNECTOR DAMAGE EVOLUTION",
+        "CONNECTOR UNIAXIAL BEHAVIOR"})
+
+    def _geostatic_steps(self, blocks: List[Block]) -> List[Block]:
+        """A linear *GEOSTATIC step of a model without pore pressure -> *STATIC, its data line
+        kept.  Abaqus applies the initial stresses "in full at time zero" and iterates to the
+        equilibrium with the step's loads and BCs (2017 "Geostatic stress state", "Initial
+        conditions"), which in a linear step is the static solution from those stresses: ccx's
+        *STATIC with the stresses as initial conditions (validate geostatic_column).  A zero or
+        blank initial increment is the period (Abaqus' default).  The step stays as it was
+        (commented out, ccx stops there: _no_procedure), warned with the reason, where
+        * the model has pore pressure elements, whose pore pressures Abaqus equilibrates too
+          (ccx's elements have none);
+        * UTOL asks for Abaqus' enhanced procedure, which changes the stresses to keep the
+          displacements below the tolerance;
+        * the step is nonlinear (NLGEOM, a used material with a card of
+          _NONLINEAR_MATERIAL_CARDS, contact, gaps, nonlinear springs, dashpots, connectors or
+          user elements): Abaqus iterates from the initial stresses with loads whose path in the
+          step it does not document.
+        The converted card -> the original (``_geostatic``: handle_static writes it)."""
+        if not any(b.keyword == "GEOSTATIC" for b in blocks):
+            return blocks
+        model = StepModel(blocks)
+        pore = sorted({b.uparam("TYPE") for b in blocks if b.keyword == "ELEMENT" and
+                       "P" in split_suffixes(b.uparam("TYPE"))[1]})
+        used = {mat.upper() for b in blocks if b.keyword.endswith("SECTION")
+                for _t, mat, _p in self._section_layers(b, strict=True) if mat}
+        nonlinear = next((f"material {g[0].uparam('NAME')}'s *{c.keyword}"
+                          for g in self._material_groups(blocks) if g[0].uparam("NAME") in used
+                          for c in g[1:] if c.keyword in self._NONLINEAR_MATERIAL_CARDS and
+                          not (c.keyword == "USER MATERIAL" and c.uparam("TYPE") == "THERMAL")), "")
+        for b in blocks if not nonlinear else ():
+            kw = b.keyword
+            if (kw == "CONTACT PAIR" and not b.has("TIED")) or kw == "CONTACT":
+                nonlinear = f"contact (*{kw})"
+            elif kw == "ELEMENT" and b.uparam("TYPE").startswith(("GAP", "ITS")):
+                nonlinear = f"{b.uparam('TYPE')} gap elements"
+            elif (kw in ("SPRING", "DASHPOT", "CONNECTOR ELASTICITY", "CONNECTOR DAMPING") and
+                  b.has("NONLINEAR")) or kw in self._NONLINEAR_CONNECTOR_CARDS:
+                nonlinear = f"*{kw}" + (", NONLINEAR" if b.has("NONLINEAR") else "")
+            elif kw == "USER ELEMENT" and not b.has("LINEAR"):
+                nonlinear = "a nonlinear *USER ELEMENT"
+            if nonlinear:
+                break
+        swap: Dict[int, Block] = {}
+        for step in model.steps:
+            b = step.procedure
+            if b is None or b.keyword != "GEOSTATIC":
+                continue
+            if pore:
+                why = (f"the model has pore pressure elements ({', '.join(pore)}), whose pore "
+                       f"pressures Abaqus equilibrates too; ccx's elements have none")
+            elif b.has("UTOL"):
+                why = ("UTOL asks for Abaqus' enhanced procedure, which changes the initial stresses "
+                       "to keep the displacements below the tolerance")
+            elif step.nlgeom or nonlinear:
+                why = (f"the step is nonlinear ({'NLGEOM' if step.nlgeom else nonlinear}): Abaqus "
+                       f"iterates to equilibrium from the initial stresses, applied in full at time "
+                       f"zero, with loads whose path in the step it does not document, which a ccx "
+                       f"*STATIC need not follow")
+            else:
+                g = (merged_data_records(b) or [[]])[0]
+                g = [x.strip() for x in g] + ["", ""]
+                try:
+                    first, period = (pf(x) if x else 0.0 for x in g[:2])
+                except ValueError:
+                    first = period = 1.0
+                data = list(b.data)
+                if data and first == 0.0:
+                    g[0] = g[1] if period > 0.0 else "1."
+                    data = [", ".join(trimmed_fields(g))]
+                new = Block("STATIC", OrderedDict(), data)
+                self._geostatic[id(new)] = b
+                swap[id(b)] = new
+                continue
+            self.report.warn(f"Step {step.no}: *GEOSTATIC not converted to *STATIC: {why}.", once=True)
         return [swap.get(id(b), b) for b in blocks] if swap else blocks
 
     def _sp_amplitudes(self, blocks: List[Block]) -> List[Block]:

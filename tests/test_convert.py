@@ -538,7 +538,7 @@ def test_general_step_is_any_but_a_linear_perturbation_step():
 *STEP\n*CLOAD\n1, 1, 1.\n*END STEP\n*STEP\n*FREQUENCY\n2\n*END STEP""")
     assert [s.general_before for s in m] == [False, True, True, True]
     assert m.pert == {2, 4}
-    body, conv, _ = convert_str(HEX_MODEL + """*STEP\n*GEOSTATIC\n*END STEP\n*STEP\n*BUCKLE\n2
+    body, conv, _ = convert_str(HEX_MODEL + """*STEP\n*GEOSTATIC, UTOL\n*END STEP\n*STEP\n*BUCKLE\n2
 *CLOAD\n7, 3, -1.\n*END STEP\n""")
     assert "*STEP, PERTURBATION\n*BUCKLE" in body and [s.general_before for s in conv.steps] == [False, True]
     assert "*NO ANALYSIS" in body
@@ -3572,14 +3572,119 @@ def test_initial_stress_expanded_to_integration_points():
     assert "per-integration" in rep.text().lower()
 
 
-def test_initial_stress_geostatic_commented():
-    deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
-            "*Element, type=CPS4, elset=e\n1,1,2,3,4\n"
-            "*Initial Conditions, type=STRESS, GEOSTATIC\ne, -100., 10., 0., 0., 0.5\n")
-    body, _, _ = convert_str(deck)
-    live = [l for l in body.splitlines() if not l.lstrip().startswith("**")]
-    assert not any("INITIAL CONDITIONS" in l.upper() for l in live)
-    assert "GEOSTATIC" in body.upper()                          # visible in the comment
+def _ic_rows(body):
+    """{(element, point): [values]} of the *INITIAL CONDITIONS, TYPE=STRESS lines of ``body``."""
+    lines = body.splitlines()
+    i = next(k for k, ln in enumerate(lines) if ln == "*INITIAL CONDITIONS, TYPE=STRESS")
+    rows = {}
+    for ln in lines[i + 1:]:
+        if ln.startswith("*"):
+            break
+        f = [x.strip() for x in ln.split(",")]
+        rows[(int(f[0]), int(f[1]))] = [float(x) for x in f[2:]]
+    return rows
+
+
+def test_initial_stress_geostatic_per_integration_point():
+    # *INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC (was commented out): at each of ccx's
+    # integration points the vertical stress, linear in z (3-D) or y (plane, axisymmetric)
+    # through the record's two (stress, elevation) points and extrapolated outside them, and
+    # K1 / K2 times it laterally: x / y in 3-D, x / thickness or hoop on plane strain and
+    # axisymmetric elements, no thickness stress on plane stress; K2 omitted is K1
+    g = 0.5 / math.sqrt(3.0)
+    low, high = 0.5 - g, 0.5 + g                       # ccx's 2 x 2 x 2 points along an edge
+    deck = (HEX.replace("EALL", "EALL") + "*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=EALL, material=M\n"
+            "*Initial Conditions, type=STRESS, GEOSTATIC\nEALL, 0., 2., -20., 0., 0.4, 0.6\n")
+    body, conv, rep = convert_str(deck)
+    rows = _ic_rows(body)
+    assert len(rows) == 8 and "GEOSTATIC" not in body.split("*INITIAL CONDITIONS")[1].split("\n")[0]
+    for (e, k), v in rows.items():
+        sv = -20.0 + 10.0 * (low if k <= 4 else high)      # (the points 5-8: the upper layer)
+        assert e == 1 and all(abs(a - b) < 1e-9 for a, b in zip(v, [0.4 * sv, 0.6 * sv, sv, 0., 0., 0.])), (k, v)
+    assert conv.reduced_physics == [] and "lateral ones K1 and K2 times it" in rep.text()
+    plane = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n*Element, type={t}, elset=E\n"
+             "1,1,2,3,4\n*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=E, material=M\n"
+             "1.\n*Initial Conditions, type=STRESS, GEOSTATIC\nE, -100., 10., 0., 0., 0.5{k2}\n")
+    for t, k2, want in (("CPS4", ", 0.7", lambda sv: [0.5 * sv, sv, 0.0]),
+                        ("CPE4", ", 0.7", lambda sv: [0.5 * sv, sv, 0.7 * sv]),
+                        ("CPE4", "", lambda sv: [0.5 * sv, sv, 0.5 * sv]),
+                        ("CAX4", ", 0.7", lambda sv: [0.5 * sv, sv, 0.7 * sv])):
+        body, conv, rep = convert_str(plane.format(t=t, k2=k2))
+        rows = _ic_rows(body)
+        assert len(rows) == 8, t
+        for (e, k), v in rows.items():
+            sv = -10.0 * (low if k in (1, 2, 5, 6) else high)
+            assert all(abs(a - b) < 1e-9 for a, b in zip(v, want(sv) + [0., 0., 0.])), (t, k, v)
+        hoop = t == "CAX4" and bool(k2)
+        assert conv.reduced_physics == (["*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC hoop coefficient "
+                                         "on axisymmetric elements"] if hoop else []), t
+        assert ("the Analysis Guide says axisymmetric cases use only one" in rep.text()) == hoop
+    # one elevation: one stress throughout, two stresses there drop the record
+    body, conv, _ = convert_str(plane.format(t="CPE4", k2="").replace("E, -100., 10., 0., 0., 0.5",
+                                                                       "E, -5., 1., -5., 1., 1., 1."))
+    assert all(v[:3] == [-5., -5., -5.] for v in _ic_rows(body).values())
+    body, conv, rep = convert_str(plane.format(t="CPE4", k2="").replace("E, -100., 10., 0., 0., 0.5",
+                                                                         "E, -5., 1., -6., 1., 1., 1."))
+    assert "two vertical stresses at one elevation" in rep.text() and conv.reduced_physics == [
+        "*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC record unread"]
+    assert "*INITIAL CONDITIONS" not in "\n".join(ln for ln in body.splitlines() if not ln.startswith("**"))
+    # shells: no continuum element (Abaqus takes geostatic stresses on those only)
+    shell = plane.format(t="S4", k2="").replace("*Solid Section, elset=E, material=M\n1.",
+                                                "*Shell Section, elset=E, material=M\n0.1")
+    _, conv, rep = convert_str(shell)
+    assert "1 element(s) are no continuum elements" in rep.text() and conv.reduced_physics == [
+        "*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC on elements without known integration points"]
+    # an orientation: Abaqus does not say which axes the coefficients take, unless the stress is
+    # the same in both (K1 = K2 = 1 in 3-D; about z also K1 = K2)
+    turned = deck.replace("material=M\n", "material=M, orientation=R\n*Orientation, name=R\n"
+                          "0.6, 0.8, 0., -0.8, 0.6, 0.\n", 1)
+    for ks, flagged in ((", 0.4, 0.6", True), (", 0.5, 0.5", False), (", 1., 1.", False)):
+        _, conv, rep = convert_str(turned.replace(", 0.4, 0.6", ks))
+        assert ("whether the lateral coefficients act along those" in rep.text()) == flagged, ks
+    _, conv, rep = convert_str(turned.replace("0.6, 0.8, 0., -0.8, 0.6, 0.", "1., 0., 0., 0., 0.6, 0.8")
+                               .replace(", 0.4, 0.6", ", 0.5, 0.5"))
+    assert "whether the lateral coefficients act along those" in rep.text()
+
+
+def test_geostatic_step_as_static():
+    # a linear *GEOSTATIC step of a model without pore pressure (was *NO ANALYSIS: ccx stopped) is
+    # a *STATIC step: Abaqus applies the initial stresses in full at time zero and finds the
+    # equilibrium with the step's loads (validate geostatic_column); a zero or blank initial
+    # increment is the period (Abaqus' default)
+    model = (HEX.replace("EALL\n", "EALL\n", 1) + "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n2.\n"
+             "*Solid Section, elset=EALL, material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 3\n"
+             "*Initial Conditions, type=STRESS, GEOSTATIC\nEALL, 0., 1., -20., 0., 0.5\n")
+    grav = "*Dload\nEALL, GRAV, 10., 0., 0., -1.\n"
+    for data, written in (("\n", "\n"), ("\n0., 2.\n", "\n2., 2.\n"), ("\n, 3.\n", "\n3., 3.\n"),
+                          ("\n0.\n", "\n1.\n"), ("\n0.25, 2., 1e-5, 0.5\n", "\n0.25, 2., 1e-5, 0.5\n")):
+        body, conv, rep = convert_str(model + _deck_step("Geostatic, HEAT=NO" + data.rstrip("\n"), grav))
+        step = body.split("*STEP")[1]
+        assert step.startswith("\n** abq2ccx: Abaqus' *GEOSTATIC, HEAT=NO\n*STATIC" + written), (data, step)
+        assert "\n*DLOAD\nEALL, GRAV, 10., 0., 0., -1.\n" in step and "*NO ANALYSIS" not in body
+        assert conv.reduced_physics == [] and "*GEOSTATIC -> *STATIC: a linear geostatic step" in rep.text()
+        assert [s.proc for s in conv.steps] == ["STATIC"]
+    # left as it was (ccx stops there), and why: pore pressure elements, UTOL (the enhanced
+    # procedure), a nonlinear step; a material no section uses changes nothing
+    plastic = "*Elastic\n1000., 0.3\n*Plastic\n10., 0.\n"
+    contact = ("*Surface, name=A\nEALL, S1\n*Surface, name=B\nEALL, S2\n*Surface Interaction, name=I\n"
+               "*Contact Pair, interaction=I\nA, B\n")
+    for deck, why in (
+            (model.replace("C3D8", "C3D8P"), "the model has pore pressure elements (C3D8P), whose pore "
+                                             "pressures Abaqus equilibrates too"),
+            (model + _deck_step("Geostatic, utol=1e-4", grav), "UTOL asks for Abaqus' enhanced procedure"),
+            (model + _deck_step("Geostatic", grav, head=", nlgeom"), "the step is nonlinear (NLGEOM)"),
+            (model.replace("*Elastic\n1000., 0.3\n", plastic), "the step is nonlinear (material M's *PLASTIC)"),
+            (model + contact, "the step is nonlinear (contact (*CONTACT PAIR))"),
+            (model + "*Spring, elset=SP, nonlinear\n1\n", "the step is nonlinear (*SPRING, NONLINEAR)")):
+        if "*Step" not in deck:
+            deck += _deck_step("Geostatic", grav)
+        body, conv, rep = convert_str(deck)
+        assert f"Step 1: *GEOSTATIC not converted to *STATIC: {why}" in rep.text(), (why, rep.text())
+        assert conv.reduced_physics[-1] == "*GEOSTATIC step (no ccx counterpart)", why
+        assert "\n*STATIC" not in body, why
+    _, conv, rep = convert_str(model + "*Material, name=UNUSED\n" + plastic + _deck_step("Geostatic", grav))
+    assert conv.reduced_physics == [] and "not converted" not in rep.text()
 
 
 def test_approximate_riks_and_default_off():
@@ -3645,21 +3750,23 @@ def test_steps_without_a_ccx_procedure_stop_ccx():
     assert "*SOILS: Abaqus' coupled pore fluid diffusion and stress analysis has no ccx " \
            "counterpart; commented out. Without a procedure ccx would run the step as the previous " \
            "step's procedure" in rep.text()
-    # as the first step: no *EL FILE; the steps after it are written as before
-    body, conv, _ = convert_str(model + _deck_step("Geostatic", "*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n")
+    # as the first step: no *EL FILE; the steps after it are written as before (a *GEOSTATIC step
+    # with UTOL: a linear one without it is a *STATIC, test_geostatic_step_as_static)
+    geo = "Geostatic, utol"
+    body, conv, _ = convert_str(model + _deck_step(geo, "*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n")
                                 + st)
     first, second = body.split("*STEP")[1:3]
-    assert "** *GEOSTATIC\n*NO ANALYSIS\n** abq2ccx: the step's other cards" in first
+    assert "** *GEOSTATIC, UTOL\n*NO ANALYSIS\n** abq2ccx: the step's other cards" in first
     assert "*EL FILE" not in first and "\n*STATIC\n*CLOAD\n7, 1, 1.\n" in second
     assert conv.reduced_physics == ["*GEOSTATIC step (no ccx counterpart)"]
     # ccx reaches no later step: one whose loads Abaqus carries from the stopped step is no
     # hollow solve
-    _, conv, _ = convert_str(model + _deck_step("Geostatic", "*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n")
+    _, conv, _ = convert_str(model + _deck_step(geo, "*Dload\nEALL, GRAV, 9.81, 0., 0., -1.\n")
                              + _deck_step("Static"))
     assert conv.unloaded_steps == [] and conv.reduced_physics == ["*GEOSTATIC step (no ccx counterpart)"]
     for kw in A.ABAQUS_ONLY_PROCS:
-        body, conv, _ = convert_str(model + st + _deck_step(kw.title()))
-        assert f"** *{kw}\n*NO ANALYSIS\n" in body, kw
+        body, conv, _ = convert_str(model + st + _deck_step(geo if kw == "GEOSTATIC" else kw.title()))
+        assert f"** *{kw}{', UTOL' if kw == 'GEOSTATIC' else ''}\n*NO ANALYSIS\n" in body, kw
         assert conv.reduced_physics == [f"*{kw} step (no ccx counterpart)"], kw
     # a step without any procedure card stops ccx too
     body, conv, rep = convert_str(model + st + _deck_step("Cload\n7, 1, 2."))

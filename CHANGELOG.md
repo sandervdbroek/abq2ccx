@@ -6,6 +6,13 @@ physics.
 
 ## Unreleased
 
+* **Geostatic initial stresses and steps** — `*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC` was
+  commented out. It is now written at each of ccx's integration points: the vertical stress
+  linear in the elevation (z in 3-D, y in plane and axisymmetric models) through the card's two
+  points, the lateral ones K1 and K2 times it. A linear `*GEOSTATIC` step of a model without
+  pore pressure elements becomes a `*STATIC` step (it was `*NO ANALYSIS`, where ccx stopped):
+  a soil column under gravity with its geostatic stresses stays put. With pore pressure, `UTOL`
+  or a nonlinear step the step stays as it was, and the warning now says why.
 * **Batch triage, crash reports, ccx install hint** — `--json` prints one object per deck per
   line (JSON Lines), now with the deck's `status` (`converted`, `reduced`, `commented` or
   `failed`) and `reduced_physics`, and a line with `error` for a deck that failed (none was

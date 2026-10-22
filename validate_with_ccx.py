@@ -2947,6 +2947,58 @@ def annulus_hoop_displacement(r, s0=100.0, e=1000.0, nu=0.3, a=1.0, b=2.0):
     return c * r * math.log(r) + aa * r + bb / r
 
 
+GEO_COLUMN = dict(h=4.0, rho=2.0, g=10.0, e=1000.0, nu=0.3)
+
+
+def geostatic_column_deck(typ, ic=True, k=(0.4, 0.6), ne=4):
+    """A soil column of ``typ`` (C3D8, or a quadratic plane or axisymmetric quad) under gravity in a *GEOSTATIC step: 1 wide
+    (r from 1 to 2 on CAX), GEO_COLUMN h high in z (3-D) or y in ``ne`` elements, its inner
+    layers tilted (the integration points sit at different heights across an element), the base
+    held vertically and every node laterally (a laterally confined column), and (``ic``) the
+    geostatic initial stresses that equilibrate it: 0 at the top, -rho g h at the base, the
+    lateral coefficients ``k``.  *EL PRINT of the stresses, *NODE PRINT of the top nodes (TOP)."""
+    h, rho, g = GEO_COLUMN["h"], GEO_COLUMN["rho"], GEO_COLUMN["g"]
+    solid = typ.startswith("C3D")
+    x0 = 1.0 if typ.startswith("CAX") else 0.0
+    lines = ["*Heading", f"Laterally confined {typ} soil column under gravity", "*Node, nset=ALL"]
+    ids: dict = {}
+
+    def layer(p, j):                                   # the height of layer j at node p
+        tilt = 0.1 * (p[0] / 2 - 0.5) + (0.05 * (p[1] / 2 - 0.5) if solid else 0.0)
+        return h * j / ne + (tilt if 0 < j < ne else 0.0)
+
+    def nid(*p):                                       # half steps across, up (3-D: x, y, up)
+        if p not in ids:
+            up = p[-1]                                 # (a midside node halfway between layers)
+            v = layer(p, up // 2) if up % 2 == 0 else (layer(p, up // 2) + layer(p, up // 2 + 1)) / 2
+            ids[p] = (len(ids) + 1, (x0 + p[0] / 2, p[1] / 2, v) if solid else (x0 + p[0] / 2, v, 0.0))
+        return ids[p][0]
+    elems = []
+    for j in range(0, 2 * ne, 2):
+        if solid:
+            q = [(0, 0), (2, 0), (2, 2), (0, 2)]
+            elems.append([nid(a, b, j) for a, b in q] + [nid(a, b, j + 2) for a, b in q])
+        else:
+            elems.append([nid(0, j), nid(2, j), nid(2, j + 2), nid(0, j + 2), nid(1, j), nid(2, j + 1),
+                          nid(1, j + 2), nid(0, j + 1)])
+    nodes = sorted(ids.items(), key=lambda kv: kv[1][0])
+    lines += [f"{n}, {x:.12f}, {y:.12f}, {z:.12f}" for _p, (n, (x, y, z)) in nodes]
+    lines += [f"*Element, type={typ}, elset=SOIL"] + [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(elems, 1)]
+    lines += ["*Nset, nset=BASE"] + _ids([n for p, (n, _x) in nodes if p[-1] == 0])
+    lines += ["*Nset, nset=TOP"] + _ids([n for p, (n, _x) in nodes if p[-1] == 2 * ne])
+    up = 3 if solid else 2
+    lines += ["*Solid Section, elset=SOIL, material=SOIL" + ("" if solid else "\n1."),
+              "*Material, name=SOIL", "*Elastic", f"{GEO_COLUMN['e']:g}, {GEO_COLUMN['nu']:g}",
+              "*Density", f"{rho:g}", "*Boundary", f"BASE, {up}, {up}"]
+    lines += ["ALL, 1, 2"] if solid else ["ALL, 1, 1"]
+    if ic:
+        lines += ["*Initial Conditions, type=STRESS, GEOSTATIC", f"SOIL, 0., {h:g}, {-rho * g * h:g}, 0., "
+                  f"{k[0]:g}, {k[1]:g}"]
+    lines += ["*Step", "*Geostatic", "*Dload", "SOIL, GRAV, %g, 0., %s" % (g, "0., -1." if solid else "-1., 0."),
+              "*Node Print, nset=TOP", "U", "*El Print, elset=SOIL", "S", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
 # the continuum-shell initial-condition checks: a plate off the x-y plane (unit normal
 # SC_IC_NORMAL, rows along SC_IC_ROW), an orientation whose axes leave it, turned 25 degrees about
 # axis 3 (Abaqus projects the turned axis 1), Abaqus' continuum-shell components 11, 22, 12 (2017
@@ -11357,6 +11409,66 @@ def main():
         ok = abs(u[4][0] + 0.2) < 1e-9
         print(f"{'PASS' if ok else 'FAIL'}  initial_stress_plane_stress (CPS4 square, initial S12 = 100, "
               f"G = 500): shear {u[4][0]:+.6f} (-tau / G = -0.2)")
+        failures += 0 if ok else 1
+    # *INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC at each of ccx's integration points and a linear
+    # *GEOSTATIC step as *STATIC: a laterally confined soil column under gravity with the
+    # geostatic stresses that equilibrate it stays put (Abaqus: "ideally ... zero deformations"),
+    # while its twin without them settles by rho g h^2 / 2M (M the confined modulus).  The
+    # stresses ccx prints are the closed form at the points' own coordinates (*EL PRINT COORD,
+    # added to the ccx deck: the converter writes none), lateral coefficients 0.4 / 0.6 along
+    # x / y in 3-D, x / thickness on CPE8, 0.5 radial and hoop on CAX8 (a tilted CAX8R mesh is not
+    # in equilibrium in Abaqus either: it integrates the stresses at 2 x 2 points, gravity fully)
+    h, rho, g = GEO_COLUMN["h"], GEO_COLUMN["rho"], GEO_COLUMN["g"]
+    e, nu = GEO_COLUMN["e"], GEO_COLUMN["nu"]
+    settle = -rho * g * h ** 2 / (2 * e * (1 - nu) / ((1 + nu) * (1 - 2 * nu)))
+    for typ, k in (("C3D8", (0.4, 0.6)), ("CPE8", (0.4, 0.6)), ("CAX8", (0.5, 0.5))):
+        tag = f"geostatic_column_{typ.lower()}"
+        runs = []
+        for ic in (True, False):
+            src = os.path.join(tmp, f"{tag}_src.inp")
+            with open(src, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(geostatic_column_deck(typ, ic, k))
+            inp = os.path.join(tmp, f"{tag}.inp")
+            _rep, conv = convert(src, inp)
+            with open(inp, encoding="utf-8") as fh:
+                text = fh.read()
+            written = "\n*STATIC\n" in text and "*NO ANALYSIS" not in text
+            with open(inp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text.replace("*EL PRINT, ELSET=SOIL\nS\n", "*EL PRINT, ELSET=SOIL\nS, COORD\n"))
+            d, status, out = run_ccx(ccx, env, inp)
+            dat = os.path.join(d, "job.dat")
+            u = dat_displacements(dat) if status == "solved" else {}
+            sig = (dat_tables(dat, "stresses") or [[]])[-1]
+            xyz = (dat_tables(dat, "global coordinates") or [[]])[-1]
+            shutil.rmtree(d, ignore_errors=True)
+            runs.append((status, written, conv.reduced_physics, u, sig, xyz, out))
+        (status, written, lost, u, sig, xyz, out), (status0, _w0, _l0, u0, _s0, _x0, out0) = runs
+        top = max((abs(v[1 if typ[:3] in ("CPE", "CAX") else 2]) for v in u.values()), default=math.inf)
+        top0 = [v[1 if typ[:3] in ("CPE", "CAX") else 2] for v in u0.values()]
+        pos = {(int(r[0]), int(r[1])): r[2:5] for r in xyz if len(r) == 5}
+        err, n_ip = 0.0, 0
+        for r in sig:
+            p = pos.get((int(r[0]), int(r[1]))) if len(r) == 8 else None
+            if p is None:
+                continue
+            sv = -rho * g * (h - p[2 if typ.startswith("C3D") else 1])
+            want = [k[0] * sv, k[1] * sv, sv] if typ.startswith("C3D") else [k[0] * sv, sv, k[1] * sv]
+            err = max(err, max(abs(a - b) for a, b in zip(r[2:5], want)), max(abs(x) for x in r[5:8]))
+            n_ip += 1
+        n_want = 4 * {"C3D8": 8, "CPE8": 27, "CAX8": 27}[typ]
+        ok = status == status0 == "solved" and written and not lost and n_ip == n_want and \
+            len(top0) > 1 and all(abs(t / settle - 1) < 1e-2 for t in top0) and \
+            top < 1e-9 * abs(settle) and err < 2e-6 * rho * g * h
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (laterally confined {typ} column under gravity, "
+              f"*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC, a *GEOSTATIC step -> *STATIC): top moves "
+              f"{top:.1e} vs {settle:.6f} without the stresses (rho g h^2 / 2M: "
+              f"{max((abs(t / settle - 1) for t in top0), default=math.inf):.1e} off); the stresses at "
+              f"{n_ip} of {n_want} integration points the geostatic ones to {err:.1e}"
+              + ("" if written else "; the step is no *STATIC")
+              + (f"; reduced physics: {'; '.join(lost)}" if lost else "")
+              + ("" if status == status0 == "solved" else f" ({status}, twin {status0})"))
+        if not ok:
+            print("\n".join(l for l in (out + out0).splitlines() if "ERROR" in l)[:400])
         failures += 0 if ok else 1
     # a continuum shell's are its components 11, 22, 12 in its material directions, with or
     # without an orientation (1, 2 on the mid-surface, 3 the stack direction; a composite ply's

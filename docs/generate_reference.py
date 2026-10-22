@@ -179,6 +179,9 @@ TRANSLATED = {
         "reframes it); `DIRECT=NO STOP` → `DIRECT`; `STABILIZE` dropped (warned).",
     "*COMPLEX FREQUENCY": "commented out, with `*NO ANALYSIS` in its place: ccx stops at that step "
         "(ccx's card computes Coriolis or flutter modes only, without damping; reduced physics).",
+    "*GEOSTATIC": "→ `*STATIC` in a linear step of a model without pore pressure elements (the "
+        "static solution from the initial stresses); with pore pressure, `UTOL` or a nonlinear step "
+        "commented out, with `*NO ANALYSIS` in its place (reduced physics).",
     "*DYNAMIC": "implicit and `EXPLICIT` both native; `DIRECT USER CONTROL` → `DIRECT`; "
         "`APPLICATION=QUASI-STATIC/MODERATE DISSIPATION` → `ALPHA=-0.3333` (and `*STEP "
         "AMPLITUDE=RAMP` for quasi-static); other Abaqus/Explicit controls dropped. An "
@@ -609,7 +612,8 @@ TRANSLATED = {
         "(SOLUTION continuation lines joined by the `*DEPVAR` size); stresses and plastic strains "
         "turned out of an orientation's axes, or a continuum shell's own, into the global ones ccx "
         "reads (at each integration point on a cylindrical or spherical system), in ccx's component "
-        "order and shear measure; `REBAR` and `SECTION POINTS` records and unknown types commented.",
+        "order and shear measure; `TYPE=STRESS, GEOSTATIC` computed at each integration point from "
+        "its elevation; `REBAR` and `SECTION POINTS` records and unknown types commented.",
     "*CREEP": "Abaqus `LAW=STRAIN/TIME` → ccx Norton (default, time hardening — warned for "
         "strain hardening with m ≠ 0); other laws → `LAW=USER`.",
     "*AMPLITUDE": "keeps `NAME`/`TIME`/`SHIFTX`/`SHIFTY`; `SCALEX`/`SCALEY` applied to the data; "
