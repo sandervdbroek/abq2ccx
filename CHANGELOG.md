@@ -63,6 +63,11 @@ physics.
   elements with two opposite free edges (a strip one element wide) are warned in models with a
   step ccx iterates, where ccx's C3D20R expansion drifts (9-410 % off). Two suspects proved
   exact and are unchanged.
+* **Assembly decks convert faster, in less memory** — an instance's mesh is no longer written
+  out as text and read back, mesh cards are read a line at a time, and the mesh takes less
+  memory per node and element: about 14 % less CPU time over the corpus's 1052 decks (17 % on
+  its 661 assembly decks) and 12–34 % less peak memory on the largest assembly decks. The
+  converted decks are the same, byte for byte.
 * **Batch triage, crash reports, ccx install hint** — `--json` prints one object per deck per
   line (JSON Lines), now with the deck's `status` (`converted`, `reduced`, `commented` or
   `failed`) and `reduced_physics`, and a line with `error` for a deck that failed (none was

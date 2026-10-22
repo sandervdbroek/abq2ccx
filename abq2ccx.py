@@ -2476,8 +2476,9 @@ class Geometry:
     """Live registry of nodes / elements / sets while processing a part."""
 
     def __init__(self) -> None:
-        self.nodes: "OrderedDict[int, Tuple[float, float, float]]" = OrderedDict()
-        self.elements: "OrderedDict[int, Tuple[str, List[int]]]" = OrderedDict()
+        # (plain dicts keep their order too, at 45 bytes an entry less than an OrderedDict)
+        self.nodes: Dict[int, Tuple[float, float, float]] = {}
+        self.elements: Dict[int, Tuple[str, List[int]]] = {}
         self.nsets: Dict[str, List[int]] = {}
         self.elsets: Dict[str, List[int]] = {}
         self.unsorted: set = set()          # node sets declared UNSORTED (keep listing order)
@@ -8303,19 +8304,41 @@ class _Mesh:
         params = OrderedDict((k, v) for k, v in b.params.items() if k != "SYSTEM")
         return Block(b.keyword, params, data).placed(b)
 
+    def _register_instance_nodes(self, b: InstanceMeshCard) -> None:
+        """_register_nodes of a flattened instance's *NODE card, from its records: its labels
+        new to the mesh (_register_nodes, else)."""
+        self.geom.nodes.update(zip(b.ids, b.rows))
+        for nid, text in b.extra.items():           # (the normal as the line gives it)
+            nrm = tuple(pf(x) for x in trimmed_fields(text.split(",")))
+            if vnorm(nrm) > 1e-12:
+                self._node_normals[nid] = vunit(nrm)
+        if b.param("NSET"):
+            self.geom.add_to_nset(b.param("NSET"), b.ids)
+
     def _register_nodes(self, b: Block) -> None:
+        if b.__class__ is InstanceMeshCard and b.unread() and self.geom.nodes.keys().isdisjoint(b.ids):
+            self._register_instance_nodes(b)
+            return
         ids = []
         nodes = self.geom.nodes
-        recs = merged_data_records(b)           # (trimmed already)
-        if recs and set(map(len, recs)) == {4}:
-            try:                                # the usual card in bulk: label, x, y, z on every
-                vals = list(map(float, itertools.chain.from_iterable(recs)))   # line, no node
-                nids = list(map(int, vals[0::4]))                             # given twice
-            except (ValueError, OverflowError):
-                nids = None                     # (else line by line, below)
-            if nids is not None and len(set(nids)) == len(nids) and nodes.keys().isdisjoint(nids):
-                nodes.update(zip(nids, zip(vals[1::4], vals[2::4], vals[3::4])))
-                ids, recs = nids, []
+        vals: List[float] = []
+        try:                                    # the usual card in bulk: label, x, y, z on every
+            for line in b.data:                 # line, no node given twice (else line by line,
+                g = list(map(str.strip, line.split(",")))   # below); a line at a time, as
+                while g and g[-1] == "":                    # merged_data_records reads it
+                    g.pop()
+                if len(g) != 4:
+                    raise ValueError
+                vals += map(float, g)
+            nids: Optional[List[int]] = list(map(int, vals[0::4]))
+        except (ValueError, OverflowError):
+            nids = None
+        recs: List[List[str]] = []
+        if nids and len(set(nids)) == len(nids) and nodes.keys().isdisjoint(nids):
+            nodes.update(zip(nids, zip(vals[1::4], vals[2::4], vals[3::4])))
+            ids = nids
+        else:
+            recs = merged_data_records(b)       # (trimmed already)
         for f in recs:
             if not f:
                 continue
@@ -8346,6 +8369,24 @@ class _Mesh:
         if b.param("NSET"):
             self.geom.add_to_nset(b.param("NSET"), ids)
 
+    def _register_instance_elements(self, b: InstanceMeshCard, typ: str) -> None:
+        """_register_elements of a flattened instance's *ELEMENT card, from its records: its
+        labels new to the mesh (_register_elements, else), its records ``b.nn`` nodes each."""
+        nn, rows = b.nn, b.rows
+        self.geom.elements.update(zip(b.ids, [(typ, rows[i:i + nn]) for i in range(0, len(rows), nn)]))
+        if b.extra:
+            self.geom.onodes.update(b.extra)
+            self._note_n1_nodes(typ)
+        self._elem_types.add(typ)
+        if b.param("ELSET"):
+            self.geom.add_to_elset(b.param("ELSET"), b.ids)
+
+    def _note_n1_nodes(self, typ: str) -> None:
+        self.report.note(f"*ELEMENT, TYPE={typ}: the node after a beam's nodes on its line gives "
+                         f"its n1 direction (from its first node; Abaqus takes it over the "
+                         f"section's n1). ccx has no such node: the beams are written without it, "
+                         f"their *BEAM SECTION once per n1 direction.", once=True)
+
     def _register_elements(self, b: Block) -> None:
         typ = b.uparam("TYPE")
         self._type_cards.setdefault(typ, b)
@@ -8353,9 +8394,17 @@ class _Mesh:
             self._register_connectors(b, typ)
             return
         nn = self._uel_nodes.get(typ) or element_node_count(typ)
-        rows = [r for r in ([t for t in map(str.strip, ln.split(",")) if t != ""] for ln in b.data) if r]
+        if b.__class__ is InstanceMeshCard and b.unread() and nn == b.nn and all(
+                k.isdisjoint(b.ids) for k in (self.geom.elements.keys(), self._conn.keys(),
+                                              self.geom.onodes.keys())):
+            self._register_instance_elements(b, typ)
+            return
+
+        def rows() -> Iterator[List[str]]:          # (the card's nonblank fields, a line each)
+            return (r for r in ([t for t in map(str.strip, ln.split(",")) if t != ""] for ln in b.data) if r)
         if nn is None:
-            nn = len(rows[0]) - 1 if rows else 0
+            first = next(rows(), None)
+            nn = len(first) - 1 if first else 0
             self.report.warn(f"Unknown element type {typ}: inferred {nn} nodes/element. "
                              f"Verify CalculiX supports it.", once=True)
         ids = []
@@ -8364,26 +8413,28 @@ class _Mesh:
         recs: List[List[str]] = []
         extra: List[Optional[str]] = []         # per record: a beam's extra node
         unread = 0
-        if nn > 0 and all(len(r) == step for r in rows):
-            toks = [t for r in rows for t in r]
-            try:                                # the usual card in bulk: one element a line,
-                vals = list(map(int, toks))     # integer labels, no element given twice (else
-            except ValueError:                  # one by one, below)
-                vals = None
-            eids = vals[::step] if vals is not None else None
-            if eids is not None and len(set(eids)) == len(eids) and \
-                    elements.keys().isdisjoint(eids) and conns.keys().isdisjoint(eids):
-                elements.update(zip(eids, [(typ, vals[i + 1:i + step])
-                                           for i in range(0, len(vals), step)]))
-                ids = eids
-            else:
-                recs, extra = rows, [None] * len(rows)
+        vals: Optional[List[int]] = [] if nn > 0 else None
+        try:                                    # the usual card in bulk: one element a line,
+            for ln in b.data if vals is not None else ():   # integer labels, no element given
+                r = [t for t in map(str.strip, ln.split(",")) if t != ""]   # twice (else one by
+                if r:                                       # one, below); a line at a time
+                    if len(r) != step:
+                        raise ValueError
+                    vals += map(int, r)
+        except ValueError:
+            vals = None
+        eids = vals[::step] if vals is not None else None
+        if eids is not None and len(set(eids)) == len(eids) and \
+                elements.keys().isdisjoint(eids) and conns.keys().isdisjoint(eids):
+            vals = list(map({}.setdefault, vals, vals))     # one int object a label (memory)
+            elements.update(zip(eids, [(typ, vals[i + 1:i + step]) for i in range(0, len(vals), step)]))
+            ids = eids
         elif nn > 0:
             # element records ("Element definition"): a line, continued on the next while the
             # element is not complete; a spatial beam's one node more is its n1 direction
             # (onodes), several whole elements on a line are read as such
             cur: List[str] = []
-            for r in rows:
+            for r in rows():
                 cur.extend(r)
                 if len(cur) < step:
                     continue
@@ -8425,10 +8476,7 @@ class _Mesh:
             self.report.warn(f"*ELEMENT TYPE={typ}: {unread} trailing token(s) not parsed; check "
                              f"connectivity.", once=True)
         if any(o is not None for o in extra):
-            self.report.note(f"*ELEMENT, TYPE={typ}: the node after a beam's nodes on its line gives "
-                             f"its n1 direction (from its first node; Abaqus takes it over the "
-                             f"section's n1). ccx has no such node: the beams are written without it, "
-                             f"their *BEAM SECTION once per n1 direction.", once=True)
+            self._note_n1_nodes(typ)
         self._elem_types.add(typ)
         if b.param("ELSET"):
             self.geom.add_to_elset(b.param("ELSET"), ids)
@@ -17548,7 +17596,7 @@ class _Rigid:
             return copies.get((t.upper(), beside), t)
 
         for i, b in enumerate(blocks):
-            data, params = list(b.data), b.params
+            data, params = None, b.params
             if b.keyword in ("BOUNDARY", "CLOAD"):
                 data = []
                 for ln in b.data:
@@ -17567,8 +17615,8 @@ class _Rigid:
                     data += [",".join([str(stand[n])] + f[1:])
                              for n in dedup(self._resolve_nodes(f[0].strip()) if f[0].strip() else [])
                              if n in stand]
-            if data != b.data or params is not b.params:
-                blocks[i] = Block(b.keyword, params, data).placed(b)
+            if data is not None and data != b.data or params is not b.params:
+                blocks[i] = Block(b.keyword, params, list(b.data) if data is None else data).placed(b)
         inner = [(x, n) for x, n in stand.items() if x not in outside]
         if inner:
             pairs = ", ".join(f"{x} -> {n}" for x, n in inner[:3])
@@ -18760,15 +18808,15 @@ class _Materials:
 
         out: List[Block] = []
         for b in blocks:
-            params, data = b.params, b.data
+            params, data = b.params, None
             key = "NAME" if b.keyword == "MATERIAL" else "MATERIAL"
             if b.uparam(key) in ren:
                 params = OrderedDict(params)
                 params[key] = ren[b.uparam(key)]
             if b.keyword.endswith("SECTION") and b.has("COMPOSITE"):
                 data = [ply(d) for d in b.data]
-            out.append(b if params is b.params and data == b.data
-                       else Block(b.keyword, params, data).placed(b))
+            out.append(b if params is b.params and (data is None or data == b.data)
+                       else Block(b.keyword, params, b.data if data is None else data).placed(b))
         return out
 
     def handle_user_material(self, b: Block) -> List[str]:
@@ -38365,7 +38413,8 @@ class _Loads:
         inter: Optional[str] = None
         for b in blocks:
             kw = b.keyword
-            vals = [x for r in merged_data_records(b) for x in r if x != ""]
+            vals = [x for r in merged_data_records(b) for x in r if x != ""] \
+                if kw in ("ELASTIC", "SURFACE BEHAVIOR") else []
             if kw == "MATERIAL":
                 mat, inter = b.uparam("NAME"), None
             elif kw == "SURFACE INTERACTION":
@@ -41058,7 +41107,8 @@ class _PostPasses:
         # ... and their values: (value, the card's amplitude), value None where not a plain
         # displacement (FIXED, unreadable)
         valued: Dict[int, List[Tuple[Tuple[int, int], Tuple[Optional[float], str]]]] = {}
-        writes: Dict[Tuple[int, int], set] = {}                     # (node, DOF) -> its BC lines
+        writes: Dict[Tuple[int, int], int] = {}                     # (node, DOF) -> its 1st BC line
+        more_writes: Dict[Tuple[int, int], List[int]] = {}          # ... and its other ones
         transformed: set = set()
         tcard: Dict[int, Optional[Tuple[str, Vec, Vec]]] = {}   # node -> its (last) *TRANSFORM
         bc_first: Dict[Tuple[int, int], int] = {}               # (node, DOF) -> card of 1st BC
@@ -41096,7 +41146,8 @@ class _PostPasses:
                             entries.append((k, z))
                             values.append((k, va))
                             bc_first.setdefault(k, ci)
-                            writes.setdefault(k, set()).add(j)
+                            if writes.setdefault(k, j) != j:
+                                more_writes.setdefault(k, []).append(j)
             elif kw == "TRANSFORM":
                 ns = nodes_of((params.get("NSET") or "").strip())
                 transformed.update(ns)
@@ -41422,12 +41473,15 @@ class _PostPasses:
         # the released DOFs' *BOUNDARY lines, written again without them (a moved one's on the
         # DOF that holds it instead)
         swap: Dict[int, List[str]] = {}
-        for j in sorted({j for k in released for j in writes[k]}):
+
+        def lines_of(k: Tuple[int, int]) -> List[int]:
+            return [writes[k]] + more_writes.get(k, [])
+        for j in sorted({j for k in released for j in lines_of(k)}):
             f = fields(j)
             d1 = int(f[1])
             d2 = int(f[2]) if len(f) > 2 and isint(f[2]) else d1
             tail = "".join(", " + x for x in f[3:])
-            gone = sorted(k for k in released if j in writes[k])
+            gone = sorted(k for k in released if j in lines_of(k))
             swap[j] = [f"** abq2ccx: no BC on node {n} DOF {d} here: the *EQUATION holds it "
                        f"(its other DOFs are held)" if released[(n, d)] == (n, d) else
                        f"** abq2ccx: the BC on node {n} DOF {d} given to node {released[(n, d)][0]} "
@@ -42631,6 +42685,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         raw = self.report.unevaluated
         for b in blocks:
             if b.keyword not in CCX_KEYWORDS or b.keyword in _NO_MODEL_DATA_CARDS or not (
+                    b.__class__ is not InstanceMeshCard and      # (numbers only: no '<')
                     any(map(operator.contains, b.data, itertools.repeat("<"))) and
                     any("<" in ln and _PARAM_TOKEN_RE.search(ln) for ln in b.data) or
                     raw and any(ln in raw for ln in b.data)):
@@ -43181,7 +43236,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         out: List[Block] = []
         for b in blocks:
             kw = b.keyword
-            f = [x.strip() for x in b.data[0].split(",")] + [""] if b.data else []
+            f = [x.strip() for x in b.data[0].split(",")] + [""] if kw in self._BLANK_PERIOD and b.data else []
             if kw == "MODAL DYNAMIC" and not merged_data_records(b):
                 self.report.warn("*MODAL DYNAMIC without a data line: Abaqus documents no default time "
                                  "increment or period, and ccx 2.23 stops on it ('definition not "
@@ -44176,6 +44231,56 @@ def _instance_transform(inst: dict, report: Report) -> Tuple[Vec, Optional[Tuple
     return T, rot
 
 
+class InstanceMeshCard(Block):
+    """An instance's *NODE card, or its *ELEMENT card of one type (_emit_instance), held as the
+    records its data lines read as: build_geometry registers them as they are, and the lines
+    are written only where a pass reads ``data`` (from then on they are the card, and it is
+    read as text).  NODE: ``ids`` the labels, ``rows`` each node's (x, y, z) as its line writes
+    it (node_line: 12 digits), ``extra`` label -> its normal's text.  ELEMENT: ``rows`` the
+    nodes of every element, ``nn`` a piece, ``extra`` a spatial beam's label -> its n1 node."""
+
+    def __init__(self, keyword: str, params, ids: List[int], rows: list, extra: dict,
+                 nn: int = 0) -> None:
+        self.keyword, self.params = keyword, OrderedDict(params)
+        self.ids, self.rows, self.extra, self.nn = ids, rows, extra, nn
+        self._lines: Optional[List[str]] = None
+
+    @property
+    def data(self) -> List[str]:
+        if self._lines is None:
+            self._lines = self._write()
+        return self._lines
+
+    @data.setter
+    def data(self, lines: List[str]) -> None:
+        self._lines = lines
+
+    def unread(self) -> bool:
+        """Whether no pass has read the lines (so none changed them): the records are the card."""
+        return self._lines is None
+
+    def _write(self) -> List[str]:
+        if self.keyword == "NODE":
+            nrm = self.extra
+            return [node_line(n, *p) + (", " + nrm[n] if n in nrm else "")
+                    for n, p in zip(self.ids, self.rows)]
+        nn, rows, n1 = self.nn, self.rows, self.extra
+        return _element_lines((e, rows[k * nn:(k + 1) * nn] + ([n1[e]] if e in n1 else []))
+                              for k, e in enumerate(self.ids))
+
+
+def _element_lines(elements) -> List[str]:
+    """The *ELEMENT data lines of (label, nodes) ``elements``: a line each, a long one split as
+    reflow splits it."""
+    out: List[str] = []
+    for eid, conn in elements:
+        if len(conn) < MAX_ENTRIES_PER_LINE:            # (reflow: one line)
+            out.append(", ".join([str(eid)] + [str(c) for c in conn]))
+        else:
+            out.extend(reflow([str(eid)] + [str(c) for c in conn], MAX_ENTRIES_PER_LINE))
+    return out
+
+
 def _emit_instance(inst: dict, parts, namer, report: Report, options,
                    gmax_node: int, gmax_elem: int, turned_eqs: Optional[list] = None,
                    uel: Optional[Dict[str, int]] = None):
@@ -44199,20 +44304,26 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     out: List[Block] = []
     T, rot = _instance_transform(inst, report)
 
-    ndata = []
+    # the mesh as the records its *NODE / *ELEMENT lines read as (InstanceMeshCard); a node's
+    # label is one int object, in the node registry and in every element naming it
+    gid_of: Dict[int, int] = {}
+    xyz: List[Vec] = []
+    nrm_text: Dict[int, str] = {}
     normals = geo_conv._node_normals
     for nid, (x, y, z) in geo.nodes.items():
         p = (x + T[0], y + T[1], z + T[2])             # (vadd)
         if rot:
             p = rotate_about_axis(p, rot[0], rot[1], rot[2])
-        gid = nid + node_off
-        ndata.append(node_line(gid, p[0], p[1], p[2]))
+        gid = gid_of[nid] = nid + node_off
+        x, y, z = p                                     # each as node_line writes it, read back
+        xyz.append((0.0 if abs(x) < 1e-12 else float("%.12g" % x), 0.0 if abs(y) < 1e-12 else
+                    float("%.12g" % y), 0.0 if abs(z) < 1e-12 else float("%.12g" % z)))
         nrm = normals.get(nid)                          # a shell normal turns with the instance
         if nrm:
             if rot:
                 nrm = vsub(rotate_about_axis(nrm, rot[0], rot[1], rot[2]),
                            rotate_about_axis((0.0, 0.0, 0.0), rot[0], rot[1], rot[2]))
-            ndata[-1] += ", " + ", ".join(_fmt_component(c) for c in nrm)
+            nrm_text[gid] = ", ".join(_fmt_component(c) for c in nrm)
         if gid > gmax_node:
             gmax_node = gid
     # the cards are at the place of the part's (or instance's) first *NODE / *ELEMENT card
@@ -44222,7 +44333,10 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     for b in mesh_cards:
         if b.keyword == "ELEMENT":
             elem_card.setdefault(b.uparam("TYPE"), b)
-    out.append(mkblock("NODE", [("NSET", namer(inst["name"]))], ndata))
+    nodes = InstanceMeshCard("NODE", [("NSET", namer(inst["name"]))], list(gid_of.values()), xyz, nrm_text)
+    # (_register_nodes reads a label through a float: one past 2**53 as the text reads it)
+    out.append(nodes if not geo.nodes or -2 ** 53 < min(geo.nodes) + node_off and gmax_node < 2 ** 53
+               else mkblock("NODE", nodes.params.items(), nodes.data))
     if node_card is not None:
         out[-1].placed(node_card)
 
@@ -44230,18 +44344,21 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     for eid, (typ, conn) in geo.elements.items():
         by_type.setdefault(typ, []).append((eid, conn))
     for typ, items in by_type.items():
-        edata = []
-        for eid, conn in items:
-            gid = eid + elem_off
-            if eid in geo.onodes:                           # a beam's n1 node, read again
-                conn = conn + [geo.onodes[eid]]
-            if len(conn) < MAX_ENTRIES_PER_LINE:            # (reflow: one line)
-                edata.append(", ".join([str(gid)] + [str(c + node_off) for c in conn]))
-            else:
-                edata.extend(reflow([str(gid)] + [str(c + node_off) for c in conn], MAX_ENTRIES_PER_LINE))
-            if gid > gmax_elem:
-                gmax_elem = gid
-        out.append(mkblock("ELEMENT", [("TYPE", typ), ("ELSET", namer(inst["name"], "ALL"))], edata))
+        params = [("TYPE", typ), ("ELSET", namer(inst["name"], "ALL"))]
+        ids = [eid + elem_off for eid, _ in items]
+        gmax_elem = max(gmax_elem, max(ids))
+        n1 = {eid + elem_off: geo.onodes[eid] + node_off for eid, _ in items if eid in geo.onodes}
+        nn = geo_conv._uel_nodes.get(typ) or element_node_count(typ)
+        if nn and all(len(conn) == nn for _, conn in items) and (not n1 or typ in ORIENTATION_NODE_BEAMS):
+            try:
+                rows = list(map(gid_of.__getitem__, itertools.chain.from_iterable(c for _, c in items)))
+            except KeyError:                            # (a node the part lacks: offset all the same)
+                rows = [gid_of.get(c, c + node_off) for _, conn in items for c in conn]
+            out.append(InstanceMeshCard("ELEMENT", params, ids, rows, n1, nn))
+        else:                                   # (an element _register_elements would read otherwise)
+            out.append(mkblock("ELEMENT", params, _element_lines(
+                (e, [c + node_off for c in conn] + ([n1[e]] if e in n1 else []))
+                for e, (_, conn) in zip(ids, items))))
         if typ.upper() in elem_card:
             out[-1].placed(elem_card[typ.upper()])
     conns: "OrderedDict[str, List[str]]" = OrderedDict()      # part-level connector elements
@@ -44566,8 +44683,8 @@ def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
                 ent = "elem" if ("ELSET" in k or "ELEMENT" in k) else \
                       "node" if ("NSET" in k or "NODE" in k) else entity
                 blk.params[k] = _resolve_field(v, maps, ent, namer)
-        # (b) instance-qualified members in data lines.
-        if not blk.data:
+        # (b) instance-qualified members in data lines (an instance's mesh lines: labels only).
+        if blk.__class__ is InstanceMeshCard or not blk.data:
             continue
         rewritten, changed = [], False
         for line in blk.data:

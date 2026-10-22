@@ -2817,6 +2817,40 @@ def test_assembly_node_not_overwritten_by_instance():
     assert len(inst_ids) == 4 and all(n > 999 for n in inst_ids)  # instances offset above it
 
 
+def test_instance_mesh_cards_register_as_their_lines():
+    # flatten_assembly hands each instance's *NODE / *ELEMENT cards over as records, not as
+    # text read again: build_geometry registers what reading their lines gives — coordinates
+    # as written (12 digits, a residue snapped to 0), a turned normal, a beam's n1 node
+    deck = ("*Part, name=p\n*Node\n1, 0.1234567890123456, 0., 0.\n2, 1., 1e-13, 0.\n"
+            "3, 1., 1., 0., 0., 0., 1.\n4, 0., 1., 0.\n5, 0., 0., 5.\n"
+            "*Element, type=S4, elset=E\n1, 1, 2, 3, 4\n*Element, type=B31, elset=B\n2, 1, 5, 3\n"
+            "*End Part\n*Assembly, name=A\n*Instance, name=i1, part=p\n*End Instance\n"
+            "*Instance, name=i2, part=p\n0.5, 0., 0.\n0., 0., 0., 1., 0., 0., 30.\n*End Instance\n"
+            "*Node\n7, 2., 2., 2.\n*End Assembly\n")
+    fd, path = tempfile.mkstemp(suffix=".inp")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        out = A.flatten_assembly(A.read_blocks(path, A.Report()), A.Report(), Opt())
+    finally:
+        os.unlink(path)
+    cards = [b for b in out if isinstance(b, A.InstanceMeshCard)]
+    assert len(cards) == 6
+    direct = A.Converter(A.Report(), Opt())
+    direct.build_geometry(out)
+    assert all(b.unread() for b in cards)                         # registered from the records
+    text = A.Converter(A.Report(), Opt())
+    text.build_geometry([A.Block(b.keyword, b.params, list(b.data)) for b in out])
+    for conv in (direct, text):
+        assert conv.geom.nodes[8] == (0.123456789012, 0.0, 0.0)
+    for get in (lambda c: c.geom.nodes, lambda c: c.geom.elements, lambda c: c.geom.onodes,
+                lambda c: c.geom.nsets, lambda c: c.geom.elsets, lambda c: c._node_normals,
+                lambda c: c._elem_types, lambda c: c.report.entries):
+        assert get(direct) == get(text)
+        assert list(get(direct)) == list(get(text))
+
+
 def test_coupling_refnode_set_resolved_and_empty_kinematic():
     # CAE writes REF NODE=<set name> (ccx hard error) and an empty *Kinematic (ccx: runs
     # but silently creates NO constraint).  Both must be repaired.
