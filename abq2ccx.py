@@ -103,7 +103,7 @@ ELEMENT_NNODES: Dict[str, int] = {
     "SPRING1": 1, "SPRING2": 2, "SPRINGA": 2, "DASHPOT1": 1, "DASHPOT2": 2, "DASHPOTA": 2,
     "GAPUNI": 2, "GAPCYL": 2, "GAPSPHER": 2, "MASS": 1, "ROTARYI": 1, "DCOUP3D": 1,
     # cohesive / gasket (approximated by a thin continuum) / connector / rigid
-    "COH2D4": 4, "COH3D6": 6, "COH3D8": 8, "COHAX4": 4, "CONN3D2": 2, "CONN2D2": 2,
+    "COH2D4": 4, "COH3D6": 6, "COH3D8": 8, "COHAX4": 4, "CONN3D2": 2, "CONN2D2": 2, "JOINTC": 2,
     "GK3D8": 8, "GK3D6": 6, "GK2D4": 4, "GK2D6": 6, "GKPS4": 4, "GKPS6": 6, "GKAX4": 4, "GKAX6": 6,
     "R3D3": 3, "R3D4": 4, "R2D2": 2, "RB2D2": 2, "RB3D2": 2, "RAX2": 2,
     # heat-transfer continuum (Abaqus-compatible names accepted by ccx)
@@ -248,7 +248,7 @@ UNSUPPORTED_ELEM_PREFIXES = ("COH", "GK", "GKPS", "GKAX", "CONN", "ROTARYI")
 
 # Abaqus element families ccx 2.23 has no element for, nor the converter a stand-in: written
 # as they are, so ccx stops ("... is an unknown element type"), and named in the report.
-# (pattern, family, examples); the group is the node count (JOINTC: 2).
+# (pattern, family, examples); the group is the node count.
 LACKING_ELEMENTS = (
     (r"C(?:PS|PE|AX|3D)(\d+)R?E", "piezoelectric", "CPS4E, CAX8RE, C3D8E, C3D20RE"),
     (r"DC(?:1D|2D|3D|AX)(\d+)E", "coupled thermal-electrical", "DC2D4E, DC3D8E"),
@@ -256,7 +256,6 @@ LACKING_ELEMENTS = (
     (r"CIN(?:PS|PE|AX|3D)(\d+)R?", "infinite", "CINPS4, CINAX4, CIN3D8, CIN3D12R"),
     (r"ACIN(?:2D|3D|AX)(\d+)", "acoustic infinite", "ACIN2D2, ACIN3D3, ACIN3D4"),
     (r"AC(?:1D|2D|3D|AX)(\d+)", "acoustic", "AC2D4, AC3D4, AC3D8, AC3D20"),
-    (r"JOINTC()", "joint", "JOINTC"),
 )
 
 
@@ -931,12 +930,12 @@ KEYWORD_ALIASES = {"AMP": "AMPLITUDE"}
 # parameter names, so parse_keyword_line maps ``REFNODE=`` / ``POSITIONTOLERANCE=`` to these.
 MULTIWORD_PARAMS = (
     "ABSOLUTE EXTERIOR TOLERANCE", "ALL EXTERIOR",
-    "ANALYTICAL SURFACE", "CHANGE NUMBER", "CONSTANT RESULTANT", "CONSTRAINT NAME",
-    "CONTACT ELEMENTS", "CONVERSION CRITERION", "CYCLIC SYMMETRY", "DAMPING PROJECTION",
-    "DIRECT USER CONTROL", "DISTORTION CONTROL", "DRILL STIFFNESS", "ELEMENT BY ELEMENT",
-    "ELEMENT CONVERSION", "ELEMENT DELETION",
+    "ANALYTICAL SURFACE", "CHANGE NUMBER", "COMPLEX STIFFNESS", "CONSTANT RESULTANT",
+    "CONSTRAINT NAME", "CONTACT ELEMENTS", "CONVERSION CRITERION", "CYCLIC SYMMETRY",
+    "DAMPING PROJECTION", "DIRECT USER CONTROL", "DISTORTION CONTROL", "DRILL STIFFNESS",
+    "ELEMENT BY ELEMENT", "ELEMENT CONVERSION", "ELEMENT DELETION",
     "ELEMENT SHIFT", "EMBED NODES", "EXPONENTIAL DECAY", "EXTERIOR TOLERANCE",
-    "FILLET RADIUS", "FIXED INTERVAL", "FRICTION DAMPING", "HOST ELSET",
+    "FILLET RADIUS", "FIXED INTERVAL", "FREQUENCY DEPENDENCE", "FRICTION DAMPING", "HOST ELSET",
     "HYBRID FORMULATION", "IMPROVED DT METHOD", "INFLUENCE RADIUS", "INITIAL GAP OPENING",
     "KINEMATIC SPLIT", "LAST ITERATIONS", "LAST MODE", "LENGTH RATIO", "LOAD CASE", "MAX DEGRADATION",
     "MEMBRANE THICKNESS", "MODE LIST", "NEO HOOKE", "NEW SET", "NO ROTATION", "NO SEPARATION",
@@ -3074,6 +3073,52 @@ def sym3_eigen(m: Sequence[Sequence[float]]) -> Tuple[List[float], List[Vec]]:
     return [a[i][i] for i in range(3)], [(v[0][i], v[1][i], v[2][i]) for i in range(3)]
 
 
+def matrix_rank(m: Sequence[Sequence[float]], tol: float = 1e-9) -> int:
+    """The rank of matrix ``m`` (rows of equal length; Gaussian elimination with partial
+    pivoting, entries below ``tol`` times the largest one taken as zero)."""
+    a = [list(map(float, r)) for r in m]
+    top = max([abs(x) for r in a for x in r] or [0.0])
+    rank, col = 0, 0
+    while a and rank < len(a) and col < len(a[0]):
+        p = max(range(rank, len(a)), key=lambda i: abs(a[i][col]))
+        if abs(a[p][col]) <= tol * top:
+            col += 1
+            continue
+        a[rank], a[p] = a[p], a[rank]
+        for i in range(rank + 1, len(a)):
+            f = a[i][col] / a[rank][col]
+            a[i] = [x - f * y for x, y in zip(a[i], a[rank])]
+        rank += 1
+        col += 1
+    return rank
+
+
+def sym_eigen(m: Sequence[Sequence[float]]) -> Tuple[List[float], List[List[float]]]:
+    """Eigenvalues and unit eigenvectors of a symmetric n x n matrix (cyclic Jacobi)."""
+    n = len(m)
+    a = [[float(m[i][j]) for j in range(n)] for i in range(n)]
+    v = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    for _ in range(100):
+        off = sum(a[i][j] ** 2 for i in range(n) for j in range(n) if i != j)
+        if off <= 1e-30 * max(1e-300, sum(a[i][i] ** 2 for i in range(n))):
+            break
+        for p, q in itertools.combinations(range(n), 2):
+            if a[p][q] == 0.0:
+                continue
+            th = 0.5 * math.atan2(2.0 * a[p][q], a[q][q] - a[p][p])
+            c, s = math.cos(th), math.sin(th)
+            for k in range(n):
+                akp, akq = a[k][p], a[k][q]
+                a[k][p], a[k][q] = c * akp - s * akq, s * akp + c * akq
+            for k in range(n):
+                apk, aqk = a[p][k], a[q][k]
+                a[p][k], a[q][k] = c * apk - s * aqk, s * apk + c * aqk
+            for k in range(n):
+                vkp, vkq = v[k][p], v[k][q]
+                v[k][p], v[k][q] = c * vkp - s * vkq, s * vkp + c * vkq
+    return [a[i][i] for i in range(n)], [[v[k][i] for k in range(n)] for i in range(n)]
+
+
 def distributing_matrices(xyz: Dict[int, Vec], weights: Dict[int, float], ref: Vec
                           ) -> Tuple[Dict[int, Tuple[List[List[float]], List[List[float]]]], List[Vec]]:
     """Abaqus' distributing coupling constraint, linearized (Theory Guide, 'Distributing
@@ -4098,11 +4143,14 @@ SPECIAL_UNSUPPORTED = {
                       "set, or balance with the equilibrating load.",
     "CONNECTOR BEHAVIOR": "connector behaviour has no ccx equivalent (a section that uses it is "
                           "commented out); remodel as *SPRING / *DASHPOT / *MPC per the behaviour.",
-    "CONNECTOR MOTION": "prescribes motion of connector components, which the converted "
-                        "connector (ccx constraints, no connector element) does not have; the "
-                        "prescribed motion is missing.",
-    "CONNECTOR LOAD": "loads connector components, which the converted connector (ccx "
-                      "constraints, no connector element) does not have; the load is missing.",
+    "CONNECTOR MOTION": "prescribes connector components; the converter writes it on the "
+                        "components of CONN3D2 / CONN2D2 elements (a *BOUNDARY on a helper node "
+                        "tied to the component), and this card names none it can write (or is an "
+                        "OP=NEW after an earlier one); the prescribed motion is missing.",
+    "CONNECTOR LOAD": "loads connector components; the converter writes it on the components of "
+                      "CONN3D2 / CONN2D2 elements (a *CLOAD on a helper node tied to the "
+                      "component), and this card names none it can write (or is an OP=NEW after "
+                      "an earlier one); the load is missing.",
     "GASKET BEHAVIOR": "gasket behaviour has no ccx equivalent.",
     "DAMAGE EVOLUTION": "ccx 2.23 added *DAMAGE INITIATION but not *DAMAGE EVOLUTION, so "
                         "progressive damage cannot fully run (the material will not soften/fail); drop.",
@@ -4710,6 +4758,17 @@ CONN_ROTATIONAL = {"REVOLUTE", "ALIGN", "UNIVERSAL", "CONSTANT VELOCITY", "CARDA
 # a behaviour such a component transmits nothing
 CONN_UNCONSTRAINED = {"CARTESIAN", "AXIAL", "PROJECTION CARTESIAN", "CARDAN", "EULER",
                       "ROTATION", "FLEXION-TORSION", "PROJECTION FLEXION-TORSION"}
+# the available components (1-3 translations, 4-6 rotations) of the basic types whose
+# components are linear in the nodal motion for small motions (Converter._conn_comp_rows): a
+# behaviour, *CONNECTOR MOTION or *CONNECTOR LOAD on them is converted.  A JOINTC element
+# has all six (its *JOINT reads as CARTESIAN + ROTATION without the offset term).
+CONN_COMPONENTS = {"CARTESIAN": (1, 2, 3), "PROJECTION CARTESIAN": (1, 2, 3), "AXIAL": (1,),
+                   "JOIN": (), "JOINTC": (1, 2, 3), "CARDAN": (4, 5, 6), "ROTATION": (4, 5, 6),
+                   "PROJECTION FLEXION-TORSION": (4, 5, 6), "REVOLUTE": (4,), "ALIGN": ()}
+CONN_COMPONENTS_2D = {"CARTESIAN": (1, 2), "AXIAL": (1,), "JOIN": (), "ROTATION": (6,), "ALIGN": ()}
+# the 21 constants of a coupled *CONNECTOR ELASTICITY / DAMPING: the upper triangle column by
+# column (D11, D12, D22, D13, ...), 1-based components
+CONN_COUPLED_ORDER = [(i, j) for j in range(1, 7) for i in range(1, j + 1)]
 
 
 # ---------------------------------------------------------------------------
@@ -7746,7 +7805,7 @@ class _Mesh:
 
     def _register_elements(self, b: Block) -> None:
         typ = b.uparam("TYPE")
-        if typ in CONN_TYPES:
+        if typ in CONN_TYPES or typ == "JOINTC":
             self._register_connectors(b, typ)
             return
         nn = element_node_count(typ)
@@ -9699,6 +9758,8 @@ class _Mesh:
         elements, whose first line Abaqus leaves blank, without that line where data lines follow:
         ccx reads a DOF line there as a coefficient, and stops on '1, 1' ('the damping
         coefficient may depend ...', probed)."""
+        if id(b) in self._joint_cards:
+            return self._joint_subcard(b)
         if id(b) not in self._dashpot_cards:
             if len(b.data) > 1 and dof_line(b.data[0]) and self._elset_types(b) == {"DASHPOTA"}:
                 return self.passthrough(Block(b.keyword, b.params, b.data[1:]))
@@ -9735,6 +9796,8 @@ class _Mesh:
             self._reduces("dashpots in an explicit *DYNAMIC step (ccx ignores them)")
         small = [st.no for st in dyn if not st.explicit and not st.nlgeom]
         lined = {row[0][0] for row in self._dashpot_rows}     # the DASHPOT1 / 2 forms' new nodes
+        # (a connector component's dashpot: its helper and ground node are held across it)
+        ends = {e: conn for e, conn in ends.items() if e not in self._conn_dashpots}
         if not small or all(conn[1] in lined for conn in ends.values()):
             return
         states, _ = self._bc_states(blocks, {n for conn in ends.values() for n in conn})
@@ -9776,6 +9839,8 @@ class _Mesh:
         probed: '100.', '1.e-3' and '1.d2' read) — so the numbers of the data lines get one
         (dotted_number).  The first line of a SPRINGA card, which Abaqus leaves blank (read_blocks
         keeps it), is left out where data lines follow: a DOF line there stops ccx too."""
+        if id(b) in self._joint_cards:
+            return self._joint_subcard(b)
         lines = list(b.data)
         first = 0
         if lines and dof_line(lines[0]):
@@ -14396,6 +14461,12 @@ class _Mesh:
         self._u1_taken.add(name.upper())
         return name
 
+    def _u1_nodes(self) -> set:
+        """The nodes of the U1 beams (_plan_u1_beams): rotations of their own on DOFs 4-6."""
+        if self._u1_node_set is None:
+            self._u1_node_set = {n for e in self._u1 for n in self.geom.elements[e][1]}
+        return self._u1_node_set
+
     def _u1_edge(self, nodes: Sequence[int]) -> bool:
         """Whether ``nodes`` are the two end nodes of a U1 element."""
         if not self._u1:
@@ -14440,8 +14511,13 @@ class _Mesh:
                         f"it expands it stops: 'gen3delem: first thickness ... is zero')")
         kws = {b.keyword for b in blocks}
         hit = [k for k in self._U1_CONSTRAINTS if k in kws]
-        if hit or self._conn or self._skins:
-            what = f"*{hit[0]}" if hit else "connector" if self._conn else "rigid"
+        # connectors written as *EQUATIONs and springs may join U1 nodes (their rotations are
+        # DOFs 4-6 of their own: probed); BEAM / WELD (a *RIGID BODY) and LINK (*MPC) may not
+        rigid_conn = any(b.keyword == "CONNECTOR SECTION" and {x.strip().upper() for r in merged_data_records(b)[:1]
+                                                               for x in r} & {"BEAM", "WELD", "LINK"}
+                         for b in blocks)
+        if hit or rigid_conn or self._skins:
+            what = f"*{hit[0]}" if hit else "BEAM / WELD / LINK connector" if rigid_conn else "rigid"
             return [], (f"the deck has {what} constraints, which this conversion does not write "
                         f"onto U1 nodes")
         nodes = {n for e in member for n in self.geom.elements[e][1]}
@@ -23030,7 +23106,8 @@ class _Constraints:
     def _register_connectors(self, b: Block, typ: str) -> None:
         """Connector elements, one per data line ``element, node a, node b``; a blank node
         is ground (Abaqus).  They stay out of the mesh — ccx has no connector element; the
-        *CONNECTOR SECTION handler writes each connection as constraints."""
+        *CONNECTOR SECTION handler writes each connection as constraints, springs and
+        dashpots.  So do JOINTC elements (their *JOINT)."""
         ids = []
         for rec in merged_data_records(b):
             if not rec or not rec[0]:
@@ -23230,8 +23307,8 @@ class _Constraints:
         linearised *EQUATION or ccx's *MPC BEAM (LINK).  An element that cannot be converted
         is listed in a commented-out copy of the card, with the reason."""
         sec = self._conn_plan.get(id(b)) or \
-            {"reason": f"*CONNECTOR SECTION on ELSET={(b.param('ELSET') or '').strip()}, which holds "
-                       f"no connector element (CONN3D2 / CONN2D2); commented out."}
+            {"reason": f"*{b.keyword} on ELSET={(b.param('ELSET') or '').strip()}, which holds "
+                       f"no connector element; commented out."}
         if sec["reason"]:
             return self._commented(b, sec["reason"], reduces=False)
         out: List[str] = []
@@ -23247,14 +23324,21 @@ class _Constraints:
                 local = local or (it["link"] == "link-eq" and any(
                     n in self._transformed for n in (it["a"], it["b"])))
             elif it["route"] == "rows":
-                rows, approx = True, approx or bool(it.get("approx"))
+                constrained = it["trans"] is not None or it["rot"] is not None
+                rows = rows or constrained
+                approx = approx or (bool(it.get("approx")) and constrained)
                 local = local or bool(it.get("local"))
                 bcs += [f"{n}, {d}, {d}" for n, d in it["bcs"]]
                 out += self._twin_lines(it["eqs"]) + self._equation_lines(it["eqs"])
+        comps = [it for it in sec["items"] if it["route"] == "rows" and
+                 (it.get("live") or it.get("sets") or it.get("hard"))]
+        out = self._conn_component_cards(comps) + out
         if bcs:
             bcs = dedup(bcs)
             out = ["*BOUNDARY"] + bcs + out
             self._conn_bcs += [x for x in bcs if x not in self._conn_bcs]
+        if comps:
+            self._note_conn_components(sec["items"])
         for body in self._mpc_bodies.get(id(b), []):
             out += self._mpc_rigid_body(body)
         if any(it["route"] == "beam" for it in sec["items"]):
@@ -23288,10 +23372,55 @@ class _Constraints:
         for reason, its in skipped.items():
             listing = ", ".join(f"{it['eid']} (nodes {'ground' if it['a'] is None else it['a']}, "
                                 f"{'ground' if it['b'] is None else it['b']})" for it in its)
-            out += self._commented(mkblock("CONNECTOR SECTION", b.params.items(),
+            out += self._commented(mkblock(b.keyword, b.params.items(),
                                            list(b.data) + [f"connector element(s) {listing}"]),
                                    reason, reduces=its[0].get("reduces", True))
         return out
+
+    def _conn_section_written(self, secs: List[dict]) -> bool:
+        """Whether every connector of the section plans ``secs`` is written (none left out)."""
+        return bool(secs) and not any(sec["reason"] for sec in secs) and \
+            all(it["route"] != "skip" for sec in secs for it in sec["items"])
+
+    def _joint_subcard(self, b: Block) -> List[str]:
+        """A *SPRING / *DASHPOT option of a *JOINT: written with its JOINTC elements
+        (handle_connector_section), or left out with them."""
+        secs = [self._conn_plan[self._joint_cards[id(b)]]] if self._joint_cards[id(b)] in self._conn_plan else []
+        if self._conn_section_written(secs):
+            return [f"** abq2ccx: *{b.keyword} option of the *JOINT above: written with its JOINTC "
+                    f"elements (springs / dashpots on their components)"]
+        return self._commented(b, f"*{b.keyword} option of a *JOINT that is commented out.",
+                               reduces=False)
+
+    def handle_connector_behavior(self, b: Block) -> List[str]:
+        """*CONNECTOR BEHAVIOR and its *CONNECTOR ELASTICITY / DAMPING: written with the
+        sections that use it (springs, dashpots, constraints) where they all are; otherwise
+        as before (no ccx equivalent, commented out)."""
+        name = self._conn_beh_cards.get(id(b))
+        secs = self._conn_beh_secs.get(name, []) if name is not None else []
+        if name is not None and self._conn_section_written(secs):
+            return self._commented(b, f"*{b.keyword} of connector behaviour {name}: written with the "
+                                      f"*CONNECTOR SECTIONs that use it (springs, dashpots and "
+                                      f"constraints on the connectors' components).", reduces=False)
+        if name is not None and not secs:
+            return self._commented(b, f"*{b.keyword} of connector behaviour {name}, which no "
+                                      f"*CONNECTOR SECTION uses: commented out, which changes "
+                                      f"nothing.", reduces=False)
+        return self.passthrough(b)
+
+    def handle_connector_motion(self, b: Block) -> List[str]:
+        """A model-data *CONNECTOR MOTION whose components the connectors' constraint rows
+        hold (_plan_connector_actuation, _conn_components): written with them.  Any other
+        *CONNECTOR MOTION / LOAD left (history ones the converter writes are *BOUNDARY / *CLOAD
+        cards by now): no ccx equivalent, commented out."""
+        if id(b) in self._conn_fixed_cards:
+            eids = self._conn_fixed_cards[id(b)]
+            secs = [sec for sec in self._conn_plan.values() if any(it["eid"] in eids for it in sec["items"])]
+            if all(it["route"] != "skip" for sec in secs for it in sec["items"] if it["eid"] in eids):
+                return self._commented(b, "*CONNECTOR MOTION in the model data fixes the components it "
+                                          "names: written with the connectors (constraint "
+                                          "*EQUATIONs that hold them).", reduces=False)
+        return self.passthrough(b)
 
     def _tie_rows(self, a: int, b: int, plan: bool = False) -> \
             Optional[List[List[Tuple[int, int, float]]]]:
@@ -26028,6 +26157,295 @@ class _Constraints:
                 f"the directions of the constraint's DOFs there; commented out — the connector "
                 f"is missing.")
 
+    @staticmethod
+    def _conn_new_behaviour() -> dict:
+        return {"K": None, "C": None, "rigid": set(), "why": None, "cards": []}
+
+    def _conn_behaviours(self, blocks: List[Block]) -> Dict[str, dict]:
+        """The *CONNECTOR BEHAVIOR definitions by name (its options: the cards after it whose
+        keyword starts with CONNECTOR), read as linear springs and dashpots: {"K", "C": 6 x 6
+        stiffness / damping matrices over components 1-6, or None — uncoupled and coupled
+        definitions added, as Abaqus adds them; "rigid": the components made rigid (0: every
+        available one); "why": the first option that does not read so (None); "cards": the
+        ids of its cards}."""
+        out: Dict[str, dict] = {}
+        cur: Optional[dict] = None
+        for b in blocks:
+            if b.keyword == "CONNECTOR BEHAVIOR":
+                cur = out.setdefault(b.uparam("NAME"), self._conn_new_behaviour())
+                cur["cards"].append(id(b))
+            elif cur is not None and b.keyword.startswith("CONNECTOR ") and \
+                    b.keyword not in ("CONNECTOR SECTION", "CONNECTOR MOTION", "CONNECTOR LOAD"):
+                cur["cards"].append(id(b))
+                cur["why"] = cur["why"] or self._conn_behaviour_option(b, cur)
+            else:
+                cur = None
+        return out
+
+    @staticmethod
+    def _conn_constant(b: Block, nvals: int, ncon: int) -> Union[str, List[float]]:
+        """The first ``ncon`` values of the data rows of card ``b`` (``nvals`` values a row
+        before its temperature and field variables, material_rows), blanks 0 — or why they do
+        not read as one constant set (rows that differ: temperature, frequency or field
+        variable dependence)."""
+        rows = material_rows(b, nvals)
+        if not rows:
+            return f"*{b.keyword} whose data lines do not read"
+        try:
+            vals = [[pf(x) if x else 0.0 for x in r[:ncon]] for r in rows]
+        except ValueError:
+            return f"*{b.keyword} whose data lines do not read"
+        if any(v != vals[0] for v in vals[1:]):
+            return f"*{b.keyword} that varies with temperature, frequency or field variables"
+        return vals[0]
+
+    def _conn_behaviour_option(self, b: Block, beh: dict) -> Optional[str]:
+        """Add option card ``b`` of a *CONNECTOR BEHAVIOR to ``beh`` (_conn_behaviours); why it
+        does not read as a linear spring / dashpot or rigid components, else None."""
+        kw = b.keyword
+        if kw not in ("CONNECTOR ELASTICITY", "CONNECTOR DAMPING"):
+            return f"*{kw}"
+        which = "K" if kw == "CONNECTOR ELASTICITY" else "C"
+        for p in ("NONLINEAR", "UNSYMM"):
+            if b.has(p):
+                return f"*{kw}, {p}"
+        if which == "C" and b.uparam("TYPE") not in ("", "VISCOUS"):
+            return f"*{kw}, TYPE={b.uparam('TYPE')}"
+        if b.uparam("FREQUENCY DEPENDENCE") not in ("", "OFF"):
+            return f"*{kw}, FREQUENCY DEPENDENCE"
+        comp = (b.param("COMPONENT") or "").strip()
+        try:
+            c = pint(comp) if comp else 0
+        except ValueError:
+            c = -1
+        if comp and not 1 <= c <= 6:
+            return f"*{kw}, COMPONENT={comp}"
+        if which == "K" and b.has("RIGID"):
+            try:
+                listed = {pint(x) for r in merged_data_records(b) for x in r if x}
+            except ValueError:
+                return f"*{kw}, RIGID whose components do not read"
+            beh["rigid"] |= {c} if c else (listed or {0})
+            return None
+        vals = self._conn_constant(b, 2 if c else 21, 1 if c else 21)
+        if isinstance(vals, str):
+            return vals
+        m = beh[which] or [[0.0] * 6 for _ in range(6)]
+        if c:
+            m[c - 1][c - 1] += vals[0]
+        else:
+            for (i, j), v in zip(CONN_COUPLED_ORDER, vals):
+                m[i - 1][j - 1] += v
+                if i != j:
+                    m[j - 1][i - 1] += v
+        beh[which] = m
+        return None
+
+    def _joint_behaviour(self, blocks: List[Block], i: int) -> dict:
+        """The behaviour of *JOINT ``blocks[i]`` as _conn_behaviours gives one: its *SPRING
+        and *DASHPOT options (the cards right after it without ELSET), one local component
+        each (the first field of their first line), linear and constant."""
+        beh = self._conn_new_behaviour()
+        for b in blocks[i + 1:]:
+            if b.keyword not in ("SPRING", "DASHPOT") or (b.param("ELSET") or "").strip():
+                break
+            beh["cards"].append(id(b))
+            which = "K" if b.keyword == "SPRING" else "C"
+            why = next((f"*{b.keyword}, {p}" for p in ("NONLINEAR", "COMPLEX STIFFNESS") if b.has(p)), None)
+            try:
+                c = pint(trimmed_fields(b.data[0].split(","))[0]) if b.data else 0
+            except (ValueError, IndexError):
+                c = 0
+            if not why and not 1 <= c <= 6:
+                why = f"*{b.keyword} whose first line names no component 1-6"
+            vals = why or self._conn_constant(Block(b.keyword, b.params, b.data[1:]), 2, 1)
+            if isinstance(vals, str):
+                beh["why"] = beh["why"] or vals
+                continue
+            m = beh[which] or [[0.0] * 6 for _ in range(6)]
+            m[c - 1][c - 1] += vals[0]
+            beh[which] = m
+        return beh
+
+    def _plan_connector_actuation(self, blocks: List[Block]) -> List[Block]:
+        """*CONNECTOR MOTION / *CONNECTOR LOAD, before the step model reads the cards.  In the
+        model data a *CONNECTOR MOTION fixes the components it names (Abaqus: its magnitudes
+        are ignored there): _conn_fixed, constraint rows of _plan_connector_rows.  In a step
+        each (connector element, component) gets a helper node, whose DOF 1 the connector's
+        rows tie to that component (_conn_components), and the card becomes a *BOUNDARY
+        (TYPE, AMPLITUDE, FIXED, USER kept) or a *CLOAD (AMPLITUDE) on that DOF — so every
+        step rule of those cards applies.  Left as it is (commented out with the reason):
+        a card naming an element or set that holds no connector, or a component that is
+        not a number; OP=NEW after an earlier card of its kind (it would remove the
+        connectors' motions / loads only, ccx's OP=NEW removes all BCs / loads)."""
+        if not self._conn or not any(b.keyword in ("CONNECTOR MOTION", "CONNECTOR LOAD") for b in blocks):
+            return blocks
+        out: List[Block] = []
+        in_step = False
+        seen: set = set()
+        made = {"CONNECTOR MOTION": False, "CONNECTOR LOAD": False}
+        for b in blocks:
+            if b.keyword == "STEP":
+                in_step = True
+            if b.keyword not in ("CONNECTOR MOTION", "CONNECTOR LOAD"):
+                out.append(b)
+                continue
+            lines: List[Tuple[List[int], int, str]] = []
+            for rec in merged_data_records(b):
+                f = trimmed_fields(rec)
+                if not f:
+                    continue
+                tok = f[0]
+                eids = [int(tok)] if re.fullmatch(r"\d+", tok) else list(self.geom.elset(tok))
+                eids = [e for e in eids if e in self._conn and self._conn[e][0] in CONN_TYPES]
+                try:
+                    c = pint(f[1]) if len(f) > 1 else 0
+                except ValueError:
+                    c = 0
+                if not eids or not 1 <= c <= 6:
+                    lines = []
+                    break
+                lines.append((eids, c, f[2] if len(f) > 2 else ""))
+            op_new = b.uparam("OP") == "NEW"
+            if not lines or (in_step and op_new and b.keyword in seen):
+                out.append(b)
+                continue
+            seen.add(b.keyword)
+            if not in_step:
+                for eids, c, _v in lines:
+                    for e in eids:
+                        self._conn_fixed.setdefault(e, set()).add(c)
+                self._conn_fixed_cards[id(b)] = {e for eids, _c, _v in lines for e in eids}
+                out.append(b)
+                continue
+            data = []
+            for eids, c, v in lines:
+                for e in eids:
+                    h = self._conn_act.get((e, c))
+                    if h is None:
+                        _t, na, nb = self._conn[e]
+                        h = self._conn_act[(e, c)] = max(self.geom.nodes) + 1
+                        self.geom.add_node(h, self.geom.nodes.get(na if na is not None else nb, (0.0, 0.0, 0.0)))
+                    data.append(f"{h}, 1, 1" + (f", {v}" if v else "") if b.keyword == "CONNECTOR MOTION"
+                                else f"{h}, 1, {v or 0.}")
+            keep = ("AMPLITUDE", "TYPE", "FIXED", "USER", "LOAD CASE") if b.keyword == "CONNECTOR MOTION" \
+                else ("AMPLITUDE", "LOAD CASE")
+            params = [(k, v) for k, v in b.params.items() if k in keep]
+            nb_ = mkblock("BOUNDARY" if b.keyword == "CONNECTOR MOTION" else "CLOAD", params, data)
+            out.append(nb_)
+            made[b.keyword] = True
+        if made["CONNECTOR MOTION"] or made["CONNECTOR LOAD"]:
+            self.report.note("History *CONNECTOR MOTION / *CONNECTOR LOAD -> *BOUNDARY / *CLOAD on DOF 1 "
+                             "of a helper node per connector and component, which the connector's "
+                             "*EQUATIONs tie to that component (its relative displacement or rotation "
+                             "in node a's local directions), so the motion / load acts on it as in "
+                             "Abaqus.", once=True)
+        later = [b for b in out[next((i for i, b in enumerate(out) if b.keyword == "STEP"), len(out)):]
+                 if b.keyword in ("BOUNDARY", "CLOAD") and b.uparam("OP") == "NEW"]
+        for kw, card in (("CONNECTOR MOTION", "BOUNDARY"), ("CONNECTOR LOAD", "CLOAD")):
+            if made[kw] and any(b.keyword == card for b in later):
+                self.report.warn(f"*{kw} with a *{card}, OP=NEW in the deck: Abaqus keeps connector "
+                                 f"{'motions' if card == 'BOUNDARY' else 'loads'} there (they have an OP "
+                                 f"of their own), the converted *{card} on the helper node is removed "
+                                 f"with the others where the OP=NEW comes after it.", once=True)
+                self._reduces(f"*{kw} removed by a later *{card}, OP=NEW")
+        return out
+
+    def _conn_wants(self, it: dict, bdef: Optional[dict]) -> bool:
+        """Whether a behaviour (``bdef``), a model-data *CONNECTOR MOTION or a history *CONNECTOR
+        MOTION / LOAD acts on components of connector item ``it``."""
+        return bool((bdef and (bdef["K"] or bdef["C"] or bdef["rigid"])) or
+                    self._conn_fixed.get(it["eid"]) or any(e == it["eid"] for e, _c in self._conn_act))
+
+    def _conn_components(self, it: dict, bdef: Optional[dict], label: str, oris: List[str],
+                         unit: Tuple[Vec, Vec, Vec]) -> None:
+        """The components of connector item ``it`` (route "rows") that its behaviour ``bdef``, a
+        model-data *CONNECTOR MOTION (_conn_fixed) or a history *CONNECTOR MOTION / LOAD
+        (_conn_act) act on, in ``it``: "avail" (the connection type's available components,
+        CONN_COMPONENTS), "frame" (node a's local directions: its orientation, else the
+        global axes), "hard" (rigid and fixed components: constraint rows), "K" / "C" (the
+        stiffness / damping over the other available components, None when zero), "act"
+        (component -> its helper node, _plan_connector_actuation), "axial" ((k, c) of an
+        AXIAL component: a SPRINGA / DASHPOTA between the nodes, exact at any motion) and
+        "uses" (the components acted on).  A type whose components are not linear in the
+        nodal motion, unknown local directions, or rotational components whose node b has
+        other local directions than node a: route "skip"; a rigid AXIAL component: "link"."""
+        e = it["eid"]
+        table = CONN_COMPONENTS_2D if it["dim"] == 2 else CONN_COMPONENTS
+        kinds = [x for x in (it["ttype"], it["rtype"]) if x is not None]
+        avail = None if any(x not in table for x in kinds) else tuple(c for x in kinds for c in table[x])
+        it.update(avail=avail or (), K=None, C=None, hard=set(), act={}, axial=None, frame=unit, uses=set())
+        if not self._conn_wants(it, bdef):
+            return
+        if avail is None:
+            it["route"], it["reason"] = "skip", (
+                f"*CONNECTOR SECTION: connection type {label} with a behaviour, *CONNECTOR MOTION or "
+                f"*CONNECTOR LOAD is not converted (the converter writes them on the components of "
+                f"CARTESIAN, AXIAL, BUSHING, CARDAN, ROTATION, REVOLUTE / HINGE and JOINTC "
+                f"connectors, which are linear in the nodal motion for small motions); commented "
+                f"out — the connector is missing.")
+            return
+        frame = self._conn_axes(oris[0]) if oris and oris[0] else unit
+        other = self._conn_axes(oris[1]) if len(oris) > 1 and oris[1] else frame
+        if frame is None:
+            it["route"], it["reason"] = "skip", (
+                "*CONNECTOR SECTION / *JOINT whose local directions (its *ORIENTATION) are not "
+                "rectangular coordinates the converter reads, with components a behaviour, motion "
+                "or load acts on; commented out — the connector is missing.")
+            return
+        if it["dim"] == 2 and abs(frame[2][2]) < 1.0 - 1e-9:
+            it["route"], it["reason"] = "skip", (
+                "*CONNECTOR SECTION on a CONN2D2 element whose local directions leave the model's "
+                "plane; commented out — the connector is missing.")
+            it["reduces"] = False
+            return
+        if it["rtype"] in ("CARDAN", "ROTATION", "PROJECTION FLEXION-TORSION") and \
+                (other is None or any(vdot(x, y) < 1.0 - 1e-6 for x, y in zip(frame, other))):
+            it["route"], it["reason"] = "skip", (
+                "*CONNECTOR SECTION whose node b has other local directions than node a at the start "
+                "(an initial relative rotation, which the rotation components are measured from), "
+                "with components a behaviour, motion or load acts on: not converted; commented out — "
+                "the connector is missing.")
+            return
+        it["frame"] = frame
+        K, C = (bdef["K"], bdef["C"]) if bdef else (None, None)
+        rigid = set(bdef["rigid"]) if bdef else set()
+        rigid = set(avail) if 0 in rigid else rigid & set(avail)
+        fixed = set(self._conn_fixed.get(e, ())) & set(avail)
+        act = {c: h for (x, c), h in self._conn_act.items() if x == e and c in avail}
+        hard = rigid | fixed
+
+        def restrict(m: Optional[List[List[float]]]) -> Optional[List[List[float]]]:
+            if not m:
+                return None
+            soft = [c for c in avail if c not in hard]
+            out = [[m[i][j] if i + 1 in soft and j + 1 in soft else 0.0 for j in range(6)] for i in range(6)]
+            return out if any(any(row) for row in out) else None
+        rK, rC = restrict(K), restrict(C)
+        if (K and not rK) or (C and not rC) or (bdef and bdef["rigid"] - set(avail) - {0}) or \
+                set(self._conn_fixed.get(e, ())) - set(avail) or \
+                any(x == e and c not in avail for x, c in self._conn_act):
+            self.report.note(f"Connector of type {label}: behaviour, motion or load on components it "
+                             f"does not have (constrained ones) is ignored, as Abaqus ignores it.",
+                             once=True)
+        K, C = rK, rC
+        if it["ttype"] == "AXIAL":
+            if it["a"] is None or it["b"] is None or vnorm(it["d"]) == 0.0:
+                it["route"], it["reason"] = "skip", (
+                    "AXIAL connector to ground or between coincident nodes with a behaviour, motion or "
+                    "load: its direction is the line between the nodes, which it does not have; "
+                    "commented out — the connector is missing.")
+                return
+            if 1 in rigid:
+                it["route"] = "link"                # (a rigid distance: exact at any motion)
+                return
+            kc = (K[0][0] if K else 0.0, C[0][0] if C else 0.0)
+            it["axial"] = kc if any(kc) else None
+            K = C = None
+        it.update(K=K, C=C, hard=hard, act=act)
+        it["uses"] = hard | set(act) | {i + 1 for m in (K, C) if m for i in range(6) if any(m[i])} | \
+            ({1} if it["axial"] else set())
+
     def _plan_connectors(self, blocks: List[Block]) -> None:
         """Connector elements, part 1 of their plan: before _plan_mpcs, whose rigid bodies the
         rigid connectors join (part 2 is _plan_connector_rows).  ccx has no connector
@@ -26055,6 +26473,11 @@ class _Constraints:
         self._conn_plan = {}
         self._conn_beam = []
         self._conn_knots = []
+        for i, b in enumerate(blocks):          # (the options of *JOINTs and behaviours)
+            if b.keyword == "JOINT":
+                self._joint_cards.update((c, id(b)) for c in self._joint_behaviour(blocks, i)["cards"])
+        behaviours = self._conn_behaviours(blocks)
+        self._conn_beh_cards = {c: name for name, beh in behaviours.items() for c in beh["cards"]}
         if not self._conn:
             return
         rotn: set = set()                       # shell/beam nodes: rotations of their own
@@ -26089,56 +26512,60 @@ class _Constraints:
                 for f in self._mpc_fields(b):
                     if f[0].upper() == "BEAM":
                         refs.update(n for tok in f[1:3] for n in self._mpc_nodes(tok))
-        # behaviours that define anything (sub-options follow *CONNECTOR BEHAVIOR)
-        rich: set = set()
-        cur = None
-        for b in blocks:
-            if b.keyword == "CONNECTOR BEHAVIOR":
-                cur = b.uparam("NAME")
-            elif cur is not None and b.keyword.startswith("CONNECTOR ") and \
-                    b.keyword != "CONNECTOR SECTION":
-                rich.add(cur)
-            else:
-                cur = None
+        unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
         items: List[Tuple[dict, int]] = []
         planned: set = set()
-        for b in blocks:
-            if b.keyword != "CONNECTOR SECTION":
+        for i, b in enumerate(blocks):
+            if b.keyword not in ("CONNECTOR SECTION", "JOINT"):
                 continue
+            joint = b.keyword == "JOINT"
             elset = (b.param("ELSET") or "").strip()
-            sec: dict = {"items": [], "reason": None}
+            sec: dict = {"items": [], "reason": None, "beh": None}
             self._conn_plan[id(b)] = sec
-            eids = [e for e in dedup(self.geom.elset(elset)) if e in self._conn]
+            eids = [e for e in dedup(self.geom.elset(elset))
+                    if e in self._conn and (self._conn[e][0] == "JOINTC") == joint]
             if not eids:
-                sec["reason"] = (f"*CONNECTOR SECTION on ELSET={elset}, which holds no connector "
-                                 f"element (CONN3D2 / CONN2D2); commented out.")
+                sec["reason"] = (f"*{b.keyword} on ELSET={elset}, which holds no "
+                                 f"{'JOINTC' if joint else 'connector'} element "
+                                 f"({'JOINTC' if joint else 'CONN3D2 / CONN2D2'}); commented out.")
                 continue
-            recs = merged_data_records(b)
-            words = [x.strip().upper() for x in (recs[0] if recs else []) if x.strip()]
-            oris = [x.strip() for x in recs[1]] if len(recs) > 1 else []
-            label = "/".join(words) or "(none)"
-            if len(words) == 1 and words[0] in CONN_ASSEMBLED:
-                trans, rot = CONN_ASSEMBLED[words[0]]
-            elif words == ["BEAM"]:
-                trans = rot = "BEAM"
+            if joint:
+                words, oris, label = ["JOINTC"], [(b.param("ORIENTATION") or "").strip()], "JOINTC"
+                trans, rot = "JOINTC", "ROTATION"       # (its rotations: small relative ones)
+                beh, bdef = "", self._joint_behaviour(blocks, i)
             else:
-                trans = next((w for w in words if w in CONN_TRANSLATIONAL), None)
-                rot = next((w for w in words if w in CONN_ROTATIONAL), None)
-                if not words or len(words) != (trans is not None) + (rot is not None):
-                    trans = rot = "?"
-            t = None if trans in CONN_UNCONSTRAINED else trans
+                recs = merged_data_records(b)
+                words = [x.strip().upper() for x in (recs[0] if recs else []) if x.strip()]
+                oris = [x.strip() for x in recs[1]] if len(recs) > 1 else []
+                label = "/".join(words) or "(none)"
+                if len(words) == 1 and words[0] in CONN_ASSEMBLED:
+                    trans, rot = CONN_ASSEMBLED[words[0]]
+                elif words == ["BEAM"]:
+                    trans = rot = "BEAM"
+                else:
+                    trans = next((w for w in words if w in CONN_TRANSLATIONAL), None)
+                    rot = next((w for w in words if w in CONN_ROTATIONAL), None)
+                    if not words or len(words) != (trans is not None) + (rot is not None):
+                        trans = rot = "?"
+                beh = b.uparam("BEHAVIOR")
+                bdef = behaviours.get(beh) if beh else None
+            sec["beh"] = bdef
+            if beh:
+                self._conn_beh_secs.setdefault(beh, []).append(sec)
+            t = None if trans in CONN_UNCONSTRAINED or trans == "JOINTC" else trans
             r = None if rot in CONN_UNCONSTRAINED else rot
-            beh = b.uparam("BEHAVIOR")
+            defines = bool(bdef and (bdef["K"] or bdef["C"] or bdef["rigid"] or bdef["why"]))
             why = None
             if trans == "?":
                 kind, why = "skip", (f"*CONNECTOR SECTION: connection type {label} is not an Abaqus "
                                      f"connection type the converter knows; commented out — the "
                                      f"connector is missing.")
-            elif beh in rich:
-                kind, why = "skip", ("*CONNECTOR SECTION with a *CONNECTOR BEHAVIOR (elasticity, "
-                                     "damping, stops, locks, friction, ...): ccx has no connector "
-                                     "element to carry it; commented out — the connector is "
-                                     "missing.")
+            elif defines and bdef["why"]:
+                kind, why = "skip", (f"*{b.keyword} with a behaviour that has {bdef['why']}: ccx has "
+                                     f"no connector element to carry it, and the converter writes "
+                                     f"only linear, constant elasticity and damping (springs and "
+                                     f"dashpots) and rigid components; commented out — the "
+                                     f"connector is missing.")
             elif not self._mechanical:
                 kind = "free"
                 self.report.note("Connector elements left out: a heat-transfer-only deck has no "
@@ -26146,10 +26573,7 @@ class _Constraints:
             elif (t, r) in (("BEAM", "BEAM"), ("JOIN", "ALIGN")):
                 kind = "rigid"
             elif t is None and r is None:
-                kind = "free"
-                self.report.note(f"Connector of type {label}: it constrains no relative motion "
-                                 f"and has no behaviour, so it transmits nothing — left out.",
-                                 once=True)
+                kind = "rows"                   # (no components: "free", below)
             elif t in (None, "JOIN") and r in (None, "REVOLUTE", "ALIGN"):
                 kind = "rows"
             elif t == "LINK" and r is None:
@@ -26159,7 +26583,7 @@ class _Constraints:
                                      f"(the converter writes JOIN, REVOLUTE, ALIGN, HINGE, WELD, "
                                      f"BEAM, LINK and the unconstrained types); commented out — "
                                      f"the connector is missing.")
-            if beh and beh not in rich:
+            if beh and not defines:
                 self.report.note(f"*CONNECTOR SECTION, BEHAVIOR={beh}: the behaviour defines nothing "
                                  f"and is ignored.", once=True)
             for e in eids:
@@ -26170,9 +26594,16 @@ class _Constraints:
                 planned.add(e)
                 typ, na, nb = self._conn[e]
                 it = {"eid": e, "a": na, "b": nb, "dim": 2 if typ == "CONN2D2" else 3,
-                      "route": kind, "reason": why, "trans": t, "rot": r, "d": (0.0, 0.0, 0.0)}
+                      "route": kind, "reason": why, "trans": t, "rot": r, "d": (0.0, 0.0, 0.0),
+                      "ttype": trans, "rtype": rot, "joint": joint}
                 sec["items"].append(it)
                 if kind in ("skip", "free"):
+                    continue
+                if t is None and r is None and not self._conn_wants(it, bdef if defines else None):
+                    it["route"] = "free"
+                    self.report.note(f"Connector of type {label}: it constrains no relative "
+                                     f"motion and has no behaviour, so it transmits nothing — "
+                                     f"left out.", once=True)
                     continue
                 if any(n is not None and n not in self.geom.nodes for n in (na, nb)) or na == nb:
                     it["route"], it["reason"] = "skip", ("Connector element on an undefined node, "
@@ -26204,6 +26635,8 @@ class _Constraints:
                             "holds that misalignment) is not converted; commented out.")
                     else:
                         it["e1"] = axes[0]
+                if it["route"] == "rows":
+                    self._conn_components(it, bdef if defines else None, label, oris, unit)
                 items.append((it, id(b)))
         if not items:
             return
@@ -26241,12 +26674,21 @@ class _Constraints:
                                                      "other node); commented out.")
             if it["route"] != "rows" or self._explicit_deck:   # (explicit: no equations on knots)
                 continue
-            ends = [a, b] if it["rot"] is not None else \
-                [a] if vnorm(it["d"]) > 0.0 else []
+            # the nodes whose rotations its rows use: both for a rotation constraint or rotation
+            # components; node a for an offset that turns with it (JOIN, CARTESIAN), both for one
+            # that turns with both (PROJECTION CARTESIAN)
+            uses = it.get("uses", ())
+            offset = vnorm(it["d"]) > 0.0 and (
+                it["trans"] == "JOIN" or (it["ttype"] in ("CARTESIAN", "PROJECTION CARTESIAN") and
+                                          any(c <= 3 for c in uses)))
+            ends = [a, b] if it["rot"] is not None or any(c >= 4 for c in uses) or (
+                offset and it["ttype"] == "PROJECTION CARTESIAN") else [a] if offset else []
             if any(n in rotn and free_rotation(n, dim) and n in self._transformed for n in ends):
                 it["route"], it["reason"] = "skip", self._CONN_OWN_ROTATION
                 continue
-            self._conn_knots += [n for n in ends if n in rotn and free_rotation(n, dim)]
+            # (a U1 beam's node has rotations of its own: no knot)
+            self._conn_knots += [n for n in ends if n in rotn and free_rotation(n, dim) and
+                                 n not in self._u1_nodes()]
 
     def _kinematic_refs(self, blocks: List[Block]) -> set:
         """Reference nodes of kinematic couplings that couple translations, where ccx carries
@@ -26604,6 +27046,127 @@ class _Constraints:
             out.append(terms)
         return out
 
+    def _conn_element(self, typ: str, nodes: List[int], value: float) -> str:
+        """A new SPRINGA / DASHPOTA element on ``nodes`` in the element set of its type and
+        stiffness / damping ``value`` (one *SPRING / *DASHPOT card per set,
+        _conn_component_cards); that set's name."""
+        eid = self._next_ids()[1] + 1
+        self.geom.add_element(eid, typ, nodes)
+        name = self._conn_sets.get((typ, value))
+        if name is None:
+            name = self._conn_sets[(typ, value)] = self._u1_name(f"ABQ2CCX_CONN_{typ}_{len(self._conn_sets) + 1}")
+        self.geom.add_to_elset(name, [eid])
+        return name
+
+    def _conn_component_elements(self, it: dict, live: List[dict]) -> List[Tuple[int, int]]:
+        """The springs and dashpots of connector item ``it``'s written component rows (``live``,
+        _conn_soft) and its AXIAL component: a SPRINGA and a DASHPOTA from the helper to a new
+        node a model span away along -x, the helper held across x and the new node in all
+        three (they stay on their line: the force is k u_h, c v_h at any motion) — not a
+        SPRING1 on the helper's DOF 1: ccx 2.23's linear *STATIC drops what a nonzero BC puts
+        on a SPRING1 / SPRING2 through an equation (probed: a prescribed node DOF moved the
+        others as if the spring were not there; NLGEOM and SPRINGA are right); a SPRINGA /
+        DASHPOTA between the nodes.  Returns the BCs they need.  Fills it["sets"] (their
+        element sets)."""
+        bcs: List[Tuple[int, int]] = []
+        sets: List[str] = []
+        for s in live:
+            h = s["h"]
+            if not (s["k"] or s["c"]):
+                continue
+            g = max(self.geom.nodes) + 1
+            self.geom.add_node(g, vsub(self.geom.nodes[h], (self._model_span(), 0.0, 0.0)))
+            if s["k"]:
+                sets.append(self._conn_element("SPRINGA", [h, g], s["k"]))
+            if s["c"]:
+                sets.append(self._conn_element("DASHPOTA", [h, g], s["c"]))
+                self._conn_dashpots.add(self._next_ids()[1])
+            bcs += [(h, 2), (h, 3), (g, 1), (g, 2), (g, 3)]
+        if it.get("axial"):
+            k, c = it["axial"]
+            sets += ([self._conn_element("SPRINGA", [it["a"], it["b"]], k)] if k else []) + \
+                ([self._conn_element("DASHPOTA", [it["a"], it["b"]], c)] if c else [])
+        it["sets"] = sets
+        return bcs
+
+    def _conn_component_cards(self, items: List[dict]) -> List[str]:
+        """The *SPRING / *DASHPOT cards of the element sets of ``items``' components not
+        written yet (_conn_component_elements, the zero SPRINGAs of _plan_connector_rows), every
+        value with a decimal point (ccx 2.23 reads a *SPRING line without one as a DOF line)."""
+        out: List[str] = []
+        names = {v: k for k, v in self._conn_sets.items()}
+        for name in dedup([n for it in items for n in it.get("sets", ())]):
+            if name in self._conn_sets_written:
+                continue
+            self._conn_sets_written.add(name)
+            typ, value = names[name]
+            out += [f"*{'DASHPOT' if typ == 'DASHPOTA' else 'SPRING'}, ELSET={name}",
+                    dotted_number(short_real(value, 12))]
+        return out
+
+    def _note_conn_components(self, items: List[dict]) -> None:
+        """The report's notes on connector components written (_plan_connector_rows)."""
+        live = [s for it in items if it["route"] == "rows" for s in it.get("live", ())]
+        if live:
+            self.report.note("Connector behaviour (*CONNECTOR ELASTICITY / DAMPING, linear) and JOINTC "
+                             "springs / dashpots -> each component (a coupled matrix: each eigenvector) "
+                             "is a helper node whose DOF 1 an *EQUATION ties to the component's "
+                             "linearised relative motion in node a's local directions — a rotation "
+                             "component through the nodes' rotations (rotation nodes, knots, U1 "
+                             "nodes) — with a SPRINGA and a DASHPOTA from it to a held node a model "
+                             "span away along that DOF: exact for small motions, and under NLGEOM for "
+                             "translations whose directions cannot turn (validate_with_ccx.py "
+                             "connector_bushing).", once=True)
+        if any(it.get("axial") for it in items if it["route"] == "rows"):
+            self.report.note("AXIAL connector elasticity / damping -> a SPRINGA / DASHPOTA between its "
+                             "nodes: the same force along their line, at any motion.", once=True)
+        if any(it.get("hard") for it in items if it["route"] == "rows"):
+            self.report.note("Rigid connector components (*CONNECTOR ELASTICITY, RIGID; a model-data "
+                             "*CONNECTOR MOTION) -> constraint *EQUATIONs that hold the component, "
+                             "exact; Abaqus enforces RIGID with a stiff penalty spring (10 times the "
+                             "surrounding elements' stiffness, else 1e6), so its answer is a little "
+                             "softer there.", once=True)
+        if any(it.get("approx") for it in items if it["route"] == "rows" and it.get("live")):
+            self.report.warn("[APPROX] Connector springs, dashpots, motions or loads under NLGEOM "
+                             "written in their linear form: rotation components, and translations "
+                             "in local directions that turn with the nodes, hold for small "
+                             "rotations only.", once=True)
+
+    def _conn_soft(self, it: dict) -> List[dict]:
+        """The springs, dashpots, motions and loads on the components of connector item ``it``
+        (_conn_components) as specs, one per row of _plan_connector_rows: {"w": component ->
+        weight, "k": stiffness, "c": damping, "h": the helper node whose DOF 1 the row ties to
+        that combination of components, "act": a *CONNECTOR MOTION / LOAD acts on it (its
+        helper from _plan_connector_actuation)}.  An uncoupled (diagonal) stiffness or damping
+        is one spec per component; a coupled one, K = sum lambda v v^T, one per eigenvector
+        v (its components' weights) — a spring of stiffness lambda on v . u is the same
+        energy.  New helpers sit at node a (ground: node b)."""
+        specs = [{"w": {c: 1.0}, "k": 0.0, "c": 0.0, "h": h, "act": True}
+                 for c, h in sorted(it.get("act", {}).items())]
+        for key, m in (("k", it.get("K")), ("c", it.get("C"))):
+            if not m:
+                continue
+            idx = [i for i in range(6) if any(m[i])]
+            if all(m[i][j] == 0.0 for i in idx for j in idx if i != j):
+                parts = [({i + 1: 1.0}, m[i][i]) for i in idx]
+            else:
+                vals, vecs = sym_eigen([[m[i][j] for j in idx] for i in idx])
+                top = max(abs(v) for v in vals)
+                parts = [({idx[q] + 1: v[q] for q in range(len(idx)) if abs(v[q]) > 1e-12}, lam)
+                         for lam, v in zip(vals, vecs) if abs(lam) > 1e-12 * top]
+            for w, val in parts:
+                sp = next((s for s in specs if s["w"] == w), None)
+                if sp is None:
+                    sp = {"w": w, "k": 0.0, "c": 0.0, "h": None, "act": False}
+                    specs.append(sp)
+                sp[key] += val
+        at = self.geom.nodes[it["a"] if it["a"] is not None else it["b"]]
+        for s in specs:
+            if s["h"] is None:
+                s["h"] = max(self.geom.nodes) + 1
+                self.geom.add_node(s["h"], at)
+        return specs
+
     def _plan_connector_rows(self, blocks: List[Block]) -> None:
         """Connector elements, part 2 of their plan (after the rigid bodies and knots): the
         LINK routes, and the constraint equations of the "rows" route, as *BOUNDARY lines
@@ -26672,10 +27235,12 @@ class _Constraints:
                     if m != ref:
                         body_of.setdefault(m, {"ref": ref})
 
+        u1n = self._u1_nodes()
+
         def carrier(n: int) -> Optional[Tuple[int, int]]:
             """(node, its DOF that carries rotation component 1) of node n's rotation."""
             for _ in range(len(body_of) + 1):
-                if n in kin:
+                if n in kin or n in u1n:
                     return (n, 4)
                 if n in self._rb_rot:
                     return (self._rb_rot[n], 1)
@@ -26709,12 +27274,54 @@ class _Constraints:
         skew = lambda d: ((0.0, -d[2], d[1]), (d[2], 0.0, -d[0]), (-d[1], d[0], 0.0))  # noqa: E731
         twin_of: Dict[int, int] = {}     # node -> its twin, while a connector's rows go through it
 
+        def comp_row(it: dict, w: Dict[int, float], a_turns: bool) -> Dict[Tuple[int, int], float]:
+            """sum_c w_c times component c of connector ``it``, linearised, in node DOFs: a
+            translation e . (u_b - u_a), e node a's local direction (AXIAL: along the nodes'
+            line), less e . (theta x d) where its frame turns: node a's rotation (CARTESIAN,
+            where it turns), the mean of both nodes' (PROJECTION CARTESIAN); none for JOINTC,
+            whose components are relative displacements; a rotation e . (theta_b - theta_a)."""
+            a, b, d, dim, axes = it["a"], it["b"], it["d"], it["dim"], it["frame"]
+            row: Dict[Tuple[int, int], float] = {}
+
+            def add(k: Tuple[int, int], v: float) -> None:
+                row[k] = row.get(k, 0.0) + v
+            for c, wc in w.items():
+                if c <= 3:
+                    e = vunit(d) if it["ttype"] == "AXIAL" else axes[c - 1]
+                    for k in ((1, 2) if dim == 2 else (1, 2, 3)):
+                        if b is not None:
+                            add((b, k), wc * e[k - 1])
+                        if a is not None:
+                            add((a, k), -wc * e[k - 1])
+                    turners = [(a, 1.0)] if it["ttype"] == "CARTESIAN" and a_turns else \
+                        [(a, 0.5), (b, 0.5)] if it["ttype"] == "PROJECTION CARTESIAN" else []
+                    dxe = vcross(d, e)
+                    for n, f in turners if vnorm(d) > 0.0 else ():
+                        if n is not None:
+                            for m in ((3,) if dim == 2 else (1, 2, 3)):
+                                add((n, 3 + m), -wc * f * dxe[m - 1])
+                else:
+                    e = (0.0, 0.0, 1.0) if dim == 2 else axes[c - 4]
+                    for m in ((3,) if dim == 2 else (1, 2, 3)):
+                        if b is not None:
+                            add((b, 3 + m), wc * e[m - 1])
+                        if a is not None:
+                            add((a, 3 + m), -wc * e[m - 1])
+            return {k: v for k, v in row.items() if abs(v) > 1e-14}
+
+        def soft_rows(it: dict, a_turns: bool) -> List[Tuple[dict, Dict[Tuple[int, int], float]]]:
+            """The rows of the components of ``it`` that springs, dashpots, motions or loads act
+            on (_conn_soft): sum_c w_c component c - u_h,1 = 0, h the spec's helper node."""
+            return [(s, {**comp_row(it, s["w"], a_turns), (s["h"], 1): -1.0}) for s in it.get("soft", ())]
+
         def rows_of(it: dict, a_turns: bool) -> List[Dict[Tuple[int, int], float]]:
             a, b, d, dim = it["a"], it["b"], it["d"], it["dim"]
             rows: List[Dict[Tuple[int, int], float]] = []
             if it["rot"] == "REVOLUTE" and vnorm(vcross(it["e1"], d)) <= 1e-9 * vnorm(d) and \
                     (b is None or all((b, g) in held for g in (4, 5, 6))):
                 a_turns = False      # node a then turns about e1 only, which leaves d in place
+            for c in sorted(it.get("hard", ())):      # rigid and fixed components: held at 0
+                rows.append(comp_row(it, {c: 1.0}, a_turns))
             if it["trans"] == "JOIN":                 # u_b - u_a - theta_a x d = 0
                 for k in ((1, 2) if dim == 2 else (1, 2, 3)):
                     row: Dict[Tuple[int, int], float] = {}
@@ -26811,21 +27418,24 @@ class _Constraints:
                                if abs(v) > 1e-14 and (not local or abs(v) > 1e-12 * big))
 
         def natives(it: dict, a_turns: bool) -> List[Dict[Tuple[int, int], float]]:
-            rows = [native(rw) for rw in rows_of(it, a_turns)]
+            rows = [native(rw) for rw in rows_of(it, a_turns) + [rw for _s, rw in soft_rows(it, a_turns)]]
             return [rw for rw in rows if not isinstance(rw, str)]
 
         def is_local(k: Tuple[int, int]) -> bool:
             return k[1] <= 3 and isinstance(frame(k[0]), tuple)
+        for it in rows_items:                 # the helper nodes of its components (_conn_soft)
+            it["soft"] = self._conn_soft(it)
         # rotations that show beyond one connector get a rotation node of their own
         uses: Dict[int, int] = {}
+        turning = {id(it) for it in rows_items if it["rot"] is not None or
+                   any(c >= 4 for c in it.get("uses", ()))}
         for it in rows_items:
-            if it["rot"] is None:
-                continue
-            for n in {k[0] for rw in natives(it, True) for k in rw if k[1] >= 4}:
-                uses[n] = uses.get(n, 0) + 1
+            if id(it) in turning:
+                for n in {k[0] for rw in natives(it, True) for k in rw if k[1] >= 4}:
+                    uses[n] = uses.get(n, 0) + 1
         for it in rows_items:                 # a JOIN offset turns with rotations node a has
             a = it["a"]
-            if it["rot"] is None and a in uses and \
+            if id(it) not in turning and a in uses and \
                     any(k[0] == a and k[1] >= 4 for rw in natives(it, True) for k in rw):
                 uses[a] += 1
         synth = sorted(n for n, c in uses.items() if carrier(n) is None and
@@ -26984,32 +27594,55 @@ class _Constraints:
                     return False
             return True
 
+        taken_deps: set = set()           # DOFs the connectors' equations eliminate so far
+        types_at: Dict[int, set] = {}
+        for typ, conn in self.geom.elements.values():
+            for n in conn:
+                types_at.setdefault(n, set()).add(typ.upper())
+        mass_only = {n for n, ts in types_at.items() if ts == {"MASS"}}
+        mass_held: set = set()
+        # rotation-node DOFs with a BC (moved there from DOFs 4-6 of its node)
+        bc_rot = {(self._rb_rot[n], d - 3) for n, d in self._conn_bc_dofs if 4 <= d <= 6 and n in self._rb_rot}
+
         def build(it: dict, a_turns: bool) -> Union[str, Tuple[List[Tuple[int, int]],
                                                                 List[List[Tuple[int, int, float]]],
-                                                                bool]]:
-            """The rows of connector ``it`` as (BCs, *EQUATIONs, whether they hold local DOFs),
-            or why it cannot be written."""
+                                                                bool, List[dict]]]:
+            """The rows of connector ``it`` as (BCs, *EQUATIONs, whether they hold local DOFs,
+            the specs of its components' rows written: _conn_soft), or why it cannot be
+            written."""
             rows = [native(rw) for rw in rows_of(it, a_turns)]
-            why = next((rw for rw in rows if isinstance(rw, str)), None)
+            soft = [(s, native(rw)) for s, rw in soft_rows(it, a_turns)]
+            why = next((rw for rw in rows + [rw for _s, rw in soft] if isinstance(rw, str)), None)
             if why is not None:
                 return why if why == self._CONN_OWN_ROTATION else self._conn_axes_reason(why)
             rows = [rw for rw in rows if rw]
+            if it.get("ttype") == "PROJECTION CARTESIAN" and vnorm(it["d"]) > 0.0 and any(
+                    k[1] >= 4 for c in (1, 2, 3) if c in it.get("uses", ())
+                    for k in native(comp_row(it, {c: 1.0}, a_turns))):
+                return ("PROJECTION CARTESIAN (BUSHING) connector between nodes apart whose rotations "
+                        "are not held, with a behaviour, motion or load on its translations: its "
+                        "directions turn with both nodes, which is not converted; commented out — "
+                        "the connector is missing.")
             if any(k[1] >= 4 and k[0] in self._rot_nodes and carrier(k[0]) is None
-                   for rw in rows for k in rw):
+                   for rw in rows + [rw for _s, rw in soft] for k in rw):
                 # a shell/beam node's rotation without a knot (explicit dynamics, where the
                 # converter makes none): ccx would ignore it in an *EQUATION
                 return ("Connector on the rotation of a shell/beam node in a deck with explicit "
                         "dynamics: ccx ignores DOFs 4-6 of a plain shell/beam node in an "
                         "*EQUATION, and its explicit solver stops on the knot that would give the "
                         "node real rotations; commented out — the connector is missing.")
-            # eliminate connector-only rotations: the rows that fix them say nothing else
-            for col in sorted({k for rw in rows for k in rw if k[1] >= 4 and carrier(k[0]) is None}):
+            # eliminate connector-only rotations: the rows that fix them say nothing else (a
+            # component row that keeps one is free: below)
+            free_cols: set = set()
+            for col in sorted({k for rw in rows + [rw for _s, rw in soft] for k in rw
+                               if k[1] >= 4 and carrier(k[0]) is None}):
                 with_col = [rw for rw in rows if col in rw]
                 if not with_col:
+                    free_cols.add(col)
                     continue
                 piv = max(with_col, key=lambda rw: abs(rw[col]))
                 rows.remove(piv)
-                for rw in rows:
+                for rw in rows + [rw for _s, rw in soft]:
                     if col in rw:
                         f = rw[col] / piv[col]
                         for k, v in piv.items():
@@ -27018,6 +27651,21 @@ class _Constraints:
                     big = max([abs(v) for v in rw.values()] or [0.0])
                     rows[i] = {k: v for k, v in rw.items() if abs(v) > 1e-12 * big}
                 rows = [rw for rw in rows if rw]
+                for i, (s, rw) in enumerate(soft):
+                    big = max([abs(v) for v in rw.values()] or [0.0])
+                    soft[i] = (s, {k: v for k, v in rw.items() if abs(v) > 1e-12 * big})
+            # components that keep a rotation only the connector has: it turns freely (Abaqus
+            # adds it), so they take no force — left out where each can be zeroed on its own
+            # (their rows' free columns of full rank), else not converted
+            loose = [i for i, (_s, rw) in enumerate(soft) if free_cols & set(rw)]
+            if loose:
+                cols = sorted(free_cols & {k for i in loose for k in soft[i][1]})
+                if matrix_rank([[soft[i][1].get(k, 0.0) for k in cols] for i in loose]) < len(loose):
+                    return ("Connector whose springs, dashpots, motions or loads act on components "
+                            "that depend on a rotation only the connector has (a node without "
+                            "rotations of its own, which Abaqus leaves free) in a way the converter "
+                            "does not write; commented out — the connector is missing.")
+                soft = [x for i, x in enumerate(soft) if i not in loose]
             # a one-DOF row holds that DOF at zero; it drops out of the others
             zero: List[Tuple[int, int]] = []
             while True:
@@ -27027,6 +27675,7 @@ class _Constraints:
                 zero += [k for k in singles if k not in zero]
                 rows = [{k: v for k, v in rw.items() if k not in zero} for rw in rows]
                 rows = [rw for rw in rows if rw]
+            soft = [(s, {k: v for k, v in rw.items() if k not in zero}) for s, rw in soft]
 
             def dof(k: Tuple[int, int]) -> Tuple[int, int]:
                 if k[1] <= 3:
@@ -27067,7 +27716,39 @@ class _Constraints:
                 return ("Connector that would hold a translation of a rigid-body member at zero "
                         "(ccx eliminates those, a boundary condition on one stops ccx); "
                         "commented out — the connector is missing.")
-            return bcs, eqs, reduced
+            # the components' rows: u_h,1 = sum w_c component c, eliminated on the helper's DOF
+            # — on another where a motion or load acts on it (ccx 2.23 applies a *CLOAD on an
+            # equation's dependent DOF wrongly, and stops on a BC there; probed): a DOF that no
+            # other equation eliminates and no BC takes
+            live: List[dict] = []
+            deps = {eq[0][:2] for eq in eqs} | taken_deps
+            for s, rw in soft:
+                terms = OrderedDict()
+                for k, v in rw.items():
+                    terms[dof(k)] = terms.get(dof(k), 0.0) + v
+                big = max([abs(v) for v in terms.values()] or [0.0])
+                terms = OrderedDict((k, v) for k, v in terms.items() if abs(v) > 1e-12 * big)
+                hk = (s["h"], 1)
+                if len(terms) < 2 or hk not in terms:
+                    continue                  # (nodes held: the component cannot move)
+                if s["act"]:
+                    cand = [k for k in terms if k != hk and k not in busy and k not in deps and
+                            not (k[0] in kin and k[1] >= 4) and not is_local(k) and
+                            k not in self._conn_bc_dofs and k not in bc_rot]
+                    if not cand:
+                        return ("Connector with a *CONNECTOR MOTION / LOAD on a component whose DOFs "
+                                "are all eliminated by other constraints, held, or local DOFs of a "
+                                "node with a *TRANSFORM; commented out — the connector is missing.")
+                    top = max(abs(terms[k]) for k in cand)
+                    big_c = [k for k in cand if abs(terms[k]) >= 0.1 * top]
+                    first = next((k for k in big_c if plain(*k)), big_c[0])
+                else:
+                    first = hk
+                eqs.append([(first[0], first[1], terms[first])] +
+                           [(k[0], k[1], v) for k, v in terms.items() if k != first])
+                deps.add(first)
+                live.append(s)
+            return bcs, eqs, reduced, live
         for it in rows_items:
             a = it["a"]
             a_turns = it["rot"] is not None or (a is not None and (carrier(a) is not None or
@@ -27094,7 +27775,7 @@ class _Constraints:
             if isinstance(got, str):
                 it["route"], it["reason"] = "skip", got
                 continue
-            bcs, eqs, reduced = got
+            bcs, eqs, reduced, live = got
             if nl and twin is None and repeats(eqs):
                 it["route"], it["reason"] = "skip", (
                     "Connector under NLGEOM (or explicit dynamics) between nodes with different "
@@ -27122,9 +27803,23 @@ class _Constraints:
                         plain(n, d) or (d <= 3 and n in self._ref_nodes and n not in carriers
                                         and (n, d) not in busy) for n, d, _ in eq[1:])
                     return one or tied
-                if not all(exact(eq) for eq in eqs):
+                # (a component in local directions is exact where they cannot turn: node a's
+                # — both nodes' for PROJECTION CARTESIAN — rotations held in every step; an
+                # AXIAL one never: its direction is the nodes' line)
+                still = all(n is None or all((n, g) in held for g in ((6,) if it["dim"] == 2 else (4, 5, 6)))
+                            for n in ([it["a"], it["b"]] if it.get("ttype") == "PROJECTION CARTESIAN"
+                                      else [it["a"]])) and it.get("ttype") != "AXIAL"
+                if not all(exact(eq) for eq in eqs) or (live and not still):
                     if self._approx and not explicit:
                         it["approx"] = True
+                    elif live:
+                        it["route"], it["reason"] = "skip", (
+                            "Connector under NLGEOM (or explicit dynamics) whose springs, dashpots, "
+                            "motions or loads act on rotations, or on translations in local "
+                            "directions that turn with its nodes: its linear form holds for small "
+                            "rotations only; commented out — rerun with --approximate to write it "
+                            "(not with explicit dynamics).")
+                        continue
                     else:
                         it["route"], it["reason"] = "skip", (
                             "Connector under NLGEOM (or explicit dynamics) whose constraint is "
@@ -27137,7 +27832,24 @@ class _Constraints:
                         continue
             if twin is not None:
                 self._mpc_twin(twin[0])          # made now, under the id its rows name
-            it["bcs"], it["eqs"] = bcs, eqs
+            taken_deps.update(eq[0][:2] for eq in eqs)
+            bcs = list(bcs) + self._conn_component_elements(it, live)
+            # a node on MASS elements alone whose DOFs only equations tie: ccx 2.23 stops ('add_sm_ei:
+            # coefficient should be 0': MASS elements are not in its matrix structure; probed) — a
+            # SPRINGA of stiffness 0 to a new held node puts the node there, changing nothing
+            for n in (it["a"], it["b"]):
+                if n is not None and n not in mass_held and n in mass_only and \
+                        any(m == n for eq in eqs for m, _d, _v in eq):
+                    mass_held.add(n)
+                    g = max(self.geom.nodes) + 1
+                    self.geom.add_node(g, vsub(self.geom.nodes[n], (self._model_span(), 0.0, 0.0)))
+                    it.setdefault("sets", []).append(self._conn_element("SPRINGA", [n, g], 0.0))
+                    bcs += [(g, 1), (g, 2), (g, 3)]
+                    self.report.note("Connector nodes on MASS elements alone get a SPRINGA of stiffness 0 to "
+                                     "a held node: ccx 2.23 stops on such a node where only equations tie "
+                                     "it ('add_sm_ei: coefficient should be 0', probed); it changes nothing.",
+                                     once=True)
+            it["bcs"], it["eqs"], it["live"] = bcs, eqs, live
             it["local"] = reduced or any(is_local(k) for k in bcs)
 
     # -- rigid couplings on shell / beam nodes ---------------------------------
@@ -39600,6 +40312,22 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._conn_bc_dofs: set = set()            # (node, DOF) with a BC in any step
         self._conn_turned: set = set()             # nodes with moments / prescribed rotations
         self._conn_rot: set = set()                # rotation nodes made for connector rotations
+        # connector components (_plan_connector_actuation, _plan_connector_rows): (element,
+        # component) -> the helper node a history *CONNECTOR MOTION / LOAD acts on; element ->
+        # the components a model-data *CONNECTOR MOTION fixes; (SPRING1 / DASHPOTA / SPRINGA,
+        # value) -> the element set of the springs / dashpots written for them, and those sets'
+        # cards written so far; the DASHPOTA elements among them
+        self._conn_act: Dict[Tuple[int, int], int] = {}
+        self._conn_fixed: Dict[int, set] = {}
+        self._conn_fixed_cards: Dict[int, set] = {}     # id(model-data *CONNECTOR MOTION) -> elements
+        self._conn_sets: "OrderedDict[Tuple[str, float], str]" = OrderedDict()
+        self._conn_sets_written: set = set()
+        self._conn_dashpots: set = set()
+        # id(*SPRING / *DASHPOT option of a *JOINT) -> id(that *JOINT); id(card of a *CONNECTOR
+        # BEHAVIOR) -> its name; name -> the plans of the sections that use it
+        self._joint_cards: Dict[int, int] = {}
+        self._conn_beh_cards: Dict[int, str] = {}
+        self._conn_beh_secs: Dict[str, List[dict]] = {}
         # no NLGEOM, a step ccx runs through its nonlinear solver (``_solver_why``: the first
         # one, in words): rigid constraints become linear *EQUATIONs (_plan_solver_facts,
         # _rigid_body_lines); such a step before an NLGEOM one
@@ -39678,6 +40406,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._u1_damping: Dict[str, Block] = {}  # a U1 copy's *DAMPING (_u1_lines): its line there
         self._u1_rest: Dict[str, str] = {}
         self._u1_refused: Optional[str] = None
+        self._u1_node_set: Optional[set] = None    # (_u1_nodes)
         self._u1_taken: set = set()                # names given to U1 sets and materials
         self._u1_pairs: Optional[set] = None       # the U1 elements' end-node pairs (lazy)
         # pressures kept on CAX8R / CAX6 edges ccx integrates at 2 points (_two_point_pressure):
@@ -39849,6 +40578,12 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "DSLOAD": "handle_dsload",
         "MPC": "handle_mpc",
         "CONNECTOR SECTION": "handle_connector_section",
+        "JOINT": "handle_connector_section",
+        "CONNECTOR BEHAVIOR": "handle_connector_behavior",
+        "CONNECTOR ELASTICITY": "handle_connector_behavior",
+        "CONNECTOR DAMPING": "handle_connector_behavior",
+        "CONNECTOR MOTION": "handle_connector_motion",
+        "CONNECTOR LOAD": "handle_connector_motion",
         "RESTART": "handle_restart",
         "AMPLITUDE": "handle_amplitude",
         "SURFACE": "handle_surface",
@@ -40150,6 +40885,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._check_nonpositive_ids()
         self._plan_free_ref_nodes(blocks)       # before every planner that reads a REF NODE
         self._plan_dp_materials(blocks)         # before the step model: NLGEOM in ccx
+        blocks = self._plan_connector_actuation(blocks)     # before the step model reads BCs / loads
         self._read_steps(blocks)                # after the last planner that rewrites a step card
         self._plan_mass_scaling_factors(blocks)     # before every planner reading material names
         self._plan_solver_facts(blocks)         # after the step model and _plan_rigid
@@ -40824,7 +41560,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
 PART_PER_INSTANCE = {"SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
                      "BEAM GENERAL SECTION", "MEMBRANE SECTION", "COHESIVE SECTION", "GASKET SECTION", "SURFACE SECTION",
                      "SPRING", "DASHPOT", "MASS", "ROTARY INERTIA", "GAP", "ORIENTATION",
-                     "DISTRIBUTION", "SURFACE", "CONNECTOR SECTION"}
+                     "DISTRIBUTION", "SURFACE", "CONNECTOR SECTION", "JOINT"}
 # Part-level constraint cards that reference the part's own nodes/elements/sets: each
 # instance needs its own copy with offset ids and prefixed names (emitted once, raw,
 # they would constrain only one instance — or the wrong nodes after renumbering).
@@ -41156,12 +41892,26 @@ AXES_ORIENTATION = "ABQ2CCX_AXES"
 
 
 def _conn_needs_axes(b: Block) -> bool:
-    """Whether *CONNECTOR SECTION ``b`` is a REVOLUTE / HINGE connector (the converted types
-    whose constraint reads node a's local directions, _plan_connectors) without an
-    orientation of node a: its local directions are then the global ones."""
+    """Whether *CONNECTOR SECTION ``b`` is a connector whose conversion reads node a's local
+    directions (REVOLUTE / HINGE, and the types whose components a behaviour, motion or load
+    acts on, _plan_connectors) without an orientation of node a — its local directions are
+    then the global ones — or *JOINT ``b`` one without ORIENTATION."""
+    if b.keyword == "JOINT":
+        return not (b.param("ORIENTATION") or "").strip()
     recs = merged_data_records(b)
     words = {x.strip().upper() for x in (recs[0] if recs else [])}
-    return bool(words & {"REVOLUTE", "HINGE"}) and not (len(recs) > 1 and recs[1] and recs[1][0].strip())
+    return bool(words & ({"REVOLUTE", "HINGE", "BUSHING"} | {t for t, cs in CONN_COMPONENTS.items() if cs})) \
+        and not (len(recs) > 1 and recs[1] and recs[1][0].strip())
+
+
+def _conn_axis1_only(b: Block) -> bool:
+    """Whether *CONNECTOR SECTION ``b`` reads only node a's local 1-direction: a REVOLUTE /
+    HINGE without a type whose components are converted (CONN_COMPONENTS)."""
+    if b.keyword != "CONNECTOR SECTION":
+        return False
+    recs = merged_data_records(b)
+    words = {x.strip().upper() for x in (recs[0] if recs else [])}
+    return not words & ({"BUSHING"} | {t for t, cs in CONN_COMPONENTS.items() if cs and t != "REVOLUTE"})
 
 
 def _section_option_ids(blocks: Sequence[Block]) -> set:
@@ -41570,15 +42320,18 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     if rot:
         axes = _instance_axes(rotv)
         turned, oriented = _turn_instance_dofs(inst_blocks, geo, axes, report, prefix)
-        # a REVOLUTE / HINGE connector without node a's orientation turns about the part's
-        # axis 1 (Abaqus: the global directions, here the part's), so it takes the instance's
-        axis_conns = {id(b) for b in inst_blocks if b.keyword == "CONNECTOR SECTION" and
-                      _conn_needs_axes(b)} if axes[0] != (1.0, 0.0, 0.0) else set()
+        # a connector without node a's orientation (a REVOLUTE / HINGE: its axis 1; a JOINTC,
+        # or a type whose components are converted: all three) has the part's axes (Abaqus:
+        # the global directions, here the part's), so it takes the instance's
+        axis_conns = {id(b) for b in inst_blocks if b.keyword in ("CONNECTOR SECTION", "JOINT") and
+                      _conn_needs_axes(b) and (axes[0] != (1.0, 0.0, 0.0) or (
+                          axes != ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)) and
+                          not _conn_axis1_only(b)))}
         if oriented or axis_conns:
             out.append(mkblock("ORIENTATION", [("NAME", namer(prefix, AXES_ORIENTATION)),
                                                ("SYSTEM", "RECTANGULAR")],
                                [", ".join(_fmt_unit(x) for x in (*axes[0], *axes[1]))]))
-    sections = PART_PER_INSTANCE - {"ORIENTATION", "DISTRIBUTION", "CONNECTOR SECTION", "SURFACE"}
+    sections = PART_PER_INSTANCE - {"ORIENTATION", "DISTRIBUTION", "CONNECTOR SECTION", "SURFACE", "JOINT"}
     for orig in inst_blocks:
         b = turned.get(id(orig), orig)
         if id(b) in sub_options:
@@ -41679,9 +42432,17 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             if id(b) in axis_conns:                 # node a: the part's axes (b's default: a's)
                 rest = nb.data[1].split(",")[1:] if len(nb.data) > 1 else []
                 nb.data[1:2] = [", ".join([namer(prefix, AXES_ORIENTATION)] + [x.strip() for x in rest])]
-                report.note(f"*INSTANCE {prefix} is rotated: its part's REVOLUTE / HINGE connectors "
-                            f"without an orientation of node a turn about the part's axis 1, as in "
-                            f"Abaqus — the instance's axes are their orientation.", once=True)
+                report.note(f"*INSTANCE {prefix} is rotated: its part's connectors without an "
+                            f"orientation of node a have the part's axes, as in Abaqus — the "
+                            f"instance's axes are their orientation.", once=True)
+            out.append(nb)
+        elif b.keyword == "JOINT":
+            nb = _remap_named(b, prefix, ("ELSET", "ORIENTATION"), namer)
+            if id(b) in axis_conns:
+                nb.params["ORIENTATION"] = namer(prefix, AXES_ORIENTATION)
+                report.note(f"*INSTANCE {prefix} is rotated: its part's connectors without an "
+                            f"orientation of node a have the part's axes, as in Abaqus — the "
+                            f"instance's axes are their orientation.", once=True)
             out.append(nb)
         elif b.keyword == "SURFACE":
             if b.uparam("TYPE") in ANALYTIC_SURFACES:
@@ -41801,14 +42562,13 @@ def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
         # connectivity as instance-qualified node refs ("1, Part-1-1.5, Part-2-1.3");
         # resolve those to global node ids (the leading element id is plain numeric and
         # is left untouched) so the element registers instead of being skipped.  Types
-        # with NO ccx equivalent (COH*, JOINTC, ...) are deliberately left unresolved:
-        # they then drop out via the non-numeric-connectivity skip, which keeps the rest
-        # of the deck solvable instead of feeding ccx a fatal unknown element.  Connector
-        # elements are resolved: the converter writes them as constraints.
+        # with NO ccx equivalent (COH*, ...) are deliberately left unresolved: they then
+        # drop out via the non-numeric-connectivity skip, which keeps the rest of the deck
+        # solvable instead of feeding ccx a fatal unknown element.  Connector and JOINTC
+        # elements are resolved: the converter writes them as constraints and springs.
         if blk.keyword == "ELEMENT":
             etyp = blk.uparam("TYPE")
-            if (etyp.startswith(UNSUPPORTED_ELEM_PREFIXES) and etyp not in CONN_TYPES) or \
-                    etyp in ("JOINTC",):
+            if etyp.startswith(UNSUPPORTED_ELEM_PREFIXES) and etyp not in CONN_TYPES:
                 continue
             entity = "node"                       # connectivity references nodes
         elif blk.keyword == "SURFACE":            # members follow the surface's TYPE

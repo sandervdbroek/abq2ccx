@@ -4,7 +4,7 @@
 
 Every Abaqus element type the converter recognises, its node count, and how it is emitted for CalculiX. **Substitutions preserve the node count** so connectivity stays valid. Solid/shell node *ordering* is identical between the two codes, so connectivity is passed through unchanged. A substitution is exact only where noted; any other replaces Abaqus' element formulation, which the converter records as reduced physics (`Converter.reduced_physics`, a header warning): ccx then solves a different discretization than Abaqus.
 
-Direct CalculiX types: **68**. Total recognised: **175**.
+Direct CalculiX types: **68**. Total recognised: **176**.
 
 ## 3D continuum
 
@@ -105,8 +105,9 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
-| `CONN2D2` | 2 | not emitted — its `*CONNECTOR SECTION` becomes ccx constraints |
-| `CONN3D2` | 2 | not emitted — its `*CONNECTOR SECTION` becomes ccx constraints |
+| `CONN2D2` | 2 | not emitted — its `*CONNECTOR SECTION` becomes ccx constraints, springs and dashpots |
+| `CONN3D2` | 2 | not emitted — its `*CONNECTOR SECTION` becomes ccx constraints, springs and dashpots |
+| `JOINTC` | 2 | not emitted — its `*JOINT`'s linear `*SPRING` / `*DASHPOT` options become springs and dashpots on its six relative components (as a connector's) |
 
 ## discrete
 
@@ -301,4 +302,3 @@ Read with their node counts and written as they are, so ccx 2.23 stops on them (
 | infinite | `CINPS4`, `CINAX4`, `CIN3D8`, `CIN3D12R` |
 | acoustic infinite | `ACIN2D2`, `ACIN3D3`, `ACIN3D4` |
 | acoustic | `AC2D4`, `AC3D4`, `AC3D8`, `AC3D20` |
-| joint | `JOINTC` |

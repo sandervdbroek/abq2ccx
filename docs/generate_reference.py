@@ -402,14 +402,24 @@ TRANSLATED = {
         "`ALIGN`, `HINGE` → `*EQUATION`s in the translations and rotation vectors (rotations on a "
         "`ROT NODE` or a knot), `*BOUNDARY` lines to ground or a held node (repeated after "
         "`OP=NEW`); `BEAM`, `WELD` → `*RIGID BODY` (with the `*MPC BEAM` bodies); `LINK` → as "
-        "`*MPC LINK`; unconstrained types left out. Under `NLGEOM` only the forms that stay exact "
-        "(`--approximate`: the rest written linear, `[APPROX]`); a behaviour, other types and "
-        "explicit-dynamics rotations on beam/shell nodes are commented out with the reason. On a "
+        "`*MPC LINK`; unconstrained types left out. A linear behaviour (`*CONNECTOR ELASTICITY` / "
+        "`DAMPING`, uncoupled or coupled; `RIGID`) on the components of `CARTESIAN`, `BUSHING`, "
+        "`CARDAN`, `ROTATION`, `REVOLUTE` / `HINGE` → a `SPRINGA` / `DASHPOTA` from a helper node an "
+        "`*EQUATION` ties to the linearised component to a held node; `AXIAL` → `SPRINGA` / "
+        "`DASHPOTA`; `RIGID` and a model-data `*CONNECTOR MOTION` → constraints; a history "
+        "`*CONNECTOR MOTION` / `LOAD` → `*BOUNDARY` / `*CLOAD` on the helper. Under `NLGEOM` only "
+        "the forms that stay exact (`--approximate`: the rest written linear, `[APPROX]`); other "
+        "behaviours, other types and explicit-dynamics rotations on beam/shell nodes are "
+        "commented out with the reason. On a "
         "node with a `*TRANSFORM` the rows are in its local DOFs, as ccx reads them (a rotation on "
         "its `ROT NODE`, which gets the node's axes; a transformed kinematic reference node's "
         "coupling becomes a `*RIGID BODY` for it); commented out where those axes are undefined "
         "or a rotation lives on DOFs 4-6 of a transformed shell/beam node, or of a kinematic "
         "reference node whose coupling stays a coupling (ccx misreads them).",
+    "*JOINT": "its `JOINTC` elements (never emitted): the linear `*SPRING` / `*DASHPOT` options after "
+        "it, one per local component 1-6 (its `ORIENTATION`'s axes, else the global ones), become "
+        "springs and dashpots on the relative displacements and small relative rotations, as a "
+        "connector's; other options leave it commented out with the reason.",
     "*EQUATION": "set-name terms resolved to node numbers, multi-node sets paired in sorted order "
         "(as Abaqus does unless `UNSORTED`); terms reordered so the eliminated (first) DOF has no "
         "BC and is not eliminated elsewhere; an equation that follows from the others and zero "
@@ -685,7 +695,7 @@ def element_category(t):
     checks = [
         (("SPRING", "DASHPOT", "GAPUNI", "GAPCYL", "GAPSPHER", "MASS", "DCOUP", "ROTARYI"), "discrete"),
         (("COH",), "cohesive"),
-        (("CONN",), "connector"),
+        (("CONN", "JOINTC"), "connector"),
         (("R3D", "RB2", "RB3", "RAX", "R2D"), "rigid"),
         (("SFM",), "surface (load carrier)"),
         (("DC3D", "DC1D"), "heat-transfer continuum"),
@@ -767,7 +777,10 @@ def _element_status(t):
     if t == "ROTARYI":
         return "on a rigid body with a `*MASS`: six point masses (exact); otherwise flagged"
     if t in A.CONN_TYPES:
-        return "not emitted — its `*CONNECTOR SECTION` becomes ccx constraints"
+        return "not emitted — its `*CONNECTOR SECTION` becomes ccx constraints, springs and dashpots"
+    if t == "JOINTC":
+        return ("not emitted — its `*JOINT`'s linear `*SPRING` / `*DASHPOT` options become springs and "
+                "dashpots on its six relative components (as a connector's)")
     if t == "DASHPOT1":
         return ("→ `DASHPOTA` to a new ground node that `*EQUATION`s keep on its DOF's line (exact, "
                 "also under `NLGEOM`); on a rotational DOF left out (reduced physics)")

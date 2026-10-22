@@ -5723,7 +5723,7 @@ def test_rotated_instance_turns_gaps_dashpots_and_constraint_axes():
     assert near([hinge["e1"]], [(c, s, 0.0)])
     g = conv.geom.elements[3][1][1]                                          # (the ground node)
     assert f"*EQUATION\n2\n{g}, 2, 0.866025403784, {g}, 1, -0.5\n" in body      # u_g . R e2 = 0
-    assert "REVOLUTE / HINGE connectors without an orientation of node a" in rep.text()
+    assert "connectors without an orientation of node a have the part's axes" in rep.text()
     assert conv.reduced_physics == []
     # a release the rotation keeps (about z: rotations 4, 5 stay 4, 5) and an unturned hinge
     body, conv, _ = convert_str(_instanced(ROT_PART2, "0., 0., 0., 0., 0., 1., 90.", tail=nl))
@@ -12373,10 +12373,14 @@ def test_connector_types_behaviour_and_free_types():
     body, _, rep = convert_str(base + "*Connector Section, elset=W\nSlot,\n")
     assert "** *CONNECTOR SECTION, ELSET=W" in body and "type SLOT is not converted" in rep.text()
     assert "** connector element(s) 20 (nodes 2, 9)" in body
+    beh = "*Connector Behavior, name=B\n*Connector Elasticity, component=1, nonlinear\n0., 0.\n1., 1.\n"
+    body, _, rep = convert_str(base + beh + "*Connector Section, elset=W, behavior=B\nJoin,\n")
+    assert "** *CONNECTOR SECTION" in body and "a behaviour that has *CONNECTOR ELASTICITY, NONLINEAR" in rep.text()
+    assert not _equations(body)
+    # a linear behaviour on a component JOIN constrains: ignored, as Abaqus ignores it
     beh = "*Connector Behavior, name=B\n*Connector Elasticity, component=1\n100.,\n"
     body, _, rep = convert_str(base + beh + "*Connector Section, elset=W, behavior=B\nJoin,\n")
-    assert "** *CONNECTOR SECTION" in body and "with a *CONNECTOR BEHAVIOR" in rep.text()
-    assert not _equations(body)
+    assert len(_equations(body)) == 3 and "components it does not have" in rep.text()
     body, _, rep = convert_str(base + "*Connector Behavior, name=B\n"
                                "*Connector Section, elset=W, behavior=B\nJoin,\n")
     assert len(_equations(body)) == 3 and "defines nothing" in rep.text()
@@ -12387,6 +12391,167 @@ def test_connector_types_behaviour_and_free_types():
     body, _, rep = convert_str(base.replace("20, 2, 9", "20, 2, 2") +
                                "*Connector Section, elset=W\nJoin,\n")
     assert not _equations(body) and "same node twice" in rep.text()
+
+
+BUSH = ("*Node\n1, 0., 0., 0.\n2, 0., 0., 0.\n*Orientation, name=OR\n0.6, 0.8, 0., -0.8, 0.6, 0.\n"
+        "*Element, type=CONN3D2, elset=C\n10, 1, 2\n*Connector Section, elset=C, behavior=B\n{typ},\n"
+        "OR,\n*Connector Behavior, name=B\n{beh}*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n2, 1, 1.\n"
+        "2, 5, 0.1\n*End Step\n")
+
+
+def test_connector_elasticity_as_springs_on_helper_nodes():
+    # a BUSHING's six stiffnesses: a SPRING1 on DOF 1 of a helper node per component, tied to
+    # the component in node a's axes (node a held: its terms drop); node b's rotation (loaded)
+    # lives on a new rotation node; the behaviour cards are written with it (no reduced physics)
+    beh = "".join(f"*Connector Elasticity, component={c}\n{10 * c}.\n" for c in range(1, 7))
+    body, conv, rep = convert_str(BUSH.format(typ="Bushing", beh=beh))
+    eqs = _all_equations(body)
+    rot = conv._rb_rot[2]
+    assert len(eqs) == 6 and all(eq[0][1:] == (1, -1.0) for eq in eqs)
+    helpers = [eq[0][0] for eq in eqs]
+    assert {(n, d) for eq in eqs[:3] for n, d, _ in eq[1:]} <= {(2, 1), (2, 2), (2, 3)}
+    assert {(n, d) for eq in eqs[3:] for n, d, _ in eq[1:]} <= {(rot, 1), (rot, 2), (rot, 3)}
+    assert sorted((n, d, round(v, 9)) for n, d, v in eqs[0][1:]) == [(2, 1, 0.6), (2, 2, 0.8)]
+    g = reparse(body)
+    # (a SPRINGA to a held node along -x: ccx 2.23's linear solve mishandles a SPRING1 there)
+    springs = {conn[0]: conn[1] for typ, conn in g.elements.values() if typ == "SPRINGA"}
+    assert sorted(springs) == sorted(helpers)
+    for h, k in zip(helpers, range(1, 7)):
+        name = next(s for s, ids in g.elsets.items() if any(g.elements[e][1][0] == h for e in ids))
+        assert f"*SPRING, ELSET={name}\n{10 * k}.\n" in body
+        assert f"{h}, 2, 2\n{h}, 3, 3" in body                          # held across its DOF 1
+        assert g.nodes[springs[h]][1:] == g.nodes[h][1:] and g.nodes[springs[h]][0] < g.nodes[h][0]
+    assert f"{rot}, 2, 0.1" in body                                      # the moment, on node b's rotation
+    assert not rep.reduced and "*CONNECTOR ELASTICITY of connector behaviour B: written" in rep.text()
+    # a coupled matrix: one spring per eigenvector, its components the weights
+    beh = "*Connector Elasticity\n100., 20., 100., 0., 0., 50., 0., 0.\n0., 1., 0., 0., 0., 0., 1., 0.\n0., 0., 0., 0., 1.\n"
+    body, conv, rep = convert_str(BUSH.format(typ="Bushing", beh=beh))
+    plans = [s for sec in conv._conn_plan.values() for it in sec["items"] for s in it["live"]]
+    ks = sorted(round(s["k"], 9) for s in plans)
+    assert ks == [1.0, 1.0, 1.0, 50.0, 80.0, 120.0] and not rep.reduced
+    two = next(s for s in plans if round(s["k"]) == 120)
+    assert sorted(two["w"]) == [1, 2] and abs(abs(two["w"][1]) - math.sqrt(0.5)) < 1e-12
+
+
+def test_connector_damping_rigid_and_axial_components():
+    # damping: a DASHPOTA from the helper to a new node held in all DOFs, a span away along -x
+    # (the spring's SPRINGA beside it)
+    beh = "*Connector Elasticity, component=1\n100.\n*Connector Damping, component=1\n4.\n"
+    body, conv, rep = convert_str(BUSH.format(typ="Cartesian", beh=beh))
+    g = reparse(body)
+    dash = [conn for typ, conn in g.elements.values() if typ == "DASHPOTA"]
+    h = _all_equations(body)[0][0][0]
+    assert len(dash) == 1 and dash[0][0] == h and g.nodes[dash[0][1]][0] < g.nodes[h][0]
+    assert [conn for typ, conn in g.elements.values() if typ == "SPRINGA"] == dash
+    assert all(f"{dash[0][1]}, {d}, {d}" in body for d in (1, 2, 3))
+    assert re.search(r"\*DASHPOT, ELSET=\S+\n4\.\n", body) and not rep.reduced
+    dyn = BUSH.format(typ="Cartesian", beh=beh).replace("*Static\n", "*Dynamic\n0.01, 1.\n")
+    body, conv, rep = convert_str(dyn.replace("*Boundary\n", "*Element, type=MASS, elset=M\n20, 2\n*Mass, elset=M\n1.\n*Boundary\n"))
+    assert "across their line" not in rep.text()                    # (its line cannot turn)
+    # rigid components: constraint rows (the component held); Abaqus' penalty spring is noted
+    beh = "*Connector Elasticity, rigid\n2, 3\n*Connector Elasticity, component=1\n100.\n"
+    body, conv, rep = convert_str(BUSH.format(typ="Cartesian", beh=beh))
+    eqs = _all_equations(body)
+    held = [eq for eq in eqs if all(n == 2 for n, _, _ in eq)]
+    assert len(held) == 1 and "2, 3, 3" in body                     # e2: an equation, e3 = z: a BC
+    assert "penalty spring" in rep.text() and not rep.reduced
+    # AXIAL: a SPRINGA / DASHPOTA between the nodes; rigid: a link
+    axial = BUSH.replace("2, 0., 0., 0.", "2, 1., 1., 0.").replace("OR,\n", "")
+    body, conv, rep = convert_str(axial.format(typ="Axial", beh=beh.replace("rigid\n2, 3", "component=1\n50.")))
+    g = reparse(body)
+    assert [conn for typ, conn in g.elements.values() if typ == "SPRINGA"] == [[1, 2]]
+    assert re.search(r"\*SPRING, ELSET=\S+\n150\.\n", body) and not _all_equations(body)
+    body, conv, rep = convert_str(axial.format(typ="Axial", beh="*Connector Elasticity, rigid\n"))
+    assert next(it for sec in conv._conn_plan.values() for it in sec["items"])["route"] == "link"
+
+
+def test_connector_motion_and_load_on_helper_nodes():
+    # history *CONNECTOR MOTION / LOAD -> *BOUNDARY / *CLOAD on the helper's DOF 1, which stays
+    # independent (ccx 2.23 misapplies a load on an equation's dependent DOF, stops on a BC
+    # there): each row is eliminated on a different DOF of node b
+    deck = BUSH.format(typ="Cartesian", beh="*Connector Elasticity, component=1\n100.\n").replace(
+        "*Cload\n2, 1, 1.\n2, 5, 0.1\n", "*Connector Motion\nC, 2, 0.01\n*Connector Load, amplitude=A\n10, 1, 3.\n")
+    deck = deck.replace("*Step", "*Amplitude, name=A\n0., 0., 1., 1.\n*Step", 1)
+    body, conv, rep = convert_str(deck)
+    h2, h1 = conv._conn_act[(10, 2)], conv._conn_act[(10, 1)]
+    assert f"*BOUNDARY\n{h2}, 1, 1, 0.01" in body and f"*CLOAD, AMPLITUDE=A\n{h1}, 1, 3." in body
+    eqs = _all_equations(body)
+    firsts = [eq[0][:2] for eq in eqs if any(n in (h1, h2) for n, _, _ in eq)]
+    assert sorted(firsts) == [(2, 1), (2, 2)]
+    assert "History *CONNECTOR MOTION / *CONNECTOR LOAD" in rep.text() and not rep.reduced
+    # a model-data *CONNECTOR MOTION fixes the component; an OP=NEW after an earlier card is
+    # left commented out (it would remove only the connector motions)
+    deck2 = BUSH.format(typ="Cartesian", beh="").replace("*Boundary\n1, 1, 6\n", "*Boundary\n1, 1, 6\n*Connector Motion\n10, 3\n")
+    body, conv, rep = convert_str(deck2)
+    assert conv._conn_fixed == {10: {3}} and "2, 3, 3" in body and not rep.reduced
+    deck3 = deck.replace("*End Step\n", "*End Step\n*Step\n*Static\n*Connector Motion, op=NEW\nC, 2, 0.\n*End Step\n")
+    body, conv, rep = convert_str(deck3)
+    assert "** *CONNECTOR MOTION, OP=NEW" in body and rep.reduced
+
+
+def test_connector_components_under_nlgeom_and_not_converted():
+    # translations in a frame that cannot turn (node a held) are exact under NLGEOM; rotation
+    # components are not: commented out, or written with --approximate ([APPROX])
+    beh = "".join(f"*Connector Elasticity, component={c}\n{10 * c}.\n" for c in range(1, 7))
+    nl = BUSH.replace("*Step\n", "*Step, nlgeom\n")
+    body, conv, rep = convert_str(nl.format(typ="Cartesian", beh=beh))
+    assert len(_all_equations(body)) == 3 and not rep.reduced
+    body, conv, rep = convert_str(nl.format(typ="Bushing", beh=beh))
+    assert not _all_equations(body) and "its linear form holds for small rotations only" in rep.text()
+    body, conv, rep = convert_str(nl.format(typ="Bushing", beh=beh), approximate=True)
+    assert len(_all_equations(body)) == 6 and "[APPROX] Connector springs" in rep.text()
+    # a nonlinear or other behaviour, a type whose components are not linear: commented out
+    for typ, b, why in (("Cartesian", "*Connector Elasticity, component=1, nonlinear\n0., 0.\n1., 1.\n",
+                         "ELASTICITY, NONLINEAR"),
+                        ("Cartesian", "*Connector Stop, component=1\n-1., 1.\n", "*CONNECTOR STOP"),
+                        ("Flexion-torsion", "*Connector Elasticity, component=4\n1.\n", "not converted")):
+        body, conv, rep = convert_str(BUSH.format(typ=typ, beh=b))
+        assert not _all_equations(body) and why in rep.text() and rep.reduced
+
+
+JOINTC_BEAMS = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 0., 0.\n4, 2., 0., 0.\n"
+                "*Element, type=B31, elset=B\n1, 1, 2\n2, 3, 4\n{sec}"
+                "*Orientation, name=OJ\n0.6, 0.8, 0., -0.8, 0.6, 0.\n*Element, type=JOINTC, elset=J\n9, 2, 3\n"
+                "*Joint, elset=J, orientation=OJ\n*Spring\n1, 1\n1.e4\n*Spring\n5\n2.e3\n*Dashpot\n6\n3.\n"
+                "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n4, 2, 1.\n*End Step\n")
+RECT_SEC = "*Beam Section, elset=B, material=M, section=RECT\n0.1, 0.1\n0., 0., 1.\n*Material, name=M\n*Elastic\n2.e11, 0.3\n"
+GEN_SEC = "*Beam General Section, elset=B, section=GENERAL\n1.e-2, 1.e-5, 0., 1.e-5, 2.e-5\n0., 0., 1.\n2.1e11, 8.1e10\n"
+
+
+def test_jointc_springs_and_dashpots_on_beam_nodes():
+    # JOINTC: its *JOINT's springs / dashpots on the relative displacement (no offset term) and
+    # small relative rotation in the joint's axes; beam nodes' rotations through knots — a U1
+    # beam's own DOFs 4-6 (no knot, and U1 is no longer refused for the connector)
+    body, conv, rep = convert_str(JOINTC_BEAMS.format(sec=RECT_SEC))
+    eqs = _all_equations(body)
+    assert len(eqs) == 3 and sorted(conv._knots) == [2, 3]
+    assert {(n, d) for n, d, _ in eqs[0][1:]} == {(2, 1), (2, 2), (3, 1), (3, 2)}
+    assert {(n, d) for n, d, _ in eqs[1][1:]} <= {(2, 4), (2, 5), (3, 4), (3, 5)}
+    assert "** abq2ccx: *SPRING option of the *JOINT above: written" in body
+    assert "JOINTC" not in "".join(l for l in _live(body) if l.startswith("*ELEMENT"))
+    assert not rep.reduced, rep.text()
+    body, conv, rep = convert_str(JOINTC_BEAMS.format(sec=GEN_SEC))
+    assert conv._u1 and not conv._knots and len(_all_equations(body)) == 3
+    assert {(n, d) for n, d, _ in _all_equations(body)[1][1:]} <= {(2, 4), (2, 5), (3, 4), (3, 5)}
+    # a nonlinear spring leaves the joint commented out, with its options
+    body, conv, rep = convert_str(JOINTC_BEAMS.format(sec=RECT_SEC).replace("*Spring\n5\n", "*Spring, nonlinear\n5\n"))
+    assert not _all_equations(body) and "** *JOINT, ELSET=J" in body and rep.reduced
+    assert "*SPRING option of a *JOINT that is commented out" in rep.text()
+
+
+def test_rotated_instance_jointc_without_orientation_takes_the_instance_axes():
+    # a *JOINT without ORIENTATION acts in the global directions, a part's in the part's: a
+    # rotated instance's copy takes the instance's axes (as a REVOLUTE connector does)
+    deck = ("*Part, name=P\n*Node\n1, 0., 0., 0.\n2, 0., 0., 0.\n*Element, type=JOINTC, elset=J\n9, 1, 2\n"
+            "*Joint, elset=J\n*Spring\n1\n10.\n*End Part\n*Assembly, name=A\n*Instance, name=I, part=P\n"
+            "0., 0., 0.\n0., 0., 0., 0., 0., 1., 90.\n*End Instance\n*End Assembly\n*Boundary\nI.1, 1, 6\n"
+            "*Step\n*Static\n*Cload\nI.2, 2, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    it = next(it for sec in conv._conn_plan.values() for it in sec["items"])
+    assert all(abs(a - b) < 1e-12 for e, f in zip(it["frame"], ((0., 1., 0.), (-1., 0., 0.), (0., 0., 1.)))
+               for a, b in zip(e, f))
+    eq = _all_equations(body)[0]
+    assert [(n, d, round(v, 9)) for n, d, v in eq[1:]] == [(2, 2, 1.0)]  # local 1 = global y
 
 
 def test_connector_nlgeom_exact_cases_only():
@@ -21172,18 +21337,18 @@ def test_mass_on_a_rigid_member_node_in_no_other_element_gets_a_tetrahedron():
 
 
 def test_element_families_ccx_lacks_are_named_and_read_with_their_node_count():
-    # piezoelectric, infinite, acoustic, thermal-electrical and joint elements: ccx 2.23 has
-    # none, so they stay as written; the report says so (it said "unknown to this converter",
-    # node count inferred from the first line)
+    # piezoelectric, infinite, acoustic and thermal-electrical elements: ccx 2.23 has none, so
+    # they stay as written; the report says so (it said "unknown to this converter", node count
+    # inferred from the first line)
     nodes = "".join(f"{n}, {n % 3}., {n // 3 % 3}., {n // 9}.\n" for n in range(1, 21))
     deck = ("*NODE\n" + nodes + "*ELEMENT, TYPE=C3D20E, ELSET=P\n1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, "
             "11, 12, 13, 14, 15,\n16, 17, 18, 19, 20\n*ELEMENT, TYPE=CINAX4, ELSET=I\n2, 1, 2, 3, 4\n"
             "*ELEMENT, TYPE=AC3D4, ELSET=AC\n3, 1, 2, 3, 4\n*ELEMENT, TYPE=DC3D8E, ELSET=E\n"
-            "4, 1, 2, 3, 4, 5, 6, 7, 8\n*ELEMENT, TYPE=JOINTC, ELSET=J\n5, 1, 2\n")
+            "4, 1, 2, 3, 4, 5, 6, 7, 8\n")
     out, _, rep = convert_str(deck)
     text = rep.text()
     for typ, what in (("C3D20E", "piezoelectric"), ("CINAX4", "infinite"), ("AC3D4", "acoustic"),
-                      ("DC3D8E", "coupled thermal-electrical"), ("JOINTC", "joint")):
+                      ("DC3D8E", "coupled thermal-electrical")):
         assert f"Element {typ} is an Abaqus {what} element: ccx 2.23 has none" in text, text
     assert "unknown to this converter" not in text and "inferred" not in text
     assert len(reparse(out).elements[1][1]) == 20

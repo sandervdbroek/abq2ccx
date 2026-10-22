@@ -98,6 +98,20 @@ physics.
   rigid bodies are left out (warned). Two blocks pressed together carry what a hand-written
   pair carries, to all digits. Without the option the cards stay commented out, and the
   warning names `--approximate`.
+* **Linear connector behaviour and JOINTC** — a connector with a `*CONNECTOR BEHAVIOR` was
+  commented out, and a JOINTC element stopped ccx. Linear `*CONNECTOR ELASTICITY` / `DAMPING`
+  (uncoupled or coupled) on the components of `CARTESIAN`, `BUSHING`, `CARDAN`, `ROTATION` and
+  `REVOLUTE` / `HINGE` connectors, and a `*JOINT`'s springs and dashpots, now become a
+  `SPRINGA` / `DASHPOTA` from a helper node that an `*EQUATION` ties to the component in node
+  a's axes (not a `SPRING1`: ccx 2.23's linear solve drops what a prescribed displacement puts on
+  one through an equation) to a held node; `AXIAL` a `SPRINGA` / `DASHPOTA`; `RIGID` components and a
+  model-data `*CONNECTOR MOTION` constraints. A history `*CONNECTOR MOTION` / `LOAD` becomes a
+  `*BOUNDARY` / `*CLOAD` on the helper. Exact for small motions, and under `NLGEOM` where the
+  directions cannot turn (rotation components: `--approximate`). A BUSHING under force and
+  moment, a coupled bushing, a JOINTC between U1 or B31 beams, motions, loads and a damped mass
+  match their closed forms (validate_with_ccx.py `connector_*`, `jointc_*`). U1 beams may now
+  carry such connectors.
+
 * **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the

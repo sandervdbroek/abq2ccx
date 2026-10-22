@@ -6111,6 +6111,167 @@ def spring_numbers_deck():
             "*STEP\n*STATIC\n*CLOAD\n1, 1, 1.\n3, 1, 1.\n5, 1, 1.\n6, 1, 1.\n*NODE PRINT, NSET=PROBE\nU\n*END STEP\n")
 
 
+# the *ORIENTATION of the connector checks (points a, b) and its unit local directions
+CONN_OR = ((0.866025403784, 0.5, 0.0), (-0.469846310393, 0.813797681349, 0.342020143326))
+CONN_K = (100.0, 200.0, 400.0, 10.0, 20.0, 40.0)
+CONN_COUPLED_K = ((100.0, 20.0, 0.0, 0.0, 5.0, 0.0), (20.0, 200.0, 10.0, 0.0, 0.0, 3.0),
+                  (0.0, 10.0, 400.0, 2.0, 0.0, 0.0), (0.0, 0.0, 2.0, 10.0, 1.0, 0.0),
+                  (5.0, 0.0, 0.0, 1.0, 20.0, 2.0), (0.0, 3.0, 0.0, 0.0, 2.0, 40.0))
+
+
+def conn_axes():
+    e1 = _unit(CONN_OR[0])
+    e3 = _unit(_cross(e1, CONN_OR[1]))
+    return e1, _cross(e3, e1), e3
+
+
+def conn_or_card(name="OR"):
+    return f"*ORIENTATION, NAME={name}\n" + ", ".join(f"{x:.12g}" for p in CONN_OR for x in p) + "\n"
+
+
+def connector_bushing_deck(form):
+    """A BUSHING (local directions conn_axes) from node 1, held, to node 2 at the same point;
+    nodes 3 at (1, 0, 0) and 4 at (0, 1, 0) follow node 2 rigidly (*MPC BEAM), which shows its
+    rotation.  A force and a moment at node 2 (connector_bushing_answer).  "uncoupled":
+    stiffnesses CONN_K by COMPONENT=; "coupled": the 21 constants of CONN_COUPLED_K."""
+    if form == "coupled":
+        vals = [CONN_COUPLED_K[i - 1][j - 1] for j in range(1, 7) for i in range(1, j + 1)]
+        beh = "*CONNECTOR ELASTICITY\n" + "\n".join(", ".join(f"{v:g}" for v in vals[a:a + 8])
+                                                     for a in (0, 8, 16)) + "\n"
+    else:
+        beh = "".join(f"*CONNECTOR ELASTICITY, COMPONENT={c + 1}\n{k:g}\n" for c, k in enumerate(CONN_K))
+    return ("*NODE, NSET=PROBE\n1, 0., 0., 0.\n2, 0., 0., 0.\n3, 1., 0., 0.\n4, 0., 1., 0.\n"
+            "*MPC\nBEAM, 3, 2\nBEAM, 4, 2\n" + conn_or_card() +
+            "*ELEMENT, TYPE=CONN3D2, ELSET=C\n10, 1, 2\n*CONNECTOR SECTION, ELSET=C, BEHAVIOR=B\n"
+            "BUSHING,\nOR,\n*CONNECTOR BEHAVIOR, NAME=B\n" + beh + "*BOUNDARY\n1, 1, 6\n*STEP\n*STATIC\n"
+            "*CLOAD\n2, 1, 0.001\n2, 2, 0.002\n2, 3, 0.003\n2, 4, 0.0005\n2, 5, -0.0003\n2, 6, 0.0002\n"
+            "*NODE PRINT, NSET=PROBE\nU\n*END STEP\n")
+
+
+def connector_bushing_answer(form):
+    """{node: displacement} of connector_bushing_deck: the local components K^-1 (F . e_i,
+    M . e_i), node 2's translation and rotation from them, nodes 3 and 4 rigidly with it."""
+    axes = conn_axes()
+    k = CONN_COUPLED_K if form == "coupled" else [[CONN_K[i] if i == j else 0.0 for j in range(6)]
+                                                  for i in range(6)]
+    f = [_dot((0.001, 0.002, 0.003), e) for e in axes] + [_dot((0.0005, -0.0003, 0.0002), e) for e in axes]
+    x = _solve([list(r) for r in k], f)
+    u = tuple(sum(x[i] * axes[i][j] for i in range(3)) for j in range(3))
+    th = tuple(sum(x[3 + i] * axes[i][j] for i in range(3)) for j in range(3))
+    return {2: u, 3: tuple(a + b for a, b in zip(u, _cross(th, (1.0, 0.0, 0.0)))),
+            4: tuple(a + b for a, b in zip(u, _cross(th, (0.0, 1.0, 0.0))))}
+
+
+def connector_actuation_deck(form):
+    """*CONNECTOR MOTION and *CONNECTOR LOAD.  "cartesian": a CARTESIAN connector (directions
+    30 degrees about z) from node 1, held, to node 2 at (1, 0, 0) with springs 100, 200, 400:
+    a load 3 on component 1, a motion 0.01 of component 2 and a force 2 along z (component 3)
+    -> 0.03 e1 + 0.01 e2 + 0.005 e3.  "hinge": a HINGE (axis e1 of conn_axes) with a spring 10
+    on its rotation, node 2 followed rigidly by nodes 3 (0, 1, 0) and 4 (0, 0, 1): step 1 a
+    moment M -> M . e1 / 10 about e1; step 2 a motion of 0.002 about it."""
+    if form == "cartesian":
+        return ("*NODE, NSET=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n*ORIENTATION, NAME=OR\n"
+                "0.866025403784, 0.5, 0., -0.5, 0.866025403784, 0.\n"
+                "*ELEMENT, TYPE=CONN3D2, ELSET=C\n10, 1, 2\n*CONNECTOR SECTION, ELSET=C, BEHAVIOR=B\n"
+                "CARTESIAN,\nOR,\n*CONNECTOR BEHAVIOR, NAME=B\n" +
+                "".join(f"*CONNECTOR ELASTICITY, COMPONENT={c}\n{k}\n" for c, k in ((1, 100.), (2, 200.), (3, 400.))) +
+                "*BOUNDARY\n1, 1, 6\n*STEP\n*STATIC\n*CONNECTOR MOTION\nC, 2, 0.01\n*CONNECTOR LOAD\n"
+                "10, 1, 3.\n*CLOAD\n2, 3, 2.\n*NODE PRINT, NSET=PROBE\nU\n*END STEP\n")
+    return ("*NODE, NSET=PROBE\n1, 0., 0., 0.\n2, 0., 0., 0.\n3, 0., 1., 0.\n4, 0., 0., 1.\n"
+            "*MPC\nBEAM, 3, 2\nBEAM, 4, 2\n" + conn_or_card() +
+            "*ELEMENT, TYPE=CONN3D2, ELSET=C\n10, 1, 2\n*CONNECTOR SECTION, ELSET=C, BEHAVIOR=B\n"
+            "HINGE,\nOR,\n*CONNECTOR BEHAVIOR, NAME=B\n*CONNECTOR ELASTICITY, COMPONENT=4\n10.\n"
+            "*BOUNDARY\n1, 1, 6\n*STEP\n*STATIC\n*CLOAD\n2, 4, 0.01\n2, 5, 0.02\n2, 6, 0.03\n"
+            "*NODE PRINT, NSET=PROBE\nU\n*END STEP\n*STEP\n*STATIC\n*CONNECTOR MOTION\n10, 4, 0.002\n"
+            "*END STEP\n")
+
+
+def connector_driven_deck(form):
+    """A CARTESIAN connector (directions 30 degrees about z) from node 1, held, to node 2 at
+    (1, 0, 0) with springs 100, 200, 400, *STATIC (linear), driven by a prescribed value that
+    reaches its springs through equations (ccx 2.23's linear solve dropped it on a SPRING1).
+    "bc": node 2 moved 0.01 along x by a BC, free in y and z: u_y from the springs' minimum,
+    0.002474; "motion": a *CONNECTOR MOTION 0.01 of component 2 and a force 2 along z: node 2 at
+    0.01 e2 + 0.005 e3 (the spring on component 1 takes no force)."""
+    step = "*BOUNDARY\n2, 1, 1, 0.01\n" if form == "bc" else "*CONNECTOR MOTION\nC, 2, 0.01\n*CLOAD\n2, 3, 2.\n"
+    return ("*NODE, NSET=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n*ORIENTATION, NAME=OR\n"
+            "0.866025403784, 0.5, 0., -0.5, 0.866025403784, 0.\n"
+            "*ELEMENT, TYPE=CONN3D2, ELSET=C\n10, 1, 2\n*CONNECTOR SECTION, ELSET=C, BEHAVIOR=B\n"
+            "CARTESIAN,\nOR,\n*CONNECTOR BEHAVIOR, NAME=B\n" +
+            "".join(f"*CONNECTOR ELASTICITY, COMPONENT={c}\n{k}\n" for c, k in ((1, 100.), (2, 200.), (3, 400.))) +
+            "*BOUNDARY\n1, 1, 6\n*STEP\n*STATIC\n" + step + "*NODE PRINT, NSET=PROBE\nU\n*END STEP\n")
+
+
+def connector_nlgeom_deck(form):
+    """Under NLGEOM, where the converted form is exact.  "rigid": a CARTESIAN connector
+    (directions 30 degrees about z) from node 1, held, to node 2 at (1, 0, 0): a spring 100 on
+    component 1, component 2 RIGID, component 3 fixed by a model-data *CONNECTOR MOTION; a
+    force (30, 20, 10) moves node 2 0.36 along e1 (the frame cannot turn: exact at any size).
+    "axial": an AXIAL connector, spring 100, from node 1 to node 2 at (cos 30, sin 30, 0), node
+    2 held in y and z and pulled 30 along x: a SPRINGA, exact at any motion."""
+    if form == "rigid":
+        return ("*NODE, NSET=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n*ORIENTATION, NAME=OR\n"
+                "0.866025403784, 0.5, 0., -0.5, 0.866025403784, 0.\n"
+                "*ELEMENT, TYPE=CONN3D2, ELSET=C\n10, 1, 2\n*CONNECTOR SECTION, ELSET=C, BEHAVIOR=B\n"
+                "CARTESIAN,\nOR,\n*CONNECTOR BEHAVIOR, NAME=B\n*CONNECTOR ELASTICITY, COMPONENT=1\n100.\n"
+                "*CONNECTOR ELASTICITY, RIGID, COMPONENT=2\n*CONNECTOR MOTION\nC, 3\n*BOUNDARY\n1, 1, 6\n"
+                "*STEP, NLGEOM\n*STATIC\n*CLOAD\n2, 1, 30.\n2, 2, 20.\n2, 3, 10.\n"
+                "*NODE PRINT, NSET=PROBE\nU\n*END STEP\n")
+    return ("*NODE, NSET=PROBE\n1, 0., 0., 0.\n2, 0.866025403784, 0.5, 0.\n"
+            "*ELEMENT, TYPE=CONN3D2, ELSET=C\n10, 1, 2\n*CONNECTOR SECTION, ELSET=C, BEHAVIOR=B\n"
+            "AXIAL,\n*CONNECTOR BEHAVIOR, NAME=B\n*CONNECTOR ELASTICITY, COMPONENT=1\n100.\n"
+            "*BOUNDARY\n1, 1, 3\n2, 2, 3\n*STEP, NLGEOM\n*STATIC\n0.1, 1.\n*CLOAD\n2, 1, 30.\n"
+            "*NODE PRINT, NSET=PROBE\nU\n*END STEP\n")
+
+
+def connector_dashpot_deck():
+    """A CARTESIAN connector from node 1, held, to node 2 at (1, 0, 0), a spring 100 and a
+    dashpot 4 on component 1; node 2 a unit mass (alone on it: ccx 2.23 stops on that where
+    equations tie the node, the converter adds a SPRING1 of stiffness 0), held in y and z, a
+    unit force along x from t = 0, *DYNAMIC: the damped oscillator, zeta 0.2."""
+    return ("*NODE, NSET=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n"
+            "*ELEMENT, TYPE=CONN3D2, ELSET=C\n10, 1, 2\n*CONNECTOR SECTION, ELSET=C, BEHAVIOR=B\n"
+            "CARTESIAN,\n*CONNECTOR BEHAVIOR, NAME=B\n*CONNECTOR ELASTICITY, COMPONENT=1\n100.\n"
+            "*CONNECTOR DAMPING, COMPONENT=1\n4.\n*ELEMENT, TYPE=MASS, ELSET=M\n20, 2\n*MASS, ELSET=M\n1.\n"
+            "*BOUNDARY\n1, 1, 6\n2, 2, 3\n"
+            "*STEP, INC=1000\n*DYNAMIC, DIRECT\n0.002, 0.5\n*CLOAD\n2, 1, 1.\n"
+            "*NODE PRINT, NSET=PROBE, FREQUENCY=25\nU\n*END STEP\n")
+
+
+def jointc_beams_deck(section):
+    """Two cantilevers along x, nodes 1-2 (clamped at 1) and 3-4, joined at x = 1 by a JOINTC
+    from node 2 to node 3 (directions conn_axes; springs 1e4, 2e4, 4e4, 1e3, 2e3, 4e3 and a
+    dashpot, idle in *STATIC), a force F and a moment M at node 4: the joint carries F and
+    M + (1, 0, 0) x F, so its relative motion in its axes is that over the springs.
+    "u1": *BEAM GENERAL SECTION beams (ccx's U1, rotations on DOFs 4-6); "b31": RECT B31 beams
+    with unloaded arms along y and z on nodes 2 (5, 6) and 3 (7, 8), whose ends show the
+    nodes' rotations."""
+    if section == "u1":
+        sec, arms = ("*BEAM GENERAL SECTION, ELSET=BM, SECTION=GENERAL\n1.e-2, 1.e-5, 0., 1.e-5, 2.e-5\n"
+                     "0., 1., 0.\n2.1e11, 8.1e10\n"), ""
+    else:
+        sec = "".join(f"*BEAM SECTION, ELSET={e}, SECTION=RECT, MATERIAL=M\n0.1, 0.1\n{n}\n"
+                      for e, n in (("BM", "0., 0., 1."), ("AY", "0., 0., 1."), ("AZ", "1., 0., 0."))) + \
+            "*MATERIAL, NAME=M\n*ELASTIC\n2.e11, 0.3\n"
+        arms = "*ELEMENT, TYPE=B31, ELSET=AY\n3, 2, 5\n5, 3, 7\n*ELEMENT, TYPE=B31, ELSET=AZ\n4, 2, 6\n6, 3, 8\n"
+    springs = "".join(f"*SPRING\n{c + 1}, {c + 1}\n{k * 100.:.6e}\n" for c, k in enumerate(CONN_K))
+    return ("*NODE, NSET=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 0., 0.\n4, 2., 0., 0.\n"
+            "5, 1., -1., 0.\n6, 1., 0., -1.\n7, 1., 1., 0.\n8, 1., 0., 1.\n"
+            "*ELEMENT, TYPE=B31, ELSET=BM\n1, 1, 2\n2, 3, 4\n" + arms + sec + conn_or_card("OJ") +
+            "*ELEMENT, TYPE=JOINTC, ELSET=J\n10, 2, 3\n*JOINT, ELSET=J, ORIENTATION=OJ\n" + springs +
+            "*DASHPOT\n1\n5.\n*BOUNDARY\n1, 1, 6\n*STEP\n*STATIC\n*CLOAD\n4, 1, 10.\n4, 2, 20.\n4, 3, 30.\n"
+            "4, 4, 5.\n4, 5, -3.\n4, 6, 2.\n*NODE PRINT, NSET=PROBE\nU\n*END STEP\n")
+
+
+def jointc_beams_answer():
+    """The relative displacement and rotation of jointc_beams_deck's joint in its axes."""
+    axes = conn_axes()
+    f, m = (10.0, 20.0, 30.0), (5.0, -3.0, 2.0)
+    mj = tuple(a + b for a, b in zip(m, _cross((1.0, 0.0, 0.0), f)))
+    return [_dot(f, e) / (100.0 * k) for e, k in zip(axes, CONN_K[:3])] + \
+        [_dot(mj, e) / (100.0 * k) for e, k in zip(axes, CONN_K[3:])]
+
+
 def connector_distributing_deck(form):
     """A 2 x 2 x 2 C3D8 cube (E 1000, nu 0.3) clamped at z = 0, its top face's nodes
     distributing-coupled to RP 9 at (0.5, 0.5, 1.5).  "conn": a BEAM connector from 9 to 19 at
@@ -14167,6 +14328,158 @@ def main():
     else:
         print("FAIL  connector_distributing_ref: no displacements")
     failures += 0 if ok else 1
+
+    # connector elasticity: the converter commented out every connector with a behaviour; now
+    # springs on helper nodes tied to the connector's components (a coupled matrix: one per
+    # eigenvector)
+    for form in ("uncoupled", "coupled"):
+        u = review_run(connector_bushing_deck(form), "connector_bushing_" + form, dat_displacements)
+        want = connector_bushing_answer(form)
+        ok = bool(u) and all(n in u for n in want)
+        if ok:
+            scale = max(abs(x) for v in want.values() for x in v)
+            err = max(abs(a - b) for n in want for a, b in zip(u[n], want[n]))
+            ok = scale > 1e-6 and err < 2e-6 * scale
+            print(f"{'PASS' if ok else 'FAIL'}  connector_bushing_{form} (a BUSHING in general local "
+                  f"directions, {'a coupled 6 x 6 stiffness' if form == 'coupled' else 'six stiffnesses'}, "
+                  f"under a force and a moment): node b and two rigid arms on it as K^-1 (F, M) in the "
+                  f"bushing's axes (max |u| {scale:.4g}; {err:.1e} off)")
+        else:
+            print(f"FAIL  connector_bushing_{form}: displacements {u}")
+        failures += 0 if ok else 1
+
+    # *CONNECTOR MOTION / LOAD (commented out before): a *BOUNDARY / *CLOAD on the helper node
+    u = review_run(connector_actuation_deck("cartesian"), "connector_motion_load", dat_displacements)
+    c30, s30 = math.cos(math.radians(30)), math.sin(math.radians(30))
+    want = (0.03 * c30 - 0.01 * s30, 0.03 * s30 + 0.01 * c30, 0.005)
+    ok = bool(u) and 2 in u
+    if ok:
+        err = max(abs(a - b) for a, b in zip(u[2], want))
+        ok = err < 1e-8
+        print(f"{'PASS' if ok else 'FAIL'}  connector_motion_load (a CARTESIAN connector: a *CONNECTOR LOAD 3 "
+              f"on component 1, a *CONNECTOR MOTION 0.01 of component 2, a force 2 on component 3, springs "
+              f"100, 200, 400): node b at ({', '.join(f'{x:.6g}' for x in u[2])}) = 0.03 e1 + 0.01 e2 + "
+              f"0.005 e3 ({err:.1e} off)")
+    else:
+        print(f"FAIL  connector_motion_load: displacements {u}")
+    failures += 0 if ok else 1
+    blocks = review_run(connector_actuation_deck("hinge"), "connector_hinge_motion",
+                        lambda dat: dat_node_blocks(dat) or None)
+    ok = bool(blocks) and len(blocks) == 2 and all(n in b for b in blocks for n in (3, 4))
+    if ok:
+        e1 = conn_axes()[0]
+        errs = []
+        for blk, th in zip(blocks, (_dot((0.01, 0.02, 0.03), e1) / 10.0, 0.002)):
+            t = tuple(th * x for x in e1)
+            errs += [abs(a - b) for n, r in ((3, (0.0, 1.0, 0.0)), (4, (0.0, 0.0, 1.0)))
+                     for a, b in zip(blk[n], _cross(t, r))]
+        ok = max(errs) < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  connector_hinge_motion (a HINGE with a spring 10 on its "
+              f"rotation: a moment, then a *CONNECTOR MOTION of 0.002 about its axis): its rigid arms "
+              f"turned M . e1 / 10 and 0.002 about e1 ({max(errs):.1e} off)")
+    else:
+        print(f"FAIL  connector_hinge_motion: {blocks}")
+    failures += 0 if ok else 1
+
+    # a prescribed value reaching the springs through the connector's equations in a linear
+    # *STATIC step: ccx 2.23 dropped it on a SPRING1 there (u_y 0 for 0.002474, -0.02 for -0.005);
+    # the helper springs are SPRINGAs along their DOF
+    for form, want in (("bc", (0.01, 0.0, 0.0)), ("motion", (-0.005, 0.0, 0.005))):
+        if form == "bc":                          # u_y: the minimum of 50 (e1.u)^2 + 100 (e2.u)^2
+            want = (0.01, 0.01 * c30 * s30 * 100.0 / (100.0 * s30 ** 2 + 200.0 * c30 ** 2), 0.0)
+        else:
+            want = (-0.01 * s30, 0.01 * c30, 0.005)
+        u = review_run(connector_driven_deck(form), "connector_driven_" + form, dat_displacements)
+        ok = bool(u) and 2 in u
+        if ok:
+            err = max(abs(a - b) for a, b in zip(u[2], want))
+            ok = err < 1e-8
+            print(f"{'PASS' if ok else 'FAIL'}  connector_driven_{form} (a CARTESIAN connector with springs, "
+                  f"linear *STATIC, {'node b moved 0.01 along x by a BC' if form == 'bc' else 'a *CONNECTOR MOTION of component 2'}"
+                  f"): node b at ({', '.join(f'{x:.6g}' for x in u[2])}) for "
+                  f"({', '.join(f'{x:.6g}' for x in want)}) ({err:.1e} off)")
+        else:
+            print(f"FAIL  connector_driven_{form}: displacements {u}")
+        failures += 0 if ok else 1
+
+    # under NLGEOM where the form is exact: translations in a frame that cannot turn (RIGID
+    # and a model-data *CONNECTOR MOTION as constraints), AXIAL as a SPRINGA
+    u = review_run(connector_nlgeom_deck("rigid"), "connector_rigid_nlgeom", dat_displacements)
+    u1 = (30.0 * c30 + 20.0 * s30) / 100.0
+    ok = bool(u) and 2 in u
+    if ok:
+        err = max(abs(a - b) for a, b in zip(u[2], (u1 * c30, u1 * s30, 0.0)))
+        ok = err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  connector_rigid_nlgeom (a CARTESIAN connector, *STATIC NLGEOM: "
+              f"a spring 100 on component 1, component 2 RIGID, 3 fixed by a model-data *CONNECTOR "
+              f"MOTION, force (30, 20, 10)): node b moves {u1:.6g} along e1 only ({err:.1e} off)")
+    else:
+        print(f"FAIL  connector_rigid_nlgeom: displacements {u}")
+    failures += 0 if ok else 1
+    u = review_run(connector_nlgeom_deck("axial"), "connector_axial_nlgeom", dat_displacements)
+    lo, hi = 0.0, 1.0
+    for _ in range(100):                     # k (l - 1) x / l = 30, x = cos 30 + u, y = sin 30
+        mid = 0.5 * (lo + hi)
+        x = c30 + mid
+        lo, hi = (mid, hi) if 100.0 * (math.hypot(x, s30) - 1.0) * x / math.hypot(x, s30) < 30.0 else (lo, mid)
+    ok = bool(u) and 2 in u
+    if ok:
+        err = abs(u[2][0] - lo)
+        ok = err < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  connector_axial_nlgeom (an AXIAL connector, spring 100, at 30 "
+              f"degrees, its end pulled 30 along x, NLGEOM): {u[2][0]:.6g} where the turning line's "
+              f"equilibrium is {lo:.6g} ({err:.1e} off)")
+    else:
+        print(f"FAIL  connector_axial_nlgeom: displacements {u}")
+    failures += 0 if ok else 1
+
+    # connector damping: a DASHPOTA from the helper node to a held node along its DOF
+    hist = review_run(connector_dashpot_deck(), "connector_dashpot",
+                      lambda dat: [(t, r[1]) for _s, title, _n, t, rows in A.dat_blocks(dat)
+                                   if title == "displacements" for r in rows if r[0] == 2] or None)
+    ok = bool(hist) and len(hist) >= 9
+    if ok:
+        w, z = 10.0, 0.2
+        wd = w * math.sqrt(1.0 - z * z)
+        want = [0.01 * (1.0 - math.exp(-z * w * t) * (math.cos(wd * t) + z / math.sqrt(1.0 - z * z) *
+                                                     math.sin(wd * t))) for t, _x in hist]
+        err = max(abs(x - y) for (_t, x), y in zip(hist, want))
+        ok = err < 2e-6 and max(x for _t, x in hist) > 0.012
+        print(f"{'PASS' if ok else 'FAIL'}  connector_dashpot (a CARTESIAN connector, spring 100 and dashpot "
+              f"4 on a unit mass, a unit force, *DYNAMIC): {len(hist)} printed displacements of the "
+              f"damped oscillator, zeta 0.2 (peak {max(x for _t, x in hist):.5f}; {err:.1e} off its "
+              f"closed form, of 0.01)")
+    else:
+        print(f"FAIL  connector_dashpot: {hist}")
+    failures += 0 if ok else 1
+
+    # JOINTC (an element ccx has none of, which stopped the deck): its *JOINT's springs on the
+    # relative motion, the rotations a U1 beam's own DOFs 4-6 or a knot's
+    want = jointc_beams_answer()
+    axes = conn_axes()
+    for sec in ("u1", "b31"):
+        blocks = review_run(jointc_beams_deck(sec), "jointc_" + sec, lambda dat: dat_node_blocks(dat) or None)
+        v = blocks[-1] if blocks else {}
+        ok = all(n in v for n in ((2, 3, 5, 6, 7, 8) if sec == "b31" else (2, 3)))
+        if ok:
+            du = [a - b for a, b in zip(v[3][:3], v[2][:3])]
+            if sec == "u1":
+                dth = [a - b for a, b in zip(v[3][3:6], v[2][3:6])]
+            else:                             # (u_y = theta x (0, d, 0), u_z = theta x (0, 0, d))
+                def theta(n, ny, nz, s):
+                    ay, az = ([s * (a - b) for a, b in zip(v[m][:3], v[n][:3])] for m in (ny, nz))
+                    return [ay[2], az[0], -ay[0]]
+                dth = [a - b for a, b in zip(theta(3, 7, 8, 1.0), theta(2, 5, 6, -1.0))]
+            got = [_dot(du, e) for e in axes] + [_dot(dth, e) for e in axes]
+            err = max(abs(a - b) for a, b in zip(got, want)) / max(abs(x) for x in want)
+            ok = err < 2e-6
+            print(f"{'PASS' if ok else 'FAIL'}  jointc_{sec} (two cantilevers joined by a JOINTC, springs on "
+                  f"all six components in general local axes, {'U1' if sec == 'u1' else 'B31 (knots)'} beams"
+                  f", a force and moment at the tip): the joint's relative displacement and rotation in its "
+                  f"axes = its load over the springs ({err:.1e} off)")
+        else:
+            print(f"FAIL  jointc_{sec}: {blocks}")
+        failures += 0 if ok else 1
 
     # two parts joined at one reference node, a distributing coupling to one of them: it wrote no
     # rotation rows, as nothing else 'acted on' the node's rotation, so no moment passed (a
