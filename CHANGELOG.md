@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **Steady-state dynamics: BC values and `DIRECT`** — Abaqus' mode-based (and subspace-based)
+  `*STEADY STATE DYNAMICS` ignores a nonzero `*BOUNDARY` value: nodes move there only through
+  `*BASE MOTION`. ccx 2.23 applied it as a prescribed motion and carried it into the next
+  steady-state step. Such values are now written as 0 (the DOF held), warned, also in a load
+  case, where Abaqus accepts no BC at all. `*STEADY STATE DYNAMICS, DIRECT` was passed through,
+  and ccx ran its mode-based form instead (or stopped without a `*FREQUENCY` step): ccx 2.23 has
+  no direct solution, so the step is now commented out, with `*NO ANALYSIS` (ccx stops there),
+  as reduced physics.
 * **Norton creep below ccx's floor flagged** — ccx 2.23 raises a Norton law's A t^m to at
   least 1e-20 (t the total time) on an isotropic `*ELASTIC`, without a message: a deck in Pa
   and s, whose A is far smaller, creeps up to 1e24 times too fast. Where that raises a creep
@@ -138,7 +146,8 @@ physics.
   (0.13–0.38 % of the displacements on 3 × 4 meshes). Such lines now become consistent nodal
   forces; a set's other elements keep the line, and `CENTRIF` under NLGEOM stays, warned. So does
   a load whose forces would share a node DOF with the deck's own `*CLOAD` in a deck of several
-  steps, or with another load on another amplitude (ccx keeps one value and amplitude per node
+  steps, or with another load on another amplitude, or that a static perturbation step changes
+  while the base state holds it on another amplitude (ccx keeps one value and amplitude per node
   DOF). Mass: an implicit `*DYNAMIC` step in ccx 2.23 runs `CPE4` / `CPS4`
   / `CAX4` / `CPE8R` / `CPS8R` / `CAX8R` with half their mass (vibrating √2 times faster): no
   card gives ccx another mass matrix, so that is now flagged reduced physics. `*FREQUENCY`
@@ -253,8 +262,7 @@ physics.
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the
   case's own, about the same base state, as Abaqus reads them; a `*BOUNDARY, OP=NEW` in any case
-  releases the base-state BCs in every case. In a steady-state dynamics step the later cases
-  give an earlier case's BCs again at 0, which ccx would keep acting. A two-case step after a loaded static step now
+  releases the base-state BCs in every case. A two-case step after a loaded static step now
   matches the hand-written single-case steps exactly (the superposed answer was 0.02 off).
 * **`*BOUNDARY, FIXED` on `*TRANSFORM` translations** — ccx 2.23 holds such a DOF at the
   node's global displacement component, read as the local value (silently wrong). It is now

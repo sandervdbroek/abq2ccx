@@ -187,6 +187,10 @@ TRANSLATED = {
         "integration and the heat of plastic work lost.",
     "*COMPLEX FREQUENCY": "commented out, with `*NO ANALYSIS` in its place: ccx stops at that step "
         "(ccx's card computes Coriolis or flutter modes only, without damping; reduced physics).",
+    "*STEADY STATE DYNAMICS": "native (ccx's is mode-based); a `*BOUNDARY` value in a mode-based "
+        "or subspace-based step → 0, as Abaqus ignores it there (motion only through `*BASE "
+        "MOTION`; warned). `DIRECT`: commented out, with `*NO ANALYSIS` in its place: ccx stops at "
+        "that step (ccx 2.23 has no direct solution and would run its modal form; reduced physics).",
     "*GEOSTATIC": "→ `*STATIC` in a linear step of a model without pore pressure elements (the "
         "static solution from the initial stresses); with pore pressure, `UTOL` or a nonlinear step "
         "commented out, with `*NO ANALYSIS` in its place (reduced physics).",

@@ -5795,7 +5795,7 @@ def test_input_data_file_inlined():
     assert set(conv.geom.nodes) == {1, 2} and "INPUT" not in body.upper()
 
 
-def _convert_files(files, deck="main.inp"):
+def _convert_files(files, deck="main.inp", **overrides):
     """Convert ``deck`` from a directory holding ``files`` (name -> text)."""
     d = tempfile.mkdtemp()
     try:
@@ -5803,7 +5803,7 @@ def _convert_files(files, deck="main.inp"):
             os.makedirs(os.path.dirname(os.path.join(d, name)), exist_ok=True)
             with open(os.path.join(d, name), "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(text)
-        return convert(os.path.join(d, deck))
+        return convert(os.path.join(d, deck), **overrides)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -6740,26 +6740,48 @@ def test_load_cases_split_into_perturbation_steps():
     assert "7, 3, 1." not in _step(body, 2) and "3, 1, 1." not in _step(body, 3)
 
 
-def test_steady_state_load_cases_give_earlier_case_bcs_again_at_zero():
-    # code check G1-2: ccx 2.23 keeps a steady-state dynamics step's BCs in the next one (it
-    # resets the loads only; probed), so a load case's base motion acted on in the later cases;
-    # Abaqus applies each case alone: the later cases' steps give those BCs again at 0, before
-    # their own (a case's own BC on the DOF wins), not where OP=NEW releases the base state's
+def test_mode_based_steady_state_bc_values_are_ignored():
+    # code checks G1-2, D1-5: Abaqus ignores a nonzero *BOUNDARY value in a mode-based (or
+    # subspace-based) steady-state dynamics step — nodes move only through *BASE MOTION — and
+    # accepts no BC in its load cases; ccx 2.23 would apply the value and carry it into the next
+    # steady-state dynamics step (a load case's too: one ccx step each).  Written as 0 (the DOF
+    # held), warned, so nothing carries over
     model = MODAL.split("*Step")[0]
-    ssd = ("*Step\n*Frequency\n3\n*End Step\n*Step\n*Steady State Dynamics\n1., 10., 2\n"
-           "*Load Case, name=A\n*Boundary\n1, 1, 1, 0.01\n4, 3\n*End Load Case\n"
+    freq = "*Step\n*Frequency\n3\n*End Step\n"
+    ssd = (freq + "*Step\n*Steady State Dynamics\n1., 10., 2\n"
+           "*Load Case, name=A\n*Boundary, type=velocity, amplitude=AF\n1, 1, 1, 0.01\n4, 3\n*End Load Case\n"
            "*Load Case, name=B\n*Cload\n7, 3, 1.\n*End Load Case\n"
            "*Load Case, name=C\n*Boundary\n4, 3, 3, 0.02\n*End Load Case\n*End Step\n")
-    body, conv, rep = convert_str(model + ssd)
+    body, conv, rep = convert_str(model + "*Amplitude, name=AF\n0., 1., 100., 1.\n" + ssd)
     a, b, c = (_step(body, k) for k in (2, 3, 4))
-    assert "*BOUNDARY\n1, 1, 1, 0.01\n" in a and "*BOUNDARY\n" not in a.split("1, 1, 1, 0.01")[1]
-    assert b.startswith("\n*STEADY STATE DYNAMICS\n1., 10., 2\n*BOUNDARY\n1, 1, 1, 0.\n4, 3, 3, 0.\n")
-    assert c.index("*BOUNDARY\n1, 1, 1, 0.\n4, 3, 3, 0.\n") < c.index("*BOUNDARY\n4, 3, 3, 0.02\n")
-    assert "a load case's BCs given again at 0 in the later ones" in rep.text() and not conv.reduced_physics
-    # no BC in a case: nothing given again; the static perturbation step's cases: the base restore
-    body, _, rep = convert_str(model + ssd.replace("*Boundary\n1, 1, 1, 0.01\n4, 3\n", "*Cload\n3, 1, 1.\n")
-                               .replace("*Load Case, name=C\n*Boundary\n4, 3, 3, 0.02\n*End Load Case\n", ""))
-    assert "1, 1, 1, 0." not in body and "given again at 0" not in rep.text()
+    assert "*BOUNDARY\n1, 1, 1, 0.\n4, 3\n" in a and "*BOUNDARY" not in b and "*BOUNDARY\n4, 3, 3, 0.\n" in c
+    assert "0.01" not in body and "0.02" not in body and not conv.reduced_physics
+    warns = [m for k, m in rep.entries if m.startswith("*BOUNDARY in mode-based *STEADY STATE DYNAMICS")]
+    assert len(warns) == 2 and all("Abaqus does not accept boundary conditions in a load case" in m for m in warns)
+    # two steps: the step with the BC alone has no response, the next none of it
+    plain = (freq + "*Step\n*Steady State Dynamics\n1., 10., 2\n*Boundary, imaginary\n1, 1, 1, 0.01\n*End Step\n"
+             "*Step\n*Steady State Dynamics, subspace projection=constant\n1., 10., 2\n*Cload\n7, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(model + plain)
+    assert "*BOUNDARY, LOAD CASE=2\n1, 1, 1, 0.\n" in _step(body, 2) and "0.01" not in body
+    assert "carry it into the next steady-state dynamics step." in rep.text() and not conv.reduced_physics
+    assert "load case" not in [m for k, m in rep.entries if m.startswith("*BOUNDARY in mode-based")][0]
+    # a static perturbation step's and a general step's values stay
+    body, _, rep = convert_str(model + "*Step, perturbation\n*Static\n*Boundary\n1, 1, 1, 0.01\n*End Step\n")
+    assert "1, 1, 1, 0.01" in body and "mode-based" not in rep.text()
+
+
+def test_direct_steady_state_dynamics_stops_ccx():
+    # code check D1-6: ccx 2.23 has no direct-solution steady-state dynamics; it ignores DIRECT
+    # and runs its modal form (or stops without a *FREQUENCY step): *NO ANALYSIS, flagged
+    model = MODAL.split("*Step")[0]
+    for freq in ("", "*Step\n*Frequency\n3\n*End Step\n"):
+        body, conv, rep = convert_str(model + freq + "*Step\n*Steady State Dynamics, direct\n1., 10., 2\n"
+                                      "*Boundary\n1, 1, 1, 0.01\n*Cload\n7, 3, 1.\n*End Step\n")
+        st = _step(body, 2 if freq else 1)
+        assert "\n*NO ANALYSIS\n" in st and "\n*STEADY STATE DYNAMICS" not in body, st
+        assert conv.reduced_physics == ["*STEADY STATE DYNAMICS, DIRECT step (no ccx counterpart)"]
+        assert "ccx 2.23's steady-state dynamics is mode-based only and ignores DIRECT" in rep.text()
+        assert "mode-based *STEADY STATE DYNAMICS" not in rep.text()
 
 
 def test_abaqus_output_filter_commented():
@@ -10292,6 +10314,89 @@ def test_two_point_load_clash_the_planner_misses_keeps_the_line_from_there_on():
     assert "*DLOAD\nEALL, GRAV, 4., 0., -1., 0.\n" in _step(body, 3) and got[2] == {}
     assert "(GRAV / CENTRIF / CENT / BX / BY)" in rep.text() and "shares nodes with another converted " \
         "load (BY on EALL)" in rep.text()
+
+
+# CAX8R_CLASH with a CAX4 in EALL too (2 x 2 body loads: its line on ABQ2CCX_QUAD_REST_EALL), a
+# TIME=TOTAL TIME amplitude AT, and steps: general on AT, static perturbation, general
+CAX8R_MIXED = CAX8R_CLASH.replace("*Material", "*Node\n9, 2.6, 0.\n10, 2.6, 1.\n*Element, type=CAX4, elset=EALL\n"
+                                              "2, 2, 9, 10, 3\n*Material", 1) + \
+    "*Amplitude, name=AT, time=total time\n0., 1., 10., 1.\n"
+SP_STEPS = ("*Step\n*Static\n*Dload, amplitude=AT\n{}*End Step\n*Step, perturbation\n*Static\n*Dload\n{}"
+            "*End Step\n*Step\n*Static\n*Dload\n{}*End Step\n")
+
+
+def _convert_unplanned(deck):
+    """``deck`` converted with _plan_nodal_form_keep switched off: every clash is one it missed."""
+    fd, path = tempfile.mkstemp(suffix=".inp")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        rep = A.Report()
+        conv = A.Converter(rep, Opt())
+        conv._plan_nodal_form_keep = lambda blocks: None
+        return "\n".join(conv.convert(A.read_blocks(path, rep))), conv, rep
+    finally:
+        os.unlink(path)
+
+
+def test_nodal_form_kept_where_a_static_perturbation_step_changes_a_total_time_load():
+    # code check D1-1: a static perturbation step's line adds to the base state's forces of the
+    # load, held on its TIME=TOTAL TIME amplitude: ccx's one amplitude per node DOF cannot take
+    # both, so the planner keeps ccx's line from the first step on (the rest set unused)
+    grav = "EALL, GRAV, {}, 0., -1., 0.\n"
+    body, conv, rep = convert_str(CAX8R_MIXED + SP_STEPS.format(grav.format("9.81"), grav.format("1."),
+                                                               grav.format("19.62")))
+    assert conv.reduced_physics == ["*STEP, PERTURBATION on a static step before a general step (its "
+                                    "response stays)"], conv.reduced_physics
+    assert "*DLOAD, AMPLITUDE=AT\nEALL, GRAV, 9.81, 0., -1., 0.\n" in _step(body, 1)
+    assert "*DLOAD\nEALL, GRAV, 10.81, 0., -1., 0.\n" in _step(body, 2)
+    assert "*DLOAD\nEALL, GRAV, 19.62, 0., -1., 0.\n" in _step(body, 3)
+    assert "ABQ2CCX_QUAD_REST_EALL, GRAV" not in body and _cloads(body) == [{}, {}, {}]
+    assert "its line in static perturbation step 2 changes the base state's load" in rep.text()
+    # CENT: its CAX8R back on CENTRIF, as for the planner's other clashes (it was commented out)
+    cent = "EALL, CENT, {}, 0., 0., 0., 0., 1., 0.\n"
+    body, conv, rep = convert_str(CAX8R_CLASH + "*Amplitude, name=AT, time=total time\n0., 1., 10., 1.\n"
+                                  + SP_STEPS.format(cent.format("100."), cent.format("10."), cent.format("50.")))
+    assert "not converted" not in body and not [r for r in conv.reduced_physics if "dropped" in r]
+    assert "*DLOAD, AMPLITUDE=AT\nABQ2CCX_CENT_EALL, CENTRIF, 100000., 0., 0., 0., 0., 1., 0.\n" in _step(body, 1)
+    assert "ABQ2CCX_CENT_EALL, CENTRIF, 110000., 0., 0., 0., 0., 1., 0.\n" in _step(body, 2)
+    assert "ABQ2CCX_CENT_EALL, CENTRIF, 50000., 0., 0., 0., 0., 1., 0.\n" in _step(body, 3)
+    assert _cloads(body) == [{}, {}, {}]
+    # a step-time amplitude the base state holds plain at its end value: no clash, nodal forces
+    body, conv, rep = convert_str(CAX8R_MIXED + SP_STEPS.replace("amplitude=AT", "amplitude=A1").format(
+        grav.format("9.81"), grav.format("1."), grav.format("19.62")))
+    assert "*DLOAD, AMPLITUDE=A1\nABQ2CCX_QUAD_REST_EALL, GRAV, 9.81, 0., -1., 0.\n" in _step(body, 1)
+    assert len(_cloads(body)[0]) == 8 and "kept as ccx loads" not in rep.text()
+
+
+def test_nodal_fallback_keeps_the_rest_set_entry_and_the_cent_line():
+    # code check D1-1: a clash the planner misses (switched off) keeps the line from its step on —
+    # a 2 x 2 body load on the planned elements' set and the rest set, whose entry an earlier step
+    # gave (on the whole set it was a second entry: the rest loaded twice), a CENT on CENTRIF
+    grav = "EALL, GRAV, {}, 0., -1., 0.\n"
+    body, conv, rep = _convert_unplanned(CAX8R_MIXED + SP_STEPS.format(grav.format("9.81"), grav.format("1."),
+                                                                       grav.format("19.62")))
+    assert "*ELSET, ELSET=ABQ2CCX_QUAD_EALL\n1\n" in body.split("*STEP")[0]
+    assert "*DLOAD, AMPLITUDE=AT\nABQ2CCX_QUAD_REST_EALL, GRAV, 9.81, 0., -1., 0.\n" in _step(body, 1)
+    assert "ABQ2CCX_QUAD_EALL, GRAV, 1., 0., -1., 0.\nABQ2CCX_QUAD_REST_EALL, GRAV, 10.81, 0., -1., 0.\n" \
+        in _step(body, 2)
+    assert "ABQ2CCX_QUAD_EALL, GRAV, 19.62, 0., -1., 0.\nABQ2CCX_QUAD_REST_EALL, GRAV, 19.62, 0., -1., 0.\n" \
+        in _step(body, 3) and "9.81" not in _step(body, 3)
+    got = _cloads(body)
+    assert len(got[0]) == 8 and got[1] == got[0] and set(got[2].values()) == {0.0}
+    assert not re.search(r"^EALL, GRAV", body, re.M)        # (no line on the whole set)
+    cent = "EALL, CENT, {}, 0., 0., 0., 0., 1., 0.\n"
+    body, conv, rep = _convert_unplanned(CAX8R_CLASH + "*Amplitude, name=AT, time=total time\n0., 1., 10., 1.\n"
+                                         + SP_STEPS.format(cent.format("100."), cent.format("10."),
+                                                           cent.format("50.")))
+    assert "not converted" not in body and not [r for r in conv.reduced_physics if "dropped" in r]
+    assert "*ELSET, ELSET=ABQ2CCX_CENT_EALL\n1\n" in body.split("*STEP")[0]
+    assert "*DLOAD\nABQ2CCX_CENT_EALL, CENTRIF, 10000., 0., 0., 0., 0., 1., 0.\n" in _step(body, 2)
+    assert "ABQ2CCX_CENT_EALL, CENTRIF, 50000., 0., 0., 0., 0., 1., 0.\n" in _step(body, 3)
+    got = _cloads(body)
+    assert len(got[0]) == 8 and got[1] == got[0] and set(got[2].values()) == {0.0}
+    assert "(GRAV / CENTRIF / CENT / BX / BY)" in rep.text()
 
 
 def test_two_d_mass_flagged_where_ccx_differs_from_abaqus():
@@ -17944,6 +18049,13 @@ def test_explicit_coupled_step_approximate():
     body, conv, rep = convert_str(TD_CUBE + _td_step(data=", T"), approximate=True)
     assert "*NO ANALYSIS" in body and not conv._td_steps
     assert "not written as ccx's *COUPLED TEMPERATURE-DISPLACEMENT (--approximate): its time period 'T'" in rep.text()
+    # code check D1-3: both warnings point at the step's procedure card
+    for data, start in ((", 0.002, , 1e-5", "[APPROX] *DYNAMIC TEMPERATURE-DISPLACEMENT"),
+                        (", T", "Step 1: *DYNAMIC TEMPERATURE-DISPLACEMENT not written")):
+        deck = TD_CUBE + _td_step(data=data)
+        _, _, rep = _convert_files({"main.inp": deck}, approximate=True)
+        k = next(i for i, (_, m) in enumerate(rep.entries) if m.startswith(start))
+        assert rep.where.get(k) == f"main.inp:{deck.splitlines().index('*DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT') + 1}"
 
 
 def test_explicit_coupled_step_two_d_mass_and_damping():
@@ -24996,6 +25108,21 @@ def test_creep_below_ccx_floor_flagged():
         assert "floor" not in report.text() and flag not in conv.reduced_physics, kw
     assert math.isclose(A.creep_floor_factor(1e-24, 2.0, 0.0, 400.0), 1.0 + 2.0 * (100.0 / 400.0) ** 3)
     assert math.isclose(A.creep_floor_factor(1e-21, -0.5, 1.0, 2.0), 1e-20 / (2e-21 * (2 ** 0.5 - 1)))
+
+
+def test_creep_planners_skip_steps_with_no_positive_time():
+    # code check D1-2: a *VISCO period of 0 or below (Abaqus rejects it; ccx runs backwards),
+    # and a later step whose total time comes back to 0, no longer crash the Norton cap and the
+    # floor check (log of a nonpositive time): converted as before, those steps skipped
+    def deck(n, *periods):
+        return (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n200000., 0.3\n"
+                f"*Creep, law=TIME\n1e-10, {n}, -0.5\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n" +
+                "".join(f"*Step, inc=1000\n*Visco, cetol=1e-4\n1., {p}\n*Dload\n1, P6, -100.\n*End Step\n"
+                        for p in periods))
+    for n, periods in ((5., ("-1000.",)), (5., ("0.",)), (3., ("-1000.", "1000.")), (5., ("-1000.", "500."))):
+        body, conv, rep = convert_str(deck(n, *periods))
+        assert body.count("*VISCO") == len(periods), (n, periods)
+        assert len(periods) > 1 or ("largest increment" not in rep.text() and not conv.reduced_physics)
 
 
 def test_unused_user_material_noted_as_never_called():

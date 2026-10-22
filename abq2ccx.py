@@ -21443,9 +21443,10 @@ class _Materials:
                         except ValueError:
                             pass
             card = st.proc_card
+            t0 = st.t_start or 0.0                  # ccx's Norton law reads the total time
             if st.proc != "VISCO" or card is None or card.has("DIRECT") or direct_added(card) or \
-                    not st.ccx_period:
-                continue
+                    st.ccx_period is None or st.ccx_period <= 0.0 or t0 < 0.0:
+                continue                            # (a period <= 0: Abaqus rejects it)
             if q <= 0.0:
                 self.report.note(f"*VISCO step {st.no}: no pressure or traction to size its "
                                  f"increments by, left uncapped. ccx 2.23 stops on 'matrix found "
@@ -21453,7 +21454,6 @@ class _Materials:
                                  f"45 / (n - 3)^1.5 times the elastic strain (Norton n > 3); a "
                                  f"largest increment below that avoids it.", once=True)
                 continue
-            t0 = st.t_start or 0.0                  # ccx's Norton law reads the total time
             caps = []                               # in logarithms: q^n or 1 / (m + 1) can pass 1e308
             for e, a, n, m in laws:
                 if e <= 0.0:
@@ -21519,6 +21519,8 @@ class _Materials:
                 if a <= 0.0 or m <= -1.0:       # (ccx stops on A <= 0)
                     continue
                 for st, t0, t1 in spans:
+                    if (t0 is not None and t0 < 0.0) or (t1 is not None and t1 <= 0.0):
+                        continue                # (a period < 0 before: Abaqus rejects it)
                     if m == 0.0:
                         f = creep_floor_factor(a, m, 0.0, 1.0)      # (whatever the times)
                     elif t0 is None or t1 is None or t1 <= t0:
@@ -32367,6 +32369,7 @@ class _Loads:
                                 else ""), once=True)
             self._reduces("*MODAL DYNAMIC step started from a deformed or moving model")
         stops = proc is None or proc == "COMPLEX FREQUENCY" or \
+            (proc == "STEADY STATE DYNAMICS" and proc_block is not None and proc_block.has("DIRECT")) or \
             (proc_block is not None and proc_block.has("RIKS") and not self._approx)
         self._yield_segfaults(None if stops else proc, cur.ccx_nlgeom)     # (_no_analysis)
         out = [self.emit.write_step(params)]
@@ -34355,11 +34358,16 @@ class _Loads:
                     side += conv
                     continue
             if label in ("GRAV", "CENTRIF", "BX", "BY") and g[0].upper() in self._two_by_two:
-                conv, rest = self._two_by_two_body(b, g)
+                conv, kept = self._two_by_two_body(b, g)
                 side += conv                    # (CAX8R / CPE8R / CPS8R: ccx's 2 x 2 rule)
-                if rest is None:
+                if not kept:
                     continue
-                g = rest
+                for k in kept[:-1]:             # (a fallback's line on the planned elements)
+                    if self._mass_scale and label in ("GRAV", "CENTRIF") and len(k) > 2 and k[2]:
+                        k = k[:2] + ["%.12g" % (pf(k[2]) * self._mass_scale)] + k[3:]
+                    body.append(", ".join(k))
+                    lines.append((tag + (k[0].upper(), label), body[-1], k[2] if len(k) > 2 else ""))
+                g = kept[-1]
             split = self._sheet_lines(g[0], label, g[2] if len(g) > 2 else "", 1.0) if family else None
             if split is not None:                     # both faces of the expanded element
                 for ln, key, mag in split:
@@ -34951,12 +34959,12 @@ class _Loads:
                     return top
         return top
 
-    def _two_by_two_body(self, b: Block, g: List[str]) -> Tuple[List[str], Optional[List[str]]]:
+    def _two_by_two_body(self, b: Block, g: List[str]) -> Tuple[List[str], List[List[str]]]:
         """*DLOAD line ``g`` (GRAV, CENTRIF, BX or BY, blank numbers 0.) on a set or element that
         _plan_two_by_two_body_loads planned -> (the comment lines of its CAX8R / CPE8R / CPS8R
         elements' consistent nodal forces (_to_nodal_forces at 3 x 3 points: Abaqus' full
-        integration), the line for the other elements, on a set of their own, or None when there
-        are none).  Probed on 2.23 (3 x 4 meshes, midside nodes at a third of each edge): CAX8R
+        integration), the lines ccx gets: the line for the other elements, on a set of their
+        own, where there are any; or the whole line where it stays).  Probed on 2.23 (3 x 4 meshes, midside nodes at a third of each edge): CAX8R
         GRAV / BY 0.38 %, CENTRIF 0.13 % of the largest displacement off the exact forces', ccx's
         own load matching the 2 x 2 forces to 1.5e-5.  Under NLGEOM too for GRAV, BX and BY,
         which ccx applies per unit undeformed volume (mass) and fixed in direction, as nodal
@@ -34966,17 +34974,19 @@ class _Loads:
         on the deformed positions), GRAV / CENTRIF without one density per element, CENTRIF on
         axisymmetric elements about another axis than theirs (_two_by_two_why), and where its
         forces would share a node DOF's ccx entry with another load (_plan_nodal_form_keep,
-        _nodal_fallback)."""
+        _nodal_fallback; from that step on the line goes on a set of those elements and on the
+        other elements' set, whose entry an earlier step's line holds in ccx: a line on the
+        whole set would be a second entry there)."""
         plan = self._two_by_two[g[0].upper()]
         label = g[1].upper()
         family = "CENTRIF" if label == "CENTRIF" else "BODY"
         why = self._two_by_two_why(plan, g)
         if why == "":
-            return [], g
+            return [], [g]
         key = ("DLOAD", g[0].upper(), label)
         if why is None and key in self.emit.nodal_kept:     # (since an earlier step's clash)
             self._nodal_fallback(key, "")
-            return [], g
+            return [], self._two_by_two_split(plan, g)
         why = why or self._nodal_keep.get(key)
         clash: List[str] = []
         if why is None:
@@ -34986,11 +34996,25 @@ class _Loads:
                       None) for e in plan["quads"]]
             side = self._to_nodal_forces(b, "DLOAD", g, faces, None, two_by_two=True, fallback=clash)
             if side is not None:
-                return side, ([plan["rest"]] + g[1:] if plan["rest"] else None)
+                return side, ([[plan["rest"]] + g[1:]] if plan["rest"] else [])
             why = self._nodal_fallback(key, clash[0])
+            self._keep_note(self._two_by_two_kept, g[0], self._two_by_two_shift(plan["quads"], plan["axi"],
+                                                                                family), why)
+            return [], self._two_by_two_split(plan, g)
         self._keep_note(self._two_by_two_kept, g[0], self._two_by_two_shift(plan["quads"], plan["axi"], family),
                         why)
-        return [], g
+        return [], [g]
+
+    def _two_by_two_split(self, plan: dict, g: List[str]) -> List[List[str]]:
+        """Line ``g`` that _two_by_two_body keeps from a clash on (_nodal_fallback) on the sets
+        an earlier step's converted line used: one of the planned CAX8R / CPE8R / CPS8R
+        elements (made here: _late_elset) and the other elements' (ABQ2CCX_QUAD_REST_...), so
+        that ccx replaces that step's entry of the rest set; the whole line where there is none."""
+        if not plan["rest"]:
+            return [g]
+        if "quad_set" not in plan:
+            plan["quad_set"] = self._late_elset(f"ABQ2CCX_QUAD_{g[0]}", plan["quads"])
+        return [[plan["quad_set"]] + g[1:], [plan["rest"]] + g[1:]]
 
     def _two_by_two_why(self, plan: dict, g: List[str]) -> Optional[str]:
         """Why body load line ``g`` on a set _plan_two_by_two_body_loads planned (``plan``)
@@ -35261,20 +35285,38 @@ class _Loads:
             why = self._nodal_keep.get(("DLOAD", tok, label))
             if label != "CENT" or not why or "moved" not in plan:
                 continue
-            token, moved = plan.pop("moved")             # back on CENTRIF, a set per density
-            taken = {id(item) for _, item, _ in moved}
-            plan["items"] = [x for x in plan["items"] if id(x) not in taken]
-            groups: "OrderedDict[float, List[int]]" = OrderedDict()
-            for e, _, rho in moved:
-                groups.setdefault(rho, []).append(e)
-            for k, (rho, members) in enumerate(groups.items(), 1):
-                name = self._fresh_name("ABQ2CCX_CENT" + ("" if tok == ALL_ELEMENTS_SET else f"_{tok}")
-                                        + (f"_{k}" if len(groups) > 1 else ""))
-                self.geom.elsets[name] = members
-                plan["groups"].append((name, rho))
-            quads = [e for e, _, _ in moved]
+            plan["items"], plan["groups"] = self._cent_regroup(plan, late=False)
+            token, moved = plan.pop("moved")
             self._keep_note(self._two_by_two_kept, token, self._two_by_two_shift(
-                quads, {e: item[3] for e, item, _ in moved}, "CENTRIF"), why)
+                [e for e, _, _ in moved], {e: item[3] for e, item, _ in moved}, "CENTRIF"), why)
+
+    def _cent_regroup(self, plan: dict, late: bool) -> Tuple[list, List[Tuple[str, float]]]:
+        """A CENT plan (_plan_rotary_loads) with the CAX8R / CPE8R / CPS8R elements
+        _cent_two_by_two moved to nodal forces back on CENTRIF, a set per density -> (its
+        nodal-force items, its CENTRIF sets [(name, density)]): for _plan_nodal_form_keep, or
+        ``late`` for a clash it missed (_rotary_lines; the sets made once: _late_elset)."""
+        if "kept" in plan:
+            return plan["kept"]
+        token, moved = plan["moved"]
+        taken = {id(item) for _, item, _ in moved}
+        groups: "OrderedDict[float, List[int]]" = OrderedDict()
+        for e, _, rho in moved:
+            groups.setdefault(rho, []).append(e)
+        tok = token.upper()
+        sets = list(plan["groups"])
+        for k, (rho, members) in enumerate(groups.items(), 1):
+            base = "ABQ2CCX_CENT" + ("" if tok == ALL_ELEMENTS_SET else f"_{tok}") + \
+                (f"_{k}" if len(groups) > 1 else "")
+            if late:
+                name = self._late_elset(base, members)
+            else:
+                name = self._fresh_name(base)
+                self.geom.elsets[name] = members
+            sets.append((name, rho))
+        got = ([x for x in plan["items"] if id(x) not in taken], sets)
+        if late:
+            plan["kept"] = got
+        return got
 
     def _nodal_candidate(self, b: Block, g: List[str]) -> Optional[Tuple[tuple, set, bool]]:
         """Load line ``g`` of *DLOAD / *DSLOAD ``b`` as _plan_nodal_form_keep weighs it: (its
@@ -35370,7 +35412,28 @@ class _Loads:
                 return (f"its forces would share nodes with another load written as nodal forces "
                         f"({other[2]} on {other[1]}) on another amplitude or TIME DELAY (ccx keeps "
                         f"one amplitude per node DOF)")
+        for s in sorted({t for t, _ in mine if t in self._sp_steps()}):
+            # a static perturbation step's line adds to the base state's forces of the load
+            # (_set_nodal_load), held plain where held_factor evaluates their step-time
+            # amplitude, else on it (_hold_nodal_loads): one amplitude per node DOF
+            base = [(t, a) for t, a in mine if t < s and not self.steps.steps[t - 1].perturbation]
+            if not base:
+                continue
+            t, a = base[-1]
+            held = None if a is None or (self._step_amp(a) and held_factor(
+                self._amp_curves.get(a[0].upper()), a[1], self.steps.steps[t - 1].period) is not None) else a
+            if any(x != held for u, x in mine if u == s):
+                return (f"its line in static perturbation step {s} changes the base state's load, "
+                        f"which is held on another amplitude (a TIME=TOTAL TIME one, or one whose "
+                        f"value at the base state's end the converter cannot evaluate), and ccx "
+                        f"keeps one amplitude per node DOF")
         return None
+
+    def _sp_steps(self) -> set:
+        """The static perturbation steps after another step, whose loads add to the base state's
+        (_plan_base_restore's ``_sp_add``, which the planners before it ask here)."""
+        return {st.no for st in self.steps if st.perturbation and st.no > 1 and
+                {b.keyword for b in st.cards[1:] if b.keyword in PROC_KW} == {"STATIC"}}
 
     def _amps_clash(self, mine: List[Tuple[int, Optional[tuple]]],
                     theirs: List[Tuple[int, Optional[tuple]]]) -> bool:
@@ -35475,7 +35538,23 @@ class _Loads:
                                                   "elements about the global z axis only", reduces=False)
         g = [token] + g[1:]
         out: List[Tuple[tuple, str, str]] = []
-        for name, rho in plan["groups"]:
+        items, groups = plan["items"], plan["groups"]
+        side: Optional[List[str]] = None
+        moved = plan.get("moved", ("", []))[1]  # (CAX8R / CPE8R / CPS8R elements as nodal forces)
+        if moved:
+            key = ("DLOAD", token.upper(), label)
+            clash: List[str] = []
+            if key in self.emit.nodal_kept:     # (since an earlier step's clash)
+                self._nodal_fallback(key, "")
+                items, groups = self._cent_regroup(plan, late=True)
+            else:
+                side = self._to_nodal_forces(b, "DLOAD", g, items, None, fallback=clash)
+                if side is None:                # a clash _plan_nodal_form_keep missed
+                    why = self._nodal_fallback(key, clash[0])
+                    items, groups = self._cent_regroup(plan, late=True)
+                    self._keep_note(self._two_by_two_kept, plan["moved"][0], self._two_by_two_shift(
+                        [e for e, _, _ in moved], {e: item[3] for e, item, _ in moved}, "CENTRIF"), why)
+        for name, rho in groups:
             w2 = fmt_num(float("%.12g" % (mag / rho * (self._mass_scale or 1.0))))
             out.append(((name.upper(), "CENTRIF"), ", ".join([name, "CENTRIF", w2] + [
                 x or "0." for x in (g[3:9] + [""] * 6)[:6]]), w2))
@@ -35489,8 +35568,9 @@ class _Loads:
                                  "mass; Abaqus' CENT 'does not account for large volume changes' "
                                  "(Abaqus 2017, Distributed loads): the two agree while volume changes "
                                  "stay small.", once=True)
-        side = self._to_nodal_forces(b, "DLOAD", g, plan["items"], None) if plan["items"] else []
-        if not out and not plan["items"]:
+        if side is None:
+            side = self._to_nodal_forces(b, "DLOAD", g, items, None) if items else []
+        if not out and not items:
             side = [f"** abq2ccx: {', '.join(x for x in g if x)} -> no load: its elements carry no "
                     f"mass" + (" (or are point masses, which Abaqus' CENT leaves alone)" if label == "CENT"
                                else "")]
@@ -36523,6 +36603,15 @@ class _Loads:
                 return ", ".join([name] + f[1:]), w
             n += 1
 
+    def _late_elset(self, base: str, members: Sequence[int]) -> str:
+        """A new element set of ``members`` (a fresh name from ``base``) for a load line written
+        while the steps are: convert() defines it before the first *STEP."""
+        self._reserve_names()
+        name = self._fresh_name(base)
+        self._late_elsets[name] = list(members)
+        self.geom.elsets[name] = list(members)      # (for _load_elements: the mesh is written)
+        return name
+
     def _dload_clash(self, lines: List[str]) -> List[str]:
         """The *DLOAD lines _track_dloads left out, commented out (warned, reduced physics)."""
         return self._comment_out(
@@ -37323,6 +37412,26 @@ class _Loads:
                                     "(CORIOLIS) or flutter (FLUTTER) modes only, without damping, "
                                     "and stops without either. Commented out: ccx stops at this "
                                     "step.", "*COMPLEX FREQUENCY step (no ccx counterpart)")
+
+    def handle_steady_state_dynamics(self, b: Block) -> List[str]:
+        """``*STEADY STATE DYNAMICS``: ccx 2.23's is mode-based (a modal superposition over the
+        last *FREQUENCY step's modes) and reads SOLVER= and HARMONIC= only
+        (steadystatedynamicss.f).  Abaqus' DIRECT solves the full mass, damping and stiffness
+        equations at each frequency, with the motion BCs prescribe and every damping source
+        (Abaqus 2017, Direct-solution steady-state dynamic analysis); ccx would ignore DIRECT
+        and run its modal form, or stop without a *FREQUENCY step before it (probed).  No ccx
+        procedure solves those equations, so that step stops ccx (_no_analysis; handle_step
+        counts it among the steps ccx stops at)."""
+        if not b.has("DIRECT"):
+            return self.passthrough(b)
+        return self._no_analysis(b, "*STEADY STATE DYNAMICS, DIRECT: Abaqus' direct-solution steady-"
+                                    "state dynamics (the full mass, damping and stiffness equations "
+                                    "at each frequency, motion prescribed by BCs, no modes) has no ccx "
+                                    "counterpart: ccx 2.23's steady-state dynamics is mode-based only "
+                                    "and ignores DIRECT (it would run a modal superposition over the "
+                                    "last *FREQUENCY step's modes, or stop without one). Commented "
+                                    "out: ccx stops at this step.",
+                                 "*STEADY STATE DYNAMICS, DIRECT step (no ccx counterpart)")
 
     def _no_analysis(self, b: Block, msg: str, reduces: str) -> List[str]:
         """Procedure card ``b`` commented out, with ``msg`` warned and ``reduces`` recorded, and
@@ -38828,7 +38937,7 @@ class _Loads:
         # its first one's (handle_step comments out the others): they differ in a step with two
         procs_of = [{b.keyword for b in step.cards[1:] if b.keyword in PROC_KW} for step in self.steps]
         static = {s for s in self._pert_idx if procs_of[s - 1] == {"STATIC"}}
-        self._sp_add = {s for s in static if s > 1}
+        self._sp_add = self._sp_steps()
         # (the first step's too: its base state has the initial temperatures)
         self._sp_temps = {s for s in static
                           if any(b.keyword == "TEMPERATURE" for b in self.steps.steps[s - 1].cards)}
@@ -43001,6 +43110,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # written, n) -> the copy's name; the copy's name -> the set it copies
         self._body_copies: Dict[Tuple[str, int], str] = {}
         self._body_copy_of: "OrderedDict[str, str]" = OrderedDict()
+        # element sets made while the steps are written (_late_elset): name -> its elements
+        self._late_elsets: "OrderedDict[str, List[int]]" = OrderedDict()
         self._mesh_sets = EmittedSets()             # the sets emit_geometry wrote
         # Abaqus surface elements left out of the ccx mesh (_drop_surface_elements): element ->
         # (type, nodes), and the full member list of each element set that had some
@@ -43343,6 +43454,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "EMBEDDED ELEMENT": "handle_embedded_element",
         "STATIC": "handle_static",
         "COMPLEX FREQUENCY": "handle_complex_frequency",
+        "STEADY STATE DYNAMICS": "handle_steady_state_dynamics",
         "DYNAMIC": "handle_dynamic",
         "FREQUENCY": "handle_frequency",
         "MATRIX OUTPUT": "handle_matrix_output",
@@ -43591,6 +43703,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         blocks = self._geostatic_steps(blocks)        # likewise
         blocks = self._explicit_coupled_steps(blocks)     # likewise (--approximate)
         blocks = self._sp_amplitudes(blocks)          # before anything reads load amplitudes
+        blocks = self._modal_ssd_motion(blocks)       # before anything reads BC values
         blocks = self._blank_periods(blocks)          # before the step model reads the periods
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
         blocks = self._plan_self_contact(blocks)      # before anything reads contact pairs
@@ -43759,6 +43872,11 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         out.extend(self.emit_other(blocks))
         self._warn_two_point_kept()
         self._warn_two_by_two_kept()
+        if self._late_elsets:                   # (_late_elset: before the first *STEP and the copies)
+            at = next(i for i, ln in enumerate(out) if ln.strip().upper().startswith("*STEP"))
+            out[at:at] = ["** abq2ccx: element sets for loads kept as ccx lines on part of a set"] + \
+                [x for name, ids in self._late_elsets.items()
+                 for x in [f"*ELSET, ELSET={name}"] + reflow([str(e) for e in ids])]
         if self._body_copy_of:                  # (_body_copy: before the first *STEP)
             at = next(i for i, ln in enumerate(out) if ln.strip().upper().startswith("*STEP"))
             out[at:at] = ["** abq2ccx: copies of element sets for body loads of one set on two "
@@ -43842,11 +43960,11 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         after the procedure where a step has none).  The base state comes back in each static
         step as after any perturbation step (_plan_base_restore).  ccx 2.23 carries a steady-
         state dynamics step's BCs into the next such step (it resets the loads only; probed: a
-        case's base motion acted on in the next case), so there a *BOUNDARY after the procedure
-        gives the earlier cases' own BCs again at 0, the base state's value of a perturbation
-        (Abaqus applies each case's alone).  The *LOAD CASE card stays as a
-        comment (``_lc_marks``); a step of another procedure, where Abaqus rejects load cases,
-        is left as it is (passthrough: the cases superposed, warned)."""
+        case's base motion acted on in the next case), but only a DIRECT step's BCs prescribe
+        motion in Abaqus, and that step stops ccx (handle_steady_state_dynamics): a mode-based
+        one's BC values are 0 (_modal_ssd_motion), which carry over as they are.  The *LOAD
+        CASE card stays as a comment (``_lc_marks``); a step of another procedure, where Abaqus
+        rejects load cases, is left as it is (passthrough: the cases superposed, warned)."""
         if not any(b.keyword == "LOAD CASE" for b in blocks):
             return blocks
         pert = self._perturbation_steps(blocks)
@@ -43883,8 +44001,6 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                                  f"one): closed at the next *LOAD CASE or *END STEP.", once=True,
                                  at=open_end)
             release = any(b.keyword == "BOUNDARY" and b.uparam("OP") == "NEW" for b in cards)
-            ssd = proc.keyword == "STEADY STATE DYNAMICS"
-            zeros: List[str] = []                 # the earlier cases' BCs, at 0
             for k in range(len(names)):
                 group = [b if k == 0 else Block(b.keyword, OrderedDict(b.params), list(b.data)).placed(b)
                          for b in cards if b.keyword != "END LOAD CASE" and owner.get(id(b), k) == k]
@@ -43894,15 +44010,6 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                              if b.keyword == "BOUNDARY" and b.uparam("OP") != "NEW" else b for b in group]
                     if not any(b.keyword == "BOUNDARY" for b in group):
                         group.insert(at + 1, Block("BOUNDARY", OrderedDict(OP="NEW"), []).placed(group[at]))
-                elif ssd and zeros:
-                    group.insert(at + 1, Block("BOUNDARY", OrderedDict(), list(zeros)).placed(group[at]))
-                for b in cards if ssd else ():
-                    if b.keyword != "BOUNDARY" or owner.get(id(b)) != k:
-                        continue
-                    for f in ([x.strip() for x in r] + [""] * 3 for r in merged_data_records(b)):
-                        line = ", ".join(f[:2] + ([f[2] or f[1], "0."] if f[1].isdigit() else []))
-                        if f[0] and f[1] and line not in zeros:
-                            zeros.append(line)
                 self._lc_marks.update((id(b), f"load case {names[k]} of the deck's step {s} "
                                               f"({k + 1} of {len(names)})")
                                       for b in group if b.keyword == "LOAD CASE")
@@ -43911,11 +44018,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                              f"steps {s + extra}-{s + extra + len(names) - 1}, one *{proc.keyword} "
                              f"perturbation step each, with the step's own loads, BCs and output "
                              f"requests and those of its load case, about the same base state "
-                             f"(Abaqus: equivalent to consecutive perturbation steps)"
-                             + ("; a load case's BCs given again at 0 in the later ones, which ccx "
-                                "2.23 would carry them into (it resets the loads only)"
-                                if ssd and zeros and not release else "")
-                             + ". Later step numbers in this report count the ccx steps.", at=cards[0])
+                             f"(Abaqus: equivalent to consecutive perturbation steps). Later step "
+                             f"numbers in this report count the ccx steps.", at=cards[0])
             extra += len(names) - 1
         return out
 
@@ -44288,6 +44392,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         swap: Dict[int, Block] = {}
         done: List[str] = []                    # the steps written so
         dropped: set = set()                    # the explicit increment controls left out
+        first: Optional[Block] = None           # the first card written so (the warning's place)
         n = 0
         for step, cards in deck_parts(blocks):
             n += step
@@ -44302,7 +44407,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             if not (math.isfinite(period) and period > 0.0):
                 self.report.warn(f"Step {n}: *DYNAMIC TEMPERATURE-DISPLACEMENT not written as ccx's "
                                  f"*COUPLED TEMPERATURE-DISPLACEMENT (--approximate): its time period "
-                                 f"'{f[1]}' is no positive number.", once=True)
+                                 f"'{f[1]}' is no positive number.", once=True, at=b)
                 continue
             dt = period * self.TD_INCREMENT_SHARE
             try:
@@ -44316,6 +44421,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             self._td_steps[id(new)] = b
             swap[id(b)] = new
             done.append(str(n))
+            first = first or b
         if not swap:
             return blocks
         self.report.warn(f"[APPROX] *DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT -> ccx's *COUPLED "
@@ -44333,8 +44439,56 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                          "thermal response does not matter, *DYNAMIC, EXPLICIT in its place keeps "
                          "explicit integration at the initial temperatures (ccx's plane and "
                          "axisymmetric elements need far smaller increments there than Abaqus' do). "
-                         "Verify.", once=True)
+                         "Verify.", once=True, at=first)
         return [swap.get(id(b), b) for b in blocks]
+
+    def _modal_ssd_motion(self, blocks: List[Block]) -> List[Block]:
+        """Abaqus' mode-based and subspace-based *STEADY STATE DYNAMICS move nodes only through
+        *BASE MOTION: "Nonzero displacement or acceleration history definitions given as
+        boundary conditions are ignored", and a support the eigenfrequency step lacks is an
+        error (Abaqus 2017, Mode-based / Subspace-based steady-state dynamic analysis; only
+        DIRECT, which stops ccx: handle_step, prescribes motion by BCs).  ccx 2.23 applies such
+        a value as a prescribed motion and holds it into the next steady-state dynamics step
+        (it resets the loads only; probed).  So in such a step a *BOUNDARY's nonzero values
+        -> 0 (the DOF held, as Abaqus holds it), its TYPE and AMPLITUDE dropped, warned; also
+        in a load case (_split_load_cases), where Abaqus accepts no BC at all (warned too)."""
+        swap: Dict[int, Block] = {}
+        n = 0
+        for step, cards in deck_parts(blocks):
+            n += step
+            proc = step_procedure(cards) if step else None
+            if proc is None or proc.keyword != "STEADY STATE DYNAMICS" or proc.has("DIRECT"):
+                continue
+            case = False                        # (after the step's *LOAD CASE: the case's own)
+            for b in cards:
+                case = case or b.keyword == "LOAD CASE"
+                if b.keyword != "BOUNDARY" or b.has("USER"):
+                    continue
+                data, zeroed = [], False
+                for rec in merged_data_records(b):
+                    f = list(rec)
+                    try:
+                        moved = len(f) > 3 and bool(f[3].strip()) and pf(f[3]) != 0.0
+                    except ValueError:
+                        moved = True
+                    if moved and re.fullmatch(r"\s*[-+]?\d+\s*", f[1]):
+                        f[3], zeroed = " 0.", True
+                    data.append(",".join(f))
+                params = OrderedDict((k, v) for k, v in b.params.items() if k not in ("TYPE", "AMPLITUDE"))
+                if not zeroed and params == b.params:
+                    continue
+                swap[id(b)] = Block(b.keyword, params, data).placed(b)
+                if zeroed:
+                    self.report.warn(f"*BOUNDARY in mode-based *STEADY STATE DYNAMICS step {n}: its "
+                                     "prescribed values written as 0 (the DOFs held). Abaqus ignores a "
+                                     "nonzero displacement or acceleration given as a boundary condition "
+                                     "there (nodes move only through *BASE MOTION), while ccx 2.23 would "
+                                     "apply it as a prescribed motion and carry it into the next steady-"
+                                     "state dynamics step." + (" Abaqus does not accept boundary "
+                                     "conditions in a load case of such a step at all (only in static "
+                                     "perturbation and direct steady-state dynamics)." if case else ""),
+                                     at=b)
+        return [swap.get(id(b), b) for b in blocks] if swap else blocks
 
     def _sp_amplitudes(self, blocks: List[Block]) -> List[Block]:
         """A static perturbation or *BUCKLE step's loads, BCs and temperatures on an amplitude:

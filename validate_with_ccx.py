@@ -140,12 +140,15 @@ def find_ccx():
     return A.find_ccx()
 
 
-def convert(path, out_inp, approximate=False, abaqus_umat=False):
-    """Convert ``path`` to ``out_inp``; returns the report and the converter."""
+def convert(path, out_inp, approximate=False, abaqus_umat=False, setup=None):
+    """Convert ``path`` to ``out_inp``; returns the report and the converter (``setup``: called
+    with the converter before it converts)."""
     rep = A.Report()
     blocks = A.read_blocks(path, rep)
     conv = A.Converter(rep, type("O", (), {"solid_dof": False, "approximate": approximate,
                                            "abaqus_umat": abaqus_umat})())
+    if setup is not None:
+        setup(conv)
     body = conv.convert(blocks)                     # convert first: the header lists warnings
     text = "\n".join(rep.header_comment_lines() + body) + "\n"
     with open(out_inp, "w", encoding="utf-8", newline="\n") as fh:
@@ -1776,6 +1779,74 @@ def nodal_clash_checks(ccx, env, tmp):
     return failures
 
 
+def nodal_clash_sp_checks(ccx, env, tmp):
+    """Code check D1-1: a CAX8R body load whose base state a static perturbation step changes
+    on a TIME=TOTAL TIME amplitude (GRAV on a set with a CAX4 too, whose line goes on a set of
+    its own; CENT) keeps ccx's line from the first step on; and where that clash is missed
+    (_plan_nodal_form_keep off), from that step on, the GRAV on the CAX8R's set and the CAX4's,
+    so the CAX4 is not loaded twice (48 % off before), the CENT on CENTRIF (it was commented
+    out).  Steps: general on the amplitude, static perturbation, general.  The last step, and
+    the perturbation step where the line is kept from the start (base + perturbation: ccx's
+    step is a general one), must solve as one step with ccx's own line of that load by hand,
+    with only the perturbation step's reduced-physics flag — to 1e-3 for the missed CENT, whose
+    CENTRIF follows steps of nodal forces: ccx 2.23 keeps 1.5e-4 of an earlier step's
+    *CLOAD response in a later static step under CENTRIF, whose own *CLOAD is 0 (probed on decks
+    by hand, at any load size).  Returns the number of failures."""
+    failures = 0
+    mixed = CAX8R_CLASH.replace("*MATERIAL", "*NODE, NSET=NALL\n9, 2.6, 0.\n10, 2.6, 1.\n*ELEMENT, TYPE=CAX4, "
+                                             "ELSET=EALL\n2, 2, 9, 10, 3\n*MATERIAL", 1)
+    amp = "*AMPLITUDE, NAME=AT, TIME=TOTAL TIME\n0., 1., 10., 1.\n"
+    out = "*NODE PRINT, NSET=NALL\nU\n*END STEP\n"
+    cases = (("grav_rest", mixed, "EALL, GRAV, {}, 0., -1., 0.\n", ("9.81", "1.", "19.62"),
+              lambda m: m),
+             ("cent", CAX8R_CLASH, "EALL, CENT, {}, 0., 0., 0., 0., 1., 0.\n", ("100.", "10.", "50."),
+              lambda m: "%g" % (float(m) / 1e-3)))
+
+    def solve(text, tag, raw=False, planned=True):
+        src, inp = os.path.join(tmp, f"spclash_{tag}_src.inp"), os.path.join(tmp, f"spclash_{tag}.inp")
+        with open(inp if raw else src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        off = None if planned else (lambda c: setattr(c, "_plan_nodal_form_keep", lambda blocks: None))
+        reduced = [] if raw else convert(src, inp, setup=off)[1].reduced_physics
+        d, status, txt = run_ccx(ccx, env, inp)
+        got = dat_node_blocks(os.path.join(d, "job.dat")) if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+        if not got:
+            print("\n".join(ln for ln in txt.splitlines() if "ERROR" in ln)[:400])
+        return got, reduced
+
+    for tag, model, line, mags, ccx_mag in cases:
+        deck = (model + amp + "*STEP\n*STATIC\n*DLOAD, AMPLITUDE=AT\n" + line.format(mags[0]) + out +
+                "*STEP, PERTURBATION\n*STATIC\n*DLOAD\n" + line.format(mags[1]) + out +
+                "*STEP\n*STATIC\n*DLOAD\n" + line.format(mags[2]) + out)
+        own = line.replace("CENT,", "CENTRIF,")
+
+        def by_hand(m):
+            return solve(model + "*STEP\n*STATIC\n*DLOAD\n" + own.format(ccx_mag(m)) + out,
+                         f"{tag}_{m}", raw=True)[0]
+        for planned in (True, False):
+            got, reduced = solve(deck, f"{tag}_{planned}", planned=planned)
+            pairs = [(2, mags[2])] + ([(1, "%g" % (float(mags[0]) + float(mags[1])))] if planned else [])
+            ok, err, peak = len(got) == 3, 0.0, 0.0
+            for k, m in pairs if ok else ():
+                ref = by_hand(m)
+                ok = ok and len(ref) == 1
+                for n, u in (ref[0].items() if ok else ()):
+                    err = max(err, max(abs(got[k][n][i] - u[i]) for i in range(2)))
+                    peak = max(peak, max(abs(x) for x in u[:2]))
+            tol = 1e-6 if planned or tag != "cent" else 1e-3
+            ok = ok and peak > 0.0 and err <= tol * peak and len(reduced) == 1 and \
+                "PERTURBATION" in reduced[0]
+            print(f"{'PASS' if ok else 'FAIL'}  nodal_clash_sp_{tag}{'' if planned else '_missed'} (a CAX8R"
+                  f"{' and a CAX4' if model is mixed else ''}, {line.split(',')[1].strip()} on a TIME=TOTAL TIME "
+                  f"amplitude, changed in a static perturbation step, then given again; "
+                  f"{'planned' if planned else 'the clash missed: the fallback'}): "
+                  f"{(err / peak if peak else math.inf):.1e} of |u| {peak:.4g} off ccx's own line by hand in step"
+                  f"{'s 2 and 3' if planned else ' 3'}; reduced: {reduced}")
+            failures += 0 if ok else 1
+    return failures
+
+
 SSD_CUBE = ("*NODE, NSET=NALL\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
             "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
             "*NSET, NSET=NP\n3, 7\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n*DENSITY\n1e-3\n"
@@ -1784,11 +1855,15 @@ SSD_CUBE = ("*NODE, NSET=NALL\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0
 
 
 def ssd_load_case_checks(ccx, env, tmp):
-    """Code check G1-2: a *STEADY STATE DYNAMICS step with two load cases, A a base motion
-    (*BOUNDARY 1, 1, 1, 0.01 on a DOF the base state holds) and B a force, on a C3D8 cube after a
-    *FREQUENCY step: each case's ccx step must give the response of a steady-state dynamics
-    step with that case's load alone (ccx carries a step's BCs into the next, which the
-    converter gives again at 0 in case B).  Returns the number of failures."""
+    """Code checks G1-2, D1-5 and D1-6, steady-state dynamics on a C3D8 cube after a *FREQUENCY
+    step.  Abaqus ignores a nonzero *BOUNDARY value in a mode-based *STEADY STATE DYNAMICS step
+    (nodes move only through *BASE MOTION), and accepts no BC in its load cases; ccx 2.23 would
+    apply the value and carry it into the next such step.  So: a step with two load cases, A a
+    BC 1, 1, 1, 0.01 on a DOF the base state holds and B a force, must give no response in
+    case A and in case B that of a step with B's force alone; two steps, the BC then the force,
+    likewise (nothing carried over).  A *STEADY STATE DYNAMICS, DIRECT step (no ccx
+    counterpart) must stop ccx, flagged, rather than run ccx's modal form.  Returns the number
+    of failures."""
     def ssd_blocks(text, tag):
         src, inp = os.path.join(tmp, f"ssd_{tag}_src.inp"), os.path.join(tmp, f"ssd_{tag}.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
@@ -1796,33 +1871,45 @@ def ssd_load_case_checks(ccx, env, tmp):
         conv = convert(src, inp)[1]
         d, status, out = run_ccx(ccx, env, inp)
         steps = {}
-        if status == "solved":
+        if status in ("solved", "accepted") or "No analysis was selected" in out:
             for st, title, _name, _t, rows in A.dat_blocks(os.path.join(d, "job.dat")):
                 if title.startswith("displacements"):
                     steps.setdefault(st, []).append({int(r[0]): r[1:] for r in rows})
-        else:
+        if status != "solved" and tag != "direct":
             print("\n".join(ln for ln in out.splitlines() if "ERROR" in ln)[:400])
         shutil.rmtree(d, ignore_errors=True)
-        return [steps[k] for k in sorted(steps)], conv.reduced_physics
+        with open(inp, encoding="utf-8") as fh:
+            text = fh.read()
+        return [steps[k] for k in sorted(steps)], conv.reduced_physics, status, text
 
-    step = "*STEP\n*STEADY STATE DYNAMICS\n1., 10., 2\n{}*NODE PRINT, NSET=NP\nU\n*END STEP\n"
-    loads = {"A": "*BOUNDARY\n1, 1, 1, 0.01\n", "B": "*CLOAD\n7, 3, 1.\n"}
-    got, reduced = ssd_blocks(SSD_CUBE + step.format("".join(f"*LOAD CASE, NAME={k}\n{v}*END LOAD CASE\n"
-                                                             for k, v in loads.items())), "cases")
-    refs = [ssd_blocks(SSD_CUBE + step.format(v), f"case_{k}")[0] for k, v in loads.items()]
-    ok = len(got) == 2 and all(len(r) == 1 and len(r[0]) == len(g) for r, g in zip(refs, got))
-    errs = []
-    if ok:
-        for g, r in zip(got, refs):
-            peak = max(abs(x) for blk in r[0] for u in blk.values() for x in u)
-            errs.append(max(abs(a - b) for gb, rb in zip(g, r[0]) for n in rb for a, b in zip(gb[n], rb[n]))
-                        / peak if peak else math.inf)
-        ok = not reduced and max(errs) <= 1e-6
-    print(f"{'PASS' if ok else 'FAIL'}  ssd_load_case_bcs (a C3D8 cube's *STEADY STATE DYNAMICS step with "
-          f"load case A a base motion and B a force, one ccx step each): "
-          + (", ".join(f"case {k} {e:.1e} of |u|" for k, e in zip(loads, errs)) if errs else "no results")
-          + " off the step with the case's load alone" + (f"; reduced: {reduced}" if reduced else ""))
-    return 0 if ok else 1
+    step = "*STEP\n*STEADY STATE DYNAMICS{}\n1., 10., 2\n{}*NODE PRINT, NSET=NP\nU\n*END STEP\n"
+    bc, force = "*BOUNDARY\n1, 1, 1, 0.01\n", "*CLOAD\n7, 3, 1.\n"
+    ref = ssd_blocks(SSD_CUBE + step.format("", force), "force")[0]
+    failures = 0
+    for tag, text in (("load_case_bcs", step.format("", f"*LOAD CASE, NAME=A\n{bc}*END LOAD CASE\n"
+                                                       f"*LOAD CASE, NAME=B\n{force}*END LOAD CASE\n")),
+                      ("bc_values", step.format("", bc) + step.format("", force))):
+        got, reduced, _, _ = ssd_blocks(SSD_CUBE + text, tag)
+        ok = len(got) == 2 and len(ref) == 1 and len(got[1]) == len(ref[0])
+        zero = err = math.inf
+        if ok:
+            zero = max(abs(x) for blk in got[0] for u in blk.values() for x in u)
+            peak = max(abs(x) for blk in ref[0] for u in blk.values() for x in u)
+            err = max(abs(a - b) for gb, rb in zip(got[1], ref[0]) for n in rb for a, b in zip(gb[n], rb[n])) / peak
+            ok = not reduced and zero == 0.0 and err <= 1e-6
+        what = "load case A" if tag == "load_case_bcs" else "step 1"
+        print(f"{'PASS' if ok else 'FAIL'}  ssd_{tag} (a C3D8 cube's *STEADY STATE DYNAMICS "
+              f"{'step with load case A a BC 1, 1, 1, 0.01 and B a force' if tag == 'load_case_bcs' else 'steps, a BC 1, 1, 1, 0.01, then a force'}"
+              f", one ccx step each): {what} |u| {zero:.1e} (Abaqus ignores the value), the force's "
+              f"{err:.1e} of |u| off the step with the force alone" + (f"; reduced: {reduced}" if reduced else ""))
+        failures += 0 if ok else 1
+    got, reduced, status, text = ssd_blocks(SSD_CUBE + step.format(", DIRECT", force), "direct")
+    ok = got == [] and status != "solved" and "\n*NO ANALYSIS\n" in text and \
+        "\n*STEADY STATE DYNAMICS" not in text and reduced == ["*STEADY STATE DYNAMICS, DIRECT step (no ccx counterpart)"]
+    print(f"{'PASS' if ok else 'FAIL'}  ssd_direct (a C3D8 cube's *STEADY STATE DYNAMICS, DIRECT step after "
+          f"a *FREQUENCY step): ccx stops there ({status}, {len(got)} steady-state result step(s)), not "
+          f"its modal form; reduced: {reduced}")
+    return failures + (0 if ok else 1)
 
 
 def umat_build_checks(tmp):
@@ -11763,7 +11850,9 @@ def main():
     failures += imperfection_checks(ccx, env, tmp)
     # --- code check G1-1: 2-point / 2 x 2 loads whose nodal forces would clash keep their line ----
     failures += nodal_clash_checks(ccx, env, tmp)
-    # --- code check G1-2: a steady-state dynamics load case's BCs do not act in the later cases --
+    # --- code check D1-1: ... and a static perturbation step's change of a TIME=TOTAL TIME load -
+    failures += nodal_clash_sp_checks(ccx, env, tmp)
+    # --- code checks G1-2, D1-5, D1-6: steady-state dynamics BC values (ignored), DIRECT (stops) --
     failures += ssd_load_case_checks(ccx, env, tmp)
 
     # --- the --run results digest (abq2ccx.ccx_results_digest) against the references above:
