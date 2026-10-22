@@ -17366,8 +17366,9 @@ def main():
                   f"from the totals on one card (T up to {top:.5g}; before: {was})")
         failures += 0 if ok else 1
     # an S8R cantilever strip one element wide in a *STATIC step ccx runs through its nonlinear
-    # solver (a *PLASTIC never reached): off its linear answer (the C3D20R's zero-energy mode),
-    # warned; two elements across: exact, not warned
+    # solver (a *PLASTIC never reached): off its linear answer (the C3D20R's zero-energy mode,
+    # whose size is round-off: 0.1 of |u| on arm64, 1.2 on x86_64), warned; two elements across:
+    # exact, not warned
     runs = [review_run(t155_s8r_deck(w, p), f"t155_s8r_strip_{w}" + ("_plastic" if p else ""),
                        dat_node_blocks) for w in (1, 2) for p in (True, False)]
     flags = []
@@ -17378,7 +17379,7 @@ def main():
     ok = all(runs)
     if ok:
         (d1, m1), (d2, m2) = same(runs[0:2]), same(runs[2:4])
-        ok = 0.03 * m1 < d1 < 0.3 * m1 and d2 <= 1e-9 * m2 and flags == [True, False]
+        ok = d1 > 0.03 * m1 and d2 <= 1e-9 * m2 and flags == [True, False]
         print(f"{'PASS' if ok else 'FAIL'}  t155_s8r_strip (an S8R cantilever strip, a never-reached "
               f"*PLASTIC): one element wide {d1 / m1:.3g} of |u| {m1:.4g} off the linear step, "
               f"{'warned' if flags[0] else 'NOT warned'}; two wide {d2:.1e} apart, "
