@@ -809,7 +809,8 @@ def gen_elements():
         if cat == "shell":
             parts.append("ccx 2.23 runs a composite `*SHELL SECTION` on `S6` and `S8R` only, and has "
                          "no layered solid section. Linear composite shells become `S6`/`S8R` with a "
-                         "node at the middle of every edge, shared with the linear shells and 2-node "
+                         "node at the middle of every edge (on the curved surface the averaged nodal "
+                         "normals define; straight where flat or folded), shared with the linear shells and 2-node "
                          "beams joined to them by an edge, which are upgraded too. Composite "
                          "continuum shells become one solid per ply, stacked from the bottom face "
                          "(`STACK DIRECTION`), each its share of the thickness with its material and "

@@ -18102,6 +18102,84 @@ def test_composite_s4r_becomes_s8r_with_shared_midside_nodes():
     assert "*ELSET, ELSET=PLATE\n1, 2" in body
 
 
+def _cylinder_panel(cells, span_deg, typ="S4", normals=False):
+    """A cylinder panel of radius 1 and height 1 over ``span_deg`` degrees: ``cells`` x 2 S4
+    cells (S3: each cell split along a diagonal), node 1 at angle 0, height 0, ids running round
+    first; *NODE normals radial with ``normals``."""
+    nodes, els = [], []
+    for j in range(3):
+        for i in range(cells + 1):
+            t = math.radians(span_deg) * i / cells
+            extra = f", {math.cos(t):.15g}, {math.sin(t):.15g}, 0." if normals else ""
+            nodes.append(f"{1 + i + (cells + 1) * j}, {math.cos(t):.15g}, {math.sin(t):.15g}, {j / 2}{extra}")
+    for j in range(2):
+        for i in range(cells):
+            q = [1 + i + (cells + 1) * j, 2 + i + (cells + 1) * j, 2 + i + (cells + 1) * (j + 1), 1 + i + (cells + 1) * (j + 1)]
+            els += [q] if typ == "S4" else [[q[0], q[1], q[2]], [q[0], q[2], q[3]]]
+    return ("*Node\n" + "\n".join(nodes) + f"\n*Element, type={typ}, elset=CYL\n"
+            + "".join(f"{k}, " + ", ".join(map(str, q)) + "\n" for k, q in enumerate(els, 1)) + COMPOSITE_MAT
+            + "*Shell Section, elset=CYL, composite\n0.001, 3, CFRP, 0.\n0.001, 3, CFRP, 90.\n"), 3 * (cells + 1)
+
+
+def test_upgraded_shells_midside_nodes_lie_on_the_curved_surface():
+    # flat facets of a thin curved shell carry pressure by plate bending between their fold
+    # lines (probed: a quarter cylinder R/t 1000 under pressure, u_r 0.22 - 2.14 of p R^2 / E t
+    # on 4 x 4 S6 cells): the new nodes go on the surface the averaged nodal normals define.
+    # Exact on a regular cylinder mesh, its free edges included (normals turned about them),
+    # the axial edges straight; the edges on z = 0 stay in that plane
+    for typ in ("S4", "S3"):
+        deck, corners = _cylinder_panel(8, 90.0, typ)
+        _, conv, rep = convert_str(deck)
+        new = {k: p for k, p in conv.geom.nodes.items() if k > corners}
+        assert len(new) == (8 * 3 + 9 * 2 if typ == "S4" else 8 * 3 + 9 * 2 + 16), (typ, len(new))
+        assert max(abs(math.hypot(p[0], p[1]) - 1.0) for p in new.values()) < 1e-12, typ
+        mids = {(min(a, c), max(a, c)): m for e in conv._quad_edges.values() for a, c, m in e}
+        for (a, c), m in mids.items():
+            pa, pc = conv.geom.nodes[a], conv.geom.nodes[c]
+            if pa[:2] == pc[:2]:                                   # axial: straight
+                assert new[m] == (pa[0], pa[1], (pa[2] + pc[2]) / 2), (typ, a, c, new[m])
+            if pa[2] == pc[2] == 0.0:
+                assert new[m][2] == 0.0
+        assert "on the curved surface the shells' averaged nodal normals define" in rep.text()
+    # 22.5 degrees between neighbouring facets: Abaqus averages no normals there (a fold at
+    # more than 20 degrees), so the edges stay straight; with the deck's own *NODE normals the
+    # surface is the cylinder again
+    deck, corners = _cylinder_panel(4, 90.0)
+    _, conv, _ = convert_str(deck)
+    mids = {m: (a, c) for e in conv._quad_edges.values() for a, c, m in e}
+    assert all(conv.geom.nodes[m] == tuple((x + y) / 2 for x, y in zip(conv.geom.nodes[a], conv.geom.nodes[c]))
+               for m, (a, c) in mids.items())
+    deck, corners = _cylinder_panel(4, 90.0, normals=True)
+    _, conv, _ = convert_str(deck)
+    new = [p for k, p in conv.geom.nodes.items() if k > corners]
+    assert max(abs(math.hypot(p[0], p[1]) - 1.0) for p in new) < 1e-12
+    # --approximate's coarse S4R -> S8R places its new nodes alike
+    deck, corners = _cylinder_panel(8, 90.0)
+    deck = deck.replace("type=S4,", "type=S4R,").replace("composite\n0.001, 3, CFRP, 0.\n0.001, 3, CFRP, 90.",
+                                                         "material=CFRP\n0.002")
+    body, conv, _ = convert_str(deck, approximate=True)
+    assert "*ELEMENT, TYPE=S8R" in body
+    new = [p for k, p in conv.geom.nodes.items() if k > corners]
+    assert new and max(abs(math.hypot(p[0], p[1]) - 1.0) for p in new) < 1e-12
+
+
+def test_surface_midpoint_is_exact_on_cylinders_and_spheres():
+    # the centre construction: on a sphere and on a cylinder (any edge direction, a helix too)
+    # the point lies on the surface over the chord's middle; parallel normals: the chord
+    c, s = math.cos(0.3), math.sin(0.3)
+    a, b = (1.0, 0.0, 0.0), (c, s, 0.0)
+    p = A.surface_midpoint(a, b, a, b)                                 # a circle
+    assert max(abs(x - y) for x, y in zip(p, (math.cos(0.15), math.sin(0.15), 0.0))) < 1e-15
+    a, b = (1.0, 0.0, 0.0), (c, s, 0.7)                                # a helix on a cylinder
+    p = A.surface_midpoint(a, b, (1.0, 0.0, 0.0), (c, s, 0.0))
+    assert max(abs(x - y) for x, y in zip(p, (math.cos(0.15), math.sin(0.15), 0.35))) < 1e-15
+    a, b = A.vunit((1.0, 0.2, 0.1)), A.vunit((0.6, 0.5, 0.7))          # a sphere
+    p = A.surface_midpoint(a, b, a, b)
+    assert abs(A.vnorm(p) - 1.0) < 1e-15 and A.vnorm(A.vcross(p, A.vadd(a, b))) < 1e-15
+    assert A.surface_midpoint((0., 0., 0.), (1., 0., 0.), (0., 0., 1.), (0., 0., 1.)) is None
+    assert A.surface_midpoint((0., 0., 0.), (1., 0., 0.), (0., 0., 1.), A.vunit((1e-4, 0., 1.))) is None
+
+
 def test_plain_s4r_bends_only_through_hourglass_stiffness():
     # ccx 2.23 expands an S4R into one C3D8R brick integrated on its mid-surface, so only the
     # hourglass stiffness ccx adds to that brick resists its bending (probed: an a/t = 100

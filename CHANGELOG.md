@@ -75,6 +75,15 @@ physics.
   EMBED=YES`. A BC on an embedded node's translations is taken off, as Abaqus neglects it. Part,
   instance and assembly level. An embedded bar on its own nodes matches the merged mesh exactly;
   under a prescribed affine field or a 1 rad turn its nodes and stress are exact.
+* **Upgraded shells' new nodes on the curved surface** — the linear shells written as `S8R` /
+  `S6` (composite sections; coarse `S4R` under `--approximate`) got their new node at the
+  middle of the straight edge, so each quadratic element was a flat facet: on a thin curved
+  shell it carried pressure by plate bending between its fold lines (a pressurized quarter
+  cylinder, R/t 1000, 8 × 8 cells: u_r −2.9 to 7.6 times the membrane value). The new node now
+  lies on the surface the shells' averaged nodal normals define (exact on cylinder and sphere
+  meshes, free and symmetry edges included: 0.999–1.003), and stays on the straight edge where
+  the shell is flat or folds (Abaqus' 20° rule for averaging normals). Flat meshes are
+  unchanged.
 * **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the

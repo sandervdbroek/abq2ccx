@@ -335,6 +335,21 @@ def dat_solve_mode_blocks(dat_path):
     return solves, modes
 
 
+def deck_nodes(text):
+    """{node: (x, y, z)} of the *NODE blocks of a ccx deck's text."""
+    out, on = {}, False
+    for ln in text.splitlines():
+        s = ln.strip()
+        if s.startswith("*"):
+            key = s.upper().split(",")[0].strip()
+            on = key == "*NODE"
+            continue
+        if on and s:
+            f = [x.strip() for x in s.split(",")]
+            out[int(f[0])] = tuple(float(x) for x in f[1:4])
+    return out
+
+
 def frame2d(nodes, elems, fixed, loads, udl=()):
     """A plane Euler-Bernoulli frame by the direct stiffness method, with consistent loads
     (the exact nodal solution of beam theory).  ``nodes`` {id: (x, y)}; ``elems`` [(a, b, E,
@@ -1767,6 +1782,40 @@ def composite_plate_deck(kind="s4r", h=0.01, stack=3, n=8):
                   "XS, 1, 1", "YS, 2, 2"]
     lines += ["*Dload"] + load + ["*Node print, nset=CENTER", "U", "*End Step"]
     return "\n".join(lines) + "\n"
+
+
+def composite_cylinder_deck(typ="S4", n=8, r_t=1000.0):
+    """A quarter of a thin cylinder (R 1, length 1) under internal pressure as linear composite
+    shells (two isotropic plies; S3: each cell split along a diagonal), n x n cells: symmetry on
+    x = 0 and y = 0, the end z = 0 held axially, the other end free, so the shell is a pure hoop
+    membrane, u_r = p R^2 / (E t) everywhere (1e-3 R here).  Returns the deck and the corner
+    node count (the converter's midside nodes come after them)."""
+    t, E = 1.0 / r_t, 210e9
+    nid = lambda i, j: 1 + i + (n + 1) * j                                   # noqa: E731
+    lines = ["*Heading", f"Pressurized thin cylinder, R/t {r_t:g}, composite {typ} (quarter model)",
+             "** ccx 2.23 runs composite shells on S8R / S6 only: abq2ccx makes these quadratic, a "
+             "node at the middle of every edge on the cylinder.", "*Node"]
+    for j in range(n + 1):
+        for i in range(n + 1):
+            a = math.pi / 2 * i / n
+            lines.append(f"{nid(i, j)}, {math.cos(a):.15g}, {math.sin(a):.15g}, {j / n:.15g}")
+    lines.append(f"*Element, type={typ}, elset=CYL")
+    e = 0
+    for j in range(n):
+        for i in range(n):
+            q = [nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)]
+            for c in ([q] if typ == "S4" else [q[:3], [q[0], q[2], q[3]]]):
+                e += 1
+                lines.append(f"{e}, " + ", ".join(map(str, c)))
+    for name, pick in (("X0", lambda i, j: i == 0), ("Y0", lambda i, j: i == n), ("Z0", lambda i, j: j == 0)):
+        lines += [f"*Nset, nset={name}"] + _ids([nid(i, j) for j in range(n + 1) for i in range(n + 1) if pick(i, j)])
+    lines += ["*Nset, nset=ALL, generate", f"1, {nid(n, n)}, 1",
+              "*Material, name=STEEL", "*Elastic", f"{E:g}, 0.3",
+              "*Shell Section, elset=CYL, composite", f"{t / 2:.12g}, 3, STEEL, 0.", f"{t / 2:.12g}, 3, STEEL, 90.",
+              "*Boundary", "X0, YSYMM", "Y0, XSYMM", "Z0, 3, 3",
+              "*Step", "*Static", "*Dload", f"CYL, P, {1e-3 * E * t:.12g}",
+              "*Node print, nset=ALL", "U", "*End Step"]
+    return "\n".join(lines) + "\n", nid(n, n)
 
 
 def composite_inplane_deck(kind="s4r", plane="XY", n=2):
@@ -10720,6 +10769,34 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  composite_plate_sc8r (STACK DIRECTION=1 on renumbered "
               f"elements, top-face load P4): {len(b)} centre displacements vs STACK DIRECTION=3, max "
               f"difference {err:.1e} of max |u|")
+        failures += 0 if ok else 1
+    # a thin curved composite shell: the upgrade's new nodes on the cylinder, not at the middle of
+    # the flat facet's chord, where it carried the pressure by plate bending between fold lines
+    # (u_r -2.86 to 7.57 times the membrane value with S8R, -0.58 to 3.64 with S6)
+    for typ in ("S4", "S3"):
+        text, corners = composite_cylinder_deck(typ)
+        tag = f"composite_cylinder_{typ.lower()}"
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        convert(src, inp)
+        with open(inp, encoding="utf-8") as fh:
+            body = fh.read()
+        new = {k: p for k, p in deck_nodes(body).items() if k > corners}
+        off = max((abs(math.hypot(p[0], p[1]) - 1.0) for p in new.values()), default=math.inf)
+        u = composite_run(text, tag)
+        if u is None:
+            failures += 1
+            continue
+        pts = deck_nodes(body)
+        ur = [(pts[k][0] * v[0] + pts[k][1] * v[1]) / math.hypot(pts[k][0], pts[k][1]) / 1e-3
+              for k, v in u[0].items() if k in pts]
+        quad = "S8R" if typ == "S4" else "S6"
+        ok = (f"*ELEMENT, TYPE={quad}\n" in body and len(ur) == len(pts) and off < 1e-12
+              and max(abs(x - 1.0) for x in ur) < 0.01)
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (quarter cylinder R/t 1000 under internal pressure, 8 x 8 "
+              f"composite {typ} -> {quad}): u_r / (p R^2 / E t) {min(ur):.4f} to {max(ur):.4f} at all "
+              f"{len(ur)} nodes (tolerance 1 %); the {len(new)} new nodes {off:.1e} off the cylinder")
         failures += 0 if ok else 1
     # ("s4r", "XYD"): the ply angles written with a Fortran exponent, 3.D1, -6.D1, 4.5D1 (one
     # was read as an orientation name, which ccx rejected)

@@ -425,7 +425,8 @@ COMPOSITE_SHELL_OK = {"S6", "S8R"}  # CalculiX restricts composite shells to the
 SHEET_SHELLS = {"S3", "S4", "S4R", "S6", "S8", "S8R"}   # the shells ccx expands (not SC6R / SC8R)
 # ccx 2.23 stops on *SHELL SECTION, COMPOSITE on any other shell ('*ERROR reading *SHELL
 # SECTION', probed on S3, S4, S4R, S8): emitted linear shell -> the quadratic shell its
-# composite section runs on, with a node at the middle of every edge (_plan_quadratic_shells)
+# composite section runs on, with a node at the middle of every edge (_plan_quadratic_shells,
+# on the curved surface: _surface_midsides)
 COMPOSITE_SHELL_UPGRADE = {"S3": "S6", "S4": "S8R", "S4R": "S8R"}
 # --approximate writes an S4R more than this many thicknesses wide (the square root of its
 # area) as S8R, else as S4 (Converter._plan_s4r_shells)
@@ -2570,6 +2571,112 @@ def echelon_rows(vectors: Sequence[Vec], tol: float = 1e-12) -> List[Tuple[int, 
         out = [(pp, [a - q[p] * b for a, b in zip(q, r)]) for pp, q in out] + [(p, r)]
     return [(p, (r[0] if abs(r[0]) >= tol else 0.0, r[1] if abs(r[1]) >= tol else 0.0,
                  r[2] if abs(r[2]) >= tol else 0.0)) for p, r in out]
+
+
+# A curved shell surface from its flat facets (the midside nodes of upgraded linear shells,
+# Converter._surface_midsides).  Abaqus averages the normals of the shells at a node where they
+# lie within SHELL_FOLD_DEG of each other, at a node of at most SHELL_FOLD_MAX shells; elsewhere
+# each shell keeps its own normal (a fold) — Abaqus "Defining the initial geometry of
+# conventional shell elements".  End normals within MIDSIDE_FLAT_RAD keep the edge straight
+# (a sag below 1.3e-4 of the edge).
+SHELL_FOLD_DEG = 20.0
+SHELL_FOLD_MAX = 30
+MIDSIDE_FLAT_RAD = 1e-3
+
+
+def circumcentre(p: Vec, q: Vec, r: Vec) -> Optional[Vec]:
+    """The centre of the circle through ``p``, ``q``, ``r``; None where they (nearly) lie on
+    a line (the circle more than twice the longest side across)."""
+    a, b = vsub(q, p), vsub(r, p)
+    axb = vcross(a, b)
+    den = 2.0 * vdot(axb, axb)
+    if den == 0.0:
+        return None
+    c = vadd(p, vscale(vadd(vscale(vcross(axb, a), vdot(b, b)), vscale(vcross(b, axb), vdot(a, a))),
+                       1.0 / den))
+    longest = max(vnorm(a), vnorm(b), vnorm(vsub(r, q)))
+    return c if vnorm(vsub(c, p)) <= 2.0 * longest else None
+
+
+def first_unknowns(m: Sequence[Sequence[float]], rhs: Sequence[Sequence[float]]
+                   ) -> Optional[List[float]]:
+    """x[0] of the 3 x 3 system ``m`` x = r for each r of ``rhs`` (Cramer's rule); None where
+    ``m`` is singular to 1e-12 of the product of its row lengths."""
+    def det(a: Sequence[Sequence[float]]) -> float:
+        return (a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+                - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+                + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]))
+    d = det(m)
+    scale = 1.0
+    for row in m:
+        scale *= math.sqrt(sum(x * x for x in row))
+    if scale == 0.0 or abs(d) <= 1e-12 * scale:
+        return None
+    return [det([[r[i], m[i][1], m[i][2]] for i in range(3)]) / d for r in rhs]
+
+
+def normal_lines_meet(lines: Sequence[Tuple[Vec, Vec]], a: Vec, b: Vec, ref: Vec) -> Optional[Vec]:
+    """The point nearest (least squares) to the lines (point, direction) as seen along unit
+    ``b``: each projected on the plane through ``a`` normal to ``b`` (``ref``: a direction off
+    ``b``); None where the projected lines are (nearly) parallel, their directions spread by
+    less than about MIDSIDE_FLAT_RAD."""
+    e1 = vunit(vsub(ref, vscale(b, vdot(ref, b))))
+    e2 = vcross(b, e1)
+    m00 = m01 = m11 = r0 = r1 = 0.0
+    for p, n in lines:
+        q0, q1 = vdot(vsub(p, a), e1), vdot(vsub(p, a), e2)
+        d0, d1 = vdot(n, e1), vdot(n, e2)
+        ln = math.hypot(d0, d1)
+        if ln < 1e-12:
+            continue
+        d0, d1 = d0 / ln, d1 / ln
+        p00, p01, p11 = 1.0 - d0 * d0, -d0 * d1, 1.0 - d1 * d1      # the projector off the line
+        m00, m01, m11 = m00 + p00, m01 + p01, m11 + p11
+        r0, r1 = r0 + p00 * q0 + p01 * q1, r1 + p01 * q0 + p11 * q1
+    tr, det = m00 + m11, m00 * m11 - m01 * m01
+    if tr <= 0.0 or det <= MIDSIDE_FLAT_RAD ** 2 * tr * tr:
+        return None
+    x0, x1 = (m11 * r0 - m01 * r1) / det, (m00 * r1 - m01 * r0) / det
+    return vadd(a, vadd(vscale(e1, x0), vscale(e2, x1)))
+
+
+def surface_midpoint(a: Vec, c: Vec, na: Vec, nc: Vec) -> Optional[Vec]:
+    """The point halfway from ``a`` to ``c`` on the surface with the unit normals ``na`` at
+    ``a`` and ``nc`` at ``c``: on the circle about the middle Q of the closest points of the
+    normal lines a + s na and c + t nc, of radius (|s| + |t|)/2, where the line from Q through
+    the chord's middle meets it (exact on a cylinder and a sphere, any edge direction); where
+    those points lie on different sides, on the circular arc whose tangents are the chord
+    turned into the planes normal to na and nc (to second order).  None — the chord's middle —
+    where the normals lie within MIDSIDE_FLAT_RAD or the sag would pass a quarter of the chord."""
+    if vdot(na, nc) < 0.0:
+        nc = vscale(nc, -1.0)
+    d = vsub(c, a)
+    length = vnorm(d)
+    if length == 0.0 or vnorm(vcross(na, nc)) < MIDSIDE_FLAT_RAD:
+        return None
+    mid = vscale(vadd(a, c), 0.5)
+    cos_n, da, dc = vdot(na, nc), vdot(na, d), vdot(nc, d)
+    s, t = (da - cos_n * dc) / (1.0 - cos_n * cos_n), (cos_n * da - dc) / (1.0 - cos_n * cos_n)
+    p = None
+    if s * t > 0.0:
+        q = vscale(vadd(vadd(a, vscale(na, s)), vadd(c, vscale(nc, t))), 0.5)
+        v = vsub(mid, q)
+        lv = vnorm(v)
+        if lv > 0.0:
+            p = vadd(mid, vscale(v, ((abs(s) + abs(t)) / 2.0 - lv) / lv))
+    if p is None:
+        e = vscale(d, 1.0 / length)
+        ta, tc = vsub(e, vscale(na, vdot(e, na))), vsub(e, vscale(nc, vdot(e, nc)))
+        if vnorm(ta) < 1e-6 or vnorm(tc) < 1e-6:
+            return None
+        ta, tc = vunit(ta), vunit(tc)
+        w = vscale(vsub(ta, tc), 0.5)
+        w = vsub(w, vscale(e, vdot(w, e)))
+        cos_al = vdot(e, vscale(vadd(ta, tc), 0.5))
+        if cos_al <= 0.0:
+            return None
+        p = vadd(mid, vscale(w, length / (2.0 * (1.0 + cos_al))))
+    return p if vnorm(vsub(p, mid)) <= 0.25 * length else None
 
 
 def rotate_about_axis(p: Vec, a: Vec, b: Vec, angle_deg: float) -> Vec:
@@ -11268,7 +11375,9 @@ class _Mesh:
         added = ""
         if up:
             others = sorted(k for k in kinds if k.split(" ->")[0] not in hits)
-            added = (f" The S8R have a node at the middle of every edge ({span})"
+            added = (f" The S8R have a node at the middle of every edge ({span}) on the curved "
+                     f"surface the shells' averaged nodal normals define (straight where it is flat "
+                     f"or folds)"
                      + (f"; {sum(kinds[k] for k in others)} other linear shell(s) joined to them by "
                         f"an edge were upgraded too ({', '.join(others)}), so no midside node hangs"
                         if others else "")
@@ -11598,8 +11707,9 @@ class _Mesh:
         """Composite shells ccx cannot run -> the quadratic shells it can.  ccx 2.23 reads
         *SHELL SECTION, COMPOSITE only on S8R and S6 (probed: '*ERROR reading *SHELL SECTION'
         on S3, S4, S4R and S8), so the linear shells of a composite section become S8R / S6
-        (COMPOSITE_SHELL_UPGRADE) with a node at the middle of every edge: the same flat
-        facets, layup, thicknesses, orientations, element ids and sets.  Every linear shell
+        (COMPOSITE_SHELL_UPGRADE) with a node at the middle of every edge, on the curved
+        surface the shells' nodal normals define (_surface_midsides; on the straight edge where
+        it is flat or folds): the same layup, thicknesses, orientations, element ids and sets.  Every linear shell
         joined to them through an edge is upgraded too — a linear neighbour would leave the
         midside node of their shared edge hanging — and a 2-node beam along an upgraded edge
         (*BEAM SECTION) becomes the 3-node beam through its midside node, so a stiffener stays
@@ -11617,8 +11727,10 @@ class _Mesh:
         self.report.warn(
             f"Composite shells: {len(comp)} element(s) emitted as quadratic shells "
             f"({', '.join(f'{k}: {v}' for k, v in kinds.items())}), each with a node at the middle "
-            f"of every edge ({span}); ccx 2.23 runs *SHELL SECTION, COMPOSITE only on S8R and S6. "
-            f"The facets, layup, thicknesses, orientations, element ids and sets are kept"
+            f"of every edge ({span}) on the curved surface the shells' averaged nodal normals "
+            f"define (on the straight edge where it is flat or folds); ccx 2.23 runs *SHELL "
+            f"SECTION, COMPOSITE only on S8R and S6. The layup, thicknesses, orientations, element "
+            f"ids and sets are kept"
             + (f"; {extra} other linear shell(s) joined to them by an edge were upgraded too, so no "
                f"midside node hangs" if extra else "")
             + (f"; {beams} 2-node beam(s) along an upgraded edge became 3-node beams through its "
@@ -11652,10 +11764,13 @@ class _Mesh:
         S8R / S6 with a node at the middle of every edge (_plan_quadratic_shells; coarse S4R
         under --approximate, _plan_s4r_shells): (the upgraded elements, 'S4R -> S8R'-like kind
         -> count, the new nodes' span, the 2-node beams along an upgraded edge made 3-node).
+        A shell's new node lies on the curved surface its nodal normals define
+        (_surface_midsides), on the straight edge where the surface is flat there or folds.
         ``plane``: linear plane and axisymmetric elements (``corners`` from
         _linear_shell_corners(plane=True)) -> PLANE_QUADRATIC_UPGRADE (plastic CPE4 / CAX4
         under --approximate, _plan_plastic_plane_quads), the deck's suffixes kept where Abaqus
-        has the quadratic element with them (CPE4H -> CPE8RH, CAX4T -> CAX8RT)."""
+        has the quadratic element with them (CPE4H -> CPE8RH, CAX4T -> CAX8RT); their new nodes
+        lie on the straight edges."""
         els = self.geom.elements
 
         def edges(e: int) -> List[Tuple[int, int]]:
@@ -11680,6 +11795,7 @@ class _Mesh:
             mid.setdefault((min(a, c), max(a, c)), m)
         made: List[Tuple[int, int, int]] = []
         kinds: "OrderedDict[str, int]" = OrderedDict()
+        curved = {} if plane else self._surface_midsides(blocks, corners, comp)
         for e in sorted(comp):
             typ, conn = els[e]
             mids = []
@@ -11687,7 +11803,7 @@ class _Mesh:
                 key = (min(a, c), max(a, c))
                 if key not in mid:
                     next_id += 1
-                    self.geom.add_node(next_id, vscale(vadd(nodes[a], nodes[c]), 0.5))
+                    self.geom.add_node(next_id, curved.get(key) or vscale(vadd(nodes[a], nodes[c]), 0.5))
                     mid[key] = next_id
                     made.append((a, c, next_id))
                     na, nc = self._node_normals.get(a), self._node_normals.get(c)
@@ -11748,6 +11864,208 @@ class _Mesh:
                              once=True)
             self._reduces("elements left with a hanging midside node of an upgraded shell")
         return comp, kinds, span, beams
+
+    def _surface_midsides(self, blocks: List[Block], corners: Dict[int, List[int]],
+                          comp: set) -> Dict[Tuple[int, int], Vec]:
+        """Edge (a, c), a < c, of the upgraded linear shells ``comp`` -> its new midside node
+        on the curved surface the shells' nodal normals define (_upgrade_linear_shells; an
+        edge left out keeps its chord's middle).  On a thin curved shell a flat quadratic
+        facet carries pressure by plate bending between its fold lines (probed, ccx 2.23: a
+        quarter cylinder, R/t 1000, under internal pressure: u_r 0.22 - 2.14 of p R^2 / E t on
+        4 x 4 S6 cells and -1.9 - 5.8 on 8 x 8 S8R with the chord's middle; 0.99 - 1.02 and
+        0.999 - 1.001 on the arc).
+
+        Normals: Abaqus averages the normals of the shells at a node in groups whose normals
+        lie within SHELL_FOLD_DEG of each other, at a node of at most SHELL_FOLD_MAX shells;
+        elsewhere each keeps its own (a fold, whose edges stay straight).  A group's normal at
+        a node is its *NODE normal, else the value at the node of the linear normal field
+        fitted to the facet normals of the group's shells there and of their groups at its
+        edge neighbours, each facet's at the circumcentre of its corner triangle (where it is
+        the surface's normal on a sphere or cylinder).  On the group's free edge those facets
+        lie on one side, which tilts the fit inwards: the normal is turned about the edge onto
+        the direction from the point where the facet normal lines meet as seen along it
+        (normal_lines_meet; a corner takes its two edges in turns).  A *NORMAL line overrides
+        its shell's normal at its node.  The new node: surface_midpoint of the end normals,
+        where every shell on the edge has the same normal at each end (an edge whose facets at
+        both ends lie within MIDSIDE_FLAT_RAD / 4 stays straight unfitted).  Exact (to roundoff) on
+        regular cylinder and sphere meshes, their free and symmetry edges included, so the
+        normals ccx computes there stay in a symmetry plane; within 1e-2 of the sag elsewhere
+        in the probes (cylinder columns moved +-30 %, cube-sphere)."""
+        nodes, els = self.geom.nodes, self.geom.elements
+        ring: Dict[int, List[int]] = {}
+        types: Dict[str, str] = {}
+        for e, (typ, conn) in els.items():
+            if e in corners:
+                ring[e] = corners[e]
+                continue
+            ct = types.get(typ)
+            if ct is None:
+                ct = types[typ] = ccx_type(typ)
+            k = 3 if ct in ("S3", "S6") or ct.startswith(("M3D3", "M3D6")) else \
+                4 if ct in SHEET_SHELLS or ct.startswith("M3D") else 0
+            r = list(conn[:k])
+            if k and len(conn) >= k and len(set(r)) == k and all(x in nodes for x in r):
+                ring[e] = r
+        at: Dict[int, List[int]] = {}
+        for e in sorted(ring):
+            for x in ring[e]:
+                at.setdefault(x, []).append(e)
+        given: Dict[Tuple[int, int], Vec] = {}
+        for b in blocks:
+            if b.keyword == "NORMAL":
+                for rec in merged_data_records(b):
+                    try:                # components by position, a blank or left-out one 0
+                        v = tuple(fields_at(rec[2:], 3)) if len(rec) >= 3 else (0.0, 0.0, 0.0)
+                        if vnorm(v) > 0.0:
+                            given[(pint(rec[0]), pint(rec[1]))] = vunit(v)
+                    except ValueError:
+                        continue
+        cos_fold = math.cos(math.radians(SHELL_FOLD_DEG))
+        facets: Dict[Tuple[int, int], Optional[Tuple[Vec, Vec, float]]] = {}
+
+        def facet(e: int, a: int) -> Optional[Tuple[Vec, Vec, float]]:
+            """(unit normal, location, corner angle) of shell e's corner triangle at node a."""
+            if (e, a) not in facets:
+                r = ring[e]
+                i = r.index(a)
+                p, q, s = nodes[a], nodes[r[(i + 1) % len(r)]], nodes[r[i - 1]]
+                u, v = vsub(q, p), vsub(s, p)
+                w = vcross(u, v)
+                lw = vnorm(w)
+                got = None
+                if lw > 1e-9 * vnorm(u) * vnorm(v):
+                    cc = circumcentre(p, q, s) or vscale(vadd(vadd(p, q), s), 1.0 / 3.0)
+                    got = (vscale(w, 1.0 / lw), cc, math.atan2(lw, vdot(u, v)))
+                facets[(e, a)] = got
+            return facets[(e, a)]
+
+        groups_at: Dict[int, Dict[int, Optional[int]]] = {}
+
+        def groups(a: int) -> Dict[int, Optional[int]]:
+            """Shell at node a -> its normal group there (the group's lowest shell), None where
+            Abaqus keeps the shell's own normal."""
+            if a not in groups_at:
+                es = at.get(a, [])
+                fs = {e: facet(e, a) for e in es}
+                out: Dict[int, Optional[int]] = {e: None for e in es}
+                left = [e for e in es if fs[e] is not None] if len(es) <= SHELL_FOLD_MAX else []
+                while left:
+                    grp, k = [left.pop(0)], 0
+                    while k < len(grp):
+                        near = [f for f in left if abs(vdot(fs[grp[k]][0], fs[f][0])) >= cos_fold]
+                        left = [f for f in left if f not in near]
+                        grp += near
+                        k += 1
+                    if all(abs(vdot(fs[x][0], fs[y][0])) >= cos_fold for x in grp for y in grp):
+                        out.update((x, grp[0]) for x in grp)
+                groups_at[a] = out
+            return groups_at[a]
+
+        normals: Dict[Tuple[int, int], Vec] = {}
+
+        def group_normal(a: int, g: int) -> Vec:
+            if (a, g) in normals:
+                return normals[(a, g)]
+            gr = groups(a)
+            members = [e for e in gr if gr[e] == g]
+            fs = [facet(e, a) for e in members]
+            ref = fs[0][0]
+            fs = [(n if vdot(n, ref) >= 0.0 else vscale(n, -1.0), x, w) for n, x, w in fs]
+            avg = vunit(tuple(sum(n[k] * w for n, _x, w in fs) for k in range(3)))
+            lines = [(x, n) for n, x, _w in fs]
+            share: Dict[int, List[int]] = {}         # edge neighbour -> the group's shells on it
+            for e in members:
+                r = ring[e]
+                i = r.index(a)
+                for x in {r[(i + 1) % len(r)], r[i - 1]}:
+                    share.setdefault(x, []).append(e)
+            for x, es in share.items():
+                gx = groups(x)
+                keys = {gx[e] for e in es} - {None}
+                for f in at[x]:
+                    fx = facet(f, x) if f in es or gx[f] in keys else None
+                    if fx:
+                        lines.append((fx[1], fx[0] if vdot(fx[0], avg) >= 0.0 else vscale(fx[0], -1.0)))
+            # the linear normal field through the facets' normals: its value at the node
+            t = (1.0, 0.0, 0.0) if abs(avg[0]) < 0.9 else (0.0, 1.0, 0.0)
+            e1 = vunit(vsub(t, vscale(avg, vdot(t, avg))))
+            e2 = vcross(avg, e1)
+            pa = nodes[a]
+            h = max(vnorm(vsub(x, pa)) for x, _n in lines) or 1.0
+            ss = tt = s2 = st = t2 = 0.0
+            rhs = [[0.0] * 3 for _ in range(3)]          # per component: sum n, s n, t n
+            for x, n in lines:
+                q = vsub(x, pa)
+                u, v = vdot(q, e1) / h, vdot(q, e2) / h
+                ss, tt, s2, st, t2 = ss + u, tt + v, s2 + u * u, st + u * v, t2 + v * v
+                for k in range(3):
+                    r = rhs[k]
+                    r[0], r[1], r[2] = r[0] + n[k], r[1] + u * n[k], r[2] + v * n[k]
+            fit = first_unknowns([[float(len(lines)), ss, tt], [ss, s2, st], [tt, st, t2]], rhs)
+            nrm = avg
+            if fit and vnorm(tuple(fit)) > 0.0 and vdot(vunit(tuple(fit)), avg) >= cos_fold:
+                nrm = vunit(tuple(fit))
+            bound = [x for x, es in share.items() if len(es) == 1]
+            if bound:                                # turned about the free edge
+                turned = nrm
+                dirs = [vunit(vsub(nodes[x], nodes[a])) for x in bound]
+                bs = [vunit(vsub(dirs[0], dirs[1]))] if len(dirs) == 2 and \
+                    vdot(dirs[0], dirs[1]) < -math.cos(math.radians(45.0)) else dirs
+                for _round in range(1 if len(bs) == 1 else 4):
+                    for b in bs:
+                        q = normal_lines_meet(lines, nodes[a], b, turned)
+                        v = vsub(nodes[a], q) if q is not None else (0.0, 0.0, 0.0)
+                        v = vsub(v, vscale(b, vdot(v, b)))
+                        if vnorm(v) == 0.0:
+                            continue
+                        side = vunit(v) if vdot(v, turned) >= 0.0 else vscale(vunit(v), -1.0)
+                        nb = vdot(turned, b)
+                        turned = vunit(vadd(vscale(b, nb), vscale(side, math.sqrt(max(0.0, 1.0 - nb * nb)))))
+                if vdot(turned, avg) >= cos_fold:
+                    nrm = turned
+            normals[(a, g)] = nrm
+            return nrm
+
+        def end_normal(x: int, shells: List[int]) -> Optional[Vec]:
+            """The one normal the shells on an edge have at its end x, else None (a deck's
+            normal more than SHELL_FOLD_DEG off a shell's facet too, which Abaqus warns of)."""
+            got: List[Vec] = []
+            for f in shells:
+                if (f, x) in given or x in self._node_normals:
+                    v = given.get((f, x)) or vunit(self._node_normals[x])
+                    own = facet(f, x)
+                    if own is None or abs(vdot(v, own[0])) < cos_fold:
+                        return None
+                    got.append(v)
+                elif groups(x)[f] is None:
+                    return None
+                else:
+                    got.append(group_normal(x, groups(x)[f]))
+            if not got or any(abs(vdot(v, got[0])) < 1.0 - 1e-12 for v in got):
+                return None
+            return got[0]
+
+        out: Dict[Tuple[int, int], Vec] = {}
+        seen: set = set()
+        for e in sorted(comp):
+            r = corners[e]
+            for k in range(len(r)):
+                a, c = r[k], r[(k + 1) % len(r)]
+                key = (min(a, c), max(a, c))
+                if key in seen:
+                    continue
+                seen.add(key)
+                shells = [f for f in at.get(a, ()) if c in ring[f] and
+                          (ring[f].index(c) - ring[f].index(a)) % len(ring[f]) in (1, len(ring[f]) - 1)]
+                fs = [facet(f, x) for x in (a, c) for f in at[x]]
+                if all(fs) and all(vnorm(vcross(fs[0][0], v[0])) < MIDSIDE_FLAT_RAD / 4 for v in fs):
+                    continue                 # flat about the edge: no fitted normal turns 1e-3 apart
+                na = end_normal(a, shells)
+                nc = end_normal(c, shells) if na is not None else None
+                p = surface_midpoint(nodes[a], nodes[c], na, nc) if nc is not None else None
+                if p is not None:
+                    out[key] = p
+        return out
 
     def _layup(self, b: Block) -> Optional[List[dict]]:
         """The layers of a composite *SHELL SECTION, bottom first (SYMMETRIC mirrored): each
