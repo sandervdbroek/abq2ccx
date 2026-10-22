@@ -2097,6 +2097,18 @@ def bc_dof_range(g: Sequence[str]) -> Optional[Tuple[int, int]]:
     return min(int(g[1]), int(last)), max(int(g[1]), int(last))
 
 
+def coupling_dof_range(g: Sequence[str]) -> Tuple[int, int]:
+    """(first, last) DOF of the DOF fields ``g`` of a *KINEMATIC / *DISTRIBUTING data line, or
+    of a *KINEMATIC COUPLING line after its member, by position: a blank or missing first DOF
+    is all six ("If this field is left blank, all degrees of freedom will be constrained"), a
+    blank or missing last one the first.  ValueError where a given DOF is not an integer."""
+    d1 = g[0].strip() if g else ""
+    if not d1:
+        return 1, 6
+    d2 = g[1].strip() if len(g) > 1 else ""
+    return pint(d1), pint(d2 or d1)
+
+
 def fields_at(rec: Sequence[str], n: int, default: float = 0.0) -> List[float]:
     """The first ``n`` fields of data record ``rec`` as numbers, read by position: a blank or
     missing field is ``default`` (Abaqus reads a blank as 0); ValueError if a field is not a
@@ -2199,6 +2211,11 @@ def hyper_d1(block: Block) -> Optional[List[Tuple[float, float]]]:
     return [(v[at], mu(v)) for v in vals]
 
 
+# *ELASTIC TYPE -> its property values per data row (before the temperature)
+ELASTIC_VALUES = {"ISOTROPIC": 2, "ISO": 2, "ORTHOTROPIC": 9, "ORTHO": 9, "ENGINEERING CONSTANTS": 9,
+                  "LAMINA": 6, "ANISOTROPIC": 21, "ANISO": 21, "TRACTION": 3, "SHEAR": 1}
+
+
 def temperature_dependent(block: Block) -> bool:
     """Whether a *ELASTIC / *DENSITY / *HYPERELASTIC / *HYPERFOAM / *EXPANSION card tabulates
     its values at more than one temperature; True when its rows do not read."""
@@ -2210,9 +2227,7 @@ def temperature_dependent(block: Block) -> bool:
     elif block.keyword == "EXPANSION":
         nvals = {"ISOTROPIC": 1, "ISO": 1, "ORTHO": 3, "ANISO": 6}.get(typ)
     else:
-        nvals = 1 if block.keyword == "DENSITY" else {
-            "ISOTROPIC": 2, "ISO": 2, "ORTHOTROPIC": 9, "ORTHO": 9, "ENGINEERING CONSTANTS": 9,
-            "LAMINA": 6, "ANISOTROPIC": 21, "ANISO": 21, "TRACTION": 3, "SHEAR": 1}.get(typ)
+        nvals = 1 if block.keyword == "DENSITY" else ELASTIC_VALUES.get(typ)
     rows = material_rows(block, nvals) if nvals else None
     if rows is None:
         return sum(1 for ln in block.data if ln.strip()) > 1
@@ -2739,11 +2754,11 @@ def analytic_profile(b: Block) -> Tuple[Optional[dict], str]:
     i = 0
     while i < len(recs) and i < {"CYLINDER": 2, "REVOLUTION": 1}.get(typ, 0) and \
             recs[i][0].strip().upper() != "START":
-        try:
-            v = [pf(x) for x in recs[i] if x != ""]
+        try:                    # by position, a blank or left-out coordinate 0
+            v = fields_at(recs[i], -(-len(recs[i]) // 3) * 3)
         except ValueError:
             return None, f"its coordinate line '{', '.join(recs[i])}' is not numeric"
-        frame += [(v[k], v[k + 1], v[k + 2]) for k in range(0, len(v) - 2, 3)]
+        frame += [(v[k], v[k + 1], v[k + 2]) for k in range(0, len(v), 3)]
         i += 1
     if frame and len(frame) != {"CYLINDER": 3, "REVOLUTION": 2}.get(typ):
         return None, "its coordinate lines do not give the points of its local system"
@@ -2751,10 +2766,7 @@ def analytic_profile(b: Block) -> Tuple[Optional[dict], str]:
         return None, "it has no START line"
 
     def nums(rec: List[str], n: int) -> List[float]:
-        v = [pf(x) for x in rec[1:] if x != ""]
-        if len(v) < n:
-            raise ValueError
-        return v[:n]
+        return fields_at(rec[1:], n)        # by position, a blank or left-out coordinate 0
 
     segs: List[tuple] = []
     try:
@@ -8104,12 +8116,12 @@ class _Mesh:
         data: List[str] = []
         recs = merged_data_records(b)
         if recs:
-            f = [x for x in recs[0] if x != ""]
-            if f:
+            f = recs[0]                 # by position: a blank thickness is 0, never the count
+            if f:                       # (Abaqus and ccx ignore it with NODAL THICKNESS)
                 if len(f) > 1:
                     self.report.note("*SHELL SECTION: integration-point count dropped (ccx wants the "
                                      "thickness only).", once=True)
-                data.append(f[0])
+                data.append(f[0] or "0.")
         rows = self._exact_axes.get(id(b))
         if rows is not None:
             return self._exact_axes_cards(b, rows, keep, data)
@@ -9460,10 +9472,9 @@ class _Mesh:
             return out
         given: Dict[Tuple[int, int], Vec] = {}
         for rec in merged_data_records(b):
-            f = [x for x in rec if x != ""]
-            try:
-                if len(f) >= 5:
-                    given[(pint(f[0]), pint(f[1]))] = (pf(f[2]), pf(f[3]), pf(f[4]))
+            try:                        # components by position, a blank or left-out one 0
+                if len(rec) >= 3:
+                    given[(pint(rec[0]), pint(rec[1]))] = tuple(fields_at(rec[2:], 3))
             except ValueError:
                 continue
         n_out = len(out)
@@ -12357,8 +12368,8 @@ class _Mesh:
                     t = sum(pf(x) for x, _m, _o in layers) if layers else None
                 else:
                     recs = merged_data_records(b)
-                    f = [x for x in recs[0] if x != ""] if recs else []
-                    t = pf(f[0]) if f else None
+                    f = recs[0] if recs else []             # by position (a blank: none)
+                    t = pf(f[0]) if f and f[0] else None
             except ValueError:
                 t = None
             if t is None or t <= 0.0:
@@ -13661,9 +13672,8 @@ class _Mesh:
         for b in blocks:
             if b.keyword == "NORMAL":
                 for rec in merged_data_records(b):
-                    f = [x for x in rec if x != ""]
                     try:
-                        given.add((pint(f[0]), pint(f[1])))
+                        given.add((pint(rec[0]), pint(rec[1])))
                     except (ValueError, IndexError):
                         continue
         knots = set(self.geom.elset(KNOT_SET)) if self._knots else set()
@@ -13855,16 +13865,12 @@ class _Mesh:
         for b in blocks:
             kw = b.keyword
             if kw == "EQUATION":
-                toks = [x for rec in merged_data_records(b) for x in rec if x != ""]
-                i = 0
-                while i + 3 < len(toks):                 # count, then node, DOF, coefficient, ...
+                for eq in self._equation_terms(b):       # its dependent (first) term
                     try:
-                        k, dof = pint(toks[i]), pint(toks[i + 2])
+                        if pint(eq[0][1]) == 3:
+                            held.update(self._resolve_nodes(eq[0][0]))
                     except ValueError:
-                        break
-                    if dof == 3:
-                        held.update(self._resolve_nodes(toks[i + 1]))
-                    i += 1 + 3 * max(k, 1)
+                        continue
             elif kw == "MPC":
                 for rec in merged_data_records(b):
                     for tok in [x for x in rec if x != ""][1:]:
@@ -13899,13 +13905,10 @@ class _Mesh:
             if b.keyword != "TRANSFORM":
                 continue
             kind = (b.param("TYPE") or "R").strip().upper()
-            try:
-                v = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
-            except ValueError:
-                v = []
+            d = self._transform_card(b)                 # (a, b by position)
             axis: Optional[Vec] = None
-            if len(v) >= 6 and kind in ("R", "C"):     # R: a x b; C: the axis through a and b
-                a, c = (v[0], v[1], v[2]), (v[3], v[4], v[5])
+            if not isinstance(d, str) and kind in ("R", "C"):   # R: a x b; C: the axis through a and b
+                a, c = d[1], d[2]
                 axis = vcross(a, c) if kind == "R" else vsub(c, a)
             if axis is None or vnorm(axis) == 0 or abs(axis[2]) < (1 - 1e-6) * vnorm(axis):
                 skew.update(self._resolve_nodes((b.param("NSET") or "").strip()))
@@ -18150,10 +18153,9 @@ class _Materials:
         if law in ("STRAIN", ""):
             # Abaqus' default is STRAIN hardening; ccx's Norton law is TIME hardening.
             # They coincide only for m = 0 (steady-state creep) or a constant stress.
-            for rec in merged_data_records(b):
-                f = [x for x in rec if x != ""]
-                try:
-                    m = pf(f[2]) if len(f) > 2 else 0.0
+            for f in material_rows(b, 3) or merged_data_records(b):     # A, n, m, T, ...
+                try:                            # by position: a blank m is 0, not the temperature
+                    m = pf(f[2]) if len(f) > 2 and f[2] else 0.0
                 except ValueError:
                     continue
                 if m != 0.0:
@@ -21260,8 +21262,7 @@ class _Dofs:
             if b.keyword not in ("SHELL SECTION", "SHELL GENERAL SECTION", "BEAM SECTION",
                                  "BEAM GENERAL SECTION"):
                 continue
-            recs = [[x.strip() for x in r if x.strip() != ""] for r in merged_data_records(b)]
-            recs = [r for r in recs if r]
+            recs = [r for r in merged_data_records(b) if r]     # fields by position
             try:
                 if b.keyword.startswith("SHELL"):
                     thick = sum(pf(t) for t, _m, _o in self._section_layers(b)) \
@@ -21271,8 +21272,7 @@ class _Dofs:
                         raise ValueError
                     key: tuple = ("S", thick, off)
                 else:
-                    key = ("B", b.uparam("SECTION"),
-                           tuple(pf(x) for x in recs[0]))
+                    key = ("B", b.uparam("SECTION"), tuple(fields_at(recs[0], len(recs[0]))))
             except (IndexError, ValueError):
                 continue
             for e in self.geom.elset((b.param("ELSET") or "").strip()):
@@ -22527,6 +22527,10 @@ class _Constraints:
         plan, self.emit.last_coupling = self.emit.last_coupling or {}, None
         if plan.get("dist"):
             return []
+        if any(not ln.split(",")[0].strip() for ln in b.data if ln.strip()):
+            # a blank first DOF: all of them (Abaqus), as without DOF lines (ccx 2.23 reads it
+            # as 0 and stops: 'starting degree of freedom cannot be less than 1')
+            b = Block(b.keyword, OrderedDict(b.params), [])
         out = self.passthrough(b)
         if out and not out[0].startswith("**") and not any(x.strip() for x in b.data) and \
                 self._mechanical and self._planar_others:
@@ -22663,14 +22667,12 @@ class _Constraints:
         weights, why = self._distributing_weights(b, dist, ref)
         listed: set = set()
         for rec in merged_data_records(dist):
-            f = [x for x in rec if x != ""]
             try:
-                d1 = pint(f[0]) if f else 0
-                d2 = pint(f[1]) if len(f) > 1 else d1
+                d1, d2 = coupling_dof_range(rec)
             except ValueError:
-                why = why or f"a *DISTRIBUTING line that does not read ({', '.join(f)})"
+                why = why or f"a *DISTRIBUTING line that does not read ({', '.join(rec)})"
                 continue
-            listed.update(range(min(d1, d2), max(d1, d2) + 1) if f else ())
+            listed.update(range(min(d1, d2), max(d1, d2) + 1))
         two_d = bool(self.geom.elements) and not self._planar_others
         plan = self._distributing_constraint(b, ref, weights, why, listed, two_d, blocks, expanded, u1, facts,
                                              line=emit_keyword("COUPLING", b.params),
@@ -23258,15 +23260,11 @@ class _Constraints:
         had_lines = False
         clamped = False
         for rec in merged_data_records(b):
-            f = [x for x in rec if x != ""]
-            if not f:
-                continue
             had_lines = True
             try:
-                d1 = pint(f[0])
-                d2 = pint(f[1]) if len(f) > 1 and f[1] else d1
+                d1, d2 = coupling_dof_range(rec)
             except ValueError:
-                lines.append(", ".join(f))
+                lines.append(", ".join(rec))
                 continue
             if d1 > 3 and d2 > 3:
                 self.report.warn("*KINEMATIC line couples only rotational DOFs (4..6); ccx supports "
@@ -24370,20 +24368,18 @@ class _Constraints:
     @staticmethod
     def _kinematic_coupling_records(b: Block) -> List[Tuple[str, Optional[set]]]:
         """The member lines of a *KINEMATIC COUPLING: (node or set, coupled DOFs: first to
-        last, all six when none are given; None when they are not numbers).  Blank lines are
-        skipped."""
+        last, all six when the first is blank or left out; None when they are not numbers).
+        Blank lines are skipped."""
         out: List[Tuple[str, Optional[set]]] = []
         for r in merged_data_records(b):
-            f = [x for x in r if x != ""]
-            if not f:
+            if not r:
                 continue
             try:
-                d1 = pint(f[1]) if len(f) > 1 else 1
-                d2 = pint(f[2]) if len(f) > 2 else (d1 if len(f) > 1 else 6)
+                d1, d2 = coupling_dof_range(r[1:])
                 dofs: Optional[set] = set(range(min(d1, d2), max(d1, d2) + 1))
             except ValueError:
                 dofs = None
-            out.append((f[0], dofs))
+            out.append((r[0], dofs))
         return out
 
     def _kinematic_coupling_lines(self, b: Block) -> List[Tuple[List[int], Optional[set]]]:
@@ -24688,9 +24684,9 @@ class _Constraints:
     def _equation_terms(b: Block) -> List[List[Tuple[str, str, str]]]:
         """The equations of an *EQUATION card as lists of (node or set, DOF, coefficient)
         fields: each starts with a line giving its number of terms, then up to four terms a
-        line.  A card that does not parse so gives []."""
-        recs = [[x.strip() for x in rec if x.strip() != ""] for rec in merged_data_records(b)]
-        recs = [r for r in recs if r]
+        line, by position (a blank coefficient is 0, as Abaqus reads it).  A card that does not
+        parse so gives []."""
+        recs = [r for r in merged_data_records(b) if r]
         out: List[List[Tuple[str, str, str]]] = []
         i = 0
         while i < len(recs):
@@ -24700,14 +24696,15 @@ class _Constraints:
                 return []
             if len(recs[i]) != 1 or count < 1:
                 return []
-            toks: List[str] = []
+            terms: List[Tuple[str, str, str]] = []
             i += 1
-            while len(toks) < 3 * count and i < len(recs):
-                toks += recs[i]
+            while len(terms) < count and i < len(recs):
+                r = recs[i] + [""] * (-len(recs[i]) % 3)
+                terms += [(r[k], r[k + 1], r[k + 2] or "0.") for k in range(0, len(r), 3)]
                 i += 1
-            if len(toks) != 3 * count:
+            if len(terms) != count:
                 return []
-            out.append([(toks[k], toks[k + 1], toks[k + 2]) for k in range(0, len(toks), 3)])
+            out.append(terms)
         return out
 
     def _plan_connector_rows(self, blocks: List[Block]) -> None:
@@ -26364,14 +26361,13 @@ class _Constraints:
         return tie, [n for n in dedup(pin) if n not in tied]
 
     def _kinematic_dofs(self, b: Block) -> set:
-        """DOFs a *KINEMATIC card couples (no data line: all of them, as in Abaqus)."""
+        """DOFs a *KINEMATIC card couples (no data line or a blank first DOF: all of them, as
+        in Abaqus)."""
         dofs: set = set()
         for rec in merged_data_records(b):
-            f = [x for x in rec if x != ""]
             try:
-                d1 = pint(f[0])
-                d2 = pint(f[1]) if len(f) > 1 else d1
-            except (IndexError, ValueError):
+                d1, d2 = coupling_dof_range(rec)
+            except ValueError:
                 continue
             dofs.update(range(min(d1, d2), max(d1, d2) + 1))
         return dofs or set(range(1, 7))
@@ -33643,9 +33639,11 @@ class _Loads:
             kw = b.keyword
             if kw == "ELASTIC":
                 typ = (b.param("TYPE") or "ISO").strip().upper()
-                try:
-                    vals = [pf(x) for rec in merged_data_records(b) for x in rec if x != ""]
-                except ValueError:
+                nvals = ELASTIC_VALUES.get(typ)
+                rows = material_rows(b, nvals) if nvals else None
+                try:                    # the first row's values by position, a blank one 0
+                    vals = [pf(x) if x else 0.0 for x in trimmed_fields(rows[0][:nvals])] if rows else []
+                except ValueError:      # (short data, left out at the end: not sized, as before)
                     continue
                 k = max_normal_stiffness(typ, vals)
                 if k:
@@ -36130,12 +36128,12 @@ class _PostPasses:
             elif kw == "TRANSFORM":
                 ns = nodes_of((params.get("NSET") or "").strip())
                 transformed.update(ns)
-                try:
-                    v = [pf(x) for j in card.rows for x in fields(j) if x]
+                try:                    # a, b by position, a blank or left-out coordinate 0
+                    v = fields_at(next(f for f in map(fields, card.rows) if f), 6)
                     tc: Optional[Tuple[str, Vec, Vec]] = (
                         "C" if (params.get("TYPE") or "").strip().upper().startswith("C") else "R",
                         (v[0], v[1], v[2]), (v[3], v[4], v[5]))
-                except (ValueError, IndexError):
+                except (ValueError, StopIteration):
                     tc = None
                 tcard.update((n, tc) for n in ns)
             elif kw == "RIGID BODY":
@@ -38735,16 +38733,10 @@ def _turn_dof_lines(b: Block, axes: Tuple[Vec, Vec, Vec], lead: int) -> Optional
     data: List[str] = []
     changed = False
     for r in merged_data_records(b):
-        f = [x for x in r if x != ""]
-        if not f:
+        if lead and not r:
             continue
         try:
-            if lead:
-                d1 = pint(f[1]) if len(f) > 1 else 1
-                d2 = pint(f[2]) if len(f) > 2 else (d1 if len(f) > 1 else 6)
-            else:
-                d1 = pint(f[0])
-                d2 = pint(f[1]) if len(f) > 1 else d1
+            d1, d2 = coupling_dof_range(r[lead:])
         except ValueError:
             return b
         dofs = set(range(min(d1, d2), max(d1, d2) + 1))
@@ -38756,7 +38748,7 @@ def _turn_dof_lines(b: Block, axes: Tuple[Vec, Vec, Vec], lead: int) -> Optional
                 return None
             new = {k for k, _ in img}
         changed = changed or new != dofs
-        data += [", ".join(f[:lead] + [str(lo), str(hi)]) for lo, hi in dof_runs(sorted(new))]
+        data += [", ".join(r[:lead] + [str(lo), str(hi)]) for lo, hi in dof_runs(sorted(new))]
     return Block(b.keyword, OrderedDict(b.params), data) if changed else b
 
 
@@ -38769,13 +38761,11 @@ def _turn_released_rotations(b: Block, axes: Tuple[Vec, Vec, Vec]) -> Optional[B
     read (_distributing_plan reports that), None where a turned axis lies along no global one."""
     listed: set = set()
     for r in merged_data_records(b):
-        f = [x for x in r if x != ""]
         try:
-            d1 = pint(f[0]) if f else 0
-            d2 = pint(f[1]) if len(f) > 1 else d1
+            d1, d2 = coupling_dof_range(r)
         except ValueError:
             return b
-        listed.update(range(min(d1, d2), max(d1, d2) + 1) if f else ())
+        listed.update(range(min(d1, d2), max(d1, d2) + 1))
     rots = listed & {4, 5, 6}
     if not listed or len(rots) in (0, 3):
         return b
@@ -39469,8 +39459,8 @@ def _remap_distribution(b: Block, prefix: str, namer, elem_off: int, move,
             try:
                 if axes:
                     v = fields_at(vals, 9 if len(vals) > 6 else 6) if any(vals) else []
-                else:
-                    v = [pf(x) for x in vals if x != ""]
+                else:                   # by position too, a blank one 0
+                    v = fields_at(vals, len(vals))
             except ValueError:
                 v = []
             if len(v) in (6, 9):
@@ -40392,7 +40382,7 @@ def _deck_nearest(path: str, points: Dict[int, List[float]],
                 continue
             f = raw.split(",")
             try:
-                n, x = int(f[0]), [pf(v) for v in f[1:4] if v.strip()] + [0.0, 0.0]
+                n, x = int(f[0]), fields_at(f[1:4], 3)      # by position, a blank one 0
             except ValueError:
                 continue
             if upto is not None and n > upto:

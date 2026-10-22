@@ -1773,6 +1773,150 @@ def test_rotated_instance_normal_reads_blank_fields_by_position():
     assert "*NORMAL\n1, 1, 0, -1, 0\n" in body                   # z turned about x: -y
 
 
+# positional readers (task 146): a blank field before a used one is 0 (or the field's
+# default), never the next field moved up
+
+
+def _as_with_zeros_line(make, blank, zeros, **overrides):
+    """_as_with_zeros where the card's own line may pass through as given: ``make(blank)``
+    converts as ``make(zeros)``, that line aside; returns the conversion of ``make(blank)``."""
+    got = [convert_str(make(x), **overrides) for x in (blank, zeros)]
+    assert got[0][0] in (got[1][0], got[1][0].replace(zeros, blank)), blank
+    return got[0]
+
+
+def test_creep_reads_m_by_position():
+    # a blank m (0: steady-state creep) before the temperature read the temperature as m: a
+    # strain-hardening warning and reduced physics for a law that does not harden
+    deck = (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Creep\n{}\n").format
+    for line, warned in (("1e-20, 5., , 20.", False), ("1e-20, 5., 0., 20.", False),
+                         ("1e-20, 5., 0.5, 20.", True)):
+        _, conv, rep = convert_str(deck(line))
+        assert ("TIME hardening" in rep.text()) == warned, line
+        assert ("*CREEP strain hardening run as time hardening" in conv.reduced_physics) == warned, line
+
+
+def test_shell_section_reads_the_thickness_by_position():
+    # a blank thickness (Abaqus ignores it with NODAL THICKNESS) took the integration-point
+    # count: 5 was written as the thickness, and DENSITY= spread over a thickness of 5
+    shell = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, "
+             "elset=E\n1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1., 0.3\n*Density\n1.\n")
+    body, _, _ = convert_str(shell + "*Nodal Thickness\n1, 0.1\n2, 0.1\n3, 0.1\n4, 0.1\n"
+                             "*Shell Section, elset=E, material=M, nodal thickness\n, 5\n")
+    assert body.endswith("*SHELL SECTION, ELSET=E, MATERIAL=M, NODAL THICKNESS\n0.")
+    _, _, rep = convert_str(shell + "*Shell Section, elset=E, material=M, density=2.\n, 5\n"
+                            "*Step\n*Frequency\n2\n*End Step\n")
+    assert "its thickness does not read as a positive number" in rep.text()
+
+
+def test_normal_reads_its_components_by_position():
+    # a blank component left the line out of the midside averaging: the upgraded beam's middle
+    # node got no *NORMAL (ccx then derives one from n1)
+    body, _, _ = _as_with_zeros_line(lambda n: CIRC_BEAM + f"*Normal\n{n}\n1, 2, 0., 1., 0.\n",
+                                     "1, 1, , 1.", "1, 1, 0., 1., 0.")
+    assert "\n1, 2, 0., 1., 0.\n1, 4, 0, 1, 0" in body
+
+
+def test_transform_planners_read_the_axes_by_position():
+    # "1., , , , 1." (local x, y: the 3-axis is z) read as two numbers, no axes: in a planar
+    # model the node lost its out-of-plane BC as if its 3-axis were skew
+    deck = ("*Node\n1, 0., 0.\n2, 1., 0.\n*Element, type=T2D2, elset=T\n1, 1, 2\n"
+            "*Solid Section, elset=T, material=M\n1.\n*Material, name=M\n*Elastic\n1., 0.3\n"
+            "*Nset, nset=N\n2\n*Transform, nset=N\n{}\n*Boundary\n1, 1, 2\n2, 2\n"
+            "*Step\n*Static\n*Cload\n2, 1, 1.\n*End Step\n").format
+    _, conv, _ = _as_with_zeros_line(deck, "1., , , , 1.", "1., 0., 0., 0., 1., 0.")
+    assert conv.geom.nset(A.PLANAR_NODES_SET) == [1, 2]
+    # the converted deck's *TRANSFORM too (_settle_dependents): with the axes known (no longer
+    # read as none), the equation's first term at the transformed node stays first
+    deck = (HEX_MODEL + "*Nset, nset=N\n6\n*Transform, nset=N\n{}\n*Boundary\n6, 2\n*Equation\n2\n"
+            "6, 1, 1., 7, 1, -1.\n").format
+    body, _, _ = _as_with_zeros_line(deck, "1., , , , 1.", "1., 0., 0., 0., 1., 0.")
+    assert body.endswith("*EQUATION\n2\n6, 1, 1., 7, 1, -1.")
+
+
+def test_wave_speeds_read_anisotropic_elasticity_by_position():
+    # a blank D1122 moved D3333 out of place: the explicit increment was sized with D1111
+    ortho = STEEL.replace("*Elastic\n210000., 0.3", "*Elastic, type=ORTHOTROPIC\n{}\n10000.")
+    deck = (HEX + ortho + "*Step\n*Dynamic, Explicit\n, 1.e-4\n*End Step\n").format
+    got = [convert_str(deck(d))[1]._courant for d in
+           ("100000., , 80000., 20000., 25000., 300000., 10000., 10000.",
+            "100000., 0., 80000., 20000., 25000., 300000., 10000., 10000.")]
+    assert got[0] == got[1] and got[0]
+    stiff = A.max_normal_stiffness("ORTHOTROPIC", [1e5, 0., 8e4, 2e4, 2.5e4, 3e5, 1e4, 1e4, 1e4])
+    assert stiff == 3e5
+
+
+def test_equation_reads_its_terms_by_position():
+    # a blank coefficient (0, as Abaqus reads it) moved the next terms up: the card no longer
+    # parsed as equations
+    deck = (HEX_MODEL + "*Equation\n3\n{}\n").format
+    _as_with_zeros_line(deck, "6, 1, 1., 7, 1, , 8, 1, -1.", "6, 1, 1., 7, 1, 0., 8, 1, -1.")
+    b = _blocks_of("*Equation\n3\n6, 1, 1., 7, 1, , 8, 1, -1.\n2\n5, 2, 1., 6, 2,\n")[0]
+    assert A.Converter._equation_terms(b) == [[("6", "1", "1."), ("7", "1", "0."), ("8", "1", "-1.")],
+                                              [("5", "2", "1."), ("6", "2", "0.")]]
+
+
+def test_coupling_dof_lines_read_a_blank_first_dof_as_all():
+    # Abaqus: "If this field is left blank, all degrees of freedom will be constrained"; the
+    # blank was compacted away and the last DOF read as the first (DOF 3 alone)
+    assert A.coupling_dof_range(["", "3"]) == (1, 6) and A.coupling_dof_range(["2", ""]) == (2, 2)
+    assert A.coupling_dof_range([]) == (1, 6) and A.coupling_dof_range(["4", "6"]) == (4, 6)
+    head = HEX + HEX_SEC + "*Node\n100, 0.5, 0.5, 2.\n*Nset, nset=TOP\n5, 6, 7, 8\n"
+    kin = head + "*Surface, type=node, name=ST\nTOP\n*Coupling, constraint name=C, ref node=100, surface=ST\n"
+    body, _, _ = convert_str(kin + "*Kinematic\n, 3\n")
+    assert body.endswith("*KINEMATIC\n1, 3")
+    # *KINEMATIC COUPLING: '5, , 3' couples node 5 in all DOFs, as '5' does
+    got = [convert_str(head + f"*Kinematic Coupling, ref node=100\n{ln}\n")[0] for ln in ("5, , 3", "5")]
+    assert got[0] == got[1]
+    # *DISTRIBUTING: as without DOF lines, planned as equations or left to ccx's card (which
+    # reads a blank first DOF as 0 and stops)
+    dist = kin + "*Distributing\n{}" + "*Step{}\n*Static\n*Cload\n100, 3, 1.\n100, 4, 1.\n*End Step\n"
+    for nl in ("", ", nlgeom"):
+        got = [convert_str(dist.format(d, nl))[0] for d in (", 6\n", "")]
+        assert got[0] == got[1], nl
+    # a rotated instance's lines too (_turn_dof_lines, _turn_released_rotations)
+    axes = ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0))         # 90 degrees about x
+    blk = A.Block("KINEMATIC COUPLING", A.OrderedDict(), ["5, , 3"])
+    assert A._turn_dof_lines(blk, axes, 1) is blk                       # (was '5, 2, 2')
+    blk = A.Block("DISTRIBUTING", A.OrderedDict(), [", 6"])
+    assert A._turn_released_rotations(blk, axes) is blk                 # (was '1, 3', '5, 5')
+
+
+def test_analytical_surface_reads_coordinates_by_position():
+    # a blank coordinate was compacted away: the frame lost a point or a segment read as not
+    # numeric, and the surface was not converted
+    def prof(text):
+        return A.analytic_profile(next(b for b in _blocks_of(text) if b.keyword == "SURFACE"))
+    got = prof("*Surface, type=REVOLUTION, name=S\n0., , 0., , , 1.\nSTART, 1., \nLINE, , 2.\n"
+               "CIRCL, 1., 3., , 2.5\n")
+    want = prof("*Surface, type=REVOLUTION, name=S\n0., 0., 0., 0., 0., 1.\nSTART, 1., 0.\nLINE, 0., 2.\n"
+                "CIRCL, 1., 3., 0., 2.5\n")
+    assert got == want and want[0]["frame"] == [(0.0, 0.0, 0.0), (0.0, 0.0, 1.0)]
+
+
+def test_rotated_instance_distribution_vectors_read_blank_fields_by_position():
+    # a 6-value row of a distribution no orientation names, with blanks, was not turned
+    part = (HEX + "*Distribution table, name=T\ncoord3D, coord3D\n*Distribution, name=D, "
+            "location=element, table=T\n, 1., 0., 0., 0., 1., 0.\n{}\n"
+            "*Solid Section, elset=EALL, material=M\n")
+    body, _, _ = _as_with_zeros(lambda d: _instanced(part.format(d)), "1, 1., , , , 1., 1.",
+                                "1, 1., 0., 0., 0., 1., 1.")
+    assert "\n** 1, 0, 1, 0, -1, 0, 1\n" in body
+
+
+def test_deck_nearest_reads_node_coordinates_by_position():
+    # "1, 1., , 2." was read as (1, 2, 0): --run's nearest node to (1, 0, 2) was node 2
+    fd, path = tempfile.mkstemp(suffix=".inp")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("*NODE\n1, 1., , 2.\n2, 1., 0., 1.9\n")
+        assert A._deck_nearest(path, {7: [1.0, 0.0, 2.0]}) == {7: 1}
+    finally:
+        os.unlink(path)
+
+
 def test_instance_qualified_set_param_resolved():
     # Output requests reference sets through a PARAMETER (elset=/nset=), not a data line.
     # An instance-qualified value (I.body / I.corner) must flatten to the renamed global

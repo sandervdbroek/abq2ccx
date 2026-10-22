@@ -15,6 +15,16 @@ physics.
   it suggested PYTHONFAULTHANDLER, which could not show it. `--run` without a ccx, and its
   version warning, say how to get ccx 2.23: `conda install -c conda-forge calculix=2.23`. The
   `--approximate` help and the user guide now name the same reframings, and the guide all of them.
+* **Blank fields read by position on more cards** — a blank field before a used one was
+  dropped and the next field read in its place. These cards now read it as Abaqus does (0, or
+  the field's default): `*CREEP` m (a blank m before the temperature warned of strain
+  hardening), the `*SHELL SECTION` thickness (with NODAL THICKNESS the integration-point count
+  was written as the thickness), `*NORMAL` components (left out of a midside node's normal),
+  `*EQUATION` coefficients, `*TRANSFORM` axes and orthotropic / anisotropic `*ELASTIC` constants
+  in the converter's planners, analytical `*SURFACE` coordinates (the surface was rejected), and
+  a rotated instance's `*DISTRIBUTION` rows. A blank first DOF on a `*KINEMATIC`,
+  `*DISTRIBUTING` or `*KINEMATIC COUPLING` line couples all DOFs, as Abaqus documents; the last
+  DOF alone was coupled, and ccx 2.23 stops on such a `*DISTRIBUTING` line passed through.
 * **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the
