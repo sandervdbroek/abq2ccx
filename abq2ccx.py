@@ -6834,6 +6834,40 @@ def held_factor(curve: Optional[AmplitudeCurve], delay: Optional[str],
         return None
 
 
+def piecewise_sum(funcs: Sequence[Tuple[float, Sequence[Tuple[float, float]]]],
+                  span: float) -> List[Tuple[float, float]]:
+    """The sum of weight x f over ``funcs`` ((weight, points)) on [0, ``span``], each f linear
+    between its points (t, value), sorted by t, where two points at one time are a jump (the
+    value before it first) and f keeps its end values beyond them: the points of the sum, a
+    jump as two points at one time; none at 0 before it or at ``span`` after it."""
+    def at(pts: Sequence[Tuple[float, float]], x: float, right: bool) -> float:
+        ts = [t for t, _ in pts]
+        if right:
+            i = bisect.bisect_right(ts, x) - 1
+            if i < 0:
+                return pts[0][1]
+            if ts[i] == x or i + 1 == len(pts):
+                return pts[i][1]
+        else:
+            i = bisect.bisect_left(ts, x)
+            if i == len(pts):
+                return pts[-1][1]
+            if ts[i] == x or i == 0:
+                return pts[i][1]
+            i -= 1
+        (t0, v0), (t1, v1) = pts[i], pts[i + 1]
+        return v0 + (v1 - v0) * (x - t0) / (t1 - t0)
+    times = sorted({t for _, f in funcs for t, _ in f if 0.0 < t < span} | {0.0, span})
+    out: List[Tuple[float, float]] = []
+    for x in times:
+        left = sum(w * at(f, x, False) for w, f in funcs) if x > 0.0 else None
+        right = sum(w * at(f, x, True) for w, f in funcs) if x < span else None
+        for v in (left, right):
+            if v is not None and (not out or out[-1] != (x, v)):
+                out.append((x, v))
+    return out
+
+
 def integrate_history(rate: Callable[[float], float], breaks: Sequence[float], period: float,
                       order: int = 1, x0: float = 0.0, r0: float = 0.0, panel: float = 0.0,
                       rel_tol: float = 1e-4, max_points: int = 1000):
@@ -10520,43 +10554,226 @@ class _Mesh:
                          f"{FREE_MASS_SET}) to a new held node: ccx 2.23 never moves a node of MASS "
                          f"elements only in *DYNAMIC (probed), with the spring it does — exact.")
 
-    def _warn_driven_dashpots(self, blocks: List[Block]) -> None:
-        """Dashpots on a node that a displacement BC moves in a *DYNAMIC step (or that an
-        *EQUATION, or the converter's DASHPOT2 form, ties to one): ccx 2.23 damps as if that
-        node stood still (probed: a mass dragged through a DASHPOTA by a node moving at constant
-        speed moved 0.19 where 0.285 is right, also through an *EQUATION; force-driven nodes are
-        right).  No form of the deck avoids it: warned, reduced physics."""
+    def _plan_driven_dashpots(self, blocks: List[Block]) -> None:
+        """Dashpots on a node that a BC moves in a *DYNAMIC step: ccx 2.23 damps as if that node
+        stood still (probed: a mass dragged through a DASHPOTA by a node moving at constant
+        speed did not move; a force-driven one is right).  Its damping forces C v reach the
+        free DOFs from free DOFs only - a prescribed DOF's displacement reaches them through
+        the stiffness, its velocity not - so a free DOF i of a DASHPOTA (coefficient c, axis n
+        from end to end, undeformed) misses -sum_p C_ip v_p over the prescribed DOFs p of its
+        ends: c n_i n_p v_p from the other end's, -c n_i n_p v_p from its own.  In a small-
+        strain implicit step that force goes on the free DOF as a *CLOAD on an amplitude of its
+        own (_dashpot_cloads), which the next step takes off: exact where the prescribed
+        velocity is a known function of time that a ccx amplitude carries (_bc_velocity;
+        probed: the dragged mass moves 0.09502 for the exact 0.095).  Warned, reduced physics,
+        elsewhere: under NLGEOM (the axis turns), in an explicit step, an end with a *TRANSFORM,
+        in a constraint (an *EQUATION, MPC, coupling, rigid body; the converter's DASHPOT1 /
+        DASHPOT2 form), a coefficient that is not one constant, a velocity history it does not
+        know, a deck *CLOAD or a converted load on the DOF, a linear perturbation step next to
+        the step."""
+        self._dash_cloads, self._dash_amps, self._dash_zero, self._dash_amp_points = {}, {}, {}, {}
         if not self.steps.dynamic:
             return
-        ends = {n for typ, conn in self.geom.elements.values() if typ.upper() == "DASHPOTA" for n in conn}
+        ends = {e: tuple(conn) for e, (typ, conn) in self.geom.elements.items()
+                if typ.upper() == "DASHPOTA" and len(conn) == 2}
         if not ends:
             return
-        partners: Dict[int, set] = {}
-        rows = [rw for rw in self._dashpot_rows] + [
-            [(n, 0, 0.0) for node, _d, _c in eq for n in self._resolve_nodes(node)]
-            for b in blocks if b.keyword == "EQUATION" for eq in self._expanded_equations(b)[0]]
-        for rw in rows:
-            ns = {t[0] for t in rw}
-            for n in ns:
-                partners.setdefault(n, set()).update(ns)
-        reach = ends | {m for n in ends for m in partners.get(n, ())}
-        driven: List[int] = []
-        for st in self.steps:
-            if st.proc != "DYNAMIC":
+        nodes = {n for conn in ends.values() for n in conn}
+        query = {(n, d) for n in nodes for d in (1, 2, 3)}
+        coef = self._dashpot_coefficients(blocks, ends)
+        tied = self._constrained_nodes(blocks)
+        step_of = {id(c): st.no for st in self.steps for c in st.cards}
+        defs = {b.uparam("NAME"): (b.param("DEFINITION") or "TABULAR").strip().upper()
+                for b in blocks if b.keyword == "AMPLITUDE" and b.param("NAME")}
+        model = [b for b in model_data(blocks) if b.keyword == "BOUNDARY"]
+        cards = model + [b for st in self.steps for b in st.cards]
+        given = {id(b): [((n, d), (b, mag)) for ns, ds, mag in self._bc_records(b)
+                         for n in ns for d in ds if (n, d) in query]
+                 for b in cards if b.keyword == "BOUNDARY"}
+        need = {st.no for st in self.steps if st.proc == "DYNAMIC"}
+        rest = self._dofs_at_rest(model, query, need)
+        steps = self.steps.steps
+        hit: List[int] = []
+        fixes: Dict[int, Dict[Tuple[int, int], list]] = {}
+        for st, state in zip(steps, self.steps.states(lambda b: given[id(b)], skip=self.steps.lc2,
+                                                      blocks=cards)):
+            if st.proc != "DYNAMIC" or st.perturbation:
                 continue
-            for c in st.cards:
-                if c.keyword != "BOUNDARY":
+            moving: Dict[Tuple[int, int], Optional[list]] = {}
+            for k, (b, mag) in state.items():
+                v = self._bc_velocity(b, mag, st, step_of.get(id(b)), defs, k in rest[st.no][0])
+                if v != "still":
+                    moving[k] = v
+            pert = any(0 <= i < len(steps) and steps[i].perturbation for i in (st.no - 2, st.no))
+            for e, (a, z) in ends.items():
+                p = [k for k in moving if k[0] in (a, z)]
+                if not p:
                     continue
-                moving = c.uparam("TYPE") in ("VELOCITY", "ACCELERATION")
-                for ns, ds, v in self._bc_records(c, rot=False):
-                    if (moving or v != 0.0) and any(d <= 3 for d in ds):
-                        driven += [n for n in ns if n in reach]
-        if driven:
-            self.report.warn(f"Dashpot(s) on {len(set(driven))} node(s) that a displacement BC moves "
-                             f"in a *DYNAMIC step, or tied to one (e.g. node {min(driven)}): ccx 2.23 "
-                             f"damps as if such a node stood still (probed: 0.19 of motion where "
-                             f"0.285 is right), so the dashpot force misses its velocity.", once=True)
-            self._reduces("dashpots on nodes moved by BCs in *DYNAMIC (ccx ignores their velocity)")
+                axis = vsub(self.geom.nodes[z], self.geom.nodes[a]) \
+                    if a in self.geom.nodes and z in self.geom.nodes else (0.0, 0.0, 0.0)
+                n = vunit(axis) if vnorm(axis) > 0.0 else axis
+                # the force each free DOF misses: (weight, velocity) per moving prescribed DOF
+                own = {(x, i): [(coef.get(e, 0.0) * n[i - 1] * n[j - 1] * (-1.0 if y == x else 1.0),
+                                 moving[(y, j)]) for y, j in p]
+                       for x in (a, z) for i in (1, 2, 3) if (x, i) not in state}
+                own = {k: [t for t in ts if t[0]] for k, ts in own.items()}
+                if st.explicit or st.nlgeom or pert or not own or coef.get(e) is None or \
+                        vnorm(axis) == 0.0 or any(x in tied or x in self._transformed for x in (a, z)) or \
+                        any(moving[k] is None for k in p) or \
+                        any(k in self._deck_cloads for k, ts in own.items() if ts):
+                    hit.append(a if any(k[0] == a for k in p) else z)
+                    continue
+                for k, ts in own.items():
+                    if ts:
+                        fixes.setdefault(st.no, {}).setdefault(k, []).extend(ts)
+        names: Dict[tuple, str] = {}
+        for s, dofs in sorted(fixes.items()):
+            for nd, funcs in dofs.items():
+                pts = tuple(piecewise_sum(funcs, steps[s - 1].period))
+                big = max(abs(v) for _, v in pts)
+                if big == 0.0:
+                    continue
+                if pts not in names:
+                    names[pts] = f"ABQ2CCX_DASH{len(names) + 1}"
+                    self._dash_amps.setdefault(s, []).append(names[pts])
+                    self._dash_amp_points[names[pts]] = pts
+                self._dash_cloads.setdefault(s, []).append((nd, names[pts]))
+        for s, lines in self._dash_cloads.items():
+            if s < len(steps):
+                after = {nd for nd, _ in self._dash_cloads.get(s + 1, ())}
+                self._dash_zero[s + 1] = [nd for nd, _ in lines if nd not in after]
+        if hit:
+            self._warn_driven_dashpots(sorted(set(hit)))
+
+    def _warn_driven_dashpots(self, nodes: List[int]) -> None:
+        """Warn of the dashpot ends that a BC moves in a *DYNAMIC step where the converter gives
+        no missing damping force (_plan_driven_dashpots)."""
+        self.report.warn(f"Dashpot(s) on {len(nodes)} node(s) that a BC moves in a *DYNAMIC step "
+                         f"(e.g. node {nodes[0]}): ccx 2.23 damps as if such a node stood still "
+                         f"(probed: a mass dragged through a dashpot did not move), so the dashpot "
+                         f"force misses its velocity. The converter adds the missing force only in "
+                         f"small-strain implicit steps, on dashpots outside constraints and "
+                         f"*TRANSFORMs, of one constant coefficient, for displacement BCs on TABULAR "
+                         f"amplitudes or ramped from rest and velocity BCs.", once=True)
+        self._reduces("dashpots on nodes moved by BCs in *DYNAMIC (ccx ignores their velocity)")
+
+    def _dashpot_coefficients(self, blocks: List[Block], ends: Dict[int, tuple]) -> Dict[int, float]:
+        """DASHPOTA element -> its coefficient: a *DASHPOT card's one data line after the blank
+        (or DOF) line Abaqus puts first; none for a NONLINEAR card or several lines (frequency
+        or temperature dependence)."""
+        out: Dict[int, float] = {}
+        for b in blocks:
+            if b.keyword != "DASHPOT":
+                continue
+            lines = list(b.data)
+            if lines and dof_line(lines[0]):
+                lines = lines[1:]
+            lines = [ln for ln in lines if ln.strip()]
+            try:
+                c = pf(trimmed_fields(lines[0].split(","))[0]) \
+                    if len(lines) == 1 and not b.has("NONLINEAR") else None
+            except (IndexError, ValueError):
+                c = None
+            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                if e in ends and c is not None:
+                    out.setdefault(e, c)
+        return out
+
+    def _bc_velocity(self, b: Block, mag: float, st: Step, given: Optional[int],
+                     defs: Dict[str, str], at_rest: bool) -> Union[str, None, list]:
+        """The velocity a *BOUNDARY line (``b``, its magnitude ``mag``; given in step
+        ``given``, None for model data) prescribes over step ``st``, as Abaqus applies it:
+        "still" (zero), the points (step time, velocity) of a piecewise-linear history (two at
+        one time: a jump), or None where the converter does not know it.  A displacement on a
+        TABULAR / EQUALLY SPACED amplitude: magnitude x its slope (VALUE=ABSOLUTE: the slope),
+        a step-time one of an earlier step holds still, a TIME=TOTAL TIME one goes on; one
+        without: ramped over the step from rest (_dofs_at_rest: ``at_rest``), held after.  A
+        velocity on such an amplitude: magnitude x the amplitude; one without: the magnitude,
+        in its step where Abaqus steps it (Step.defaults) and after; a step-time amplitude's
+        end value after its step.  An acceleration, a FIXED / USER / SUBMODEL BC, a TIME DELAY:
+        FIXED holds still, the others are not known."""
+        T, t0 = st.period, st.t_start
+        q = self._bc_type(b)
+        if b.has("FIXED"):
+            return "still"
+        if q not in ("DISPLACEMENT", "VELOCITY") or b.has("USER") or b.has("SUBMODEL") or \
+                b.param("TIME DELAY") or T is None or not T > 0.0 or math.isnan(mag):
+            return None
+        here = given == st.no
+        name = b.uparam("AMPLITUDE")
+        if not name:
+            if q == "DISPLACEMENT":
+                if not here or mag == 0.0:
+                    return "still"
+                return [(0.0, mag / T), (T, mag / T)] if at_rest else None
+            if mag == 0.0:
+                return "still"
+            src = st if here else self.steps.steps[given - 1] if given else None
+            return [(0.0, mag), (T, mag)] if src is not None and src.defaults.get("VELOCITY") == "STEP" \
+                else None
+        curve = self._amp_curves.get(name)
+        if curve is None or defs.get(name) not in ("TABULAR", "EQUALLY SPACED"):
+            return None
+        k = 1.0 if curve.absolute else mag
+        if not curve.total and not here:
+            if q == "DISPLACEMENT" or given is None:
+                return "still"
+            end = held_factor(curve, None, self.steps.steps[given - 1].period)
+            return None if end is None else "still" if k * end == 0.0 else [(0.0, k * end), (T, k * end)]
+        if curve.total and t0 is None:
+            return None
+        off = t0 if curve.total else 0.0
+        ts = [off] + [t for t in curve.breaks if off < t < off + T] + [off + T]
+        if q == "VELOCITY":
+            pts = [(t - off, k * curve.value(t)) for t in ts]
+        else:
+            pts = [p for t1, t2 in zip(ts, ts[1:])
+                   for s in [k * (curve.value(t2) - curve.value(t1)) / (t2 - t1)]
+                   for p in ((t1 - off, s), (t2 - off, s))]
+        return "still" if all(v == 0.0 for _, v in pts) else pts
+
+    def _dashpot_cloads(self) -> List[str]:
+        """The missing dashpot forces of this step (_plan_driven_dashpots): a *CLOAD of
+        magnitude 1 per DOF on an amplitude of the force's history, defined here; and those
+        of the step before taken off on the
+        constant amplitude CONST_AMP (ccx holds a step-time load at its end value).  A jump goes
+        from 1e-6 of the step before it to 1e-6 after: the mean at its time, which ccx's
+        integration takes there (probed: exact, where the jump's two values at that time are
+        1.4e-3 / 2.7e-3 off).  A DOF a converted load (nodal forces) shares is left to it,
+        warned in its step."""
+        s = self.emit.no
+        taken = {nd for f, _a in self.emit.nodal_loads.values() for nd in f}
+        fix = [(nd, name) for nd, name in self._dash_cloads.get(s, ()) if nd not in taken]
+        if len(fix) < len(self._dash_cloads.get(s, ())):
+            self._warn_driven_dashpots(sorted({nd[0] for nd, _ in self._dash_cloads[s] if nd in taken}))
+        zero = [nd for nd in self._dash_zero.get(s, ()) if nd not in taken]
+        out: List[str] = []
+        if fix:
+            out.append("** abq2ccx: the damping forces ccx 2.23 leaves out where a BC moves a "
+                       "dashpot end (it damps as if that end stood still), as loads")
+            span = self.steps.steps[s - 1].period
+            for name in self._dash_amps.get(s, ()):
+                pts = list(self._dash_amp_points[name])
+                for i in range(len(pts) - 1):
+                    if pts[i][0] == pts[i + 1][0]:
+                        t = pts[i][0]
+                        pts[i], pts[i + 1] = (t - 1e-6 * span, pts[i][1]), (t + 1e-6 * span, pts[i + 1][1])
+                out += [f"*AMPLITUDE, NAME={name}"] + amplitude_lines(pts)
+            groups: "OrderedDict[str, List[str]]" = OrderedDict()
+            for nd, name in fix:
+                groups.setdefault(name, []).append(f"{nd[0]}, {nd[1]}, 1.")
+            for name, lines in groups.items():
+                out += [f"*CLOAD, AMPLITUDE={name}"] + lines
+            self.report.note("Dashpots with an end a BC moves in a *DYNAMIC step: ccx 2.23 damps "
+                             "as if that end stood still (probed), so the missing damping force, "
+                             "the coefficient times the end's velocity along the dashpot, goes on "
+                             "the free end as a *CLOAD on an amplitude of its history (exact in a "
+                             "small-strain step).", once=True)
+        if zero:
+            out += ["** abq2ccx: the missing dashpot forces of the step before, off"] + \
+                self._const_amp_lines() + [f"*CLOAD, AMPLITUDE={self.CONST_AMP}"] + \
+                [f"{n}, {d}, 0." for n, d in zero]
+        return out
 
     def _constrained_nodes(self, blocks: List[Block]) -> set:
         """Nodes that a constraint ccx assembles as an MPC names (any term of a deck's *EQUATION,
@@ -12661,7 +12878,9 @@ class _Mesh:
         already global, so the instance transform is included), in ccx's end, middle, end
         order (probed on 2.23: end, end, middle stops with a nonpositive jacobian).  Element
         ids and element sets are unchanged; node sets, node surfaces and coupling lines take
-        the midside node as _extend_edge_sets says."""
+        the midside node as _extend_edge_sets says.  Under --approximate also B31 / B31R
+        beams of a RECT section whose temperature gradients change ([APPROX]:
+        _gradient_beams)."""
         table: Dict[int, str] = {}                     # element -> its section (PIPE/BOX first)
         for b in blocks:
             sec = b.uparam("SECTION") \
@@ -12671,12 +12890,16 @@ class _Mesh:
             for e in self.geom.elset((b.param("ELSET") or "").strip()):
                 if table.get(e, "CIRC") == "CIRC":
                     table[e] = sec
+        grad = self._gradient_beams(blocks, table) if self._approx else set()
+        table.update((e, "") for e in grad)
         if not table:
             return
         nodes = self.geom.nodes
         next_id = max(nodes, default=0)
         sections: set = set()                          # the Abaqus sections involved
-        kinds: "OrderedDict[str, int]" = OrderedDict()   # "TYPE -> new type" counts
+        # "TYPE -> new type" counts and the new midside nodes: for a section, for gradients
+        kinds: Tuple["OrderedDict[str, int]", "OrderedDict[str, int]"] = (OrderedDict(), OrderedDict())
+        mids: Tuple[List[int], List[int]] = ([], [])
         for eid, (typ, conn) in list(self.geom.elements.items()):
             new = QUADRATIC_UPGRADE.get(ccx_type(typ)) if eid in table else None
             if new is None or len(conn) != 2 or not all(n in nodes for n in conn):
@@ -12688,26 +12911,63 @@ class _Mesh:
             self._elem_types.add(new)
             sections.add(table[eid])
             kind = f"{typ.upper()} -> {new}"
-            kinds[kind] = kinds.get(kind, 0) + 1
+            k = 0 if table[eid] else 1
+            kinds[k][kind] = kinds[k].get(kind, 0) + 1
+            mids[k].append(next_id)
         if not self._midside:
             return
-        label = "/".join(s for s in SECTION_BEAM_UPGRADE if s in sections)
-        why = []
-        if "CIRC" in sections:
-            why.append("stops on linear beams with a circular section")
-        if sections - {"CIRC"}:
-            why.append("accepts PIPE and BOX sections only on B32R")
-        mids = [m for _, _, m in self._midside.values()]
-        span = f"node {mids[0]}" if len(mids) == 1 else f"nodes {mids[0]}-{mids[-1]}"
-        self.report.warn(f"SECTION={label} beams: {len(mids)} 2-node element(s) emitted as 3-node "
-                         f"beams ({', '.join(f'{k}: {v}' for k, v in kinds.items())}), each with a "
-                         f"new midside node at its midpoint ({span}); ccx 2.23 {' and '.join(why)}. "
-                         f"Element ids and sets are kept, and BCs, temperatures and initial "
-                         f"conditions on both end nodes also reach the midside node. The quadratic "
-                         f"beam is closer to beam theory than the linear one, so results can differ "
-                         f"slightly from Abaqus.", once=True)
-        self._reduces(f"element {', '.join(kinds)} (SECTION={label} needs a 3-node beam in ccx)")
+        spans = [f"node {m[0]}" if len(m) == 1 else f"nodes {m[0]}-{m[-1]}" if m else "" for m in mids]
+        if mids[0]:
+            label = "/".join(s for s in SECTION_BEAM_UPGRADE if s in sections)
+            why = []
+            if "CIRC" in sections:
+                why.append("stops on linear beams with a circular section")
+            if sections - {"CIRC", ""}:
+                why.append("accepts PIPE and BOX sections only on B32R")
+            self.report.warn(f"SECTION={label} beams: {len(mids[0])} 2-node element(s) emitted as "
+                             f"3-node beams ({', '.join(f'{k}: {v}' for k, v in kinds[0].items())}), "
+                             f"each with a new midside node at its midpoint ({spans[0]}); ccx 2.23 "
+                             f"{' and '.join(why)}. Element ids and sets are kept, and BCs, "
+                             f"temperatures and initial conditions on both end nodes also reach the "
+                             f"midside node. The quadratic beam is closer to beam theory than the "
+                             f"linear one, so results can differ slightly from Abaqus.", once=True)
+            self._reduces(f"element {', '.join(kinds[0])} (SECTION={label} needs a 3-node beam in ccx)")
+        if mids[1]:
+            self.report.warn(f"[APPROX] B31 / B31R beams whose temperatures change the gradients "
+                             f"across them: {len(mids[1])} element(s) emitted as 3-node beams "
+                             f"({', '.join(f'{k}: {v}' for k, v in kinds[1].items())}), each with a "
+                             f"new midside node at its midpoint ({spans[1]}), which read the "
+                             f"gradients — ccx 2.23 ignores them on its 2-node beams (probed: a "
+                             f"cantilever stays straight; B32R bends exactly). Temperatures, BCs and "
+                             f"initial conditions on both end nodes also reach the midside node; the "
+                             f"quadratic beam is closer to beam theory than Abaqus' linear one.",
+                             once=True)
         self._extend_edge_sets(blocks, list(self._midside.values()), beam=True)
+
+    def _gradient_beams(self, blocks: List[Block], taken: Dict[int, str]) -> set:
+        """The B31 / B31R elements of a *BEAM SECTION, SECTION=RECT (ccx's own 2-node beam
+        section; the others go to U1 or are 3-node beams already: ``taken``) whose nodes the
+        deck's temperatures give changing gradients across the section (_gradient_changes;
+        a TEMPERATURE=VALUES section's point values read as their gradients) - which ccx 2.23
+        ignores on them (_plan_shell_gradients) - for _upgrade_section_beams under
+        --approximate."""
+        readers: Dict[int, tuple] = {}
+        elems: Dict[int, List[int]] = {}
+        for b in blocks:
+            if b.keyword != "BEAM SECTION" or b.uparam("SECTION") != "RECT":
+                continue
+            r = self._point_reader(b)
+            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                info = self.geom.elements.get(e)
+                if info is None or e in taken or ccx_type(info[0]) not in ("B31", "B31R") or \
+                        len(info[1]) != 2:
+                    continue
+                elems[e] = info[1]
+                if r is not None:
+                    for n in info[1]:
+                        readers.setdefault(n, r)
+        changed = self._gradient_changes(blocks, {n for conn in elems.values() for n in conn}, readers)
+        return {e for e, conn in elems.items() if changed.intersection(conn)}
 
     def _note_quadratic_beams(self, blocks: List[Block]) -> None:
         """Records the B32R (QUADRATIC_BEAM) elements under a RECT or CIRC section, whose *EL
@@ -32644,12 +32904,14 @@ class _Loads:
                            ["** " + x for x in [emit_keyword(was.keyword, was.params)] + list(was.data)])
             out.extend(self.translate_one(b))
         out.extend(self._modal_damping_add.get(self.emit.no, []))
+        out.extend(self._carried_pressures())
         out.extend(self._boundary_pieces(self._vel_tail.get(self.emit.no, [])))
         self._dload_op_new_first(out)
         out.extend(self._flush_dloads())
         out.extend(self._flush_cloads())
         out.extend(self._flush_heat())
         out.extend(self._flush_nodal_loads())
+        out.extend(self._dashpot_cloads())
         if self.emit.no not in self._pert_idx:
             self._hold_nodal_loads()
         self._merge_delay_cards(out)
@@ -35950,50 +36212,174 @@ class _Loads:
                     "the Abaqus default)")
         return None
 
-    def _warn_carried_tractions(self, blocks: List[Block]) -> None:
+    # a constant amplitude: a load on it acts in full from a step's first increment (a traction
+    # carried into an NLGEOM step as a pressure and its nodal forces retired: _carried_pressures;
+    # the missing dashpot forces taken off: _dashpot_cloads), defined where first used
+    CONST_AMP = "ABQ2CCX_CONST"
+
+    def _const_amp_lines(self) -> List[str]:
+        """The *AMPLITUDE of CONST_AMP, the first time it is asked for (in a step: ccx reads an
+        amplitude there for the steps after it too); [] after."""
+        if self._const_written:
+            return []
+        self._const_written = True
+        return [f"*AMPLITUDE, NAME={self.CONST_AMP}"] + amplitude_lines([(0.0, 1.0), (1.0, 1.0)])
+
+    def _plan_carried_tractions(self, blocks: List[Block]) -> None:
         """A surface traction (TRVEC / TRSHR) of a small-strain step that stays in force into a
         later step with NLGEOM: Abaqus applies it there as the load it is under NLGEOM (a
-        follower load per current area, unless FOLLOWER=NO, CONSTANT RESULTANT=YES), ccx keeps
-        the earlier step's nodal forces, fixed (_traction_nodal_lines; the step itself writes
-        what it gives again).  Warned, reduced physics."""
+        follower load per current area, unless FOLLOWER=NO, CONSTANT RESULTANT=YES), where ccx
+        would keep the earlier step's nodal forces, fixed (_to_nodal_forces).  A TRVEC normal
+        to flat continuum faces (_normal_pressure) is ccx's NLGEOM face pressure there: the
+        first such step gets the traction's lines again (_carried_block: at the value the
+        earlier step left them), on the constant amplitude CONST_AMP, which converts them to
+        that pressure and retires the nodal forces on the same amplitude (_as_pressure), so
+        the one replaces the other at once, as Abaqus carries the load on (probed on 2.23: a
+        cube loaded in a small-strain step, then turned 90 degrees in NLGEOM steps, gives the
+        reactions of the same pressure applied from the start at every increment; plain lines
+        ramp from the one load to the other, 0.065 off mid-step).  Planned per step
+        (``_carried``), written where the step leaves it possible (_carried_pressures).  The
+        rest is warned, reduced physics (_warn_carried): a shear part, other FOLLOWER /
+        CONSTANT RESULTANT choices, faces other than flat continuum ones, a TOTAL TIME
+        amplitude or one the converter cannot evaluate, a linear perturbation step between."""
+        self._carried, self._carried_from = {}, {}
         if not self._nl_any:
             return
-        active: Dict[Tuple[str, str], Tuple[Block, int]] = {}
+        # (card, set / surface, label) -> [the step that gave it, its lines there (card, fields),
+        # a linear perturbation step since]
+        active: Dict[Tuple[str, str, str], list] = {}
         hit: List[Tuple[int, int]] = []
         for st in self.steps:
-            if st.perturbation:
-                continue                        # (its loads act in it only)
+            if st.perturbation:                 # (its loads act in it only)
+                for v in active.values():
+                    v[2] = True
+                continue
+            given: set = set()
             for c in st.cards:
                 if c.keyword not in ("DLOAD", "DSLOAD"):
                     continue
-                if c.uparam("OP") == "NEW":
-                    active.clear()
+                if c.uparam("OP") == "NEW":     # (that card's earlier loads: _reset_nodal_loads)
+                    for k in [k for k in active if k[0] == c.keyword]:
+                        del active[k]
                 for rec in merged_data_records(c):
                     g = trimmed_fields(rec)
                     label = g[1].upper() if len(g) > 1 else ""
                     if not re.fullmatch(r"(TRVEC|TRSHR)[1-6]?", label):
                         continue
+                    key = (c.keyword, g[0].upper(), label)
+                    if key not in given:        # (a step's first line replaces, the next ones add)
+                        given.add(key)
+                        active.pop(key, None)
                     try:
                         zero = not (pf(g[2]) if len(g) > 2 and g[2] else 0.0)
                     except ValueError:
                         zero = False
-                    if zero or st.nlgeom:
-                        active.pop((g[0].upper(), label), None)
-                    else:
-                        active[(g[0].upper(), label)] = (c, st.no)
-            if st.nlgeom:                       # (what the step gives again or removes is its own)
-                hit += [(no, st.no) for (_t, label), (b, no) in active.items()
-                        if self._nlgeom_load_inexact(b, label[:5])]
-                active.clear()
+                    if not zero and not st.nlgeom:      # (an NLGEOM step's own: converted there)
+                        active.setdefault(key, [st.no, [], False])[1].append((c, g))
+            if not st.nlgeom:
+                continue
+            for key, (no, lines, crossed) in active.items():
+                if not any(self._nlgeom_load_inexact(c, key[2][:5]) for c, _ in lines):
+                    continue                    # (fixed nodal forces: as Abaqus applies it)
+                b = None if crossed else self._carried_block(key, lines, self.steps.steps[no - 1])
+                if b is None:
+                    hit.append((no, st.no))
+                else:
+                    self._carried.setdefault(st.no, []).append(b)
+                    self._carried_from[id(b)] = no
+            active.clear()                      # (what the step gives again or removes is its own)
         if hit:
-            self.report.warn(f"A surface traction (TRVEC / TRSHR) of small-strain step {hit[0][0]} "
-                             f"stays in force in step {hit[0][1]}, which runs under NLGEOM: Abaqus "
-                             f"applies it from then on as a follower load per current area (FOLLOWER, "
-                             f"CONSTANT RESULTANT), ccx keeps the nodal forces it became, fixed. Give "
-                             f"the traction again in that step to have it converted for NLGEOM.",
-                             once=True)
-            self._reduces("traction of a small-strain step carried into an NLGEOM step (fixed nodal "
-                          "forces)")
+            self._warn_carried(*hit[0])
+
+    def _carried_block(self, key: Tuple[str, str, str], lines: List[Tuple[Block, List[str]]],
+                       given: Step) -> Optional[Block]:
+        """Traction ``key``'s lines (card, fields) of step ``given`` that a later NLGEOM step
+        carries on, as a card of that step (_plan_carried_tractions): each at the value its step
+        ended with (a step-time amplitude's end value, as Abaqus and ccx hold it), on
+        CONST_AMP; None where the traction is no ccx pressure under NLGEOM (_normal_pressure,
+        on the faces handle_dload / handle_dsload would give it) or that value is unknown."""
+        data: List[str] = []
+        for c, g in lines:
+            m = re.fullmatch(r"TRVEC([1-6]?)", key[2])
+            if not m:
+                return None
+            if c.keyword == "DLOAD":
+                pairs = [(g[0], m.group(1))] if m.group(1) and g[0] else None
+            else:
+                sd = self.surfaces.get(key[1])
+                pairs = sd[1] if sd and all(re.fullmatch(r"S[1-6]", face or "") for _, face in sd[1]) \
+                    else None
+            if pairs is None or self._normal_pressure(c, g, pairs) is None:
+                return None
+            name = c.uparam("AMPLITUDE")
+            factor = 1.0 if not name else None if name in self._total_amps else \
+                held_factor(self._amp_curves.get(name), c.param("TIME DELAY"), given.period)
+            if factor is None:
+                return None
+            mag = g[2] if len(g) > 2 and g[2] else "0."
+            if factor != 1.0:
+                mag = short_real(pf(mag) * factor, 12)
+            data.append(", ".join([g[0], g[1], mag] + list(g[3:])))
+        return Block(key[0], OrderedDict([("AMPLITUDE", self.CONST_AMP)]), data)
+
+    def _carried_pressures(self) -> List[str]:
+        """The tractions _plan_carried_tractions carries on into this NLGEOM step as ccx
+        pressures on CONST_AMP (its cards, through handle_dload / handle_dsload), where the step
+        leaves that possible (ccx keeps one amplitude per node DOF and per face in a step): the
+        nodal forces they retire share no node DOF with the deck's own *CLOAD, with a converted
+        load the step gives, nor with one held on an amplitude (one held plain goes on
+        CONST_AMP too, at the same value; not after the step's *CLOAD, OP=NEW), and the
+        pressure's faces carry no other load, of the step or held from an earlier one.
+        Otherwise the nodal forces stay, warned (_warn_carried).  The amplitude is defined
+        before its first card."""
+        out: List[str] = []
+        case = ("1", "")
+        carry = self._load_amp(OrderedDict([("AMPLITUDE", self.CONST_AMP)]))
+        for b in self._carried.get(self.emit.no, ()):
+            g0 = trimmed_fields(b.data[0].split(","))
+            key = (b.keyword, g0[0].upper(), g0[1].upper())
+            held = self.emit.nodal_loads.get(key)
+            if held is None or key in self.emit.nodal_fresh:
+                continue                        # (the step's own, or dropped where it was given)
+            if b.keyword == "DLOAD":
+                pairs = [(g0[0], g0[1][5:])]
+            else:
+                pairs = self.surfaces[key[1]][1]
+            faces = frozenset().union(*(self._dl_faces((t, "P" + f[-1], case)) for t, f in pairs))
+            earlier = frozenset().union(*(self._dl_faces(w) for o, st in self.emit.dl_state.items()
+                                          for k, entries in st.items() if (o, k) not in self.emit.dl_fresh
+                                          for _l, _p, w, _x in entries))
+            others = [k for k, (f, a) in self.emit.nodal_loads.items()
+                      if k != key and not f.keys().isdisjoint(held[0])]
+            blocked = any(nd in self._deck_cloads for nd in held[0]) or \
+                any(k in self.emit.nodal_fresh or self.emit.nodal_loads[k][1] not in (None, (self.CONST_AMP, ""))
+                    for k in others) or (others and self.emit.cload_new) or \
+                any(self.emit.dl_taken.get(x, carry) != carry for x in faces) or bool(faces & earlier)
+            if blocked:
+                self._warn_carried(self._carried_from[id(b)], self.emit.no)
+                continue
+            for k in others:
+                self.emit.nodal_loads[k] = (self.emit.nodal_loads[k][0], (self.CONST_AMP, ""))
+            out += self._const_amp_lines() + self.translate_one(b)
+            self.report.note(f"A surface traction (TRVEC) of small-strain step "
+                             f"{self._carried_from[id(b)]}, still in force in NLGEOM step "
+                             f"{self.emit.no}, normal to its flat faces -> from then on ccx's NLGEOM "
+                             f"face pressure, its nodal forces retired, both at once on the constant "
+                             f"amplitude {self.CONST_AMP}: Abaqus applies the carried traction as a "
+                             f"follower load per current area there (FOLLOWER=YES, CONSTANT "
+                             f"RESULTANT=NO).", once=True)
+        return out
+
+    def _warn_carried(self, given: int, step: int) -> None:
+        """Warn that a traction step ``given`` left in force stays fixed nodal forces in NLGEOM
+        step ``step`` (_plan_carried_tractions)."""
+        self.report.warn(f"A surface traction (TRVEC / TRSHR) of small-strain step {given} stays in "
+                         f"force in step {step}, which runs under NLGEOM: Abaqus applies it from then "
+                         f"on as a follower load per current area (FOLLOWER, CONSTANT RESULTANT), ccx "
+                         f"keeps the nodal forces it became, fixed. Give the traction again in that "
+                         f"step to have it converted for NLGEOM.", once=True)
+        self._reduces("traction of a small-strain step carried into an NLGEOM step (fixed nodal "
+                      "forces)")
 
     def _follower_pressure(self, b: Block, g: List[str], pairs: Sequence[Tuple[str, str]]
                            ) -> Optional[str]:
@@ -36006,7 +36392,13 @@ class _Loads:
         or into all of them, is that pressure (Abaqus' P pushes against the outward normal).
         ``pairs``: (element / set, face — S1..S6 or 1..6).  Not on shells and membranes, whose
         pressure needs the faces planned before the steps (_plan_sheet_pressure)."""
-        if not self._loads_nlgeom() or b.param("ORIENTATION") or \
+        return self._normal_pressure(b, g, pairs) if self._loads_nlgeom() else None
+
+    def _normal_pressure(self, b: Block, g: List[str], pairs: Sequence[Tuple[str, str]]
+                         ) -> Optional[str]:
+        """_follower_pressure's answer for traction line ``g`` of card ``b`` under NLGEOM, in
+        any step (_plan_carried_tractions asks it ahead of the step)."""
+        if b.param("ORIENTATION") or \
                 (b.param("FOLLOWER") or "YES").strip().upper() == "NO" or \
                 (b.param("CONSTANT RESULTANT") or "NO").strip().upper() == "YES":
             return None
@@ -36053,11 +36445,17 @@ class _Loads:
     def _as_pressure(self, b: Block, card: str, g: List[str]) -> tuple:
         """Traction line ``g`` goes as a pressure (_follower_pressure): its nodal forces of an
         earlier step go (given again, Abaqus replaces them).  Returns the prefix that keys its
-        *DLOAD lines apart from a P on the same faces, which Abaqus applies besides it."""
+        *DLOAD lines apart from a P on the same faces, which Abaqus applies besides it.  A
+        traction carried on from a small-strain step (_carried_pressures) retires them on its
+        constant amplitude: at once."""
         label, name = g[1].upper(), g[0].upper()
         key = (card, name, label)
         if key in self.emit.nodal_loads and key not in self.emit.nodal_fresh:
-            self._set_nodal_load(key, {}, None)
+            if id(b) in self._carried_from:
+                self._set_nodal_load(key, dict.fromkeys(self.emit.nodal_loads[key][0], 0.0),
+                                     (self.CONST_AMP, ""))
+            else:
+                self._set_nodal_load(key, {}, None)
         self.report.note(f"*{b.keyword} {label} under NLGEOM normal to its flat faces -> ccx face "
                          f"pressure: Abaqus applies a follower traction's normal part along the "
                          f"current normal per unit current area (FOLLOWER=YES, CONSTANT RESULTANT=NO, "
@@ -38666,34 +39064,15 @@ class _Loads:
         initial one strains nothing, in either program.  Likewise the gradients across B31 /
         B31R beams, which ccx 2.23 ignores too (probed: a cantilever's tip stays straight;
         B32 / B32R read them), given as such or written by _plan_point_temperatures for a
-        TEMPERATURE=VALUES beam section."""
+        TEMPERATURE=VALUES beam section.  Under --approximate those beams are 3-node beams
+        already (_upgrade_section_beams)."""
         flat = {n: "shell" for e, (typ, conn) in self.geom.elements.items()
                 if ccx_type(typ) in ("S4", "S4R") and e not in self._point_temps for n in conn}
         knots = set(self.geom.elsets.get(KNOT_SET, ()))     # (the converter's force-free B31s)
         flat.update((n, "points" if e in self._point_beams else "beam")
                     for e, (typ, conn) in self.geom.elements.items()
                     if ccx_type(typ) in ("B31", "B31R") and e not in knots for n in conn)
-        initial: Dict[int, tuple] = {}
-        changed: set = set()
-        for kw in ("INITIAL CONDITIONS", "TEMPERATURE") if flat else ():
-            for b in blocks:
-                if b.keyword != kw or (kw != "TEMPERATURE" and b.uparam("TYPE") != "TEMPERATURE"):
-                    continue
-                for rec in merged_data_records(b):
-                    rec = [x.strip() for x in rec]
-                    t = BaseStateRestore.temperature(rec) if rec and rec[0] else None
-                    if t is None:
-                        continue
-                    g = tuple(t[1:])
-                    while g and not g[-1]:
-                        g = g[:-1]
-                    for n in self._resolve_nodes(rec[0]):
-                        if n not in flat:
-                            continue
-                        if kw != "TEMPERATURE":
-                            initial[n] = g
-                        elif g != initial.get(n, ()) or (g and b.param("AMPLITUDE")):
-                            changed.add(n)
+        changed = self._gradient_changes(blocks, set(flat))
         shells = [n for n in changed if flat[n] == "shell"]
         if shells:
             self.report.warn(f"Temperatures change the gradient through the thickness of S4 / S4R "
@@ -38710,8 +39089,43 @@ class _Loads:
                     f"node(s), ")
             self.report.warn(what + "which ccx 2.23 ignores on these elements (probed: B32 / B32R "
                              "read them), so their thermal bending is lost. Mesh those beams with "
-                             "B32 to keep it.")
+                             "B32 to keep it, or rerun with --approximate (RECT sections as B32R).")
             self._reduces("temperature gradient on B31 / B31R beams (ccx ignores it)")
+
+    def _gradient_changes(self, blocks: List[Block], nodes: set,
+                          readers: Optional[Dict[int, tuple]] = None) -> set:
+        """The nodes of ``nodes`` whose temperature gradients (a line's values after the
+        temperature) a step's *TEMPERATURE changes from their *INITIAL CONDITIONS ones (none:
+        0), or gives on an amplitude: a gradient the deck never changes strains nothing.
+        ``readers``: node -> the _point_reader of a TEMPERATURE=VALUES beam section, whose
+        lines give the values at its points (read as their gradients: _point_line)."""
+        initial: Dict[int, tuple] = {}
+        changed: set = set()
+        memo: Dict[tuple, tuple] = {}
+        for kw in ("INITIAL CONDITIONS", "TEMPERATURE") if nodes else ():
+            for b in blocks:
+                if b.keyword != kw or (kw != "TEMPERATURE" and b.uparam("TYPE") != "TEMPERATURE"):
+                    continue
+                for rec in merged_data_records(b):
+                    rec = [x.strip() for x in rec]
+                    t = BaseStateRestore.temperature(rec) if rec and rec[0] else None
+                    if t is None:
+                        continue
+                    for n in self._resolve_nodes(rec[0]):
+                        if n not in nodes:
+                            continue
+                        r = readers.get(n) if readers else None
+                        if (r, t) not in memo:
+                            g = tuple((self._point_line(r, tuple(t))[0] if r else t)[1:])
+                            while g and not g[-1]:
+                                g = g[:-1]
+                            memo[(r, t)] = g
+                        g = memo[(r, t)]
+                        if kw != "TEMPERATURE":
+                            initial[n] = g
+                        elif g != initial.get(n, ()) or (g and b.param("AMPLITUDE")):
+                            changed.add(n)
+        return changed
 
     def _plan_offset_gradients(self, blocks: List[Block]) -> None:
         """Temperature lines with a gradient on the nodes of OFFSET shells: the line's
@@ -43597,6 +44011,17 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._shell_sec: Dict[int, Tuple[float, float]] = {}    # shell -> (thickness, OFFSET); decks with ties
         self._beam_n1: Dict[int, Optional[Vec]] = {}    # beam -> approximate n1 of its section
         self._deck_cloads: Dict[Tuple[int, int], set] = {}   # deck *CLOAD (node, DOF) -> _cload_amp
+        # tractions carried into an NLGEOM step as pressures (_plan_carried_tractions): step ->
+        # its cards, id(card) -> the step that gave it
+        self._carried: Dict[int, List[Block]] = {}
+        self._carried_from: Dict[int, int] = {}
+        # the missing dashpot forces (_plan_driven_dashpots): step -> its (node DOF, amplitude)
+        # *CLOAD lines, the amplitudes it defines, the DOFs it takes them off; amplitude -> points
+        self._dash_cloads: Dict[int, List[Tuple[Tuple[int, int], str]]] = {}
+        self._dash_amps: Dict[int, List[str]] = {}
+        self._dash_zero: Dict[int, List[Tuple[int, int]]] = {}
+        self._dash_amp_points: Dict[str, Tuple[Tuple[float, float], ...]] = {}
+        self._const_written = False                # CONST_AMP defined (_const_amp_lines)
         self._has_normal = False
         self._planar_beams = False                  # the deck's beams are 2-D (B21, B22, ...)
         self._total_amps: set = set()               # the TIME=TOTAL TIME amplitudes' names
@@ -44332,7 +44757,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_coupled_inertia(blocks)
         self._plan_explicit_mass_scaling(blocks)    # after it: the deck's masses scaled once
         self._plan_load_facts(blocks)           # after the mesh planners: the final element types
-        self._warn_carried_tractions(blocks)
+        self._plan_carried_tractions(blocks)
         self._plan_point_temperatures(blocks)   # after _plan_load_facts: the temperature points
         self._plan_shell_gradients(blocks)      # after it: the gradients it writes
         self._plan_offset_gradients(blocks)     # after it: the lines it reads and the point lines
@@ -44341,7 +44766,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_transformed_springs(blocks)  # likewise
         self._plan_anisotropic_masses(blocks)   # after _plan_node_classes: the nodes with rotations
         self._plan_free_masses(blocks)          # after it and the planners adding elements above
-        self._warn_driven_dashpots(blocks)      # after _plan_dashpots: their rows
+        self._plan_driven_dashpots(blocks)      # after _plan_dashpots: their rows
         self._warn_partial_couplings_nlgeom(blocks)
         self._plan_member_mass_tets(blocks)     # after _plan_rot_nodes: the *MPC BEAM bodies
         self._warn_massless_frequency(blocks)   # after it: its massless tetrahedra
@@ -44582,6 +45007,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                             b.uparam("TIME").replace(" ", "") == "TOTALTIME"}
         self._amp_curves = {b.uparam("NAME"): amplitude_curve(b) for b in blocks
                             if b.keyword == "AMPLITUDE" and b.param("NAME")}
+        # (and the converter's constant one, _const_amp_lines: a load on it holds its value)
+        self._amp_curves.setdefault(self.CONST_AMP, AmplitudeCurve(lambda t: 1.0, [0.0, 1.0]))
         self._tie_names = {b.uparam("NAME") for b in blocks if b.keyword == "TIE"}
         # the VALUE=ABSOLUTE amplitudes only load / BC cards name (AMPLITUDE=), with magnitude 1
         # on every line: ccx's magnitude x amplitude is then the amplitude, as Abaqus applies it

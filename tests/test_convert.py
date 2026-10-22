@@ -25685,6 +25685,33 @@ def test_b31_gradients_warned():
     assert "B31 / B31R beams" not in rep.text()
     _, conv, rep = convert_str(beam.format("B32", "100., 0.").replace("1, 1, 2\n2, 2, 3\n", "1, 1, 2, 3\n"))
     assert "B31 / B31R beams" not in rep.text()
+    assert "rerun with --approximate (RECT sections as B32R)" in convert_str(beam.format("B31", "100., 0."))[2].text()
+
+
+def test_b31_gradients_as_b32r_under_approximate():
+    # --approximate: B31 / B31R beams whose gradients change run as B32R, which reads them
+    # (probed: a cantilever's tip -0.02, -0.05 as beam theory; the B31 stays straight)
+    beam = ("*Node, nset=NALL\n1, 0., 0., 0.\n2, 0., 0., 0.5\n3, 0., 0., 1.\n*Element, type={}, elset=B\n"
+            "1, 1, 2\n2, 2, 3\n*Material, name=M\n*Elastic\n1000., 0.\n*Expansion\n1e-3\n"
+            "*Beam Section, elset=B, material=M, section=RECT{}\n0.1, 0.1\n1., 0., 0.\n*Boundary\n1, 1, 6\n"
+            "*Initial Conditions, type=TEMPERATURE\nNALL, 0.\n*Step\n*Static\n*Temperature\nNALL, {}\n"
+            "*End Step\n")
+    for typ in ("B31", "B31R"):
+        body, conv, rep = convert_str(beam.format(typ, "", "10., 100., 40."), approximate=True)
+        g = reparse(body)
+        assert g.elements[1] == ("B32R", [1, 4, 2]) and g.elements[2] == ("B32R", [2, 5, 3])
+        assert "[APPROX] B31 / B31R beams whose temperatures change the gradients" in rep.text()
+        assert conv.reduced_physics == ["--approximate: B31 / B31R beams whose temperatures change the "
+                                        "gradients across them"]
+        assert {4, 5} <= set(g.nsets["NALL"])           # (its temperatures: _extend_edge_sets)
+    # the values at a TEMPERATURE=VALUES section's corners: their gradients too
+    pts = "8., 12., 22., 18."                         # T = 15 + 40 x1 + 100 x2
+    body, conv, _ = convert_str(beam.format("B31", ", temperature=VALUES", pts), approximate=True)
+    assert reparse(body).elements[1][0] == "B32R"
+    # a gradient never changed, or no --approximate: B31 as before
+    for line, kw in (("10., 0., 0.", {"approximate": True}), ("10., 100., 40.", {})):
+        body, conv, _ = convert_str(beam.format("B31", "", line), **kw)
+        assert reparse(body).elements[1] == ("B31", [1, 2])
 
 
 def test_free_point_mass_gets_a_zero_spring_in_dynamic_decks():
@@ -25708,16 +25735,55 @@ def test_free_point_mass_gets_a_zero_spring_in_dynamic_decks():
     assert "FREE_MASS" not in body
 
 
-def test_dashpot_on_a_bc_driven_node_warned():
-    # ccx 2.23's DASHPOTA damps as if a node a displacement BC moves stood still (probed)
-    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=MASS, elset=EM\n11, 1\n*Mass, elset=EM\n1.\n"
-            "*Element, type=DASHPOTA, elset=D\n21, 1, 2\n*Dashpot, elset=D\n\n10.\n*Boundary\n1, 2, 3\n2, 2, 3\n"
-            "*Step\n*Dynamic\n0.01, 2.\n*Cload\n1, 1, 1.\n*Boundary\n2, 1, 1, {}\n*End Step\n")
-    _, conv, rep = convert_str(deck.format("0.1"))
-    assert "Dashpot(s) on 1 node(s) that a displacement BC moves" in rep.text()
-    assert "dashpots on nodes moved by BCs in *DYNAMIC (ccx ignores their velocity)" in conv.reduced_physics
-    _, conv, rep = convert_str(deck.format("0."))
-    assert "Dashpot(s) on" not in rep.text()
+DRAGGED_MASS = ("*Node\n1, 0., 0., 0.\n2, {}, 0.\n*Element, type=MASS, elset=EM\n11, 1\n*Mass, elset=EM\n"
+                "1.\n*Element, type=DASHPOTA, elset=D\n21, 1, 2\n*Dashpot, elset=D\n\n10.\n"
+                "*Amplitude, name=KINK\n0., 0., 1., 0.25, 2., 1.\n*Boundary\n1, 2, 3\n2, 2, 3\n")
+
+
+def test_dashpot_on_a_bc_driven_node_gets_its_missing_force():
+    # ccx 2.23's DASHPOTA damps as if a node a BC moves stood still (probed): the force it
+    # leaves out, c (v . n) n, goes on the free end as a *CLOAD on its history's amplitude
+    step = "*Step{}\n*Dynamic{}\n0.01, 2.\n{}*Boundary{}\n2, 1, 1, {}\n*End Step\n"
+    body, conv, rep = convert_str(DRAGGED_MASS.format("1., 0.") + step.format("", "", "", "", "0.1"))
+    s1 = _step(body, 1)
+    assert _card_at(s1, "*AMPLITUDE, NAME=ABQ2CCX_DASH1") == ["0, 0.5, 2, 0.5"]     # 10 x 0.1 / 2
+    assert _card_at(s1, "*CLOAD, AMPLITUDE=ABQ2CCX_DASH1") == ["1, 1, 1."]
+    assert "Dashpot(s) on" not in rep.text() and not conv.reduced_physics
+    # a velocity jump: from 1e-6 of the step before to 1e-6 after (ccx takes the mean there)
+    body, conv, _ = convert_str(DRAGGED_MASS.format("1., 0.") + step.format("", "", "", ", amplitude=KINK", "0.1"))
+    assert _card_at(_step(body, 1), "*AMPLITUDE, NAME=ABQ2CCX_DASH1") == \
+        ["0, 0.25, 0.999998, 0.25, 1.000002, 0.75, 2, 0.75"]
+    # a velocity BC on an amplitude: that amplitude; an oblique dashpot: both free DOFs
+    body, conv, _ = convert_str(DRAGGED_MASS.format("1., 1.").replace("1, 2, 3\n", "1, 3, 3\n") +
+                                step.format("", "", "", ", type=VELOCITY, amplitude=KINK", "0.2"))
+    s1 = _step(body, 1)
+    assert _card_at(s1, "*AMPLITUDE, NAME=ABQ2CCX_DASH1") == ["0, 0, 1, 0.25, 2, 1"]   # 5 x 0.2 x KINK
+    assert _card_at(s1, "*CLOAD, AMPLITUDE=ABQ2CCX_DASH1") == ["1, 1, 1.", "1, 2, 1."]
+    # the next step takes it off at once
+    body, conv, _ = convert_str(DRAGGED_MASS.format("1., 0.") + step.format("", "", "", "", "0.1") +
+                                "*Step\n*Dynamic\n0.01, 1.\n*End Step\n")
+    assert _card_at(_step(body, 2), "*CLOAD, AMPLITUDE=ABQ2CCX_CONST") == ["1, 1, 0."]
+    assert "*AMPLITUDE, NAME=ABQ2CCX_CONST" in _step(body, 2)
+    # a BC that holds the node: nothing; warned where the converter has no form
+    body, conv, rep = convert_str(DRAGGED_MASS.format("1., 0.") + step.format("", "", "", "", "0."))
+    assert "ABQ2CCX_DASH" not in body and "Dashpot(s) on" not in rep.text()
+    why = "dashpots on nodes moved by BCs in *DYNAMIC (ccx ignores their velocity)"
+    for deck in (step.format(", nlgeom", "", "", "", "0.1"),           # the axis turns
+                 step.format("", ", explicit", "", "", "0.1"),
+                 step.format("", "", "*Cload\n1, 1, 1.\n", "", "0.1"),   # one entry per node DOF
+                 step.format("", "", "", ", type=ACCELERATION", "0.1")):
+        body, conv, rep = convert_str(DRAGGED_MASS.format("1., 0.") + deck)
+        assert "ABQ2CCX_DASH" not in body
+        assert "Dashpot(s) on 1 node(s) that a BC moves" in rep.text() and why in conv.reduced_physics
+
+
+def test_piecewise_sum():
+    ramp, jump = [(0.0, 0.0), (2.0, 2.0)], [(0.0, 1.0), (1.0, 1.0), (1.0, 3.0), (2.0, 3.0)]
+    assert A.piecewise_sum([(1.0, ramp), (2.0, jump)], 2.0) == [(0.0, 2.0), (1.0, 3.0), (1.0, 7.0),
+                                                                 (2.0, 8.0)]
+    # its end values beyond its points; a jump at 0 or at the end leaves no point outside
+    assert A.piecewise_sum([(1.0, [(0.5, 1.0), (1.5, 2.0)])], 2.0) == [(0.0, 1.0), (0.5, 1.0),
+                                                                     (1.5, 2.0), (2.0, 2.0)]
 
 
 def test_couplings_on_one_reference_node_become_one():
@@ -25771,6 +25837,37 @@ def test_traction_carried_into_an_nlgeom_step_warned():
     assert "stays in force" not in rep.text()
     _, conv, rep = convert_str(hexs + one.format("") + "*Step, nlgeom\n*Static\n*Dsload, op=NEW\n*End Step\n")
     assert "stays in force" not in rep.text()
+
+
+def test_normal_traction_carried_into_an_nlgeom_step_becomes_a_pressure():
+    # a TRVEC normal to flat continuum faces is ccx's NLGEOM pressure there: from the NLGEOM
+    # step on it goes as one, its nodal forces retired, both on a constant amplitude (probed)
+    hexs = HEX + HEX_SEC + "*Surface, name=TOP\nEALL, S2\n*Boundary\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 3, 3\n"
+    one = "*Step\n*Static\n{}*Dsload{}\nTOP, TRVEC, 4., 0., 0., -1.\n*End Step\n"
+    nl = "*Step, nlgeom\n*Static\n*End Step\n"
+    body, conv, rep = convert_str(hexs + one.format("", "") + nl + nl)
+    s2 = _step(body, 2)
+    assert _card_at(s2, "*AMPLITUDE, NAME=ABQ2CCX_CONST") == ["0, 1, 1, 1"]
+    assert _card_at(s2, "*DLOAD, AMPLITUDE=ABQ2CCX_CONST") == ["EALL, P2, 4."]
+    assert _card_at(s2, "*CLOAD, AMPLITUDE=ABQ2CCX_CONST") == ["5, 3, 0", "6, 3, 0", "7, 3, 0", "8, 3, 0"]
+    assert "*DLOAD" not in _step(body, 3) and "*CLOAD" not in _step(body, 3)
+    assert "still in force in NLGEOM step 2" in rep.text()
+    assert "which runs under NLGEOM" not in rep.text() and not conv.reduced_physics
+    # element-based; on a step-time amplitude at its end value
+    body, _, _ = convert_str(hexs + "*Step\n*Static\n*Dload\nEALL, TRVEC2, 4., 0., 0., -1.\n*End Step\n" + nl)
+    assert _card_at(_step(body, 2), "*DLOAD, AMPLITUDE=ABQ2CCX_CONST") == ["EALL, P2, 4."]
+    body, conv, _ = convert_str(hexs.replace("*Boundary", "*Amplitude, name=A\n0., 0., 1., 0.5\n*Boundary") +
+                                one.format("", ", amplitude=A") + nl)
+    assert _card_at(_step(body, 2), "*DLOAD, AMPLITUDE=ABQ2CCX_CONST") == ["EALL, P2, 2."]
+    # warned, the nodal forces kept: a perturbation step between, a TIME=TOTAL TIME amplitude,
+    # the step's own pressure on those faces (ccx: one amplitude per face in a step)
+    for deck in (hexs + one.format("", "") + "*Step\n*Frequency\n2\n*End Step\n" + nl,
+                 hexs.replace("*Boundary", "*Amplitude, name=A, time=TOTAL TIME\n0., 0., 1., 0.5\n*Boundary") +
+                 one.format("", ", amplitude=A") + nl,
+                 hexs + one.format("", "") + nl.replace("*End", "*Dload\nEALL, P2, 1.\n*End")):
+        body, conv, rep = convert_str(deck)
+        assert "ABQ2CCX_CONST" not in body and "stays in force in step" in rep.text()
+        assert any("carried into an NLGEOM step" in r for r in conv.reduced_physics)
 
 
 def test_plane_node_cload_in_a_modal_step_warned():

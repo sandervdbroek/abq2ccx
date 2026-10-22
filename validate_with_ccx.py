@@ -8966,6 +8966,70 @@ def transformed_beam_moment_deck(twin):
             f"*CLOAD\n{load}*NODE PRINT, NSET=TIP, GLOBAL=YES\nU\n*END STEP\n")
 
 
+def carried_traction_deck(form, pressure=False, steps=6, step_deg=15.0):
+    """follower_turning_deck's cube (``form`` "3d": *DSLOAD TRVEC on its face x = 1) or square
+    ("2d": *DLOAD TRVEC2 on its edge x = 1), the unit traction into the far face given in a
+    first small-strain step and left in force while ``steps`` NLGEOM steps turn the held face
+    about z (4 increments each); ``pressure``: the same load as a pressure P from the start."""
+    deck = follower_turning_deck(form, steps, step_deg)
+    two = form == "2d"
+    load = (["*DLOAD", "EALL, P2, 1." if pressure else "EALL, TRVEC2, 1., -1., 0., 0."] if two else
+            ["*DSLOAD", "FAR, P, 1." if pressure else "FAR, TRVEC, 1., -1., 0., 0."])
+    deck = deck.replace("\n".join(load[:1] + ["EALL, TRVEC2, 1., -1., 0., 0." if two else
+                                              "FAR, TRVEC, 1., -1., 0., 0."]) + "\n", "")
+    deck = deck.replace("*STATIC\n1., 1.\n", "*STATIC\n0.25, 1.\n")
+    first = ["*STEP", "*STATIC", "*BOUNDARY", "LEFT, 1, 2, 0."] + ([] if two else ["1, 3, 3, 0.", "4, 3, 3, 0."]) + \
+        load + ["*NODE PRINT, NSET=LEFT, TOTALS=ONLY", "RF", "*END STEP"]
+    head, rest = deck.split("*STEP, NLGEOM", 1)
+    return head + "\n".join(first) + "\n*STEP, NLGEOM" + rest
+
+
+def dragged_mass_deck(bc):
+    """A unit point mass on node 1 dragged along x by a DASHPOTA (c = 10) from node 2 at (1, 0, 0),
+    which a BC moves over a *DYNAMIC step of 2 (fixed increments of 0.005): ``bc`` "ramp" (a
+    displacement of 0.1 on a ramp amplitude), "plain" (the same without one: ramped from rest),
+    "kink" (0.1 on the points (0, 0), (1, 0.25), (2, 1): 0.025 then 0.075 per unit time), or
+    "velocity" (TYPE=VELOCITY 0.1 on that ramp amplitude: 0.05 t)."""
+    card = {"ramp": "*BOUNDARY, AMPLITUDE=RAMP\n2, 1, 1, 0.1", "plain": "*BOUNDARY\n2, 1, 1, 0.1",
+            "kink": "*BOUNDARY, AMPLITUDE=KINK\n2, 1, 1, 0.1",
+            "velocity": "*BOUNDARY, TYPE=VELOCITY, AMPLITUDE=RAMP\n2, 1, 1, 0.1"}[bc]
+    return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n*NSET, NSET=P\n1\n*ELEMENT, TYPE=MASS, ELSET=EM\n11, 1\n"
+            "*MASS, ELSET=EM\n1.\n*ELEMENT, TYPE=DASHPOTA, ELSET=D\n21, 1, 2\n*DASHPOT, ELSET=D\n\n10.\n"
+            "*AMPLITUDE, NAME=RAMP\n0., 0., 2., 1.\n*AMPLITUDE, NAME=KINK\n0., 0., 1., 0.25, 2., 1.\n"
+            "*BOUNDARY\n1, 2, 3\n2, 2, 3\n*STEP, INC=100000\n*DYNAMIC, DIRECT\n0.005, 2.\n"
+            f"{card}\n*NODE PRINT, NSET=P\nU\n*END STEP\n")
+
+
+def dragged_mass_reference(bc, m=1.0, c=10.0, t_end=2.0):
+    """The exact x(t_end) of dragged_mass_deck's mass: m x'' = c (v_b - x'), from rest."""
+    tau = m / c
+
+    def const(v, t, v0=0.0):            # (x gained, end velocity) over t at a drive speed v
+        return v * t + (v0 - v) * tau * (1.0 - math.exp(-t / tau)), v + (v0 - v) * math.exp(-t / tau)
+    if bc in ("ramp", "plain"):
+        return const(0.05, t_end)[0]
+    if bc == "kink":
+        x1, v1 = const(0.025, 1.0)
+        return x1 + const(0.075, 1.0, v1)[0]
+    a = 0.05                            # v_b = a t
+    return a * t_end ** 2 / 2.0 - a * tau * t_end + a * tau ** 2 * (1.0 - math.exp(-t_end / tau))
+
+
+def b31_gradient_deck(typ, values=False):
+    """A cantilever along z of two ``typ`` beams (RECT 0.1 x 0.1, E 1000, alpha 1e-3) whose
+    temperatures change to 10 with gradients 100 along local 2 and 40 along local 1 - at the
+    section's corners for ``values`` (TEMPERATURE=VALUES): tip (-0.02, -0.05, 0.01) by beam
+    theory (curvature alpha g, L = 1)."""
+    pts = ", ".join(f"{10.0 + 40.0 * x + 100.0 * y:g}" for x, y in
+                    ((-0.05, -0.05), (0.05, -0.05), (0.05, 0.05), (-0.05, 0.05)))
+    return ("*NODE, NSET=NALL\n1, 0., 0., 0.\n2, 0., 0., 0.5\n3, 0., 0., 1.\n"
+            f"*ELEMENT, TYPE={typ}, ELSET=B\n1, 1, 2\n2, 2, 3\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n"
+            f"*EXPANSION\n1e-3\n*BEAM SECTION, ELSET=B, MATERIAL=M, SECTION=RECT"
+            f"{', TEMPERATURE=VALUES' if values else ''}\n0.1, 0.1\n1., 0., 0.\n*BOUNDARY\n1, 1, 6\n"
+            "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nNALL, 0.\n*STEP\n*STATIC\n*TEMPERATURE\n"
+            f"NALL, {pts if values else '10., 100., 40.'}\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+
+
 def knot_drilling_deck(modal=True, nx=30, ny=10):
     """An S4 plate 1000 x 50, thickness 10, clamped at both ends, loaded across its width at
     one and two thirds of its length in a static step; ``modal``: a *FREQUENCY and a *STEADY
@@ -18419,6 +18483,56 @@ def main():
               f"for its modal steps): the static step as without them ({err:.1e} apart; |u| {moved:.4g}; "
               f"before 0.11 of it)")
     failures += 0 if ok else 1
+
+    # a normal traction of a small-strain step left in force while NLGEOM steps turn the body:
+    # Abaqus applies it as a follower load there, ccx kept the fixed nodal forces it became (the
+    # reaction stayed at (1, 0)); now ccx's NLGEOM pressure from that step on.  Against the same
+    # load as a pressure from the start, at every increment
+    def reactions(path):
+        return [rows[0] for _, rows in dat_history(path, "total force", "LEFT")]
+    for form, how in (("3d", "C3D8 face, *DSLOAD TRVEC"), ("2d", "CPE4 edge, *DLOAD TRVEC2")):
+        runs = [review_run(carried_traction_deck(form, pressure=p), f"carried_traction_{form}" +
+                           ("_ref" if p else ""), reactions) for p in (False, True)]
+        ok = all(runs) and len(runs[0]) == len(runs[1]) == 25
+        if ok:
+            err = max(abs(a - b) for f, g in zip(*runs) for a, b in zip(f, g))
+            turn = math.hypot(runs[0][-1][0], runs[0][-1][1] - 1.0)
+            ok = err <= 1e-9 and turn < 2e-3
+            print(f"{'PASS' if ok else 'FAIL'}  carried_traction ({how} in a small-strain step, the "
+                  f"body turned 90 deg in 6 NLGEOM steps): reaction at 90 deg ({runs[0][-1][0]:+.5f}, "
+                  f"{runs[0][-1][1]:+.5f}) (follower (0, 1); before (1, 0)), {err:.1e} from the "
+                  f"pressure given from the start over all 25 increments")
+        failures += 0 if ok else 1
+
+    # a dashpot whose other end a BC moves in *DYNAMIC: ccx damped as if that end stood still
+    # (the dragged mass did not move); now the missing force on the free end.  Against the
+    # exact motion m x'' = c (v_b - x')
+    for bc in ("ramp", "plain", "kink", "velocity"):
+        u = review_run(dragged_mass_deck(bc), f"dragged_mass_{bc}", dat_displacements)
+        ok = bool(u) and 1 in u
+        if ok:
+            want = dragged_mass_reference(bc)
+            err = abs(u[1][0] / want - 1.0)
+            ok = err < 1e-4
+            print(f"{'PASS' if ok else 'FAIL'}  dragged_mass ({bc}: a unit mass dragged through a "
+                  f"DASHPOTA by its BC-driven other end): x = {u[1][0]:.7g} (exact {want:.7g}, "
+                  f"{err:.1e} off; before 0)")
+        failures += 0 if ok else 1
+
+    # --approximate: B31 / B31R beams whose temperature gradients change run as B32R, which
+    # reads them (the B31 cantilever stayed straight)
+    for typ, values in (("B31", False), ("B31R", True)):
+        u = review_run(b31_gradient_deck(typ, values), f"b31_gradient_{typ}", dat_displacements,
+                       approximate=True)
+        ok = bool(u) and 3 in u
+        if ok:
+            err = max(abs(a - b) for a, b in zip(u[3], (-0.02, -0.05, 0.01)))
+            ok = err < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  b31_gradient ({typ} cantilever, temperature "
+                  f"{'at the section corners' if values else 'gradients'}, --approximate: B32R): tip "
+                  f"({u[3][0]:+.6f}, {u[3][1]:+.6f}, {u[3][2]:+.6f}) (beam theory (-0.02, -0.05, "
+                  f"0.01), {err:.1e} off; before (0, 0, 0.01))")
+        failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)

@@ -472,6 +472,17 @@ physics.
     traction carried into an NLGEOM step, `*CLOAD` on plane-element nodes in modal steps, a
     `*FREQUENCY` range feeding a modal step (ccx superposes every mode it computes), and
     couplings of different DOFs on one reference node.
+* **Exact forms for three of those warnings** (each probed on 2.23):
+  - A traction normal to flat continuum faces that a small-strain step leaves in force into an
+    NLGEOM step stayed fixed nodal forces there; from that step on it is ccx's NLGEOM face
+    pressure, the follower load Abaqus applies, its nodal forces retired at once (both on a
+    constant amplitude).
+  - A dashpot whose other end a BC moves in a small-strain implicit `*DYNAMIC` step: ccx damps
+    as if that end stood still (a mass dragged through a dashpot did not move). The missing
+    force, c (v . n) n, now goes on the free end as a `*CLOAD` on an amplitude of the BC's
+    velocity history (displacements on TABULAR amplitudes or ramped from rest, velocities).
+  - `--approximate`: B31 / B31R beams of a RECT section whose temperature gradients change run
+    as B32R, which reads the gradients (the B31 stays straight).
 
 ## 1.5.0 (October 2026)
 
