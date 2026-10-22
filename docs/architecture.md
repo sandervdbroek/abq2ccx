@@ -214,7 +214,7 @@ regenerate the docs (below).
 * **Mark an Abaqus keyword as supported by ccx** → add it to `CCX_KEYWORDS`. It will
   then pass through unchanged instead of being commented.
 * **Add a translation** → write a `handle_xxx(self, b)` method returning `list[str]`,
-  and register it in the `handlers` dict inside `translate_one()`.
+  and register its name in `Converter._HANDLERS`, which `translate_one()` dispatches on.
 * **Add/declare an element type** → add its node count to `ELEMENT_NNODES`; then either
   add it to `CCX_ELEMENTS` (direct) or to `ELEMENT_TYPE_MAP` (substitution — keep the
   node count identical to the target, the test suite enforces this).

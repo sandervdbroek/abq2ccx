@@ -6,12 +6,13 @@
   anywhere or run it from the repository, or install it as the `abq2ccx` command with
   `pipx install abq2ccx`, or the latest main with
   `pipx install git+https://github.com/sandervdbroek/abq2ccx` (`pip install .` in a clone).
-* CalculiX (`ccx`) only to run the result. `--run` and `validate_with_ccx.py` take `$CCX`
-  (`--run` also `--ccx PATH`), else look on `PATH`, then in FreeCAD (FreeCAD 1.1.4 ships ccx
-  2.23), PrePoMax and bConverged installs on Windows, and in FreeCAD's macOS bundle and
-  Homebrew/MacPorts elsewhere. A conda environment's ccx on Windows needs no `conda activate`:
-  it runs with the folders activation would put on `PATH`. `--run` prints the version it runs
-  and warns if it is not 2.22 or 2.23, the versions the converter targets.
+* CalculiX (`ccx`) 2.23 only to run the result: `conda install -c conda-forge calculix=2.23`
+  installs it on Linux, macOS and Windows. `--run` and `validate_with_ccx.py` take `$CCX`
+  (`--run` also `--ccx PATH`), else look on `PATH`, then in the install folders of programs
+  that ship ccx (PrePoMax and bConverged on Windows) and Homebrew/MacPorts. A conda
+  environment's ccx on Windows needs no `conda activate`: it runs with the folders activation
+  would put on `PATH`. `--run` prints the version it runs and warns if it is not 2.22 or 2.23,
+  the versions the converter targets.
 
 ## Command line
 
@@ -35,7 +36,9 @@ overwrites a deck abq2ccx did not write.
 | `--max-ply-elements N` | write composite continuum shells as one solid per ply only up to `N` solids (default 1000000; `0`: no limit) |
 | `--check` | parse, convert and report; write nothing |
 | `--strict` | exit 3 if the conversion produced warnings or commented-out cards |
-| `--json` | print a machine-readable report on stdout |
+| `--json` | print one JSON object per deck per line on stdout ([batch triage](#batch-triage)) |
+| `--summary FILE.csv` | write one CSV row per deck ([batch triage](#batch-triage)) |
+| `--debug` | on an internal error (exit 4), print the Python traceback |
 | `--run` | run CalculiX on the result and print a digest of its results |
 | `--ccx PATH` | the CalculiX executable for `--run` (`$CCX` works too) |
 | `--timeout SECONDS` | stop ccx after `SECONDS` of wall-clock time (`--run`; default: no limit) |
@@ -43,7 +46,10 @@ overwrites a deck abq2ccx did not write.
 | `--version`, `-h` | version; help |
 
 **Exit codes:** `0` converted · `1` cannot read or write, or `--run` failed · `2` usage
-error · `3` `--strict` findings · `4` internal conversion error. `--run` fails when ccx
+error · `3` `--strict` findings · `4` internal conversion error, a bug: the traceback goes
+into the `.log` (with `--debug` also to stderr); please report it at
+[the issues](https://github.com/sandervdbroek/abq2ccx/issues) with the deck or a cut-down one
+that fails the same way. `--run` fails when ccx
 stops with an `*ERROR`, crashes, writes NaN/Inf results or runs a step that sets up no
 equations — ccx 2.23 ends a diverged solution, and such a step, with "Job finished" all the
 same, so `--run` reads the results and names the first NaN/Inf value, or the step.
@@ -53,6 +59,20 @@ top; `<output>.log`, the same report as text; and a one-line summary plus the re
 stderr. Run the deck with `ccx <output>` (no `.inp` extension). `--run` streams ccx's output
 to stderr as it comes and to `<output>.ccx.log` (its first 100 MB, then its last lines), and
 ends with ccx's own `*ERROR` and `*WARNING` lines.
+
+### Batch triage
+
+`--json` prints one object per deck per line (JSON Lines): `input`, `output`, `nodes`,
+`elements`, `counts`, `entries` (the report), `status`, `reduced_physics`, `instances`, with
+`--run` also `run` and `results`, and `error` for a deck that failed. `status` is `failed`
+(nothing converted), `reduced` (ccx solves another model; `reduced_physics` says what),
+`commented` (cards commented out, the physics kept) or `converted`. `--summary FILE.csv` writes a
+row per deck as it goes: deck, status, nodes, elements, warnings, commented cards, reduced
+physics, ccx's status and the last step's digest line (`--run`), and the error.
+
+```bash
+abq2ccx variants/*.inp --outdir out --run --quiet --summary out/summary.csv
+```
 
 ## `--approximate`
 
@@ -93,7 +113,22 @@ a different model without saying so. With it, these reframings are made, each wi
   `TYPE=SURFACE TO SURFACE` (within 0.1 % of symmetric pairs on a mild closure, 10–13 % off
   on a deep one);
 * `CPE4` / `CAX4` of a plastic material (they lock in plastic flow), and flagged plastic
-  `CPE4R` / `CAX4R` → `CPE8R` / `CAX8R` with midside nodes, their linear neighbours too.
+  `CPE4R` / `CAX4R` → `CPE8R` / `CAX8R` with midside nodes, their linear neighbours too;
+* `S4`, `S4R5`, `S4T` and `S4RT` shells collapsed to a triangle → `S3`, `S3R`, `S3T`, `S3RT`
+  (a collapsed `S4R` is `S3R` without the option: exact);
+* a `*DAMPING` value the materials share but Abaqus does not apply to point masses, springs or
+  contact → the materials' value, which ccx's one model-wide pair applies to them too;
+* explicit mass scaling to a target increment (`TYPE=BELOW MIN`) → ccx's selective mass
+  scaling, `DT` the step's minimum increment;
+* a distributing coupling that turns, in a deck with NLGEOM → linear `*EQUATION`s (exact for
+  small rotations); a kinematic coupling of some rotations about its `ORIENTATION`'s axes
+  under NLGEOM → tied about the initial axes; one of only some translations in a deck with a
+  `*DYNAMIC` step and NLGEOM → linear `*EQUATION`s (7 % off at 0.36 rad);
+* a `*FREQUENCY` step after general steps without NLGEOM that resolve an overclosure as an
+  interference fit → `*STEP, PERTURBATION` (it keeps the contact status, and adds the fit's
+  stress stiffness);
+* a last `*BUCKLE` step loaded by a prescribed displacement after a general step → without
+  PERTURBATION, which buckles it without its preload.
 
 ## `--abaqus-umat`
 

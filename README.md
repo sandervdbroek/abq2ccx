@@ -18,6 +18,7 @@ command (`abq2ccx model.inp`, same options):
 ```bash
 pipx install abq2ccx                                       # from PyPI
 pipx install git+https://github.com/sandervdbroek/abq2ccx  # the latest main
+conda install -c conda-forge calculix=2.23                 # CalculiX 2.23, to run the decks
 ```
 
 ```bash

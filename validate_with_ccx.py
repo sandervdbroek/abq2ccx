@@ -112,7 +112,8 @@ A ratio over a scale from ccx's output (ccx_ratio) fails its check when that sca
     python validate_with_ccx.py
 
 Exits 0 if every available check passes (or ccx is not installed — then it skips with
-a clear message), 1 if a check fails.  Requires CalculiX; install it or FreeCAD.
+a clear message), 1 if a check fails.  Requires CalculiX 2.23:
+``conda install -c conda-forge calculix=2.23``.
 """
 
 import itertools
@@ -7117,7 +7118,7 @@ def main():
     ccx, env = find_ccx()
     if not ccx:
         print("CalculiX (ccx) not found — skipping end-to-end validation.")
-        print("Install CalculiX or FreeCAD to enable it.")
+        print(f"Install CalculiX {A.CCX_VERSIONS[-1]} to enable it: {A.CCX_INSTALL}")
         return 0
     print(f"Using ccx: {ccx}\n")
 

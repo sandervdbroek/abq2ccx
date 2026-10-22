@@ -5272,6 +5272,48 @@ def test_cli_reports_an_error_reading_the_deck_as_a_failed_conversion():
     assert code == 4 and "conversion failed for" in err.getvalue() and "ValueError: unreadable" in err.getvalue()
 
 
+def test_crash_writes_its_traceback_to_the_log_and_with_debug_to_stderr():
+    # exit 4 (a bug in the converter): the traceback goes into the deck's .log, with --debug
+    # also to stderr, and the message points to the issues page; --json prints a failed line
+    import contextlib
+    import json
+    d = tempfile.mkdtemp()
+    deck = os.path.join(d, "a.inp")
+    with open(deck, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(HEX_MODEL)
+
+    def boom(self, blocks):
+        self.report.warn("said before the crash")
+        raise KeyError("lost-set")
+    real, runs = A.Converter.convert, {}
+    A.Converter.convert = boom
+    try:
+        for extra in ([], ["--debug"], ["--check"], ["--json"]):
+            err, out = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                code = A.main([deck] + extra)
+            runs[" ".join(extra)] = (code, err.getvalue(), out.getvalue())
+        log = os.path.join(d, "a_ccx.log")
+        with open(log, encoding="utf-8") as fh:
+            text = fh.read()
+        wrote = os.path.exists(os.path.join(d, "a_ccx.inp"))
+    finally:
+        A.Converter.convert = real
+        shutil.rmtree(d, ignore_errors=True)
+    msg = f"conversion failed for {deck} (KeyError: 'lost-set')"
+    assert not wrote and "Traceback (most recent call last)" in text and "KeyError: 'lost-set'" in text
+    assert A.ISSUES_URL in text and text.endswith("[WARNING] said before the crash\n"), text
+    for key, (code, err, out) in runs.items():
+        assert code == 4 and msg in err and A.ISSUES_URL in err, (key, err)
+        assert ("Traceback (most recent call last)" in err) == (key == "--debug"), (key, err)
+    assert runs[""][1].endswith(f"the traceback is in {log}.\n"), runs[""][1]
+    assert runs["--debug"][1].endswith(f"the traceback is above and in {log}.\n"), runs["--debug"][1]
+    assert runs["--check"][1].endswith("rerun with --debug for the traceback.\n"), runs["--check"][1]
+    doc = json.loads(runs["--json"][2])
+    assert (doc["status"], doc["error"], doc["log"], doc["output"], doc["nodes"], doc["reduced_physics"]) \
+        == ("failed", msg, log, None, None, []), doc
+
+
 def test_unresolved_parameter_tokens_and_orphan_data_lines_warned_once():
     _, _, rep = convert_str("1, 2\n3, 4\n5, 6\n*NODE\n1, <x>, 0., 0.\n2, <x>, <y>, 0.\n"
                             "** <z> in a comment\n")
@@ -17509,6 +17551,78 @@ def test_json_has_the_instances_and_the_run():
     assert doc["results"] == [{"step": 1, "time": 1.0}]
     assert seen == {"digest": False, "instances": doc["instances"], "model": (16, 2), "timeout": None,
                     "holds": {}}
+
+
+def test_batch_triage_json_lines_and_summary_csv():
+    # --json: one object per deck per line, with its status and reduced physics; --summary:
+    # one CSV row per deck, with --run ccx's status and the last step's digest line
+    import contextlib
+    import csv
+    import json
+    d = tempfile.mkdtemp()
+    step = "*Step\n*Static\n{}*End Step\n"
+    decks = {"clean": HEX_MODEL + step.format(""),
+             "monitor": HEX_MODEL + step.format("*Monitor, node=1, dof=1\n"),
+             "imperfect": HEX_MODEL + "*Imperfection, file=x, step=1\n1, 0.1\n" + step.format(""),
+             "text": "no keywords here\n"}
+    paths = []
+    for name, text in decks.items():
+        paths.append(os.path.join(d, name + ".inp"))
+        with open(paths[-1], "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+    paths.append(os.path.join(d, "missing.inp"))
+    summary = os.path.join(d, "new", "summary.csv")             # (its folder made)
+
+    def fake_run(out_path, override, quiet, digest, instances, model, expanded=None, timeout=None,
+                 holds=None):
+        return {"code": 0, "ccx": "ccx", "ccx_version": "2.23", "status": "solved", "log": "x.ccx.log",
+                "results": [{"step": 1, "procedure": "STATIC", "time": 1.0},
+                            {"step": 2, "procedure": "FREQUENCY", "frequencies": [1.5, 2.5]}]}
+    real = A.run_ccx
+    try:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = A.main(paths + ["--outdir", os.path.join(d, "out"), "--json", "--summary", summary])
+        with open(summary, newline="", encoding="utf-8") as fh:
+            rows = list(csv.reader(fh))
+        A.run_ccx = fake_run
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            ran = A.main([paths[0], "--outdir", os.path.join(d, "out"), "--run", "--summary", summary])
+        with open(summary, newline="", encoding="utf-8") as fh:
+            run_rows = list(csv.reader(fh))
+    finally:
+        A.run_ccx = real
+        shutil.rmtree(d, ignore_errors=True)
+    docs = [json.loads(ln) for ln in out.getvalue().splitlines()]
+    assert code == 1 and ran == 0 and [x["input"] for x in docs] == paths
+    assert [x["status"] for x in docs] == ["converted", "commented", "reduced", "failed", "failed"]
+    assert [x["reduced_physics"] for x in docs] == [[], [], ["*IMPERFECTION"], [], []]
+    assert docs[3]["error"].startswith("no Abaqus keywords found") and \
+        docs[4]["error"] == f"cannot read {paths[4]}: no such file" and "error" not in docs[0]
+    assert rows[0] == list(A.SUMMARY_COLUMNS) and len(rows) == 6
+    assert rows[1] == [paths[0], "converted", "8", "1", str(docs[0]["counts"]["warnings"]), "0", "", "",
+                       "", ""], rows[1]
+    assert rows[2][1] == "commented" and rows[2][5] == "1" and rows[3][1:2] + rows[3][6:7] == \
+        ["reduced", "*IMPERFECTION"]
+    assert rows[5] == [paths[4], "failed", "", "", "1", "0", "", "", "", docs[4]["error"]], rows[5]
+    assert run_rows[1][7:] == ["solved", "step 2 *FREQUENCY: 2 frequencies (cycles/time) 1.5, 2.5", ""]
+
+
+def test_run_without_ccx_says_how_to_install_it():
+    import contextlib
+    saved, ccx = A.find_ccx, os.environ.pop("CCX", None)
+    A.find_ccx = lambda override=None: (None, {})
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            run = A.run_ccx(os.path.join(tempfile.gettempdir(), "job.inp"), None, True)
+    finally:
+        A.find_ccx = saved
+        if ccx is not None:
+            os.environ["CCX"] = ccx
+    assert run["code"] == 1 and run["ccx"] is None and "FreeCAD" not in err.getvalue()
+    assert "no CalculiX executable found" in err.getvalue() and \
+        "(conda install -c conda-forge calculix=2.23)" in err.getvalue(), err.getvalue()
 
 
 def test_ccx_version_is_read_and_checked():

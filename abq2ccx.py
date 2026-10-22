@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import ast
 import bisect
+import csv
 import functools
 import gc
 import glob
@@ -57,6 +58,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
@@ -40727,6 +40729,8 @@ def free_rotations(path: str, holds: Dict[int, tuple]) -> List[str]:
 
 
 CCX_VERSIONS = ("2.22", "2.23")      # the ccx versions the converter targets (validated on 2.23)
+CCX_INSTALL = "conda install -c conda-forge calculix=2.23"     # (Linux, macOS and Windows)
+ISSUES_URL = "https://github.com/sandervdbroek/abq2ccx/issues"
 _ccx_versions: Dict[str, Optional[str]] = {}
 _ccx_warned: set = set()
 
@@ -40764,7 +40768,8 @@ def _warn_ccx_version(exe: str, version: Optional[str]) -> None:
     what = f"{exe} is ccx {version}" if version else f"could not tell which ccx version {exe} is"
     sys.stderr.write(f"abq2ccx: warning: {what}; abq2ccx targets ccx {CCX_VERSIONS[0]}-"
                      f"{CCX_VERSIONS[-1]} (validated on {CCX_VERSIONS[-1]}), and other versions may "
-                     f"stop on or solve some converted cards differently.\n")
+                     f"stop on or solve some converted cards differently ({CCX_INSTALL} installs "
+                     f"ccx {CCX_VERSIONS[-1]}).\n")
 
 
 def _ccx_messages_text(r: CcxRun, show: int = 10) -> List[str]:
@@ -40810,9 +40815,9 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
                          f"executable file nor a command on PATH.\n")
         return run
     if not exe:
-        sys.stderr.write("abq2ccx: no CalculiX executable found (searched PATH, FreeCAD, "
-                         "PrePoMax and bConverged installs, Homebrew/MacPorts); install ccx or "
-                         "pass --ccx PATH.\n")
+        sys.stderr.write(f"abq2ccx: no CalculiX executable found (searched PATH and the usual "
+                         f"install folders); install ccx {CCX_VERSIONS[-1]} ({CCX_INSTALL}) or "
+                         f"pass --ccx PATH.\n")
         return run
     env = dict(os.environ)
     env.update(extra_env)
@@ -40890,39 +40895,100 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
     return run
 
 
-def _convert_one(path: str, args) -> int:
+def _output_path(path: str, args) -> str:
+    """Where the deck converted from ``path`` goes: -o, else <input>_ccx.inp (in --outdir)."""
+    if args.output:
+        return args.output
+    out = default_output(path)
+    return os.path.join(args.outdir, os.path.basename(out)) if args.outdir else out
+
+
+def _deck_doc(path: str, args, report: Report, conv: Optional["Converter"] = None,
+              out_path: Optional[str] = None, error: Optional[str] = None) -> dict:
+    """The --json object (one line) and --summary row of a deck: its counts, report and
+    ``status`` — "failed" (``error``: nothing converted), "reduced" (ccx solves another model
+    than the deck's: ``reduced_physics``), "commented" (cards commented out, the physics kept)
+    or "converted"."""
+    status = ("failed" if error else "reduced" if report.reduced else
+              "commented" if report.n_commented else "converted")
+    doc = {
+        "tool": "abq2ccx", "version": __version__, "input": path, "output": out_path,
+        "check_only": bool(args.check),
+        "nodes": len(conv.geom.nodes) if conv and not error else None,
+        "elements": len(conv.geom.elements) if conv and not error else None,
+        "counts": {"warnings": report.n_warnings, "notes": report.n_notes,
+                   "commented_cards": report.n_commented},
+        "entries": [{"level": lvl, "message": m} for lvl, m in report.entries],
+        "ok": not error and report.n_warnings == 0 and report.n_commented == 0,
+        "status": status, "reduced_physics": [] if error else list(report.reduced),
+        "instances": report.instances,
+    }
+    if error:
+        doc["error"] = error
+    return doc
+
+
+def _failed(path: str, args, report: Report, code: int, msg: str) -> Tuple[int, dict]:
+    sys.stderr.write(f"abq2ccx: {msg}\n")
+    return code, _deck_doc(path, args, report, error=msg)
+
+
+def _crashed(path: str, args, report: Report, exc: Exception) -> Tuple[int, dict]:
+    """Exit 4: the converter raised ``exc`` on ``path``, a bug.  Its traceback goes into the
+    deck's .log (not with --check or --no-log) and, with --debug, to stderr."""
+    trace = traceback.format_exc()
+    log = None
+    if not (args.check or args.no_log):
+        log = os.path.splitext(_output_path(path, args))[0] + ".log"
+        try:
+            if args.outdir and not args.output:
+                os.makedirs(args.outdir, exist_ok=True)
+            with open(log, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(f"abq2ccx {__version__} (Python {sys.version.split()[0]}) failed converting "
+                         f"{path}; no deck was written. "
+                         f"Please report it at {ISSUES_URL} with this traceback and the deck (or "
+                         f"a cut-down one that fails the same way).\n\n{trace}\nThe report up to "
+                         f"the failure:\n{report.text()}")
+        except OSError:
+            log = None
+    if args.debug:
+        sys.stderr.write(trace)
+    where = ("the traceback is above" + (f" and in {log}" if log else "") if args.debug else
+             f"the traceback is in {log}" if log else "rerun with --debug for the traceback")
+    msg = f"conversion failed for {path} ({type(exc).__name__}: {exc})"
+    sys.stderr.write(f"abq2ccx: {msg}. This is a bug in abq2ccx: please report it at {ISSUES_URL} "
+                     f"with the deck (or a cut-down one that fails the same way); {where}.\n")
+    doc = _deck_doc(path, args, report, error=msg)
+    doc["log"] = log
+    return 4, doc
+
+
+def _convert_one(path: str, args) -> Tuple[int, dict]:
+    """Convert (and with --run solve) one deck: its exit code and _deck_doc."""
     report = Report()
     try:
         blocks = read_blocks(path, report)
         if blocks:
             conv = Converter(report, args)
             body = conv.convert(blocks)
-    except Exception as exc:                # surface a clean message, not a bare traceback
-        sys.stderr.write(f"abq2ccx: conversion failed for {path} ({type(exc).__name__}: {exc}).\n"
-                         f"Please report this deck. Run with PYTHONFAULTHANDLER for a traceback.\n")
-        return 4
+    except Exception as exc:                # a clean message, the traceback in the .log
+        return _crashed(path, args, report, exc)
     if not blocks:
         if not os.path.exists(path):
-            sys.stderr.write(f"abq2ccx: cannot read {path}: no such file\n")
-        else:
-            sys.stderr.write(f"abq2ccx: no Abaqus keywords found in {path} "
-                             f"(is it an Abaqus .inp deck?)\n")
-            msg = report.text().strip()
-            if msg and not msg.startswith("No conversion issues"):
-                sys.stderr.write(msg + "\n")
-        return 1
+            return _failed(path, args, report, 1, f"cannot read {path}: no such file")
+        msg = report.text().strip()
+        code, doc = _failed(path, args, report, 1, f"no Abaqus keywords found in {path} (is it an "
+                                                   f"Abaqus .inp deck?)")
+        if msg and not msg.startswith("No conversion issues"):
+            sys.stderr.write(msg + "\n")
+        return code, doc
 
-    if args.output:
-        out_path = args.output
-    else:
-        out_path = default_output(path)
-        if args.outdir:
-            try:
-                os.makedirs(args.outdir, exist_ok=True)
-            except OSError as exc:
-                sys.stderr.write(f"abq2ccx: cannot create --outdir {args.outdir}: {exc}\n")
-                return 1
-            out_path = os.path.join(args.outdir, os.path.basename(out_path))
+    out_path = _output_path(path, args)
+    if args.outdir and not args.output:
+        try:
+            os.makedirs(args.outdir, exist_ok=True)
+        except OSError as exc:
+            return _failed(path, args, report, 1, f"cannot create --outdir {args.outdir}: {exc}")
     text = "\n".join(report.header_comment_lines() + body) + "\n"
 
     wrote = False
@@ -40932,8 +40998,7 @@ def _convert_one(path: str, args) -> int:
                 fh.write(text)
             wrote = True
         except OSError as exc:
-            sys.stderr.write(f"abq2ccx: cannot write {out_path}: {exc}\n")
-            return 1
+            return _failed(path, args, report, 1, f"cannot write {out_path}: {exc}")
         if not args.no_log:
             log_path = os.path.splitext(out_path)[0] + ".log"
             try:
@@ -40953,26 +41018,31 @@ def _convert_one(path: str, args) -> int:
     run = run_ccx(out_path, args.ccx, args.quiet, not args.json_out, report.instances,
                   conv.model_labels, expanded=conv._qmem_copies, timeout=args.timeout,
                   holds=conv.rotation_holds) if args.run and wrote and not strict else None
-    if args.json_out:
-        doc = {
-            "tool": "abq2ccx", "version": __version__, "input": path,
-            "output": out_path if wrote else None, "check_only": bool(args.check),
-            "nodes": len(conv.geom.nodes), "elements": len(conv.geom.elements),
-            "counts": {"warnings": report.n_warnings, "notes": report.n_notes,
-                       "commented_cards": report.n_commented},
-            "entries": [{"level": lvl, "message": m} for lvl, m in report.entries],
-            "ok": report.n_warnings == 0 and report.n_commented == 0,
-            "instances": report.instances,
-        }
-        if run is not None:
-            doc["run"] = {k: run.get(k) for k in ("ccx", "ccx_version", "status", "log")}
-            if run.get("free_rotations"):
-                doc["run"]["free_rotations"] = run["free_rotations"]
-            doc["results"] = run["results"]
-        print(json.dumps(doc))
+    doc = _deck_doc(path, args, report, conv, out_path if wrote else None)
+    if run is not None:
+        doc["run"] = {k: run.get(k) for k in ("ccx", "ccx_version", "status", "log")}
+        if run.get("free_rotations"):
+            doc["run"]["free_rotations"] = run["free_rotations"]
+        doc["results"] = run["results"]
     if strict:
-        return 3
-    return run["code"] if run else 0
+        return 3, doc
+    return (run["code"] if run else 0), doc
+
+
+SUMMARY_COLUMNS = ("deck", "status", "nodes", "elements", "warnings", "commented_cards",
+                   "reduced_physics", "ccx_status", "digest", "error")
+
+
+def _summary_row(doc: dict) -> list:
+    """A deck's --summary row (SUMMARY_COLUMNS) from its _deck_doc: ``digest`` is the
+    results digest's line of the last step a solved --run reports."""
+    results = doc.get("results") or []
+    lines = format_results_digest(results[-1:])
+    return [doc["input"], doc["status"], doc["nodes"], doc["elements"], doc["counts"]["warnings"],
+            doc["counts"]["commented_cards"], "; ".join(doc["reduced_physics"]),
+            (doc.get("run") or {}).get("status"),
+            next((ln.strip() for ln in lines if ln.lstrip().startswith("step ")), None),
+            doc.get("error")]
 
 
 def _tolerant_stdio() -> None:
@@ -41007,8 +41077,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         prog="abq2ccx",
         description="Convert Abaqus .inp file(s) to CalculiX (ccx) .inp files.",
-        epilog="Exit codes: 0 converted; 1 cannot read/write; 2 usage error; "
-               "3 --strict findings; 4 internal conversion error. "
+        epilog="Exit codes: 0 converted; 1 cannot read/write, or --run failed; 2 usage error; "
+               "3 --strict findings; 4 internal conversion error (a bug: please report it at "
+               f"{ISSUES_URL}). "
                "The output is a starting point: always review the [WARNING]/[NOTE] lines.")
     ap.add_argument("input", nargs="+",
                     help="Abaqus input deck(s) (.inp); glob patterns allowed. With two, "
@@ -41022,11 +41093,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--no-log", action="store_true", help="do not write a .log report file")
     ap.add_argument("--quiet", action="store_true", help="suppress the report on stderr")
     ap.add_argument("--approximate", action="store_true",
-                    help="opt-in: reframe constructs ccx cannot run as approximately equivalent "
-                         "ones it can (Riks->static, nu>=0.5 clamped, I-beam in space->U1 or RECT, "
-                         "NLGEOM follower tractions->fixed nodal forces, surface elements with "
-                         "rebar or mass->left out, S4R->S4 / S8R, CPS4R / CPE4R / CAX4R / M3D4R / "
-                         "B31R->their fully integrated twins), each with a loud [APPROX] warning")
+                    help="opt-in: reframe what ccx cannot run exactly as a close equivalent it "
+                         "can, e.g. a Riks step as plain static, nu >= 0.5 as 0.475, S4R as S4 or "
+                         "S8R, NLGEOM follower tractions as fixed nodal forces, a curved analytical "
+                         "rigid surface as flat facets; each flagged [APPROX] and named in the "
+                         "'Reduced physics' warning. The user guide's '--approximate' section "
+                         "lists them all")
     ap.add_argument("--abaqus-umat", action="store_true",
                     help="opt-in: write *USER MATERIAL materials for ccx's Abaqus-UMAT interface "
                          "(ABAQUS<name>, ABAQUSNL<name> under NLGEOM), for a ccx rebuilt with the "
@@ -41039,7 +41111,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--strict", action="store_true",
                     help="exit 3 if the conversion produced warnings or commented-out cards")
     ap.add_argument("--json", dest="json_out", action="store_true",
-                    help="print a machine-readable JSON report to stdout")
+                    help="print a machine-readable report to stdout: one JSON object per deck per "
+                         "line (JSON Lines), with its status (converted / reduced / commented / "
+                         "failed) and reduced_physics")
+    ap.add_argument("--summary", metavar="FILE.csv",
+                    help="write one CSV row per deck: deck, status, nodes, elements, warnings, "
+                         "commented cards, reduced physics, and with --run ccx's status and the "
+                         "last step's results digest")
+    ap.add_argument("--debug", action="store_true",
+                    help="on an internal conversion error (exit 4), print the Python traceback "
+                         "(it also goes into the .log)")
     ap.add_argument("--run", action="store_true",
                     help="run CalculiX on the converted output (auto-detected; see --ccx)")
     ap.add_argument("--ccx", help="CalculiX executable to use with --run ($CCX also honoured)")
@@ -41072,7 +41153,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.timeout is not None and not (args.run and args.timeout > 0):
         ap.error("--timeout needs --run and a number of seconds above 0")
 
-    codes = [_convert_one(p, args) for p in inputs]
+    summary = None
+    if args.summary:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(args.summary)), exist_ok=True)
+            summary = open(args.summary, "w", encoding="utf-8", newline="")
+        except OSError as exc:
+            sys.stderr.write(f"abq2ccx: cannot write --summary {args.summary}: {exc}\n")
+            return 1
+    codes = []
+    rows = csv.writer(summary) if summary else None
+    try:
+        if rows:
+            rows.writerow(SUMMARY_COLUMNS)
+        for p in inputs:
+            code, doc = _convert_one(p, args)
+            codes.append(code)
+            if args.json_out:
+                print(json.dumps(doc), flush=True)
+            if rows:
+                rows.writerow(_summary_row(doc))
+                summary.flush()                     # (a long batch: the rows so far)
+    finally:
+        if summary:
+            summary.close()
     if len(inputs) > 1 and not args.quiet and not args.json_out:
         ok = sum(1 for c in codes if c == 0)
         sys.stderr.write(f"abq2ccx: converted {ok}/{len(inputs)} deck(s)"

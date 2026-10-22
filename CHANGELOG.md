@@ -6,6 +6,15 @@ physics.
 
 ## Unreleased
 
+* **Batch triage, crash reports, ccx install hint** — `--json` prints one object per deck per
+  line (JSON Lines), now with the deck's `status` (`converted`, `reduced`, `commented` or
+  `failed`) and `reduced_physics`, and a line with `error` for a deck that failed (none was
+  printed). `--summary FILE.csv` writes a row per deck: status, counts, reduced physics, and
+  with `--run` ccx's status and the last step's digest line. An internal error (exit 4) writes
+  its traceback into the `.log` (with `--debug` also to stderr) and points to the issues page;
+  it suggested PYTHONFAULTHANDLER, which could not show it. `--run` without a ccx, and its
+  version warning, say how to get ccx 2.23: `conda install -c conda-forge calculix=2.23`. The
+  `--approximate` help and the user guide now name the same reframings, and the guide all of them.
 * **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the
