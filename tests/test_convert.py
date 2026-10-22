@@ -5520,6 +5520,64 @@ def test_include_inserts_the_file_text():
     assert set(conv.geom.nodes) == {1, 2} and "*INCLUDE cycle detected" in rep.text()
 
 
+def test_report_says_where_each_card_is():
+    # each card keeps the file and line of its keyword line through *INCLUDE (a file in a
+    # sub-folder), *PARAMETER (its block left out) and continued keyword lines; the report,
+    # the deck's header and --json say where the card a warning or note is about is
+    import contextlib
+    import json
+    files = {
+        "main.inp": "*HEADING\nlocations\n*PARAMETER\nlen = 2.0\n*INCLUDE, INPUT=model/mesh.inp\n"
+                    "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n"
+                    "*FOOBAR\n*STEP\n*STATIC\n*BOUNDARY\n1, 1, 3\n*END STEP\n",
+        "model/mesh.inp": "** a mesh\n" + HEX.replace("*NODE\n", "*NODE,\n  NSET=ALL\n").replace(
+            "2, 1.,0.,0.", "2, <len>,0.,0.") + "*NGEN, NSET=LINE\n1, 2, 0\n*INCLUDE\n"}
+    with tempfile.TemporaryDirectory() as d:
+        for name, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(d, name)), exist_ok=True)
+            with open(os.path.join(d, name), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+        deck = os.path.join(d, "main.inp")
+        rep = A.Report()
+        blocks = A.read_blocks(deck, rep)
+        assert [(b.keyword, b.where) for b in blocks] == [
+            ("HEADING", "main.inp:1"), ("NODE", "model/mesh.inp:2"), ("ELEMENT", "model/mesh.inp:12"),
+            ("NGEN", "model/mesh.inp:14"), ("MATERIAL", "main.inp:6"), ("ELASTIC", "main.inp:7"),
+            ("SOLID SECTION", "main.inp:9"), ("FOOBAR", "main.inp:10"), ("STEP", "main.inp:11"),
+            ("STATIC", "main.inp:12"), ("BOUNDARY", "main.inp:13"), ("END STEP", "main.inp:15")]
+        A.Converter(rep, Opt()).convert(blocks)
+        text = rep.text()
+        assert "[WARNING] model/mesh.inp:16: *INCLUDE without INPUT= ignored.\n" in text
+        assert "[NOTE] model/mesh.inp:14: *NGEN increment 0 read as the default 1.\n" in text
+        assert "[WARNING] main.inp:10: *FOOBAR has no CalculiX equivalent" in text
+        assert "[NOTE] *PARAMETER: resolved 1 parameter(s)" in text     # (no one card)
+        assert "** [WARNING] main.inp:10: *FOOBAR has no CalculiX equivalent" in \
+            "\n".join(rep.header_comment_lines())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            A.main([deck, "--check", "--json"])
+        entries = json.loads(out.getvalue())["entries"]
+        foo = next(e for e in entries if e["message"].startswith("*FOOBAR"))
+        par = next(e for e in entries if e["message"].startswith("*PARAMETER"))
+        assert foo["location"] == "main.inp:10" and par["location"] is None
+    # a card's place does not make it another card
+    assert A.Block("NODE", {}, [], "a.inp", 3) == A.Block("NODE", {})
+
+
+def test_cards_made_from_a_card_report_its_place():
+    # an instance's copy of its part's cards (and its mesh) is at the part's card
+    part = ("*PART, NAME=P\n" + HEX + "*SOLID SECTION, ELSET=EALL, MATERIAL=M, CONTROLS=C\n"
+            "*END PART\n*ASSEMBLY, NAME=A\n*INSTANCE, NAME=I1, PART=P\n*END INSTANCE\n"
+            "*INSTANCE, NAME=I2, PART=P\n2., 0., 0.\n*END INSTANCE\n*END ASSEMBLY\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n")
+    _, conv, rep = _convert_files({"main.inp": part})
+    k = next(i for i, (_, m) in enumerate(rep.entries) if m.startswith("*SOLID SECTION parameter CONTROLS"))
+    assert rep.where[k] == "main.inp:13" and len(conv.geom.elements) == 2
+    # the flat deck's *ELEMENT cards are at the part's
+    blocks = A.flatten_assembly(_blocks_of(part), A.Report(), Opt())
+    assert [b.line for b in blocks if b.keyword in ("NODE", "ELEMENT")] == [2, 11, 2, 11]
+
+
 def test_include_with_file_instead_of_input_is_reported():
     # *INCLUDE takes INPUT=; Abaqus stops on FILE=, and nothing is read
     _, conv, rep = convert_str(Q4 + "*INCLUDE, FILE=sections.inp\n")
@@ -6092,7 +6150,8 @@ def test_pretension_node_and_element_sets_resolved():
     for name, why in (("TWO", "a set of 2 nodes"), ("NOSUCH", "no node set")):
         body, conv, rep = convert_str(bar + f"*Pre-tension Section, surface=CUT, node={name}\n")
         assert f"*PRE-TENSION SECTION, SURFACE=CUT, NODE={name}" in body.splitlines()
-        assert f"[WARNING] *PRE-TENSION SECTION NODE={name} names {why}" in rep.text()
+        assert any(lv == "WARNING" and m.startswith(f"*PRE-TENSION SECTION NODE={name} names {why}")
+                   for lv, m in rep.entries)
         assert not conv.reduced_physics
     # a part's card naming its set: each instance's copy names that instance's node
     body, _, _ = convert_str(PART_BOLT.format(part="*Nset, nset=PT\n99\n*Pre-tension Section, surface=CUT, "
@@ -6113,7 +6172,7 @@ def test_pretension_node_and_element_sets_resolved():
         # (the beam cuts become equations: test_pretension_truss_and_beam_cuts_as_equations)
         assert "-> the cut element 1 ends at node 199, the copy of node 2: u(199) = u(2) + n u(99, 1)" in body
         assert "-> the cut element 3 ends at node 200, the copy of node 101: u(200) = u(101) + n u(198, 1)" in body
-        assert "[WARNING] *PRE-TENSION" not in rep.text()
+        assert not any(lv == "WARNING" and m.startswith("*PRE-TENSION") for lv, m in rep.entries)
 
 
 PT_BOLT = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n99, 1., 0., 0.\n"
@@ -21303,13 +21362,14 @@ def test_part_without_instance_reported():
     # no assembly at all (an *INCLUDE fragment): Abaqus needs one; nothing is converted
     body, conv, rep = convert_str(part)
     assert "*ELEMENT" not in body and conv.reduced_physics == []
-    assert "[WARNING] *PART P without any *INSTANCE" in rep.text()
+    assert any(lv == "WARNING" and m.startswith("*PART P without any *INSTANCE") for lv, m in rep.entries)
     # a second part no instance names: a note
     deck = part.replace("*End Part\n", "*End Part\n*Part, name=Q\n*Node\n1, 0., 0., 0.\n*End Part\n"
                         "*Assembly, name=A\n*Instance, name=I, part=P\n*End Instance\n*End Assembly\n")
     body, _, rep = convert_str(deck)
     assert "*ELEMENT, TYPE=T3D2" in body
-    assert "[NOTE] *PART Q: no *INSTANCE names it" in rep.text() and "*PART P" not in rep.text()
+    assert any(lv == "NOTE" and m.startswith("*PART Q: no *INSTANCE names it") for lv, m in rep.entries)
+    assert "*PART P" not in rep.text()
 
 
 def test_continuum_shell_section_parameters_dropped_noted():
@@ -22939,7 +22999,8 @@ def test_friction_anisotropic_behavior_reduced():
     _, conv, rep = convert_str(HEX_MODEL + "*Surface Interaction, name=SI\n*Friction, anisotropic\n"
                                "0.1, 0.2\n")
     assert any("*FRICTION, ANISOTROPIC BEHAVIOR" == r for r in conv.reduced_physics)
-    assert "[WARNING] *FRICTION parameter ANISOTROPIC BEHAVIOR dropped" in rep.text()
+    assert any(lv == "WARNING" and m.startswith("*FRICTION parameter ANISOTROPIC BEHAVIOR dropped")
+               for lv, m in rep.entries)
 
 
 PLANE_RB = ("*Node\n1, 0, 0\n2, 1, 0\n3, 1, 1\n4, 0, 1\n5, 2, 0\n6, 2, 1\n100, 2.5, 0.5\n"

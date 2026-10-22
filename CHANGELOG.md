@@ -13,6 +13,11 @@ physics.
   pore pressure elements becomes a `*STATIC` step (it was `*NO ANALYSIS`, where ccx stopped):
   a soil column under gravity with its geostatic stresses stays put. With pore pressure, `UTOL`
   or a nonlinear step the step stays as it was, and the warning now says why.
+* **Warnings and notes say where the card is** — a report entry about one card starts with its
+  file and line (`mesh/part.inp:120: ...`; an `*INCLUDE` file relative to the deck's folder), in
+  the report, the converted deck's header and `--json` (`location` in each of `entries`, null
+  for an entry about no one card). Lines count through `*INCLUDE` and `*PARAMETER`, and a card
+  the converter makes from another (an instance's copy of its part's cards) points to that card.
 * **Batch triage, crash reports, ccx install hint** — `--json` prints one object per deck per
   line (JSON Lines), now with the deck's `status` (`converted`, `reduced`, `commented` or
   `failed`) and `reduced_physics`, and a line with `error` for a deck that failed (none was

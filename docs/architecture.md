@@ -99,7 +99,9 @@ Converter._audit_loads()     load audit: step_load_audit() on the Abaqus blocks 
 and flattening write into it; `emit_geometry()` reads from it.
 
 **`Report`** — collects `[NOTE]`/`[WARNING]` entries (`once=True` de-duplicates),
-and renders the header comment block / log.
+each at its card's `file:line` (`at=`, else `Report.card`: the card `translate_one` or
+`build_geometry` is at; `Block.file` / `Block.line` come from `read_blocks`, `Block.placed` gives
+a made card its source's), and renders the header comment block / log.
 
 **`Converter`** — keeps `convert()`, the dispatch, the reporting helpers and the deck facts,
 and inherits one class per concern: `_Mesh`, `_Rigid`, `_Materials`, `_Axes`, `_Dofs`,

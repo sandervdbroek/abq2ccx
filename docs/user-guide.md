@@ -63,7 +63,8 @@ ends with ccx's own `*ERROR` and `*WARNING` lines.
 ### Batch triage
 
 `--json` prints one object per deck per line (JSON Lines): `input`, `output`, `nodes`,
-`elements`, `counts`, `entries` (the report), `status`, `reduced_physics`, `instances`, with
+`elements`, `counts`, `entries` (the report: `level`, `message` and `location`, the card's
+`file:line` or null), `status`, `reduced_physics`, `instances`, with
 `--run` also `run` and `results`, and `error` for a deck that failed. `status` is `failed`
 (nothing converted), `reduced` (ccx solves another model; `reduced_physics` says what),
 `commented` (cards commented out, the physics kept) or `converted`. `--summary FILE.csv` writes a
@@ -241,7 +242,10 @@ must be ported to a UMAT, and the option leaves it alone.
   exact equivalent, an unresolved overconstraint, a card commented out, a load that could not
   be converted.
 
-Messages are de-duplicated. A clean conversion says *"No conversion issues were flagged."*
+An entry about one card starts with where the card is: `[WARNING] mesh/part.inp:120: ...`
+(an `*INCLUDE` file relative to the deck's folder; lines count as the file has them). A card
+the converter makes from another, such as an instance's copy of its part's cards, points to
+that card. Messages are de-duplicated. A clean conversion says *"No conversion issues were flagged."*
 
 | Message | Meaning and action |
 | --- | --- |
@@ -300,8 +304,8 @@ result = abq2ccx.convert_file("model.inp", solid_dof=False, approximate=False, a
 
 result.text           # the converted deck, report header included
 result.body           # the deck lines without the header
-result.report         # .summary(), .entries: [(level, message)], .n_warnings, .n_notes,
-                      # .instances: an assembly's instance map
+result.report         # .summary(), .entries: [(level, message)], .where: {entry index:
+                      # "file:line"}, .n_warnings, .n_notes, .instances: an assembly's instance map
 result.geometry       # the flattened, expanded model: .nodes, .elements, .nsets, .elsets
 result.ok             # False if nothing could be converted
 ```

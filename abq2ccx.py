@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import ast
 import bisect
+import contextlib
 import csv
 import functools
 import gc
@@ -812,6 +813,10 @@ class Report:
         # data lines (stripped) holding a *PARAMETER substituted as its expression text, which
         # did not evaluate (apply_parameters; Converter._undefined_parameter_data)
         self.unevaluated: set = set()
+        # the card being converted (Converter.translate_one): an entry is at its place in the
+        # deck unless warn / note give another; entry index -> "file:line"
+        self.card: Optional["Block"] = None
+        self.where: Dict[int, str] = {}
 
     def reduce(self, what: str) -> None:
         """Record reduced physics: ``what`` part of the Abaqus model the ccx model drops or
@@ -819,24 +824,50 @@ class Report:
         if what not in self.reduced:
             self.reduced.append(what)
 
-    def warn(self, msg: str, once: bool = False) -> None:
+    def warn(self, msg: str, once: bool = False, at: Union["Block", str, None] = None) -> None:
+        """Report warning ``msg`` (``once``: unless reported already) about card ``at`` (a
+        Block or "file:line"; "" for none), by default the card being converted."""
         if once:
             if msg in self._seen:
                 return
             self._seen.add(msg)
         self.entries.append(("WARNING", msg))
+        self._locate(at)
         if msg.startswith("[APPROX]"):
             # an --approximate reframing makes ccx solve another model than the deck's
             text = msg[len("[APPROX]"):].strip()
             cuts = [i for i in (text.find(": "), text.find("; "), text.find(" (")) if i >= 25]
             self.reduce("--approximate: " + text[:min(cuts + [len(text), 100])].rstrip(" ,;:."))
 
-    def note(self, msg: str, once: bool = False) -> None:
+    def note(self, msg: str, once: bool = False, at: Union["Block", str, None] = None) -> None:
+        """Report note ``msg``, as warn."""
         if once:
             if msg in self._seen:
                 return
             self._seen.add(msg)
         self.entries.append(("NOTE", msg))
+        self._locate(at)
+
+    def _locate(self, at: Union["Block", str, None]) -> None:
+        where = at if isinstance(at, str) else at.where if at is not None else ""
+        if not where and not isinstance(at, str) and self.card is not None:
+            where = self.card.where             # (a card the converter made: its source's)
+        if where:
+            self.where[len(self.entries) - 1] = where
+
+    @contextlib.contextmanager
+    def about(self, card: Optional["Block"]) -> Iterator[None]:
+        """What is reported meanwhile is at ``card``'s place (Report.card)."""
+        outer, self.card = self.card, card
+        try:
+            yield
+        finally:
+            self.card = outer
+
+    def shown(self, i: int) -> str:
+        """Entry ``i``'s message as the report shows it: after its "file:line: ", if any."""
+        where = self.where.get(i)
+        return f"{where}: {self.entries[i][1]}" if where else self.entries[i][1]
 
     @property
     def n_warnings(self) -> int:
@@ -857,8 +888,8 @@ class Report:
                  "** --------------------------------------------------------------------"]
         if not self.entries:
             lines.append("** No conversion issues were flagged.")
-        for level, msg in self.entries:
-            for i, chunk in enumerate(_wrap(msg, 66)):
+        for k, (level, _msg) in enumerate(self.entries):
+            for i, chunk in enumerate(_wrap(self.shown(k), 66)):
                 prefix = f"** [{level}] " if i == 0 else "**          "
                 lines.append(prefix + chunk)
         for line in self.instance_lines():
@@ -869,7 +900,7 @@ class Report:
         return lines
 
     def text(self) -> str:
-        lines = [f"[{level}] {msg}" for level, msg in self.entries] or \
+        lines = [f"[{level}] {self.shown(k)}" for k, (level, _) in enumerate(self.entries)] or \
             ["No conversion issues were flagged."]
         return "\n".join(lines + self.instance_lines()) + "\n"
 
@@ -919,6 +950,20 @@ class Block:
     keyword: str                                   # upper-case, no leading '*', spaces kept
     params: "OrderedDict[str, Optional[str]]"      # PARAM (upper) -> value (orig case) or None
     data: List[str] = field(default_factory=list)  # raw data lines (comments/newlines stripped)
+    # where the keyword line is (read_blocks): the file (interned, relative to the deck's
+    # directory) and its line; "" and 0 for a card the converter made (but see placed)
+    file: str = field(default="", compare=False, repr=False)
+    line: int = field(default=0, compare=False, repr=False)
+
+    @property
+    def where(self) -> str:
+        """"file:line" of the card, "" when it has no place in the deck."""
+        return f"{self.file}:{self.line}" if self.line else ""
+
+    def placed(self, src: "Block") -> "Block":
+        """This card at ``src``'s place in the deck: a card made from ``src``."""
+        self.file, self.line = src.file, src.line
+        return self
 
     def param(self, key: str, default: Optional[str] = None) -> Optional[str]:
         return self.params.get(key.upper(), default)
@@ -1636,7 +1681,8 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
     ``params`` collects the values (an INPUT= data file is substituted with them, its
     lines the data of keyword ``card``).  A ``<name>`` no parameter defines is warned
     about, naming the ccx cards whose model data hold one (reduced physics:
-    Converter._undefined_parameter_data)."""
+    Converter._undefined_parameter_data).  The dropped lines are "**" lines, so that every
+    line keeps its number (Block.line)."""
     raw_defs: List[Tuple[str, str]] = []
     kept: List[str] = []
     n, done = len(lines), 0         # lines before this one are kept (or read as definitions)
@@ -1659,6 +1705,7 @@ def apply_parameters(lines: List[str], report: Report, params: Dict[str, object]
                 name, expr = s.split("=", 1)
                 raw_defs.append((name.strip(), expr.strip()))
             j += 1
+        kept.extend(["**"] * (j - k))
         done = j
     kept.extend(lines[done:])
 
@@ -1777,7 +1824,7 @@ def _substitute_params(line: str, params: Dict[str, object]) -> str:
     return _PARAM_REF_RE.sub(lambda m: str(params.get(m.group(1), m.group(0))), line)
 
 
-def join_keyword_continuations(lines: List[str]) -> List[str]:
+def join_keyword_continuations(lines: List[str], pad: bool = False) -> List[str]:
     """Splice Abaqus keyword-parameter continuation lines back onto their keyword.
 
     A keyword card whose parameter list is long may end the ``*KEYWORD`` line with a
@@ -1796,7 +1843,9 @@ def join_keyword_continuations(lines: List[str]) -> List[str]:
     This is what distinguishes a continuation from a genuine data record — so a stray
     trailing comma on a ``*NODE,`` / ``*ELEMENT, TYPE=C3D8,`` header does NOT swallow
     the first data line (which would silently drop a node/element).  Comment / blank
-    lines between the keyword and its continuation are skipped (Abaqus allows them)."""
+    lines between the keyword and its continuation are skipped (Abaqus allows them).
+    ``pad``: each line merged (or skipped) is a "**" line, so that every line keeps its
+    number."""
     bare_flags = {"GENERATE", "GEN", "SHIFT", "UNSORTED", "REFLECT", "INTERNAL", "ROUGH",
                   "NLGEOM", "PERTURBATION", "PERT", "EXPLICIT", "DIRECT", "RIKS",
                   "STEADY STATE", "SMALL SLIDING", "TIED", "COMPOSITE", "SYMMETRIC",
@@ -1840,12 +1889,26 @@ def join_keyword_continuations(lines: List[str]) -> List[str]:
             acc = acc + " " + nxt
             i = j
         out.append(acc)
+        if pad:
+            out.extend(["**"] * (i - k))
         done = i + 1
     out.extend(lines[done:])
     return out
 
 
 _MAX_INCLUDE_READS = 10000   # files read per deck: bounds a file included many times over
+
+
+def _shown_path(path: str, job_dir: str) -> str:
+    """How the report names deck file ``path`` (Block.file): relative to the job directory
+    when in it, with "/" on every OS; interned, as every card of the file keeps it."""
+    try:
+        rel = os.path.relpath(path, job_dir or os.curdir)
+    except ValueError:                          # on another drive (Windows)
+        rel = path
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        rel = path
+    return sys.intern(rel.replace(os.sep, "/"))
 
 
 def _input_path(name: str, job_dir: str, here: str) -> str:
@@ -1867,35 +1930,39 @@ def _input_path(name: str, job_dir: str, here: str) -> str:
 def read_blocks(path: str, report: Report) -> List[Block]:
     """Read a file into Blocks.  Abaqus inserts an ``*INCLUDE`` file's text at the
     *INCLUDE line (a file of data lines continues the card above it), so the files are
-    expanded first; ``*PARAMETER`` is then resolved over the whole text, and it is parsed."""
+    expanded first; ``*PARAMETER`` is then resolved over the whole text, and it is parsed.
+    Each Block is at its keyword line's place (Block.file, Block.line)."""
     job_dir = os.path.dirname(path)
     raw_lines: List[str] = []
+    places: Dict[int, Tuple[str, int]] = {}     # index of a keyword line -> its file and line
     seen: Dict[str, "OrderedDict[str, object]"] = {}    # abbreviations (parse_keyword_line)
     stack: List[str] = []   # the files being read: only a file that includes itself is a
     reads = [0]             # cycle, not one included twice (two parts sharing a mesh file)
 
-    def expand(fpath: str) -> None:
+    def expand(fpath: str, by: str = "") -> None:
+        """Read file ``fpath`` into raw_lines (named by the *INCLUDE line at ``by``)."""
         realpath = os.path.realpath(fpath)
         if realpath in stack:
-            report.warn(f"*INCLUDE cycle detected for {fpath}; skipped.")
+            report.warn(f"*INCLUDE cycle detected for {fpath}; skipped.", at=by)
             return
         reads[0] += 1
         if reads[0] > _MAX_INCLUDE_READS:
             report.warn(f"*INCLUDE: more than {_MAX_INCLUDE_READS} files read; the rest are "
-                        f"skipped.", once=True)
+                        f"skipped.", once=True, at=by)
             report.reduce("an *INCLUDE file could not be read")
             return
         try:
             with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
                 lines = fh.read().splitlines()
         except OSError as exc:
-            report.warn(f"Could not read {fpath}: {exc}")
+            report.warn(f"Could not read {fpath}: {exc}", at=by)
             report.reduce("an *INCLUDE file could not be read")
             return
         here = os.path.dirname(fpath)
+        name = _shown_path(fpath, job_dir)
         stack.append(realpath)
         try:
-            joined = join_keyword_continuations(lines)
+            joined = join_keyword_continuations(lines, pad=True)
             done = 0                    # lines before this one are in raw_lines (or read here)
             # (only a line with a '*' can be a keyword line: the others go a run at a time)
             for at in [at for at, line in enumerate(joined) if "*" in line]:
@@ -1908,20 +1975,21 @@ def read_blocks(path: str, report: Report) -> List[Block]:
                 keyword, params = parse_keyword_line(line, seen)
                 if keyword == "INCLUDE":
                     inc = (params.get("INPUT") or params.get("INP") or "").strip().strip('"')
+                    where = f"{name}:{at + 1}"
                     if not inc and params:
                         given = ", ".join(f"{k}={v}" if v else k for k, v in params.items())
                         report.warn(f"*INCLUDE, {given}: *INCLUDE takes INPUT= (Abaqus stops on "
                                     f"this card too), so no file is read and what it holds is "
-                                    f"missing from the conversion.")
+                                    f"missing from the conversion.", at=where)
                         report.reduce("an *INCLUDE file could not be read")
                     elif not inc:
-                        report.warn("*INCLUDE without INPUT= ignored.")
+                        report.warn("*INCLUDE without INPUT= ignored.", at=where)
                     else:
                         if "<" in inc:          # a file name given by a *PARAMETER above
                             known: Dict[str, object] = {}
                             apply_parameters(raw_lines, Report(), known)
                             inc = _substitute_params(inc, known)
-                        expand(_input_path(inc, job_dir, here))
+                        expand(_input_path(inc, job_dir, here), where)
                     continue
                 src = (params.get("INPUT") or "").strip().strip('"')
                 if src and "<" not in src and _input_path(src, job_dir, here) != os.path.join(
@@ -1939,6 +2007,7 @@ def read_blocks(path: str, report: Report) -> List[Block]:
                     full = full.replace(os.sep, "/")    # the same deck text on every OS
                     toks[k] = f'{toks[k].partition("=")[0]}="{full}"'
                     line = ",".join(toks)
+                places[len(raw_lines)] = (name, at + 1)
                 raw_lines.append(line)
             raw_lines.extend(joined[done:])
         finally:
@@ -1991,7 +2060,8 @@ def read_blocks(path: str, report: Report) -> List[Block]:
         blank = None
         if stripped.startswith("*"):           # keyword line
             keyword, params = parse_keyword_line(raw.rstrip(), seen)
-            current = Block(keyword=keyword, params=params)
+            fname, fline = places.get(at, ("", 0))
+            current = Block(keyword=keyword, params=params, file=fname, line=fline)
             blocks.append(current)
             src = params.get("INPUT")
             if src:
@@ -2006,19 +2076,20 @@ def read_blocks(path: str, report: Report) -> List[Block]:
                 except OSError:
                     report.warn(f"*{keyword}, INPUT={src}: data file not found next to the deck; "
                                 f"the card has no data lines (copy the file alongside and "
-                                f"reconvert).", once=True)
+                                f"reconvert).", once=True, at=current)
                     report.reduce(f"*{keyword}, INPUT={src}: data file missing")
                 else:
                     current.data.extend(x.strip() for x in ext
                                         if x.strip() and not x.strip().startswith("*"))
                     report.note(f"*{keyword}, INPUT={src}: data lines inlined from the file "
-                                f"(ccx has no INPUT= on data cards).", once=True)
+                                f"(ccx has no INPUT= on data cards).", once=True, at=current)
                 del params["INPUT"]
         elif current is None:                   # data line
             orphans.append(stripped)
         else:
             current.data.append(stripped)
     data_lines(raw_lines[done:])
+    places.clear()          # (expand's closure is a cycle, freed only by the cyclic collector)
     if blank is not None and not blank.data:
         blank.data.append("")
     if orphans:
@@ -2045,18 +2116,19 @@ def close_open_steps(blocks: Sequence[Block], report: Report) -> List[Block]:
     end of the deck, with one warning naming them, so that every step walker counts the same
     steps: read_blocks, and Converter.convert for a caller that builds its blocks itself."""
     closed: List[Block] = []
-    open_step, where = False, []
+    open_step, where, first = None, [], None
     for b in list(blocks) + [Block("STEP", OrderedDict())]:
         if b.keyword == "STEP" and open_step:
             closed.append(Block("END STEP", OrderedDict()))
             where.append(len([x for x in closed if x.keyword == "STEP"]))
+            first = first or open_step
         if b.keyword in ("STEP", "END STEP"):
-            open_step = b.keyword == "STEP"
+            open_step = b if b.keyword == "STEP" else None
         closed.append(b)
     if where:
         report.warn(f"*STEP without *END STEP (Abaqus requires one): step(s) "
                     f"{', '.join(map(str, where))} closed before the next *STEP or at the end of "
-                    f"the deck.")
+                    f"the deck.", at=first)
     return closed[:-1]
 
 
@@ -7697,7 +7769,9 @@ class _Mesh:
     # Pass A -- build geometry
     # ======================================================================
     def build_geometry(self, blocks: List[Block]) -> None:
+        outer = self.report.card                # (what it reports is at the card's place)
         for b in blocks:
+            self.report.card = b
             kw = b.keyword
             if kw == "NODE":
                 self._register_nodes(b)
@@ -7733,7 +7807,9 @@ class _Mesh:
                 self._register_surface(b)
         for b in blocks:                        # DEFINITION=NODES: nodes may follow the card
             if b.keyword == "ORIENTATION" and b.uparam("DEFINITION").startswith("NODES"):
+                self.report.card = b
                 self._register_orientation(b)
+        self.report.card = outer
 
     def _types_where(self, test: Callable[[str], bool]) -> set:
         """The element types of the mesh (as it spells them) that pass ``test``."""
@@ -7811,17 +7887,17 @@ class _Mesh:
                     new, problem = None, ""
                 if problem:
                     self.report.warn(f"*SYSTEM with {problem}: Abaqus' axes are undefined; read as "
-                                     f"a translation to its first point.", once=True)
+                                     f"a translation to its first point.", once=True, at=b)
                     self._reduces("*SYSTEM axes undefined (read as a translation)")
                 if new is not None:
                     self.report.note("*SYSTEM: the *NODE coordinates (and *NGEN extra points) after "
                                      "it are given in its frame and were transformed into global "
                                      "coordinates, their normals turned with its axes (Abaqus 'Node "
                                      "definition'; a *SYSTEM without data, or the end of the part "
-                                     "or instance, returns to global coordinates).", once=True)
+                                     "or instance, returns to global coordinates).", once=True, at=b)
                 elif frame is None:
                     self.report.note("Bare *SYSTEM (reset to global coordinates) dropped — no "
-                                     "effect.", once=True)
+                                     "effect.", once=True, at=b)
                 frame = new
                 continue
             if kw in self._SYSTEM_SCOPE:
@@ -7832,7 +7908,8 @@ class _Mesh:
                 b = self._framed_ngen_card(b, frame)
             elif kw in ("NCOPY", "NMAP") and frame is not None:
                 self.report.warn(f"*{kw} after a *SYSTEM card: Abaqus does not say whether its "
-                                 f"coordinates are in the *SYSTEM frame; read as global.", once=True)
+                                 f"coordinates are in the *SYSTEM frame; read as global.", once=True,
+                                 at=b)
                 self._reduces(f"*{kw} coordinates under a *SYSTEM frame")
             out.append(b)
         return out
@@ -7877,7 +7954,7 @@ class _Mesh:
                              "Abaqus reads in the same form (*NODE: their second entry is an "
                              "angle, in a spherical system their third too).", once=True)
         params = OrderedDict((k, v) for k, v in b.params.items() if k != "SYSTEM")
-        return Block(b.keyword, params, data)
+        return Block(b.keyword, params, data).placed(b)
 
     @staticmethod
     def _framed_ngen_card(b: Block, frame: Frame) -> Block:
@@ -7903,7 +7980,7 @@ class _Mesh:
                     g[7:10] = [repr(x) for x in normal]
             data.append(", ".join(g))
         params = OrderedDict((k, v) for k, v in b.params.items() if k != "SYSTEM")
-        return Block(b.keyword, params, data)
+        return Block(b.keyword, params, data).placed(b)
 
     def _register_nodes(self, b: Block) -> None:
         ids = []
@@ -7950,6 +8027,7 @@ class _Mesh:
 
     def _register_elements(self, b: Block) -> None:
         typ = b.uparam("TYPE")
+        self._type_cards.setdefault(typ, b)
         if typ in CONN_TYPES or typ == "JOINTC":
             self._register_connectors(b, typ)
             return
@@ -8121,7 +8199,9 @@ class _Mesh:
                 for eid, conn in items:
                     out.extend(reflow([str(eid)] + [str(c) for c in conn], MAX_ENTRIES_PER_LINE))
                 continue
-            out_typ = ccx_element_type(typ, self.report)
+            outer, self.report.card = self.report.card, self._type_cards.get(typ.upper())
+            out_typ = ccx_element_type(typ, self.report)    # (its notes: at the type's first card)
+            self.report.card = outer
             loss = substitution_loss(typ)
             if loss and typ.upper() not in SLAB_TYPES:    # (_plan_incompatible_slabs says why)
                 self._reduces(loss)
@@ -10209,12 +10289,12 @@ class _Mesh:
                     params = OrderedDict((k, v) for k, v in b.params.items() if k != "TYPE")
                     params["TYPE"] = "SURFACE TO SURFACE"
                     lines = dedup(f"{s}, {s}" for s in (name(x.split(",")[0]) for x in own))
-                    sb = Block(b.keyword, params, lines)
+                    sb = Block(b.keyword, params, lines).placed(b)
                     self._self_approx[id(sb)] = b
-                    out += [Block(b.keyword, b.params, keep)] * bool(keep) + [sb]
+                    out += [Block(b.keyword, b.params, keep).placed(b)] * bool(keep) + [sb]
                     continue
                 if own:
-                    nb = Block(b.keyword, b.params, keep)
+                    nb = Block(b.keyword, b.params, keep).placed(b)
                     self._self_contact[id(nb)] = (b, own)
                     b = nb
             out.append(b)
@@ -11265,7 +11345,7 @@ class _Mesh:
                         self.report.warn(f"*SURFACE {name}: trimming leaves none of its faces, and "
                                          f"Abaqus stops on such a surface (TRIM=NO keeps them).",
                                          once=False)
-            out.append(Block(b.keyword, b.params, data))
+            out.append(Block(b.keyword, b.params, data).placed(b))
             self._register_surface(out[-1])
         return out
 
@@ -12306,7 +12386,7 @@ class _Mesh:
             self.geom.nsets[sub] = new
             params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
             params["NSET"] = sub
-            blocks.insert(i + 1, Block(b.keyword, params, list(b.data)))
+            blocks.insert(i + 1, Block(b.keyword, params, list(b.data)).placed(b))
             self.report.note("*TRANSFORM copied onto the nodes the converter put between two of its "
                              "nodes where its node set did not take them (a load counts the set, or "
                              "the node is held by an *EQUATION): their BCs and ties are in its local "
@@ -13936,7 +14016,7 @@ class _Mesh:
         stops where it was their elasticity.  The original is recorded (``_copied_materials``:
         _copied_away).  Returns the copy's cards."""
         self._copied_materials.add(group[0].uparam("NAME"))
-        clone = [Block(c.keyword, OrderedDict(c.params), list(c.data))
+        clone = [Block(c.keyword, OrderedDict(c.params), list(c.data)).placed(c)
                  for c in group if c is group[0] or c.keyword not in drop]
         clone[0].params["NAME"] = name
         at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
@@ -14324,7 +14404,7 @@ class _Mesh:
             b.params["ELSET"] = rest
             params: "OrderedDict[str, Optional[str]]" = OrderedDict(b.params)
             params["ELSET"] = solid
-            twin = Block(b.keyword, params, list(b.data))
+            twin = Block(b.keyword, params, list(b.data)).placed(b)
             self._qmem_sections.add(id(twin))
             inserts.append((i + 1, twin))
         for i, twin in reversed(inserts):
@@ -15080,7 +15160,7 @@ class _Mesh:
                         "that element set holds no element (are its elements in a file not read?), "
                         "so the section covers none")
                 self.report.warn(f"*{b.keyword}, ELSET={name}: {what}; ccx stops with 'element set "
-                                 f"{name.upper()} has not yet been defined'.", once=True)
+                                 f"{name.upper()} has not yet been defined'.", once=True, at=b)
         if not any(b.keyword == "STEP" for b in blocks):
             return
         bare = [e for e, (t, _c) in self.geom.elements.items()
@@ -15983,7 +16063,8 @@ class _Rigid:
                 for e in rid if (e, side) in self._skins]
         members_of: Dict[int, List[int]] = {}   # id(*RIGID BODY) -> nodes its skins / surface add
         for b in analytic:
-            self._mesh_analytic(b, blocks, axisym, members_of, deck_nodes)
+            with self.report.about(b):
+                self._mesh_analytic(b, blocks, axisym, members_of, deck_nodes)
         for name, (elset, face) in self._analytic.items():
             body = next((r for r in bodies if r.uparam("ANALYTICAL SURFACE")
                          == name), None)
@@ -17106,7 +17187,7 @@ class _Rigid:
             elif x in turns and x in self._rigid_body_members(b)[1]:
                 joined.append(x)
                 self._pin_to_tie(params, x)
-            blocks[i] = Block(b.keyword, params, list(b.data))
+            blocks[i] = Block(b.keyword, params, list(b.data)).placed(b)
         # the node sets the reference-point cards name that hold such a node — with the new
         # node in the original's place (a *TRANSFORM too: the original node, a member now, keeps
         # no axes, so its rotation can be tied to the ROT NODE, which carries them), or beside
@@ -17166,7 +17247,7 @@ class _Rigid:
                              for n in dedup(self._resolve_nodes(f[0].strip()) if f[0].strip() else [])
                              if n in stand]
             if data != b.data or params is not b.params:
-                blocks[i] = Block(b.keyword, params, data)
+                blocks[i] = Block(b.keyword, params, data).placed(b)
         inner = [(x, n) for x, n in stand.items() if x not in outside]
         if inner:
             pairs = ", ".join(f"{x} -> {n}" for x, n in inner[:3])
@@ -18250,6 +18331,7 @@ class _Materials:
         Abaqus/Explicit deck, whose user materials are VUMATs.  The *MATERIAL and every
         reference to it (MATERIAL=, composite plies) are renamed."""
         mech: "OrderedDict[str, str]" = OrderedDict()     # upper-case NAME -> NAME
+        umat: Dict[str, Block] = {}                        # upper-case NAME -> its *USER MATERIAL
         cur = None
         for b in blocks:                          # ccx gives a card to the *MATERIAL last read
             if b.keyword == "MATERIAL":
@@ -18257,6 +18339,7 @@ class _Materials:
             elif b.keyword == "USER MATERIAL" and cur and \
                     b.uparam("TYPE") != "THERMAL":
                 mech[cur.upper()] = cur
+                umat[cur.upper()] = b
         self._umat_explicit = any((b.keyword == "DYNAMIC" and b.has("EXPLICIT")) or
                                   b.keyword == "DYNAMIC TEMPERATURE-DISPLACEMENT" for b in blocks)
         if not mech:
@@ -18290,7 +18373,7 @@ class _Materials:
                             hit, f"its own {hit} material law")
                 self.report.note(f"*USER MATERIAL {name}: material renamed {new} — ccx hands a user "
                                  f"material whose name starts with {hit} to {what} instead of "
-                                 f"stopping with 'no user material subroutine'.")
+                                 f"stopping with 'no user material subroutine'.", at=umat[key])
                 continue
             iface = ("umat_abaqusnl.f: logarithmic strain, for the NLGEOM steps" if nl
                      else "umat_abaqus.f: small strain")
@@ -18364,7 +18447,7 @@ class _Materials:
             if b.keyword.endswith("SECTION") and b.has("COMPOSITE"):
                 data = [ply(d) for d in b.data]
             out.append(b if params is b.params and data == b.data
-                       else Block(b.keyword, params, data))
+                       else Block(b.keyword, params, data).placed(b))
         return out
 
     def handle_user_material(self, b: Block) -> List[str]:
@@ -19699,7 +19782,7 @@ class _Materials:
                              f"thermal response keeps the true mass) and GRAV magnitudes {f:g} times "
                              f"smaller (Abaqus' gravity loads keep it too): ccx's mass matrix is "
                              f"Abaqus' scaled one, and its stable increment {math.sqrt(f):.4g} times "
-                             f"larger.", once=True)
+                             f"larger.", once=True, at=cards[0] if cards else None)
         if part:
             self.report.note(f"*FIXED MASS SCALING with ELSET (Abaqus/Explicit: the original mass of the "
                              f"set's elements times its FACTOR from the start of step {steps[0]}, a "
@@ -20200,7 +20283,7 @@ class _Materials:
         last card of the deck and has a data line (e.g. a plane-element thickness), as for
         any card it rejects there (HISTORY_ONLY_KW).  Flag it so the stop is explained."""
         defined = {b.uparam("NAME") for b in blocks if b.keyword == "MATERIAL"}
-        missing: "OrderedDict[str, str]" = OrderedDict()
+        missing: "OrderedDict[str, Block]" = OrderedDict()     # material -> its first section
         for b in blocks:
             if not b.keyword.endswith("SECTION"):
                 continue
@@ -20209,14 +20292,14 @@ class _Materials:
                 names += [m for _t, m, _o in self._section_layers(b) if m]
             for nm in names:
                 if nm and nm.upper() not in defined and nm.upper() not in missing:
-                    missing[nm.upper()] = b.param("ELSET") or "?"
-        for nm, elset in list(missing.items())[:5]:
+                    missing[nm.upper()] = b
+        for nm, sec in list(missing.items())[:5]:
             known = (f"defined: {', '.join(sorted(defined)[:6])}" if defined
                      else "the deck defines no *MATERIAL at all — is a material *INCLUDE missing?")
-            self.report.warn(f"A section (ELSET={elset}) references material '{nm}', which is never "
-                             f"defined ({known}). ccx stops with 'nonexistent material' (ccx 2.23 "
-                             f"segfaults instead when the section is the deck's last card and has "
-                             f"a data line).", once=True)
+            self.report.warn(f"A section (ELSET={sec.param('ELSET') or '?'}) references material "
+                             f"'{nm}', which is never defined ({known}). ccx stops with 'nonexistent "
+                             f"material' (ccx 2.23 segfaults instead when the section is the deck's "
+                             f"last card and has a data line).", once=True, at=sec)
 
     # model data that never belongs to a *MATERIAL (where a material's options end)
     _NOT_MATERIAL = {"BOUNDARY", "CLOAD", "DLOAD", "DSLOAD", "AMPLITUDE", "INITIAL CONDITIONS",
@@ -24631,7 +24714,7 @@ class _Constraints:
                 params["REF NODE"] = str(n)
                 if name:
                     params["CONSTRAINT NAME"] = f"{name}_{n}"
-                copies.append(Block(b.keyword, params, list(b.data)))
+                copies.append(Block(b.keyword, params, list(b.data)).placed(b))
             radius = self._influence_radius(b) is not None
             if nxt.keyword == "KINEMATIC":
                 seen: set = set()
@@ -24650,7 +24733,7 @@ class _Constraints:
                     out.append(b)
                     continue
             for c in copies:
-                out += [c, Block(nxt.keyword, OrderedDict(nxt.params), list(nxt.data))]
+                out += [c, Block(nxt.keyword, OrderedDict(nxt.params), list(nxt.data)).placed(nxt)]
             i += 1                                  # (``nxt`` copied)
             self.report.note(f"*COUPLING REF NODE={ref} names {len(refs)} nodes: one coupling per "
                              f"reference node, as in Abaqus (CONSTRAINT NAME=<name>_<node>), of the "
@@ -26664,7 +26747,7 @@ class _Constraints:
             keep = ("AMPLITUDE", "TYPE", "FIXED", "USER", "LOAD CASE") if b.keyword == "CONNECTOR MOTION" \
                 else ("AMPLITUDE", "LOAD CASE")
             params = [(k, v) for k, v in b.params.items() if k in keep]
-            nb_ = mkblock("BOUNDARY" if b.keyword == "CONNECTOR MOTION" else "CLOAD", params, data)
+            nb_ = mkblock("BOUNDARY" if b.keyword == "CONNECTOR MOTION" else "CLOAD", params, data).placed(b)
             out.append(nb_)
             made[b.keyword] = True
         if made["CONNECTOR MOTION"] or made["CONNECTOR LOAD"]:
@@ -30219,7 +30302,7 @@ class _Loads:
                         continue
                     f = [f[0], str(rng[0]), "30"] + f[3:]
                 data.append(", ".join(f))
-            out.append(Block(b.keyword, b.params, data) if len(cut) > before else b)
+            out.append(Block(b.keyword, b.params, data).placed(b) if len(cut) > before else b)
         if cut:
             self.report.warn(f"{len(cut)} *BOUNDARY line(s) name DOFs above 30, which Abaqus does "
                              f"not have (first: '{cut[0]}'): those DOFs are left out.")
@@ -30683,7 +30766,7 @@ class _Loads:
             if any(b is x for x in extra):
                 out.extend(self._comment_out(two, [emit_keyword(b.keyword, b.params)] + list(b.data),
                                              False, comment=f"a second procedure in step "
-                                             f"{self.emit.no} (Abaqus allows one)"))
+                                             f"{self.emit.no} (Abaqus allows one)", at=b))
                 continue
             if b.keyword != "BOUNDARY" and self._op_new_drop.get(id(b)):     # (handle_boundary's own)
                 out.append(self._op_new_drop[id(b)])
@@ -31227,6 +31310,8 @@ class _Loads:
             out.append(blocks[-1])
         if src is not None:
             self._piece_src.update((id(p), id(src)) for p in blocks)
+            for p in blocks:
+                p.placed(src)
         return out
 
     def _mid_pieces(self, pieces: List[object]) -> List[object]:
@@ -39636,14 +39721,16 @@ class _PostPasses:
                                if s and d == [] and i < run]
         procs: List[Optional[str]] = []             # each step's procedure, counted as there:
         cur: Optional[List[str]] = None             # a *STEP before *END STEP replaces the open one
+        step_cards: List[Block] = []                # and its *STEP card
         for b in list(blocks) + [Block("END STEP", OrderedDict())]:
             if b.keyword == "STEP":
-                cur = []
+                cur, card = [], b
             elif b.keyword != "END STEP":
                 if cur is not None:
                     cur.append(b.keyword)
             elif cur is not None:
                 procs.append(next((k for k in cur if k in PROC_KW), None))
+                step_cards.append(card)
                 cur = None
         for i in self.unloaded_steps:
             lost = src[i - 1]
@@ -39652,7 +39739,8 @@ class _PostPasses:
                              f"conversion: ccx would solve it with no load at all, "
                              + ("so its buckling factors mean nothing" if procs[i - 1:i] == ["BUCKLE"]
                                 else "to a zero response") +
-                             ". See the commented-out load cards.")
+                             ". See the commented-out load cards.",
+                             at=step_cards[i - 1] if i <= len(step_cards) else None)
             self._reduces(f"step {i}: every load lost")
         if self.source_unloaded:
             self.report.note("The Abaqus deck applies no load, prescribed displacement or "
@@ -40708,6 +40796,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._uel_nodes: Dict[str, int] = {}       # *USER ELEMENT type -> its node count
         self._uel_cards: List[Block] = []          # the deck's *USER ELEMENT cards (emit_geometry)
         self._uel_written: set = set()             # those written before their elements
+        self._type_cards: Dict[str, Block] = {}    # element type -> its first *ELEMENT card
         self._param_values: set = set()            # the deck's parameter values (_plan_material_facts)
         self._sc_types: Dict[str, set] = {}        # *SECTION CONTROLS name -> its Abaqus types
         self._sc_damage = False
@@ -41011,7 +41100,11 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                     out.extend(self._default_temperature_ic())
                 out.extend(self.emit.out_tp_cards)      # ccx: *TIME POINTS before any *STEP
                 self.emit.out_tp_cards = []
-                out.extend(self.handle_step(cards))
+                self.report.card = b                    # (translate_one: its cards' own)
+                try:
+                    out.extend(self.handle_step(cards))
+                finally:
+                    self.report.card = None
                 self.emit.proc = None                   # (no step's after its *END STEP)
                 self._warn_loose_midside_temperatures()
             elif b.keyword in ("HEADING", "END STEP") or b.keyword in GEOM_KW:
@@ -41129,6 +41222,14 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
     }
 
     def translate_one(self, b: Block) -> List[str]:
+        """The ccx lines of card ``b``; what it reports is at ``b``'s place (Report.card)."""
+        outer, self.report.card = self.report.card, b
+        try:
+            return self._translate_one(b)
+        finally:
+            self.report.card = outer
+
+    def _translate_one(self, b: Block) -> List[str]:
         kw = b.keyword
         if id(b) in self._dp_unused:                  # _plan_deformation_plasticity
             return self._commented(b, self._dp_unused[id(b)], reduces=False)
@@ -41221,19 +41322,21 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                 reduces = False
                 msg += f" No section uses material {mat}, so this changes nothing."
         return self._comment_out(msg, [emit_keyword(b.keyword, b.params)] + list(b.data),
-                                 reduces, warn=reduces is not False)
+                                 reduces, warn=reduces is not False, at=b)
 
     def _comment_out(self, msg: str, lines: Sequence[str], reduces: Union[bool, str],
-                     comment: Optional[str] = None, warn: bool = True) -> List[str]:
+                     comment: Optional[str] = None, warn: bool = True,
+                     at: Optional[Block] = None) -> List[str]:
         """Card text ``lines`` as comment lines under '** abq2ccx: ' + ``comment`` (else
-        ``msg``), with ``msg`` reported as a warning (a note unless ``warn``) and, unless
-        ``reduces`` is False, ``reduces`` recorded as reduced physics (True: the card's
-        keyword, else ``msg``).  One commented card."""
+        ``msg``), with ``msg`` reported as a warning (a note unless ``warn``; about card
+        ``at``, by default the card being converted) and, unless ``reduces`` is False,
+        ``reduces`` recorded as reduced physics (True: the card's keyword, else ``msg``).
+        One commented card."""
         self.report.n_commented += 1
         if warn:
-            self.report.warn(msg, once=True)
+            self.report.warn(msg, once=True, at=at)
         else:
-            self.report.note(msg, once=True)
+            self.report.note(msg, once=True, at=at)
         if reduces is True:
             reduces = lines[0].partition(",")[0] if lines and lines[0].startswith("*") else msg
         if reduces is not False:
@@ -41602,14 +41705,14 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                                  f"one): closed at the next *LOAD CASE or *END STEP.", once=True)
             release = any(b.keyword == "BOUNDARY" and b.uparam("OP") == "NEW" for b in cards)
             for k in range(len(names)):
-                group = [b if k == 0 else Block(b.keyword, OrderedDict(b.params), list(b.data))
+                group = [b if k == 0 else Block(b.keyword, OrderedDict(b.params), list(b.data)).placed(b)
                          for b in cards if b.keyword != "END LOAD CASE" and owner.get(id(b), k) == k]
                 if release:
-                    group = [Block(b.keyword, OrderedDict(b.params, OP="NEW"), list(b.data))
+                    group = [Block(b.keyword, OrderedDict(b.params, OP="NEW"), list(b.data)).placed(b)
                              if b.keyword == "BOUNDARY" and b.uparam("OP") != "NEW" else b for b in group]
                     if not any(b.keyword == "BOUNDARY" for b in group):
                         at = next(i for i, b in enumerate(group) if b.keyword in STEP_PROCS)
-                        group.insert(at + 1, Block("BOUNDARY", OrderedDict(OP="NEW"), []))
+                        group.insert(at + 1, Block("BOUNDARY", OrderedDict(OP="NEW"), []).placed(group[at]))
                 self._lc_marks.update((id(b), f"load case {names[k]} of the deck's step {s} "
                                               f"({k + 1} of {len(names)})")
                                       for b in group if b.keyword == "LOAD CASE")
@@ -41619,7 +41722,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                              f"perturbation step each, with the step's own loads, BCs and output "
                              f"requests and those of its load case, about the same base state "
                              f"(Abaqus: equivalent to consecutive perturbation steps). Later step "
-                             f"numbers in this report count the ccx steps.")
+                             f"numbers in this report count the ccx steps.", at=cards[0])
             extra += len(names) - 1
         return out
 
@@ -41804,7 +41907,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             elif kw in self._BLANK_PERIOD and f and not f[1]:
                 if b.has("STEADY STATE") and kw not in ("DYNAMIC", "VISCO"):
                     f[1] = "1."
-                    b = Block(b.keyword, b.params, [", ".join(f[:max(2, len(f) - 1)])] + list(b.data[1:]))
+                    b = Block(b.keyword, b.params,
+                              [", ".join(f[:max(2, len(f) - 1)])] + list(b.data[1:])).placed(b)
                     self.report.note(f"*{kw}, STEADY STATE with a blank time period -> 1. (ccx 2.23 "
                                      f"reads the blank as 0, step time NaN; a steady-state solution "
                                      f"does not depend on it).", once=True)
@@ -41864,7 +41968,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                 self.report.warn(f"Step {n}: *MATRIX GENERATE not converted to ccx's *FREQUENCY, "
                                  f"SOLVER=MATRIXSTORAGE: {why}.", once=True)
                 continue
-            new = Block("FREQUENCY", OrderedDict(SOLVER="MATRIXSTORAGE"), [])
+            new = Block("FREQUENCY", OrderedDict(SOLVER="MATRIXSTORAGE"), []).placed(b)
             self._matrix_steps[id(new)] = b
             swap[id(b)] = new
         return [swap.get(id(b), b) for b in blocks] if swap else blocks
@@ -42016,7 +42120,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                             pass
                     data.append(", ".join(rec))
                 swap[id(b)] = Block(b.keyword, OrderedDict(
-                    (k, v) for k, v in b.params.items() if k not in ("AMPLITUDE", "TIME DELAY")), data)
+                    (k, v) for k, v in b.params.items() if k not in ("AMPLITUDE", "TIME DELAY")),
+                    data).placed(b)
                 scaled[proc].append(f"{s} (*{b.keyword} on {amp}: x{a0:g})")
                 zeroed = zeroed or a0 == 0.0
             if proc == "BUCKLE" and not any(
@@ -42297,7 +42402,7 @@ def _partition_assembly(blocks: List[Block]):
         if kw == "INSTANCE":
             inst = {"name": b.uparam("NAME"),
                     "part": b.uparam("PART"),
-                    "data": list(b.data), "extra": []}
+                    "data": list(b.data), "extra": [], "card": b}
             instances.append(inst)
             state = ("INST", inst)
             continue
@@ -42446,7 +42551,7 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
             data = list(b.data)
     else:
         data = list(b.data)
-    return Block(kw, p, data)
+    return Block(kw, p, data).placed(b)
 
 
 # Section sub-options: cards that belong to the section card they follow, so a part's go out
@@ -42572,7 +42677,7 @@ def _turn_equation(b: Block, axes: Tuple[Vec, Vec, Vec],
                                for t in rows])
     if not changed:
         return b, None
-    return Block(b.keyword, OrderedDict(b.params), data), None
+    return Block(b.keyword, OrderedDict(b.params), data).placed(b), None
 
 
 def _turn_dof_lines(b: Block, axes: Tuple[Vec, Vec, Vec], lead: int) -> Optional[Block]:
@@ -42601,7 +42706,7 @@ def _turn_dof_lines(b: Block, axes: Tuple[Vec, Vec, Vec], lead: int) -> Optional
             new = {k for k, _ in img}
         changed = changed or new != dofs
         data += [", ".join(r[:lead] + [str(lo), str(hi)]) for lo, hi in dof_runs(sorted(new))]
-    return Block(b.keyword, OrderedDict(b.params), data) if changed else b
+    return Block(b.keyword, OrderedDict(b.params), data).placed(b) if changed else b
 
 
 def _turn_released_rotations(b: Block, axes: Tuple[Vec, Vec, Vec]) -> Optional[Block]:
@@ -42628,7 +42733,7 @@ def _turn_released_rotations(b: Block, axes: Tuple[Vec, Vec, Vec]) -> Optional[B
     if new == rots:
         return b
     return Block(b.keyword, OrderedDict(b.params),
-                 [", ".join(str(x) for x in run) for run in [(1, 3)] + dof_runs(sorted(new))])
+                 [", ".join(str(x) for x in run) for run in [(1, 3)] + dof_runs(sorted(new))]).placed(b)
 
 
 def _turn_spring_dofs(b: Block, axes: Tuple[Vec, Vec, Vec]) -> Optional[Block]:
@@ -42649,7 +42754,7 @@ def _turn_spring_dofs(b: Block, axes: Tuple[Vec, Vec, Vec]) -> Optional[Block]:
     if [k for k, _ in img] == ds:
         return b
     return Block(b.keyword, OrderedDict(b.params),
-                 [", ".join(str(k) for k, _ in img)] + list(b.data[1:]))
+                 [", ".join(str(k) for k, _ in img)] + list(b.data[1:])).placed(b)
 
 
 def _turn_instance_dofs(blocks: Sequence[Block], geo, axes: Tuple[Vec, Vec, Vec],
@@ -42674,7 +42779,7 @@ def _turn_instance_dofs(blocks: Sequence[Block], geo, axes: Tuple[Vec, Vec, Vec]
     def oriented(b: Block) -> Block:
         p = OrderedDict(b.params)
         p["ORIENTATION"] = AXES_ORIENTATION
-        return Block(b.keyword, p, list(b.data))
+        return Block(b.keyword, p, list(b.data)).placed(b)
 
     def on_local(b: Block, ends: int) -> Optional[bool]:
         """Whether the spring / dashpot nodes of card ``b`` all have a part *TRANSFORM (their
@@ -42778,13 +42883,14 @@ def _instance_transform(inst: dict, report: Report) -> Tuple[Vec, Optional[Tuple
     except ValueError:
         report.warn(f"*INSTANCE {inst['name']}: could not fully parse the transform "
                     f"line(s); any unparsed translation/rotation is dropped — verify "
-                    f"positioning.", once=True)
+                    f"positioning.", once=True, at=inst.get("card"))
         report.reduce(f"*INSTANCE {inst['name']} transform not fully parsed")
     if rot:
         report.note(f"*INSTANCE {inst['name']} is rotated: node coordinates, *NODE normals, "
                     f"*ORIENTATION axes (also per-element *DISTRIBUTION axes), beam n1 directions "
                     f"and part-level *NORMAL/*TRANSFORM data are turned with it (validate_with_ccx.py "
-                    f"assembly_rotated_instances and distribution_solid_plate).", once=True)
+                    f"assembly_rotated_instances and distribution_solid_plate).", once=True,
+                    at=inst.get("card"))
     return T, rot
 
 
@@ -42805,7 +42911,7 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     geo = geo_conv.geom
     if not geo.nodes and not geo.elements:
         report.warn(f"*INSTANCE {inst['name']}: no mesh found in part {inst['part']} or the "
-                    f"instance itself; skipped.")
+                    f"instance itself; skipped.", at=inst.get("card"))
         return None
     node_off, elem_off = gmax_node, gmax_elem
     out: List[Block] = []
@@ -42827,7 +42933,16 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             ndata[-1] += ", " + ", ".join(_fmt_component(c) for c in nrm)
         if gid > gmax_node:
             gmax_node = gid
+    # the cards are at the place of the part's (or instance's) first *NODE / *ELEMENT card
+    mesh_cards = parts.get(inst["part"], []) + inst["extra"]
+    node_card = next((b for b in mesh_cards if b.keyword == "NODE"), None)
+    elem_card: Dict[str, Block] = {}                    # element type -> its first card
+    for b in mesh_cards:
+        if b.keyword == "ELEMENT":
+            elem_card.setdefault(b.uparam("TYPE"), b)
     out.append(mkblock("NODE", [("NSET", namer(inst["name"]))], ndata))
+    if node_card is not None:
+        out[-1].placed(node_card)
 
     by_type: "OrderedDict[str, List[Tuple[int, List[int]]]]" = OrderedDict()
     for eid, (typ, conn) in geo.elements.items():
@@ -42845,6 +42960,8 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             if gid > gmax_elem:
                 gmax_elem = gid
         out.append(mkblock("ELEMENT", [("TYPE", typ), ("ELSET", namer(inst["name"], "ALL"))], edata))
+        if typ.upper() in elem_card:
+            out[-1].placed(elem_card[typ.upper()])
     conns: "OrderedDict[str, List[str]]" = OrderedDict()      # part-level connector elements
     for eid, (typ, a, c) in geo_conv._conn.items():
         conns.setdefault(typ, []).append(", ".join(
@@ -42852,6 +42969,8 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
         gmax_elem = max(gmax_elem, eid + elem_off)
     for typ, edata in conns.items():
         out.append(mkblock("ELEMENT", [("TYPE", typ)], edata))
+        if typ.upper() in elem_card:
+            out[-1].placed(elem_card[typ.upper()])
 
     renamed: "OrderedDict[str, str]" = OrderedDict()       # Abaqus set/surface -> ccx name
     for sname, ids in geo.nsets.items():
@@ -42904,11 +43023,13 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             out.append(mkblock("ORIENTATION", [("NAME", namer(prefix, AXES_ORIENTATION)),
                                                ("SYSTEM", "RECTANGULAR")],
                                [", ".join(_fmt_unit(x) for x in (*axes[0], *axes[1]))]))
+            if inst.get("card") is not None:
+                out[-1].placed(inst["card"])
     sections = PART_PER_INSTANCE - {"ORIENTATION", "DISTRIBUTION", "CONNECTOR SECTION", "SURFACE", "JOINT"}
     for orig in inst_blocks:
         b = turned.get(id(orig), orig)
         if id(b) in sub_options:
-            out.append(Block(b.keyword, OrderedDict(b.params), list(b.data)))
+            out.append(Block(b.keyword, OrderedDict(b.params), list(b.data)).placed(b))
         elif b.keyword in sections:
             nb = _remap_named(b, prefix, ("ELSET", "ORIENTATION", "MEMBRANE THICKNESS"), namer)
             if b.has("COMPOSITE"):
@@ -43028,11 +43149,12 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
             out.append(_remap_part_constraint(b, prefix, namer, node_off, elem_off, rotv, rotp))
             if b is not orig and b.keyword == "EQUATION" and turned_eqs is not None:
                 turned_eqs.append((prefix, out[-1]))
-    for kw in dedup([b.keyword for b in inst["extra"] if id(b) not in sub_options and
-                     b.keyword not in GEOM_KW | PART_PER_INSTANCE | PART_CONSTRAINT_KW]):
+    left = [b for b in inst["extra"] if id(b) not in sub_options and
+            b.keyword not in GEOM_KW | PART_PER_INSTANCE | PART_CONSTRAINT_KW]
+    for kw in dedup([b.keyword for b in left]):
         report.warn(f"*{kw} inside an *INSTANCE left out: only an instance's mesh, sets, surfaces, "
                     f"sections, orientations, distributions and constraints are written per "
-                    f"instance — verify.", once=True)
+                    f"instance — verify.", once=True, at=next(b for b in left if b.keyword == kw))
         report.reduce(f"*{kw} inside an *INSTANCE left out")
     eids = list(geo.elements) + list(geo_conv._conn)
     entry = {"name": inst["name"], "part": inst["part"], "node_offset": node_off,
@@ -43060,6 +43182,7 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer,
 
     out: List[Block] = []
     lost: "OrderedDict[str, List[str]]" = OrderedDict()     # instance -> sets on it
+    lost_at: Dict[str, Block] = {}                          # instance -> the first of them
     for b in assembly_blocks:
         kw = b.keyword
         if kw in ("NSET", "ELSET"):
@@ -43071,6 +43194,7 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer,
                 off = maps[inst.upper()][0 if kw == "NSET" else 1]
             elif inst:
                 lost.setdefault(inst.strip(), []).append(f"*{kw} {name}")
+                lost_at.setdefault(inst.strip(), b)
                 continue
             gen = b.has("GENERATE")
             ids: List[int] = []
@@ -43083,7 +43207,8 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer,
                     try:
                         base = expand_generate(rec)
                     except ValueError:              # left for _register_set to report
-                        out.append(mkblock(kw, [(kw, name.upper()), ("GENERATE", None)], [", ".join(rec)]))
+                        out.append(mkblock(kw, [(kw, name.upper()), ("GENERATE", None)],
+                                           [", ".join(rec)]).placed(b))
                         continue
                     ids.extend(x + (off or 0) for x in base)
                 else:
@@ -43094,9 +43219,9 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer,
                             kind, val = resolve(tok, "node" if kw == "NSET" else "elem")
                             (ids if kind == "id" else names).append(val)
             if ids:
-                out.append(set_block(kw, name.upper(), ids))
+                out.append(set_block(kw, name.upper(), ids).placed(b))
             if names:
-                out.append(mkblock(kw, [(kw, name.upper())], [", ".join(str(n) for n in names)]))
+                out.append(mkblock(kw, [(kw, name.upper())], [", ".join(str(n) for n in names)]).placed(b))
         elif kw == "SURFACE":
             if b.param("NAME"):
                 namer.reserve(b.param("NAME"))
@@ -43109,7 +43234,7 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer,
                     continue
                 kind, val = resolve(f[0], surf_ent)
                 data.append(", ".join([str(val)] + f[1:]))
-            out.append(Block("SURFACE", OrderedDict(b.params), data))
+            out.append(Block("SURFACE", OrderedDict(b.params), data).placed(b))
         else:
             out.append(b)
     for inst, sets in lost.items():
@@ -43119,7 +43244,7 @@ def _emit_assembly_blocks(assembly_blocks: List[Block], maps, namer,
                         f"or its part has no mesh): Abaqus stops on such a set. Its labels are "
                         f"left out (they would name another instance's nodes or elements), so "
                         f"ccx stops where a card names the set.",
-                        once=True)
+                        once=True, at=lost_at[inst])
     return out
 
 
@@ -43225,14 +43350,15 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
     if idle:
         # a part enters the model only through an *INSTANCE of it (2017 "Assembly definition")
         shown = ", ".join(idle[:5]) + (f" and {len(idle) - 5} more" if len(idle) > 5 else "")
+        card = next(b for b in blocks if b.keyword == "PART" and b.uparam("NAME") == idle[0])
         if instances:
             report.note(f"*PART {shown}: no *INSTANCE names it, so its mesh, sets, sections and "
-                        f"constraints are not in the model; left out.", once=True)
+                        f"constraints are not in the model; left out.", once=True, at=card)
         else:
             report.warn(f"*PART {shown} without any *INSTANCE (Abaqus needs *ASSEMBLY and *INSTANCE "
                         f"wherever *PART is used, and a part enters the model only as an instance): "
                         f"its mesh, sets, sections and constraints are left out, so the ccx deck has "
-                        f"none of them.", once=True)
+                        f"none of them.", once=True, at=card)
 
     out: List[Block] = list(pre)
     out.extend(_emit_part_global_data(parts))
@@ -43252,7 +43378,7 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
     if asm_geom:
         report.note("Assembly-level *NODE/*ELEMENT (e.g. CAE reference points) kept with their "
                     "original ids; instance meshes are numbered above them so ids do not collide.",
-                    once=True)
+                    once=True, at=asm_geom[0])
     out.extend(asm_geom)
 
     maps: Dict[str, Tuple[int, int]] = {}      # instance -> (node_off, elem_off)
@@ -43332,7 +43458,7 @@ def _remap_distribution(b: Block, prefix: str, namer, elem_off: int, move,
             if len(v) in (6, 9):
                 vals = [_fmt_component(x) for i in range(0, len(v), 3) for x in move(tuple(v[i:i + 3]))]
         data.append(", ".join([label] + vals))
-    return Block(b.keyword, p, data)
+    return Block(b.keyword, p, data).placed(b)
 
 
 def _remap_node_orientation(b: Block, nodes: Dict[int, Vec], node_off: int, turn,
@@ -43369,7 +43495,7 @@ def _remap_named(b: Block, prefix: str, keys: Sequence[str], namer) -> Block:
     for k in keys:
         if k in p and p[k]:
             p[k] = namer(prefix, p[k])
-    return Block(b.keyword, p, list(b.data))
+    return Block(b.keyword, p, list(b.data)).placed(b)
 
 
 def _place_analytic(b: Block, prefix: str, namer, rotp) -> Block:
@@ -43385,7 +43511,7 @@ def _place_analytic(b: Block, prefix: str, namer, rotp) -> Block:
     typ = b.uparam("TYPE")
     prof, _ = analytic_profile(b)
     if prof is None:
-        return Block("SURFACE", p, list(b.data))
+        return Block("SURFACE", p, list(b.data)).placed(b)
     data: List[str] = []
     if typ == "SEGMENTS":
         def mv(q: Tuple[float, float]) -> List[str]:
@@ -43394,7 +43520,7 @@ def _place_analytic(b: Block, prefix: str, namer, rotp) -> Block:
         data.append(", ".join(["START"] + mv(prof["start"])))
         for seg in prof["segs"]:
             data.append(", ".join([seg[0]] + [x for q in seg[1:] for x in mv(q)]))
-        return Block("SURFACE", p, data)
+        return Block("SURFACE", p, data).placed(b)
     frame = prof["frame"] or ([(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, -1.0)] if typ == "CYLINDER"
                               else [(0.0, 0.0, 0.0), (0.0, 1.0, 0.0)])
     pts = [rotp(q) for q in frame]
@@ -43404,7 +43530,7 @@ def _place_analytic(b: Block, prefix: str, namer, rotp) -> Block:
     data.append(", ".join(["START"] + [fmt_coord(x) for x in prof["start"]]))
     for seg in prof["segs"]:
         data.append(", ".join([seg[0]] + [fmt_coord(x) for q in seg[1:] for x in q]))
-    return Block("SURFACE", p, data)
+    return Block("SURFACE", p, data).placed(b)
 
 
 def _remap_surface(b: Block, prefix: str, namer, node_off: int, elem_off: int) -> Block:
@@ -43423,7 +43549,7 @@ def _remap_surface(b: Block, prefix: str, namer, node_off: int, elem_off: int) -
         else:
             first = namer(prefix, f[0])
         data.append(", ".join([first] + f[1:]))
-    return Block("SURFACE", p, data)
+    return Block("SURFACE", p, data).placed(b)
 
 
 # ---------------------------------------------------------------------------
@@ -44828,7 +44954,8 @@ def _deck_doc(path: str, args, report: Report, conv: Optional["Converter"] = Non
         "elements": len(conv.geom.elements) if conv and not error else None,
         "counts": {"warnings": report.n_warnings, "notes": report.n_notes,
                    "commented_cards": report.n_commented},
-        "entries": [{"level": lvl, "message": m} for lvl, m in report.entries],
+        "entries": [{"level": lvl, "message": m, "location": report.where.get(k)}
+                    for k, (lvl, m) in enumerate(report.entries)],
         "ok": not error and report.n_warnings == 0 and report.n_commented == 0,
         "status": status, "reduced_physics": [] if error else list(report.reduced),
         "instances": report.instances,
