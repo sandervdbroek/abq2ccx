@@ -82,6 +82,12 @@ as `--run` runs it (`run_ccx_job`), its output streamed to `job.ccx.log` in its 
 and held in memory only in part (ccx 2.23 can print without end), and is stopped after
 600 s or 100 MB of output.
 
+Each check is a function `check_<name>(ccx, env, tmp, shared)` registered with
+`@check(name, description, needs=())`, run in the order registered; it returns its failure
+count. `--list` prints the names; `--only NAME[,NAME...]` (names or globs, e.g. `'t14*'`) runs
+those checks and the ones they `need`. `shared` holds `shared_helpers()` (`review_run`,
+`same`, ...) and the results a check leaves for later ones.
+
 | Example | Check | Reference | Agreement |
 | --- | --- | --- | --- |
 | `nle10_thickplate` | NAFEMS LE10 σyy at point D | published −5.38 MPa | −5.650 MPa, 5 % (element and mesh) |

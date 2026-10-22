@@ -22828,6 +22828,33 @@ def test_composite_examples_match_the_validation_decks():
             assert fh.read() == text, f"examples/{name}.inp differs from validate_with_ccx.py's deck"
 
 
+def test_validate_checks_are_listed_and_selected_by_name_or_glob():
+    # validate_with_ccx.py's registered checks: --list prints each once, in order; --only takes
+    # names and globs and adds the checks a chosen one needs, still in the registered order
+    import contextlib
+    import io
+    import validate_with_ccx as V
+    names = [c.name for c in V.CHECKS]
+    assert len(names) == len(set(names)) > 50, names
+    assert all(names.index(n) < names.index(c.name) for c in V.CHECKS for n in c.needs)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert V.select_checks(["--list"]) is None
+    assert [line.split()[0] for line in out.getvalue().splitlines()] == names, out.getvalue()
+    assert V.select_checks([]) == V.CHECKS
+    got = [c.name for c in V.select_checks(["--only", "nle10_surface_elements"])]
+    assert got == ["nle10_thickplate", "nle10_surface_elements"], got
+    got = [c.name for c in V.select_checks(["--only", "beam_circ_*, nle10_thickplate"])]
+    assert got == [n for n in names if n.startswith("beam_circ_") or n == "nle10_thickplate"], got
+    for argv in (["--only", "no_such_check"], ["--only", "beam_circ_*,no_such_*"]):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                V.select_checks(argv)
+        except SystemExit as exc:
+            assert exc.code == 2, (argv, exc.code)
+        else:
+            raise AssertionError(f"{argv} selected checks")
+
 
 def test_material_ends_at_a_gasket_or_connector_behavior():
     # the cards after *GASKET BEHAVIOR / *CONNECTOR BEHAVIOR are that behaviour's, not the
