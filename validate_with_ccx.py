@@ -7551,6 +7551,15 @@ def norton_creep_deck(creep="3.125E-14, 5."):
                       "*NODE PRINT, NSET=X1", "U", "*END STEP"]) + "\n"
 
 
+def norton_creep_floor_deck():
+    """norton_creep_deck in Pa and s: E 2e11, a pressure 1e6 on x = 1, Norton creep A 1e-30,
+    n 3, so 1e-12 per second at that stress and a creep strain of 1e-15 in 1e-3 s of *VISCO.
+    ccx 2.23 raises A t^m to 1e-20 (incplas.f): 1e-2 per second, 1e-5 in the step."""
+    return norton_creep_deck().replace("200.E3, 0.3", "2.E11, 0.3").replace(
+        "3.125E-14, 5.", "1.E-30, 3.").replace("1, P4, -200.", "1, P4, -1.E6").replace(
+        "*VISCO, CETOL=5.E-3\n1.E-6, 100.", "*VISCO, CETOL=1.E-3\n1.E-4, 1.E-3")
+
+
 def include_files_deck():
     """Two T3D2 bars (E 1000, nu 0), parts A and B that *INCLUDE one mesh file; it *INCLUDEs a
     file of node data lines by a job-relative path, and the length 2, the area 0.5 and the
@@ -17938,6 +17947,25 @@ def main():
               f"*PLASTIC): one element wide {d1 / m1:.3g} of |u| {m1:.4g} off the linear step, "
               f"{'warned' if flags[0] else 'NOT warned'}; two wide {d2:.1e} apart, "
               f"{'warned' if flags[1] else 'not warned'}")
+    failures += 0 if ok else 1
+
+    # --- Norton creep below ccx's 1e-20 floor on A t^m: warned, reduced physics ---
+    u = review_run(norton_creep_floor_deck(), "norton_creep_floor", dat_displacements)
+    rep, conv = convert(os.path.join(tmp, "norton_creep_floor_src.inp"),
+                        os.path.join(tmp, "norton_creep_floor_flag.inp"))
+    warned = re.search(r"ccx creeps (\S+) times as much", rep.text())
+    ok = bool(u and warned) and any("1e-20 floor" in r for r in conv.reduced_physics)
+    if ok:
+        creep = [u.get(n, [math.inf])[0] - 1e6 / 2e11 for n in (2, 3, 6, 7)]
+        factor = float(warned.group(1))
+        ok = factor == 1e10 and max(abs(c / (1e-30 * 1e6 ** 3 * 1e-3) / factor - 1) for c in creep) < 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  norton_creep_floor (a C3D8 cube in Pa and s, Norton A "
+              f"1e-30, n 3 under 1e6 for 1e-3 s of *VISCO: creep strain 1e-15): ccx solved, creep "
+              f"strain {', '.join(f'{c:.5g}' for c in creep)}, the warned {factor:g} times the law's "
+              f"(ccx raises A t^m to 1e-20; reduced physics)")
+    else:
+        print(f"FAIL  norton_creep_floor: {'solved' if u else 'no results'}, "
+              f"{'warned' if warned else 'NOT warned'}, reduced physics {conv.reduced_physics}")
     failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

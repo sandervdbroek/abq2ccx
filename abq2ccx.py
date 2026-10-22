@@ -2277,6 +2277,27 @@ def material_rows(block: Block, nvals: int) -> Optional[List[List[str]]]:
     return rows
 
 
+CREEP_FLOOR = 1e-20     # ccx 2.23 raises a Norton law's A t^m to at least this (incplas.f)
+
+
+def creep_floor_factor(a: float, m: float, t0: float, t1: float) -> float:
+    """How many times the creep strain of a Norton law A q^n t^m (time hardening, a > 0,
+    -1 < m) at a constant stress q from total time t0 to t1 > t0 ccx 2.23 gives, which raises
+    A t^m to at least CREEP_FLOOR (incplas.f: isotropic *ELASTIC): the integral of
+    max(A t^m, CREEP_FLOOR) over that of A t^m.  1.0 where the floor never bites."""
+    if m == 0.0:
+        return max(a, CREEP_FLOOR) / a
+
+    def integral(lo: float, hi: float) -> float:
+        return a / (m + 1.0) * (hi ** (m + 1.0) - lo ** (m + 1.0))
+    # A t^m = CREEP_FLOOR at t = tc: below it before tc for m > 0, after it for m < 0
+    tc = math.exp(max(-700.0, min(700.0, (math.log(CREEP_FLOOR) - math.log(a)) / m)))
+    c = min(max(tc, t0), t1)
+    floored = CREEP_FLOOR * (c - t0) + integral(c, t1) if m > 0.0 else \
+        integral(t0, c) + CREEP_FLOOR * (t1 - c)
+    return floored / integral(t0, t1)
+
+
 # a row of a field-dependent material table (field_table_at): its property values as written,
 # then its independent variables, each (value, token as written)
 FieldRow = Tuple[Tuple[str, ...], Tuple[Tuple[float, str], ...]]
@@ -21446,6 +21467,63 @@ class _Materials:
             cap = float(f"{math.exp(min(caps)):.3g}")
             if cap < st.ccx_period:
                 self._creep_caps[st.no] = cap
+
+    def _plan_creep_floor(self, blocks: List[Block]) -> None:
+        """Warn where ccx 2.23 creeps faster than a Norton law (*CREEP, LAW=STRAIN / TIME on an
+        isotropic *ELASTIC): incplas.f raises A t^m to at least CREEP_FLOOR, t ccx's total time
+        at an increment's end, without a message (a tiny A in Pa and s: up to 1e24 times too
+        fast).  Each step ccx creeps in (incplas.f: *VISCO, *DYNAMIC, *COUPLED and transient
+        *UNCOUPLED TEMPERATURE-DISPLACEMENT) whose creep strain at a constant stress comes out
+        more than 0.1 % above the law's (creep_floor_factor) makes it reduced physics.  No exact
+        form: units with a larger A rescale every stress, load and time of the deck, and ccx's
+        orthotropic path (ortho_plas.f), which has no floor, ignores CETOL and reads temperature
+        rows otherwise (probed)."""
+        spans = []                              # (step, its ccx total time at start and end)
+        t: Optional[float] = 0.0
+        for st in self.steps:
+            t1 = None if t is None or st.ccx_period is None else t + st.ccx_period
+            card = st.proc_card
+            if st.proc in ("VISCO", "DYNAMIC", "COUPLED TEMPERATURE-DISPLACEMENT") or \
+                    (st.proc == "UNCOUPLED TEMPERATURE-DISPLACEMENT" and not card.has("STEADY STATE")):
+                spans.append((st, t, t1))
+            t = t1
+        if not spans:
+            return
+        for name, opts in self._material_options(blocks).items():
+            creep = [c for c in opts if c.keyword == "CREEP"]
+            el = [c for c in opts if c.keyword == "ELASTIC"]
+            if not creep or len(el) != 1 or el[0].uparam("TYPE") not in ("", "ISO", "ISOTROPIC") or \
+                    creep[0].uparam("LAW") not in ("", "STRAIN", "TIME"):
+                continue
+            rows = material_rows(creep[0], 3) or []
+            worst = None                        # (factor, A, m, temperature, step)
+            for row in rows:
+                try:
+                    a, m = pf(row[0]), pf(row[2]) if row[2] else 0.0
+                except ValueError:
+                    continue
+                if a <= 0.0 or m <= -1.0:       # (ccx stops on A <= 0)
+                    continue
+                for st, t0, t1 in spans:
+                    if m == 0.0:
+                        f = creep_floor_factor(a, m, 0.0, 1.0)      # (whatever the times)
+                    elif t0 is None or t1 is None or t1 <= t0:
+                        continue
+                    else:
+                        f = creep_floor_factor(a, m, t0, t1)
+                    if f > 1.001 and (worst is None or f > worst[0]):
+                        worst = (f, row[0], m, row[3], st)
+            if worst is None:
+                continue
+            f, a_text, m, temp, st = worst
+            self.report.warn(f"*CREEP of material {name}: ccx 2.23 raises a Norton law's A t^m to at "
+                             f"least 1e-20 (t the total time), without a message; with A = {a_text}"
+                             f"{f', m = {m:g}' if m else ''}"
+                             f"{f' (temperature {temp})' if len(rows) > 1 else ''} ccx creeps "
+                             f"{f:.4g} times as much as the deck's law at a constant stress in "
+                             f"*{st.proc} step {st.no}. Units with a larger A (it scales as "
+                             f"stress^-n time^-(m+1), e.g. MPa for Pa) avoid it.", at=creep[0])
+            self._reduces("*CREEP A t^m below ccx's 1e-20 floor (a faster creep)")
 
     def _creep_visco(self, b: Block, params: "OrderedDict[str, Optional[str]]") -> Block:
         """The *VISCO card ``b`` of the current step (automatic incrementation) with
@@ -43572,6 +43650,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_fixed_values(blocks)         # after it: the cards it leaves
         self._plan_material_facts(blocks)       # after the mesh planners: the final element types
         self._plan_creep_increments(blocks)     # after _read_steps: the step model, amplitudes
+        self._plan_creep_floor(blocks)          # likewise
         self._plan_base_state_facts(blocks)     # after _plan_rigid: the analytical surfaces left
         self._plan_initial_temperatures(blocks)     # after the mesh planners: their new nodes
         self._order_material_cards(blocks)      # after the planners that add material cards

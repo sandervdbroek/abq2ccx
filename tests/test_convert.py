@@ -24863,16 +24863,57 @@ def test_visco_increment_capped_for_norton_creep():
         assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n" + text + "\n" in body, kw
     assert "no pressure or traction to size its increments" in report.text()
     # code check G5-1: valid data whose cap overflows a float (m near -1: 1 / (m + 1) = 100; q^n
-    # past 1e308) converts: the cap in logarithms, none past 1e6 increments (warned)
+    # past 1e308) converts: the cap in logarithms, none past 1e6 increments (warned).  Both laws
+    # are below ccx's 1e-20 floor on A t^m (t > 1 here; A 1e-300): that alone is reduced physics
+    floor = ["*CREEP A t^m below ccx's 1e-20 floor (a faster creep)"]
     body, conv, report = convert_str(deck(creep="1e-20, 5., -0.99", visco="1., 1000."))
-    assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n1., 1000.\n" in body and not conv.reduced_physics
+    assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n1., 1000.\n" in body and conv.reduced_physics == floor
     body, conv, report = convert_str(deck(creep="1e-300, 20.", load="*Dload\n1, P4, -1e20\n",
                                           visco="1., 1000."))
-    assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n1., 1000.\n" in body and not conv.reduced_physics
+    assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n1., 1000.\n" in body and conv.reduced_physics == floor
     assert "would take more than 1e+06 increments" in report.text()
     # m = -0.9 from t = 0: (7.07e-3 * 0.1 / (2e-15 200^5))^10 = 2.71 h, as the float form gave
     body, _, _ = convert_str(deck(creep="2e-15, 5., -0.9", visco="0.002, 1000."))
     assert "*STEP, INC=410\n*VISCO, CETOL=5.E-3\n0.002,1000.,,2.71\n" in body
+
+
+def test_creep_below_ccx_floor_flagged():
+    # ccx 2.23 raises a Norton law's A t^m to at least 1e-20 (incplas.f, isotropic *ELASTIC),
+    # t the total time: an SI deck's A = 1e-30 creeps 1e10 times too fast, without a message
+    flag = "*CREEP A t^m below ccx's 1e-20 floor (a faster creep)"
+
+    def deck(creep="1.E-30, 3.", elastic="*Elastic\n2.E11, 0.3", static="1.E-7, 1.E-6",
+             visco="*Visco, cetol=1.E-3\n1.E-4, 1.E-3", law="TIME"):
+        return (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n" + elastic +
+                "\n*Creep, law=" + law + "\n" + creep + "\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n*Step\n*Static\n"
+                + static + "\n*Dload\n1, P4, -1.E6\n*End Step\n*Step\n" + visco + "\n*End Step\n")
+    _, conv, report = convert_str(deck())
+    assert "with A = 1.E-30 ccx creeps 1e+10 times as much as the deck's law at a constant stress " \
+           "in *VISCO step 2" in report.text() and conv.reduced_physics == [flag]
+    # m > 0 from total time 0 (the *STATIC step's 1e-6): below the floor up to t = 100 of 200,
+    # 1 + m (100 / 200)^(m + 1) = 1.25 (probed: 1.246, ccx's increments end-point rule);
+    # after a *STATIC step of 1000 the floor never bites
+    _, conv, report = convert_str(deck(creep="1.E-22, 3., 1.", visco="*Visco, cetol=1.E-3\n1., 200."))
+    assert "m = 1 ccx creeps 1.25 times as much" in report.text() and conv.reduced_physics == [flag]
+    # m < 0 after a total time of 1: past the floor's t = 0.01 throughout
+    _, _, report = convert_str(deck(creep="1.E-21, 3., -0.5", static="1., 1.",
+                                    visco="*Visco, cetol=1.E-3\n1.E-3, 0.1"))
+    assert "m = -0.5 ccx creeps 10.24 times as much" in report.text()
+    # temperature rows: the row below the floor is named
+    _, _, report = convert_str(deck(creep="1.E-30, 3., 0., 20.\n1.E-10, 3., 0., 500."))
+    assert "with A = 1.E-30 (temperature 20.) ccx creeps 1e+10 times" in report.text()
+    # not flagged: above the floor (NAFEMS' A in MPa and h), m > 0 after the floor's time, an
+    # orthotropic *ELASTIC (ortho_plas.f has no floor: probed), another creep law, no step
+    # where ccx creeps
+    ortho = "*Elastic, type=ORTHOTROPIC\n2.7e11, 1.2e11, 2.7e11, 1.2e11, 1.2e11, 2.7e11, 7.7e10, 7.7e10\n7.7e10"
+    for kw in (dict(creep="3.125E-14, 5."), dict(creep="1.E-22, 3., 1.", static="1000., 1000.",
+                                                  visco="*Visco, cetol=1.E-3\n1., 200."),
+               dict(elastic=ortho), dict(law="HYPERBOLIC SINE"),
+               dict(visco="*Static\n1., 1.")):
+        _, conv, report = convert_str(deck(**kw))
+        assert "floor" not in report.text() and flag not in conv.reduced_physics, kw
+    assert math.isclose(A.creep_floor_factor(1e-24, 2.0, 0.0, 400.0), 1.0 + 2.0 * (100.0 / 400.0) ** 3)
+    assert math.isclose(A.creep_floor_factor(1e-21, -0.5, 1.0, 2.0), 1e-20 / (2e-21 * (2 ** 0.5 - 1)))
 
 
 def test_unused_user_material_noted_as_never_called():

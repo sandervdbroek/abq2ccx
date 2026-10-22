@@ -6,6 +6,11 @@ physics.
 
 ## Unreleased
 
+* **Norton creep below ccx's floor flagged** — ccx 2.23 raises a Norton law's A t^m to at
+  least 1e-20 (t the total time) on an isotropic `*ELASTIC`, without a message: a deck in Pa
+  and s, whose A is far smaller, creeps up to 1e24 times too fast. Where that raises a creep
+  step's creep strain by more than 0.1 %, the report now gives the factor and the step, and the
+  deck counts as reduced physics. Units with a larger A avoid it (MPa for Pa).
 * **Geostatic initial stresses and steps** — `*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC` was
   commented out. It is now written at each of ccx's integration points: the vertical stress
   linear in the elevation (z in 3-D, y in plane and axisymmetric models) through the card's two
