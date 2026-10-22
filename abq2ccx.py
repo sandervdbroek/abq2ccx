@@ -2244,6 +2244,12 @@ def has_field_dependence(block: Block) -> bool:
         return True
 
 
+def thermal_expansion(block: Block) -> bool:
+    """Whether ``block`` is an *EXPANSION card of thermal expansion, not of field expansion
+    (FIELD=, which handle_expansion comments out: _plan_field_expansion)."""
+    return block.keyword == "EXPANSION" and not block.has("FIELD")
+
+
 def material_rows(block: Block, nvals: int) -> Optional[List[List[str]]]:
     """The data rows of a material card with ``nvals`` property values per row: the values,
     the temperature, then the DEPENDENCIES= field values, as stripped tokens ("" for a blank
@@ -11401,7 +11407,7 @@ class _Mesh:
             c = self._amp_curves.get(name)
             return math.inf if c is None or c.panel or not c.breaks else \
                 max(abs(c.value(t)) for t in c.breaks)
-        heated = any(b.keyword == "EXPANSION" for b in blocks)
+        heated = any(thermal_expansion(b) for b in blocks)
         loads = ("CLOAD", "DLOAD", "DSLOAD", "CONNECTOR LOAD", "CONNECTOR MOTION", "BASE MOTION") + \
             (("TEMPERATURE", "CFLUX", "DFLUX", "DSFLUX", "FILM", "SFILM", "RADIATE", "SRADIATE")
              if heated else ())
@@ -12136,7 +12142,10 @@ class _Mesh:
           (_tabular_lines).  ccx 2.23's face-to-face contact reads no TABULAR table at all
           (springforc_f2f takes the point count from plconloc(81), materialdata_sp stores it in
           plconloc(801); probed: no contact force): a table p = K h becomes LINEAR K there,
-          exact on face-to-face pairs; any other is reduced physics there.
+          exact on face-to-face pairs; any other is reduced physics there.  A curve with
+          pressure at a clearance is reduced physics on node-to-surface pairs where that
+          clearance is past ccx's springs (_n2f_reach, as for EXPONENTIAL below; probed: two
+          cubes 0.002 apart, no force for Abaqus' 800).
         * EXPONENTIAL: Abaqus' pressure is zero at the clearance c0 and p0 at contact
           (exponential_overclosure); ccx's is p0 100^(-d/c0) at a clearance d, never zero
           (probed: 9865 for Abaqus' 4177).  On node-to-surface pairs Abaqus' curve becomes a
@@ -12217,6 +12226,20 @@ class _Mesh:
                              f"no pressure. A NODE TO SURFACE pair reads it.", once=True)
             self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR on a face-to-face pair "
                           "(no contact pressure in ccx 2.23)")
+        # pressure at a clearance (soft contact from a negative overclosure on): up to the
+        # point before the first positive pressure; ccx's node-to-surface springs reach less far
+        first = next((i for i, (p, _h) in enumerate(pts) if p > 0.0), None)
+        gap = -pts[max(first - 1, 0)][1] if first is not None else 0.0
+        reach = self._n2f_reach(si) if gap > 0.0 and "N2F" in kinds else None
+        if gap > 0.0 and "N2F" in kinds and (reach is None or gap > reach):
+            self.report.warn(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR of interaction {si}: "
+                             f"Abaqus' curve gives pressure from a clearance of {short_real(gap, 6)} "
+                             f"on, but ccx's node-to-surface contact makes a spring only to a "
+                             f"clearance of 1e-3 sqrt(A) (A: a slave node's area"
+                             f"{f', here at least {short_real(reach, 3)}' if reach else ''}), so "
+                             f"the pressure at larger clearances is left out.", once=True)
+            self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR (no pressure at "
+                          "clearances beyond ccx's node-to-surface springs)")
         if slope > 0.0:
             self.report.note("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR: a point added far "
                              "out on the last slope (Abaqus extrapolates the curve on it, ccx would "
@@ -13068,7 +13091,8 @@ class _Mesh:
                         f"an edge were upgraded too ({', '.join(others)}), so no midside node hangs"
                         if others else "")
                      + (f"; {beams} 2-node beam(s) along an upgraded edge became 3-node beams "
-                        f"through its midside node" if beams else "")
+                        f"through its midside node, on the straight edge there (Abaqus' beam is "
+                        f"straight)" if beams else "")
                      + ". BCs, temperatures and initial conditions on both ends of an edge reach its "
                        "midside node, and so do the node sets of BCs, couplings, ties and output.")
         self.report.warn(f"[APPROX] Element {what} written as {parts[0]}: {why}. ccx's "
@@ -13395,13 +13419,14 @@ class _Mesh:
         on S3, S4, S4R and S8), so the linear shells of a composite section become S8R / S6
         (COMPOSITE_SHELL_UPGRADE) with a node at the middle of every edge, on the curved
         surface the shells' nodal normals define (_surface_midsides; on the straight edge where
-        it is flat or folds): the same layup, thicknesses, orientations, element ids and sets.  Every linear shell
-        joined to them through an edge is upgraded too — a linear neighbour would leave the
-        midside node of their shared edge hanging — and a 2-node beam along an upgraded edge
-        (*BEAM SECTION) becomes the 3-node beam through its midside node, so a stiffener stays
-        joined along the whole edge.  The new nodes join the node sets that hold both ends of
-        their edge (_extend_edge_sets), and BCs, temperatures and initial conditions on both
-        ends reach them (_midside_records)."""
+        it is flat or folds, or carries a beam): the same layup, thicknesses, orientations,
+        element ids and sets.  Every linear shell joined to them through an edge is upgraded
+        too — a linear neighbour would leave the midside node of their shared edge hanging —
+        and a 2-node beam along an upgraded edge (*BEAM SECTION) becomes the 3-node beam
+        through its midside node, so a stiffener stays joined along the whole edge (and
+        straight, as in Abaqus: that node is on the chord).  The new nodes join the node sets
+        that hold both ends of their edge (_extend_edge_sets), and BCs, temperatures and
+        initial conditions on both ends reach them (_midside_records)."""
         corners = self._linear_shell_corners()
         seeds = [e for b in blocks
                  if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION") and b.has("COMPOSITE")
@@ -13420,7 +13445,7 @@ class _Mesh:
             + (f"; {extra} other linear shell(s) joined to them by an edge were upgraded too, so no "
                f"midside node hangs" if extra else "")
             + (f"; {beams} 2-node beam(s) along an upgraded edge became 3-node beams through its "
-               f"midside node" if beams else "")
+               f"midside node, on the straight edge there (Abaqus' beam is straight)" if beams else "")
             + ". BCs, temperatures and initial conditions on both ends of an edge reach its midside "
               "node, and so do the node sets of BCs, couplings, ties and output. The quadratic "
               "shell is more accurate than the linear one on the same mesh, so results differ "
@@ -13451,12 +13476,13 @@ class _Mesh:
         under --approximate, _plan_s4r_shells): (the upgraded elements, 'S4R -> S8R'-like kind
         -> count, the new nodes' span, the 2-node beams along an upgraded edge made 3-node).
         A shell's new node lies on the curved surface its nodal normals define
-        (_surface_midsides), on the straight edge where the surface is flat there or folds.
-        ``plane``: linear plane and axisymmetric elements (``corners`` from
-        _linear_shell_corners(plane=True)) -> PLANE_QUADRATIC_UPGRADE (plastic CPE4 / CAX4
-        under --approximate, _plan_plastic_plane_quads), the deck's suffixes kept where Abaqus
-        has the quadratic element with them (CPE4H -> CPE8RH, CAX4T -> CAX8RT); their new nodes
-        lie on the straight edges."""
+        (_surface_midsides), on the straight edge where the surface is flat there or folds, or
+        where a 2-node beam runs along the edge (straight in Abaqus).  ``plane``: linear plane
+        and axisymmetric elements (``corners`` from _linear_shell_corners(plane=True)) ->
+        PLANE_QUADRATIC_UPGRADE (plastic CPE4 / CAX4 under --approximate,
+        _plan_plastic_plane_quads), the deck's suffixes kept where Abaqus has the quadratic
+        element with them (CPE4H -> CPE8RH, CAX4T -> CAX8RT); their new nodes lie on the
+        straight edges."""
         els = self.geom.elements
 
         def edges(e: int) -> List[Tuple[int, int]]:
@@ -13482,6 +13508,14 @@ class _Mesh:
         made: List[Tuple[int, int, int]] = []
         kinds: "OrderedDict[str, int]" = OrderedDict()
         curved = {} if plane else self._surface_midsides(blocks, corners, comp)
+        general = {e for b in blocks if b.keyword == "BEAM GENERAL SECTION"
+                   for e in self.geom.elset((b.param("ELSET") or "").strip())}
+        # the edges of 2-node beams that become 3-node ones through the edge's new node (below):
+        # it stays on the chord there, as the Abaqus beam is straight
+        straight = {(min(conn), max(conn)) for e, (typ, conn) in els.items()
+                    if len(conn) == 2 and e not in comp and e not in self._midside and
+                    e not in general and e not in self._u1 and QUADRATIC_UPGRADE.get(ccx_type(typ))
+                    } if curved else set()
         for e in sorted(comp):
             typ, conn = els[e]
             mids = []
@@ -13489,7 +13523,8 @@ class _Mesh:
                 key = (min(a, c), max(a, c))
                 if key not in mid:
                     next_id += 1
-                    self.geom.add_node(next_id, curved.get(key) or vscale(vadd(nodes[a], nodes[c]), 0.5))
+                    self.geom.add_node(next_id, (None if key in straight else curved.get(key)) or
+                                       vscale(vadd(nodes[a], nodes[c]), 0.5))
                     mid[key] = next_id
                     made.append((a, c, next_id))
                     na, nc = self._node_normals.get(a), self._node_normals.get(c)
@@ -13508,8 +13543,6 @@ class _Mesh:
             kinds[kind] = kinds.get(kind, 0) + 1
         self._edge_nodes += [(a, c, m, 0.5) for a, c, m in made]
         # 2-node beams along an upgraded edge, and other elements left with a hanging midside node
-        general = {e for b in blocks if b.keyword == "BEAM GENERAL SECTION"
-                   for e in self.geom.elset((b.param("ELSET") or "").strip())}
         beams = 0
         hanging: Dict[int, List[Tuple[int, int, int]]] = {}
         ends: Dict[int, List[Tuple[int, int]]] = {}
@@ -13567,7 +13600,9 @@ class _Mesh:
         a node is its *NODE normal, else the value at the node of the linear normal field
         fitted to the facet normals of the group's shells there and of their groups at its
         edge neighbours, each facet's at the circumcentre of its corner triangle (where it is
-        the surface's normal on a sphere or cylinder).  On the group's free edge those facets
+        the surface's normal on a sphere or cylinder) — or, where the group's facets there are
+        coplanar, their normal (the fit would lean it towards a fold one element on, which
+        Abaqus' average does not).  On the group's free edge those facets
         lie on one side, which tilts the fit inwards: the normal is turned about the edge onto
         the direction from the point where the facet normal lines meet as seen along it
         (normal_lines_meet; a corner takes its two edges in turns).  A *NORMAL line overrides
@@ -13689,7 +13724,10 @@ class _Mesh:
                     r[0], r[1], r[2] = r[0] + n[k], r[1] + u * n[k], r[2] + v * n[k]
             fit = first_unknowns([[float(len(lines)), ss, tt], [ss, s2, st], [tt, st, t2]], rhs)
             nrm = avg
-            if fit and vnorm(tuple(fit)) > 0.0 and vdot(vunit(tuple(fit)), avg) >= cos_fold:
+            # (where the group's facets are coplanar the surface is flat at the node: their
+            # normal, Abaqus' too; the fit would lean it towards a fold beyond the next node)
+            if fit and vnorm(tuple(fit)) > 0.0 and vdot(vunit(tuple(fit)), avg) >= cos_fold and \
+                    any(vnorm(vcross(n, avg)) >= MIDSIDE_FLAT_RAD / 4 for n, _x, _w in fs):
                 nrm = vunit(tuple(fit))
             bound = [x for x, es in share.items() if len(es) == 1]
             if bound:                                # turned about the free edge
@@ -15502,7 +15540,7 @@ class _Mesh:
             if len(drows) > 1:
                 return f"material {mat}: a temperature-dependent *DENSITY"
             density = drows[0][0].strip() if drows else None
-            expansion = any(g.keyword == "EXPANSION" for g in group)
+            expansion = any(thermal_expansion(g) for g in group)
         else:
             mat = ""
             n1_at = beam_n1_line(b)
@@ -18352,7 +18390,9 @@ class _Materials:
         beta K in *DYNAMIC steps only (nonlingeo.c; dyna.c and steadystate.c take them from
         *MODAL DAMPING, RAYLEIGH alone): M the whole mass matrix, K the tangent one, so point
         masses (implicit and explicit), SPRINGA springs and node-to-surface contact are damped
-        too (probed); its explicit solver stops on a BETA (nonlingeo.c: without massless
+        too (probed), and so are the converter's connector springs and gap elements (springs
+        in ccx too, elements.f); a TIED contact pair is a *TIE in ccx.  Its explicit solver
+        stops on a BETA (nonlingeo.c: without massless
         contact, which the converter does not write; probed).  So each
         parameter is written as the one value of every source it acts on (exact), else left
         out: reduced physics where a step uses it, or under --approximate the materials' one
@@ -18422,7 +18462,14 @@ class _Materials:
                 if re.fullmatch(r"\s*[-+]?(\d+\.?\d*|\.\d+)([eEdD][-+]?\d+)?\s*", x)))
                for b in blocks):
             stiff.append(("springs (Abaqus damps none)", 0.0))
-        if any(b.keyword in ("CONTACT PAIR", "CONTACT") for b in blocks):
+        # the SPRINGA elements the converter writes for connector elasticity (_conn_element;
+        # Abaqus damps a connector by its *CONNECTOR DAMPING alone) and gap elements (GAPUNI:
+        # a spring in ccx, contact in Abaqus)
+        if any(typ == "SPRINGA" and k != 0.0 for typ, k in self._conn_sets):
+            stiff.append(("connector springs (Abaqus damps none)", 0.0))
+        if any(t.upper().startswith("GAP") for t in self._elem_types):
+            stiff.append(("gap elements (Abaqus damps none)", 0.0))
+        if self._freq_contact:      # the contact pairs ccx gets: a TIED one is a *TIE there
             stiff.append(("contact (Abaqus damps none)", 0.0))
         extra_b = stiff if implicit else []
 
@@ -19458,7 +19505,7 @@ class _Materials:
     def _expansion_card(self, group: List[Block]) -> Tuple[Optional[str], Optional[Block]]:
         """``("ORTHO" | "ANISO", card)`` when a material's (last) *EXPANSION is orthotropic or
         anisotropic as it is written for ccx (_plan_expansion_as_ortho), else ``(None, None)``."""
-        exp = [g for g in group if g.keyword == "EXPANSION"]
+        exp = [g for g in group if thermal_expansion(g)]
         typ = (exp[-1].param("TYPE") or "ISO").strip().upper() if exp else "ISO"
         kind = {"ORTHO": "ORTHO", "ORTHOTROPIC": "ORTHO", "ANISO": "ANISO",
                 "ANISOTROPIC": "ANISO"}.get(typ)
@@ -19483,7 +19530,7 @@ class _Materials:
         for group in self._material_groups(blocks):
             name = (group[0].param("NAME") or "").strip()
             for exp in group:
-                if exp.keyword != "EXPANSION" or exp.has("USER") or \
+                if not thermal_expansion(exp) or exp.has("USER") or \
                         exp.uparam("TYPE") not in ("ANISO", "ANISOTROPIC"):
                     continue
                 rows = material_rows(exp, 6)
@@ -19504,6 +19551,20 @@ class _Materials:
         one halved (handle_dependent_material), and an anisotropic one without shear
         coefficients written as TYPE=ORTHO (alpha11, alpha22, alpha33[, temperature]) where
         _plan_expansion_as_ortho chose it."""
+        if b.has("FIELD"):
+            var = (b.param("FIELD") or "").strip()
+            what = (f"*EXPANSION, FIELD={var} (field expansion: strain from changes of field variable "
+                    f"{var}; ccx has no field variables and would read the card as a thermal "
+                    f"expansion, its last *EXPANSION card winning)")
+            why = self._field_expansion[id(b)] if id(b) in self._field_expansion else \
+                self._field_expansion_loss(b, None)
+            if why is None:
+                return self._commented(b, f"{what}: field variable {var} keeps its initial values at "
+                                          f"the nodes of its material's elements all the analysis "
+                                          f"long, so its strain is 0. Commented out (exact).",
+                                       reduces=False)
+            return self._commented(b, f"{what}: {why}, so ccx solves the model without that strain. "
+                                      f"Commented out.", reduces="*EXPANSION, FIELD (field expansion)")
         out = self.handle_dependent_material(b)
         mat = self._expansion_as_ortho.get(id(b))
         if mat is None:
@@ -20584,7 +20645,7 @@ class _Materials:
             sym = None
             for c in opts[1:]:
                 typ = c.uparam("TYPE")
-                tensor = c.keyword in ("ELASTIC", "EXPANSION", "CONDUCTIVITY")
+                tensor = c.keyword in ("ELASTIC", "CONDUCTIVITY") or thermal_expansion(c)
                 if c.keyword == "USER MATERIAL" or (c.keyword == "HYPERELASTIC" and c.has("ANISOTROPIC")) \
                         or (tensor and typ in ("ANISOTROPIC", "ANISO")):
                     sym = "aniso"
@@ -20734,12 +20795,19 @@ class _Materials:
         by a user routine or from a results file), for a user material, a card whose rows are
         not known (field_card_layout) and above FIELD_COPY_MAX copies.  ``_fields_absorbed``:
         nothing the conversion leaves reads field values (no other card with DEPENDENCIES, no
-        user material or element), so the cards that set them change nothing in ccx."""
-        self._fields_absorbed = False
+        user material or element), so the cards that set them change nothing in ccx.
+        ``_field_facts``: the nodes' initial field values and the (variable, node) whose value
+        leaves its initial one in a step, None where user code or a results file sets them
+        (_plan_field_expansion)."""
+        self._fields_absorbed = self._field_copies = False
+        self._field_facts = ({}, set())
         setters = [b for b in blocks if b.keyword == "FIELD" or
                    (b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "FIELD")]
-        if not setters or any(b.keyword == "USER DEFINED FIELD" for b in blocks) or any(
+        if not setters:
+            return
+        if any(b.keyword == "USER DEFINED FIELD" for b in blocks) or any(
                 b.has(k) for b in setters for k in ("USER", "FILE", "OUTPUT VARIABLE", "NUMBER")):
+            self._field_facts = None
             return
         zero: Tuple[float, Tuple[float, ...]] = (0.0, ())
 
@@ -20757,6 +20825,7 @@ class _Materials:
             init = dict(kv for b in setters if b.keyword == "INITIAL CONDITIONS" for kv in values(b))
             state, during = dict(init), None
             changed: Dict[Tuple[int, int], int] = {}        # (variable, node) -> the first step changing it
+            moved: set = set()          # (variable, node) whose value leaves its initial one
             for step in self.steps:
                 cards = [c for c in step.cards if c.keyword == "FIELD"]
                 # (OP=NEW in a perturbation step: the fields it leaves out are 0, *FIELD keywords)
@@ -20773,16 +20842,22 @@ class _Materials:
                     a, c = state.get(key, zero), new.get(key, zero)
                     if (key in amp and (a != zero or c != zero)) or (a != c and not at_once):
                         changed.setdefault(key, step.no)
+                    if (key in amp and (a != zero or c != zero)) or c != init.get(key, zero):
+                        moved.add(key)
                 if not step.perturbation:
                     state = new
                 if during is None:
                     during = state
         except ValueError:
+            self._field_facts = None
             return
+        self._field_facts = (init, moved)
         during = init if during is None else during
         opts = self._material_options(blocks)
         deps: "OrderedDict[str, List[Block]]" = OrderedDict(
-            (m, [c for c in g[1:] if has_field_dependence(c)]) for m, g in opts.items())
+            (m, [c for c in g[1:] if has_field_dependence(c) and (c.keyword != "EXPANSION" or
+                                                                  thermal_expansion(c))])
+            for m, g in opts.items())       # (a field expansion: _plan_field_expansion)
         deps = OrderedDict((m, cs) for m, cs in deps.items() if cs)
         ndeps: Dict[str, int] = {}
         for m, cs in deps.items():
@@ -20864,11 +20939,12 @@ class _Materials:
             return
         mine = {id(c) for cs in deps.values() for c in cs}
         self._fields_absorbed = \
-            not any((has_field_dependence(b) and id(b) not in mine) or
+            not any((has_field_dependence(b) and id(b) not in mine and
+                     (b.keyword != "EXPANSION" or thermal_expansion(b))) or
                     b.keyword in ("USER MATERIAL", "USER ELEMENT") for b in blocks) \
             and all(m in states and len(rows[(m, next(iter(states[m])))]) == len(deps[m])
-                    for m in deps if m in used) \
-            and not (changed and any(b.keyword == "EXPANSION" and b.has("FIELD") for b in blocks))
+                    for m in deps if m in used)
+        self._field_copies = bool(states)
         if not states:
             return
         # the copies, after their material in deck order, then the material itself at its first state
@@ -20969,13 +21045,73 @@ class _Materials:
         is commented out as reduced physics)."""
         if not self._fields_absorbed:
             return None
+        why = (["field-dependent material data are written at each element's values (material "
+                "copies ..._FIELD<k>)"] if self._field_copies else []) + \
+            (["a field expansion (*EXPANSION, FIELD=) is 0 while the fields keep their initial "
+              "values, as here"] if self._field_expansion else [])
         return self._commented(b, f"{card}: ccx has no field variables, and nothing in the converted "
-                                  f"deck reads them: field-dependent material data are written at "
-                                  f"each element's values (material copies ..._FIELD<k>). Commented "
-                                  f"out.", reduces=False)
+                                  f"deck reads them: {'; '.join(why) or 'no material data depend on them'}. "
+                                  f"Commented out.", reduces=False)
 
     def handle_field(self, b: Block) -> List[str]:
         return self._field_setter_absorbed(b, "*FIELD") or self.passthrough(b)
+
+    def _plan_field_expansion(self, blocks: List[Block]) -> None:
+        """``*EXPANSION, FIELD=n``: field expansion (Abaqus/Standard), the strain alpha_f (f_n -
+        f_n0) less its value at the initial field values (2017 "Field expansion"; f_n0 the
+        ZERO).  ccx has no field variables: it ignores FIELD and reads the card as a thermal
+        expansion, its material's last *EXPANSION card winning (probed on 2.23: 100 times the
+        thermal strain), so handle_expansion comments the card out.  That is exact where the
+        strain stays 0: field n keeps its initial value at every node of the material's
+        elements all the analysis long, and alpha_f is one value or those initial values are
+        its ZERO (else alpha_f moving with temperature moves the strain).  ``_field_expansion``:
+        each card -> None there, else why it is lost; then the cards setting fields are no
+        longer absorbed (_fields_absorbed), as they would drive it.  After _plan_material_cards
+        (the materials' cards) and _plan_field_materials (_field_facts)."""
+        self._field_expansion = {}
+        cards = [b for b in blocks if b.keyword == "EXPANSION" and b.has("FIELD")]
+        if not cards:
+            return
+        mats = {(self._card_material.get(id(b)) or "").upper() for b in cards}
+        nodes_of: Dict[str, set] = {}
+        els = self.geom.elements
+        for b in blocks:
+            elset = (b.param("ELSET") or "").strip()
+            if not b.keyword.endswith("SECTION") or not elset:
+                continue
+            hit = {m.upper() for _t, m, _p in self._section_layers(b) if m} & mats
+            if hit:
+                nodes = {n for e in self._existing(elset) for n in els[e][1]}
+                for m in hit:
+                    nodes_of.setdefault(m, set()).update(nodes)
+        for b in cards:
+            mat = (self._card_material.get(id(b)) or "").upper()
+            why = self._field_expansion_loss(b, nodes_of.get(mat, set()))
+            self._field_expansion[id(b)] = why
+            if why and mat in self._used_materials:
+                self._fields_absorbed = False
+
+    def _field_expansion_loss(self, b: Block, nodes: Optional[set]) -> Optional[str]:
+        """Why field expansion ``b`` (*EXPANSION, FIELD=n) gives a strain at ``nodes`` (None:
+        at any node), which ccx cannot have; None where it stays 0 (_plan_field_expansion)."""
+        facts = self._field_facts
+        try:
+            var = pint((b.param("FIELD") or "").strip())
+            zero = pf((b.param("ZERO") or "").strip() or "0")
+        except ValueError:
+            return "its FIELD= or ZERO= does not read as a number"
+        if nodes is not None and not nodes:
+            return None
+        if facts is None:
+            return "user code or a results file sets the field values"
+        init, moved = facts
+        if any(v == var and (nodes is None or n in nodes) for v, n in moved):
+            return f"a step changes field variable {var} at nodes of its elements"
+        if (temperature_dependent(b) or has_field_dependence(b)) and any(
+                val[0] != zero for (v, n), val in init.items() if v == var and (nodes is None or n in nodes)):
+            return (f"its coefficient varies with temperature or field variables while field "
+                    f"variable {var} starts away from its ZERO ({zero:g}), so the strain moves with them")
+        return None
 
     def _plan_heatless_materials(self, blocks: List[Block]) -> None:
         """In a thermal step (CCX_THERMAL_PROCS) ccx 2.23 gives every element temperature DOFs,
@@ -21913,7 +22049,8 @@ class _Axes:
         mat_dist: Dict[str, List[Tuple[Block, str, int]]] = {}
         for mat, group in opts.items():
             for c in group[1:]:
-                recs = merged_data_records(c) if c.keyword in ("ELASTIC", "DENSITY", "EXPANSION") else []
+                recs = merged_data_records(c) if c.keyword in ("ELASTIC", "DENSITY") or \
+                    thermal_expansion(c) else []
                 d = named(recs[0][0]) if recs and recs[0] else None
                 if d is None:
                     continue
@@ -38600,8 +38737,8 @@ class _Loads:
         # (the first step's too: its base state has the initial temperatures)
         self._sp_temps = {s for s in static
                           if any(b.keyword == "TEMPERATURE" for b in self.steps.steps[s - 1].cards)}
-        self._sp_temp_dep = any(b.keyword in ("ELASTIC", "HYPERELASTIC", "HYPERFOAM", "EXPANSION") and
-                                temperature_dependent(b) for b in model)
+        self._sp_temp_dep = any((b.keyword in ("ELASTIC", "HYPERELASTIC", "HYPERFOAM") or
+                                 thermal_expansion(b)) and temperature_dependent(b) for b in model)
         acts = self.steps.acting(skip=self.steps.lc2, blocks=blocks)
         deck = model + [b for step in self.steps for b in step.cards]
         given = {id(b): self._boundary_pairs(b) for b in deck
@@ -42420,6 +42557,12 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._depvar_counts: set = set()
         self._fields_set = False
         self._fields_absorbed = False           # _plan_field_materials
+        # (initial field values, the (variable, node) whose value a step moves from it) or
+        # None: user code sets them (_plan_field_materials)
+        self._field_facts: Optional[Tuple[Dict[Tuple[int, int], Tuple[float, Tuple[float, ...]]],
+                                          set]] = ({}, set())
+        self._field_copies = False              # field-dependent material copies written
+        self._field_expansion: Dict[int, Optional[str]] = {}     # (_plan_field_expansion)
         self.steps: Optional[StepModel] = None     # the deck's steps (_plan_deck_facts, _read_steps)
         self.emit = EmitState()                     # what the emission has written so far
         self._synth_counter = 0
@@ -43433,6 +43576,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_initial_temperatures(blocks)     # after the mesh planners: their new nodes
         self._order_material_cards(blocks)      # after the planners that add material cards
         self._plan_material_cards(blocks)
+        self._plan_field_expansion(blocks)      # after it: the cards' materials
         self._plan_damping(blocks)              # after it: the materials sections use
         self._plan_modal_damping(blocks)        # after it: _modal_rayleigh, _damping
         self._undefined_parameter_data(blocks)
@@ -44222,7 +44366,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._sheet_contact_thickness(blocks, lines)
         self._tdep_material = any(b.keyword in ("ELASTIC", "DENSITY", "HYPERELASTIC", "HYPERFOAM")
                                   and temperature_dependent(b) for b in blocks)
-        self._expansion = any(b.keyword == "EXPANSION" for b in blocks)
+        self._expansion = any(thermal_expansion(b) for b in blocks)
         model = model_data(blocks)
         self._model_stressed = any(b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") not in
                                   ("TEMPERATURE", "FIELD") for b in blocks) or \

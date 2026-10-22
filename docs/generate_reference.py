@@ -251,7 +251,8 @@ TRANSLATED = {
         "with rotations, whose axes Abaqus turns, and where the `ORIENTATION`'s axes are unknown: "
         "then M11 alone). `ALPHA` goes into the model-wide `*DAMPING` (see there).",
     "*DAMPING": "ccx 2.23 has one `ALPHA`, `BETA` pair for the whole model, applied in `*DYNAMIC` "
-        "steps to all mass and stiffness (point masses, springs, contact too): a value every "
+        "steps to all mass and stiffness (point masses, springs, connector springs, gap elements "
+        "and contact too; a `TIED` pair is a tie): a value every "
         "material, section and point mass it acts on shares → that pair, both given (a missing one "
         "is 0); one that differs → left out, reduced physics (`--approximate`: the materials' "
         "value where only point masses, springs or contact differ). `BETA` with an explicit step "
@@ -554,7 +555,8 @@ TRANSLATED = {
     "*SURFACE BEHAVIOR": "`TABULAR`: a point far out on the last slope (ccx holds the last "
         "pressure); `EXPONENTIAL`: Abaqus' curve as a TABULAR one (ccx's c0 is where p = p0 / 100). "
         "ccx 2.23's face-to-face contact reads no TABULAR table: a line through the origin becomes "
-        "`LINEAR`, other curves are reduced physics.",
+        "`LINEAR`, other curves are reduced physics. On node-to-surface pairs a curve with pressure "
+        "at a clearance beyond ccx's springs (1e-3 √A, A a slave node's area) is reduced physics.",
     "*GAP CONDUCTANCE": "a table against clearance becomes the closed-gap value for every pressure "
         "(ccx reads it against pressure; it conducts across closed gaps only), and is left out "
         "beside a `PRESSURE` card.",
@@ -593,7 +595,9 @@ TRANSLATED = {
         "written at each element's field values, one material copy per state (`..._FIELD<k>`, "
         "sections split by element set): exact where an element's nodes share their values all "
         "the analysis long; reduced physics where they differ, vary through a shell or beam "
-        "section, or change in a step. A linear-elastic `*ELASTIC` less anisotropic than its "
+        "section, or change in a step. `*EXPANSION, FIELD=n` (field expansion; ccx would read it as "
+        "a thermal expansion) is commented out: exact where field n keeps its initial values, else "
+        "reduced physics. A linear-elastic `*ELASTIC` less anisotropic than its "
         "material's `*EXPANSION` (isotropic beside `ORTHO`, isotropic / orthotropic / engineering "
         "constants beside `ANISO`) is written as `ENGINEERING CONSTANTS` / `ANISO` with the same "
         "stiffness, since ccx 2.23 otherwise uses a wrong stiffness in linear steps once the deck has "
@@ -860,7 +864,8 @@ def gen_elements():
             parts.append("ccx 2.23 runs a composite `*SHELL SECTION` on `S6` and `S8R` only, and has "
                          "no layered solid section. Linear composite shells become `S6`/`S8R` with a "
                          "node at the middle of every edge (on the curved surface the averaged nodal "
-                         "normals define; straight where flat or folded), shared with the linear shells and 2-node "
+                         "normals define; straight where flat or folded, or where a 2-node beam runs along the "
+                         "edge), shared with the linear shells and 2-node "
                          "beams joined to them by an edge, which are upgraded too. Composite "
                          "continuum shells become one solid per ply, stacked from the bottom face "
                          "(`STACK DIRECTION`), each its share of the thickness with its material and "

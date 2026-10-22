@@ -6679,6 +6679,80 @@ def rayleigh_explicit_deck(b="*Damping, alpha=2."):
             "*Node Print, nset=PROBE, frequency=100000\nU\n*End Step\n")
 
 
+def connector_rayleigh_deck():
+    """A held C3D8 cube of material M (*DAMPING, BETA=0.01) beside an AXIAL CONN3D2 connector of
+    stiffness 100 from a held node to a point mass 1 that starts at velocity 1 along it:
+    implicit *DYNAMIC (ALPHA=0) over 1.  Abaqus damps a connector by its *CONNECTOR DAMPING
+    alone, so the mass swings undamped, u = sin(10 t) / 10 (code check G2-1: ccx's BETA damped
+    the converter's SPRINGA, zeta 0.05)."""
+    cube = "".join(f"{i + 1}, {x}., {y}., {z}.\n" for i, (x, y, z) in enumerate(
+        [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]))
+    return ("*NODE, NSET=CUBE\n" + cube + "*NODE\n21, 5., 0., 0.\n22, 6., 0., 0.\n"
+            "*ELEMENT, TYPE=C3D8, ELSET=A\n1, 1, 2, 3, 4, 5, 6, 7, 8\n*ELEMENT, TYPE=CONN3D2, ELSET=C\n"
+            "3, 21, 22\n*ELEMENT, TYPE=MASS, ELSET=PM\n4, 22\n*MASS, ELSET=PM\n1.\n"
+            "*CONNECTOR SECTION, ELSET=C, BEHAVIOR=CB\nAXIAL\n*CONNECTOR BEHAVIOR, NAME=CB\n"
+            "*CONNECTOR ELASTICITY, COMPONENT=1\n100.\n*SOLID SECTION, ELSET=A, MATERIAL=M\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n1.\n*DAMPING, BETA=0.01\n"
+            "*NSET, NSET=N22\n22\n*BOUNDARY\nCUBE, 1, 3\n21, 1, 3\n22, 2, 3\n"
+            "*INITIAL CONDITIONS, TYPE=VELOCITY\n22, 1, 1.\n*STEP, INC=10000\n"
+            "*DYNAMIC, ALPHA=0., DIRECT\n0.002, 1.\n*NODE PRINT, NSET=N22, FREQUENCY=5\nU\n*END STEP\n")
+
+
+def tied_rayleigh_deck(tied=True, beta="*DAMPING, BETA=0.01"):
+    """A column of two unit C3D8 cubes along z (E 1000, nu 0, density 1, ``beta``), the lateral
+    DOFs and the bottom held, the top moving up at 1: implicit *DYNAMIC (ALPHA=0) over 0.4,
+    the top printed.  ``tied``: the cubes on nodes of their own, joined by *CONTACT PAIR, TIED
+    (code check G2-2: the converter dropped the BETA as if ccx damped contact there; it gets a
+    *TIE); else one mesh, the twin."""
+    zs = (0, 1, 1, 2) if tied else (0, 1, 2)
+    nodes = "".join(f"{1 + 4 * k + j}, {x}., {y}., {z}.\n" for k, z in enumerate(zs)
+                    for j, (x, y) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1))))
+    up = "9, 10, 11, 12, 13, 14, 15, 16" if tied else "5, 6, 7, 8, 9, 10, 11, 12"
+    top = 13 if tied else 9
+    pair = ("*SURFACE, NAME=LTOP\nLOW, S2\n*SURFACE, NAME=UBOT\nUP, S1\n*SURFACE INTERACTION, NAME=SI\n"
+            "*CONTACT PAIR, INTERACTION=SI, TIED, TYPE=SURFACE TO SURFACE\nUBOT, LTOP\n") if tied else ""
+    return (f"*NODE, NSET=ALL\n{nodes}*ELEMENT, TYPE=C3D8, ELSET=LOW\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            f"*ELEMENT, TYPE=C3D8, ELSET=UP\n2, {up}\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n"
+            f"*DENSITY\n1.\n{beta}\n*SOLID SECTION, ELSET=LOW, MATERIAL=M\n"
+            f"*SOLID SECTION, ELSET=UP, MATERIAL=M\n*NSET, NSET=TOP\n{top}, {top + 1}, {top + 2}, {top + 3}\n"
+            f"*NSET, NSET=TIP\n{top + 2}\n{pair}*BOUNDARY\nALL, 1, 2\n1, 3, 3\n2, 3, 3\n3, 3, 3\n4, 3, 3\n"
+            "*INITIAL CONDITIONS, TYPE=VELOCITY\nTOP, 3, 1.\n*STEP, INC=10000\n"
+            "*DYNAMIC, ALPHA=0., DIRECT\n5e-4, 0.4\n*NODE PRINT, NSET=TIP, FREQUENCY=10\nU\n*END STEP\n")
+
+
+def field_expansion_deck():
+    """A statically determinate C3D8 cube heated by 100 whose material has *EXPANSION 1e-5,
+    then *EXPANSION, FIELD=1 1e-3, the field 0 at every node all along: Abaqus' field expansion
+    strain is 0, u = 0.001 at node 7 (code check G2-3: ccx read the field card as the thermal
+    expansion, 0.1)."""
+    cube = "".join(f"{i + 1}, {x}., {y}., {z}.\n" for i, (x, y, z) in enumerate(
+        [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]))
+    return ("*NODE, NSET=ALLN\n" + cube + "*ELEMENT, TYPE=C3D8, ELSET=ALL\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*SOLID SECTION, ELSET=ALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            "*EXPANSION\n1e-5\n*EXPANSION, FIELD=1\n1e-3\n*BOUNDARY\n1, 1, 3\n2, 2, 3\n4, 1, 1\n4, 3, 3\n"
+            "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nALLN, 0.\n*INITIAL CONDITIONS, TYPE=FIELD, VARIABLE=1\n"
+            "ALLN, 0.\n*NSET, NSET=N7\n7\n*STEP\n*STATIC\n*TEMPERATURE\nALLN, 100.\n*NODE PRINT, NSET=N7\nU\n"
+            "*END STEP\n")
+
+
+def tabular_clearance_deck(gap):
+    """Two stiff unit cubes (E 1e9, nu 0) ``gap`` apart, both held, in node-to-surface contact
+    by a TABULAR pressure-overclosure curve (0, -0.01), (1000, 0): pressure at clearances below
+    0.01, Abaqus' force 1000 (1 - gap / 0.01); the upper cube's total reaction printed (code
+    check G2-4: ccx's springs reach a clearance of 1e-3 sqrt(A) = 5e-4 only)."""
+    nodes = "".join(f"{1 + 4 * k + j}, {x}., {y}., {z:.12g}\n" for k, z in enumerate((0., 1., 1. + gap, 2. + gap))
+                    for j, (x, y) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1))))
+    return ("*NODE\n" + nodes + "*ELEMENT, TYPE=C3D8, ELSET=A\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*ELEMENT, TYPE=C3D8, ELSET=B\n2, 9, 10, 11, 12, 13, 14, 15, 16\n*NSET, NSET=BOTA\n1, 2, 3, 4\n"
+            "*NSET, NSET=BN\n9, 10, 11, 12, 13, 14, 15, 16\n*SOLID SECTION, ELSET=A, MATERIAL=M\n"
+            "*SOLID SECTION, ELSET=B, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1e9, 0.\n"
+            "*SURFACE, NAME=SA\nA, S2\n*SURFACE, NAME=SB\nB, S1\n*SURFACE INTERACTION, NAME=I\n"
+            "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR\n0., -0.01\n1000., 0.\n"
+            "*CONTACT PAIR, INTERACTION=I, TYPE=NODE TO SURFACE\nSB, SA\n*BOUNDARY\nBOTA, 1, 3\nBN, 1, 3\n"
+            "*STEP, NLGEOM\n*STATIC\n0.1, 1.\n*BOUNDARY\nBN, 3, 3, 0.\n*NODE PRINT, NSET=BN, TOTALS=ONLY\n"
+            "RF\n*END STEP\n")
+
+
 ANISO_MASS_AXES = ((1.0, 2.0, 2.0), (-2.0, 2.0, -1.0))   # ORIENTATION a, b: v1 = a / 3, v2 = b / 3
 
 
@@ -14875,6 +14949,20 @@ def main():
               f"nodes): solved, its right brick's displacements as the hand-written two-material deck's "
               f"(E 212.5 / 337.5; {err:.1e} of max |u| {end:.4g} apart; the field-0 collapse gave both E 150)")
     failures += 0 if ok else 1
+    # code check G2-3: *EXPANSION, FIELD=1 is field expansion, 0 while the field keeps its
+    # initial value; ccx read it as the thermal expansion (its last card wins): 100 times the strain
+    src = os.path.join(tmp, "field_expansion_constant_src.inp")
+    with open(src, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(field_expansion_deck())
+    _, conv = convert(src, os.path.join(tmp, "field_expansion_constant_check.inp"))
+    u = review_run(field_expansion_deck(), "field_expansion_constant", dat_displacements)
+    got = (u or {}).get(7, [math.nan] * 3)
+    ok = all(abs(x / 0.001 - 1) < 1e-6 for x in got) and not conv.reduced_physics
+    print(f"{'PASS' if ok else 'FAIL'}  field_expansion_constant (a free C3D8 cube heated by 100, "
+          f"*EXPANSION 1e-5 then *EXPANSION, FIELD=1 1e-3, the field 0 all along): u(7) "
+          f"{', '.join(f'{x:.7g}' for x in got)} vs 0.001 (before: 0.1, the field card read as the "
+          f"thermal expansion); reduced physics {conv.reduced_physics or 'none'}")
+    failures += 0 if ok else 1
     # a part's equation, partial kinematic couplings and SPRING1 / SPRING2 in rotated instances:
     # Abaqus turns them with the instance, so each one's displacements are R u(unturned
     # instance). They kept the part's DOF numbers: 101 % / 42 % of max |u| off.
@@ -15049,6 +15137,55 @@ def main():
               f"{u[11][0]:.6f} (1 - e^-2) / 2 = {want:.6f}; {err:.1e} off (undamped: 1)")
     else:
         print("FAIL  rayleigh_explicit: no displacements of the cubes")
+    failures += 0 if ok else 1
+
+    # code check G2-1: ccx's BETA damps the SPRINGA the converter writes for a connector's
+    # elasticity, Abaqus' BETA no connector: the material's BETA is left out (reduced physics),
+    # and the mass on the connector swings undamped, u = sin(10 t) / 10, as in Abaqus
+    def tip_x(dat):
+        return [(t, rows[0][0]) for t, rows in dat_history(dat, "displacements", "N22") if rows]
+    src = os.path.join(tmp, "rayleigh_connector_src.inp")
+    with open(src, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(connector_rayleigh_deck())
+    _, conv = convert(src, os.path.join(tmp, "rayleigh_connector_check.inp"))
+    h = review_run(connector_rayleigh_deck(), "rayleigh_connector", tip_x)
+    ok = bool(h) and len(h) > 50 and abs(h[-1][0] - 1.0) < 1e-9
+    if ok:
+        err = max(abs(u - math.sin(10.0 * t) / 10.0) for t, u in h) / 0.1
+        flagged = any("BETA" in r for r in conv.reduced_physics)
+        ok = err < 2e-3 and flagged
+        print(f"{'PASS' if ok else 'FAIL'}  rayleigh_connector (a held cube of a material with BETA "
+              f"0.01 beside an AXIAL connector, k 100, to a mass 1 starting at 1; implicit *DYNAMIC, "
+              f"ALPHA=0): the mass's history {err:.1e} of its amplitude 0.1 from the undamped sin(10 t) "
+              f"/ 10, BETA left out, flagged {flagged} (before: ccx's BETA damped the connector's "
+              f"spring, zeta 0.05: u(1) -0.0324 for -0.0544)")
+    else:
+        print("FAIL  rayleigh_connector: no history of the mass")
+    failures += 0 if ok else 1
+    # code check G2-2: a TIED contact pair is a *TIE in ccx, which damps no contact there: the
+    # materials' BETA stays, and the tied column runs as the one-mesh twin
+    def tip_z(dat):
+        return [(t, rows[0][2]) for t, rows in dat_history(dat, "displacements", "TIP") if rows]
+    src = os.path.join(tmp, "rayleigh_tied_pair_src.inp")
+    with open(src, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(tied_rayleigh_deck())
+    _, conv = convert(src, os.path.join(tmp, "rayleigh_tied_pair_check.inp"))
+    runs = [review_run(tied_rayleigh_deck(tied, beta), tag, tip_z) for tied, beta, tag in (
+        (True, "*DAMPING, BETA=0.01", "rayleigh_tied_pair"), (False, "*DAMPING, BETA=0.01", "rayleigh_tied_pair_ref"),
+        (False, "", "rayleigh_tied_pair_undamped"))]
+    ok = all(runs) and len(runs[0]) == len(runs[1]) == len(runs[2]) > 50
+    if ok:
+        amp = max(abs(u) for _, u in runs[1])
+        err = max(abs(a[1] - b[1]) for a, b in zip(runs[0], runs[1])) / amp
+        decay = max(abs(a[1] - b[1]) for a, b in zip(runs[1], runs[2])) / amp
+        ok = err < 1e-6 and decay > 0.1 and not conv.reduced_physics
+        print(f"{'PASS' if ok else 'FAIL'}  rayleigh_tied_pair (two C3D8 cubes of a material with BETA "
+              f"0.01 joined by *CONTACT PAIR, TIED; implicit *DYNAMIC, ALPHA=0): the top's history "
+              f"{err:.1e} of its amplitude from the one-mesh twin's, {decay:.2f} from the undamped "
+              f"one's; reduced physics {conv.reduced_physics or 'none'} (before: BETA left out as if "
+              f"ccx damped contact there)")
+    else:
+        print("FAIL  rayleigh_tied_pair: no top histories")
     failures += 0 if ok else 1
 
     # mode-based steps: ccx 2.23 applies *MODAL DAMPING only. Material Rayleigh damping that
@@ -17390,6 +17527,25 @@ def main():
         elif res:
             print(f"FAIL  {tag}: no heat flux printed")
         failures += 0 if ok else 1
+    # code check G2-4: ccx's node-to-surface springs reach a clearance of 1e-3 sqrt(A) (here
+    # 5e-4): a TABULAR curve's pressure at larger clearances is lost there, reduced physics
+    # (Abaqus' force 1000 (1 - gap / 0.01): 970 and 800)
+    got, flagged = [], []
+    for gap in (3e-4, 2e-3):
+        tag = f"contact_tabular_clearance_{gap:g}"
+        src = os.path.join(tmp, f"{tag}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(tabular_clearance_deck(gap))
+        _, conv = convert(src, os.path.join(tmp, f"{tag}_check.inp"))
+        flagged.append(any("clearances beyond" in r for r in conv.reduced_physics))
+        f = review_run(tabular_clearance_deck(gap), tag, lambda dat: dat_history(dat, "total force", "BN"))
+        got.append(0.0 - f[-1][1][0][2] if f else math.nan)
+    ok = abs(got[0] / 970.0 - 1) < 1e-3 and abs(got[1]) < 1e-6 and all(flagged)
+    print(f"{'PASS' if ok else 'FAIL'}  contact_tabular_clearance (two held stiff cubes 3e-4 / 2e-3 "
+          f"apart, node-to-surface, TABULAR (0, -0.01), (1000, 0)): contact force {got[0]:.6g} / "
+          f"{got[1]:.6g} for Abaqus' 970 / 800 (ccx's springs end at a clearance of 5e-4), flagged "
+          f"{flagged} (before: no warning)")
+    failures += 0 if ok else 1
 
     # --- task 129: *TIE of conventional shells on solid faces: Abaqus ties the shell nodes ---
     # (the untied nodes compared: ccx prints a tied shell node at another point than a merged one)

@@ -3018,6 +3018,23 @@ def test_exponential_overclosure_as_abaqus_curve():
                                     "face-to-face pair (ccx's exponential law differs)"]
 
 
+def test_tabular_overclosure_with_pressure_at_a_clearance():
+    # code check G2-4: ccx's node-to-surface contact makes a spring only to a clearance of
+    # 1e-3 sqrt(A), here 5e-4: a TABULAR curve with pressure from a larger clearance on loses
+    # it there, as EXPONENTIAL's c0 does (validate_with_ccx contact_tabular_clearance)
+    flag = ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR (no pressure at clearances beyond "
+            "ccx's node-to-surface springs)"]
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=TABULAR\n0., -0.01\n1000., 0.\n")
+    assert conv.reduced_physics == flag
+    assert "pressure from a clearance of 0.01 on" in rep.text() and "here at least 0.0005" in rep.text()
+    # zero pressure up to the point before the first positive one
+    _, conv, rep = cubes("*Surface Behavior, pressure-overclosure=TABULAR\n0., -0.02\n0., -0.002\n1000., 0.\n")
+    assert conv.reduced_physics == flag and "from a clearance of 0.002 on" in rep.text()
+    for curve in ("0., -1e-4\n1000., 0.\n", "0., 0.\n100., 0.01\n"):
+        _, conv, rep = cubes("*Surface Behavior, pressure-overclosure=TABULAR\n" + curve)
+        assert conv.reduced_physics == [] and "from a clearance" not in rep.text(), curve
+
+
 def test_exponential_overclosure_points():
     # within EXP_OVERCLOSURE_TOL of the pressure between the points, from 1e-3 p0 up
     for c0, p0, kmax in ((2e-4, 100.0, None), (1.0, 1.0, None), (0.01, 100.0, 1e5)):
@@ -4303,6 +4320,45 @@ def test_damping_structural_tabular_and_composite():
     assert len(conv.reduced_physics) == 1
 
 
+def test_damping_beta_with_connector_springs_and_gap_elements():
+    # code check G2-1: ccx's BETA damps the SPRINGA springs the converter writes for connector
+    # elasticity and its GAPUNI elements; Abaqus damps neither (a connector only by its
+    # *CONNECTOR DAMPING; validate_with_ccx rayleigh_connector: no decay in Abaqus)
+    beta = "*Damping, alpha=2., beta=1e-3"
+    conn = ("*Element, type=CONN3D2, elset=C\n31, 7, 17\n*Connector Section, elset=C, behavior=CB\n"
+            "AXIAL\n*Connector Behavior, name=CB\n*Connector Elasticity, component=1\n{}\n")
+    body, conv, rep = convert_str(damping_deck(a=beta, b=beta, extra=conn.format("100.")))
+    assert "*ELEMENT, TYPE=SPRINGA" in body and damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0."] * 2
+    assert "connector springs (Abaqus damps none): 0" in rep.text()
+    assert conv.reduced_physics == ["*DAMPING, BETA (stiffness-proportional damping) that differs within the model"]
+    body, conv, rep = convert_str(damping_deck(a=beta, b=beta, extra=conn.format("100.")), approximate=True)
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0.001"] * 2
+    assert "[APPROX] *DAMPING, BETA" in rep.text() and "connector springs" in rep.text()
+    # no spring written: nothing else to damp
+    body, conv, rep = convert_str(damping_deck(a=beta, b=beta, extra=conn.format("0.")))
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0.001"] * 2 and conv.reduced_physics == []
+    # mode-based steps: the materials' BETA projected onto the modes is no one Rayleigh pair
+    body, conv, rep = convert_str(damping_deck(a=beta, b=beta, step=MODE_STEPS, extra=conn.format("100.")))
+    assert modal_lines(body) == [[], []] and "material damping in mode-based steps" in conv.reduced_physics
+    gap = "*Element, type=GAPUNI, elset=G\n31, 7, 17\n*Gap, elset=G\n0.1, 1., 0., 0.\n"
+    body, conv, rep = convert_str(damping_deck(a=beta, b=beta, extra=gap))
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0."] * 2
+    assert "gap elements (Abaqus damps none): 0" in rep.text() and len(conv.reduced_physics) == 1
+
+
+def test_damping_beta_beside_a_tied_contact_pair():
+    # code check G2-2: a TIED contact pair is a *TIE in ccx, which damps no contact there, so
+    # the materials' one BETA stays (validate_with_ccx rayleigh_tied_pair); a pair ccx gets as
+    # contact still differs
+    deck = STACKED_CUBES.replace("*Conductivity\n1.\n", "*Density\n1.\n*Damping, beta=1e-3\n")
+    body, conv, rep = convert_str(deck.format(si="", pair=", tied, type=SURFACE TO SURFACE",
+                                              proc="*Dynamic", el="C3D8"))
+    assert "*TIE" in body and damping_lines(body) == ["*DAMPING, ALPHA=0., BETA=0.001"]
+    assert conv.reduced_physics == []
+    body, conv, rep = convert_str(deck.format(si="", pair="", proc="*Dynamic", el="C3D8"))
+    assert damping_lines(body) == [] and "contact (Abaqus damps none): 0" in rep.text()
+
+
 MODE_STEPS = "*Frequency\n4\n*End Step\n*Step\n*Modal Dynamic\n0.01, 1."
 
 
@@ -5305,6 +5361,54 @@ def test_field_dependent_materials_left_to_the_collapse():
                                 + "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n9, 1, 1.\n*End Step\n")
     assert conv.reduced_physics[:1] == ["field-dependent material data on elements whose field values "
                                         "vary through the shell or beam section"]
+
+
+def field_expansion_cube(fexp="*Expansion, field=1\n1e-3", first=True, f0="0.", step=""):
+    """A free C3D8 cube heated by 100 whose material has *EXPANSION 1e-5 and ``fexp`` (after
+    it, or before it unless ``first``), the nodes' initial field 1 ``f0``."""
+    thermal = "*Expansion\n1e-5\n"
+    return (FIELD_BAR.split("9, 2., 0., 0.")[0] + "*Element, type=C3D8, elset=BAR\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Nset, nset=ALLN, generate\n1, 8, 1\n*Solid Section, elset=BAR, material=M\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n" + (thermal + fexp + "\n" if first else fexp + "\n" + thermal) +
+            "*Boundary\n1, 1, 3\n2, 2, 3\n4, 1, 1\n4, 3, 3\n*Initial Conditions, type=TEMPERATURE\nALLN, 0.\n"
+            f"*Initial Conditions, type=FIELD, variable=1\nALLN, {f0}\n*Step\n*Static\n*Temperature\nALLN, 100.\n"
+            f"{step}*End Step\n")
+
+
+def test_field_expansion_commented_out():
+    # code check G2-3: ccx has no field variables and read *EXPANSION, FIELD=n as a thermal
+    # expansion, its last *EXPANSION card winning (100 times the thermal strain here, probed;
+    # validate_with_ccx field_expansion_constant); Abaqus' field expansion is 0 while the field
+    # keeps its initial values, so the card is commented out, exact
+    for first in (True, False):
+        body, conv, rep = convert_str(field_expansion_cube(first=first))
+        live = "\n".join(_live(body))
+        assert "*EXPANSION\n1e-5" in live and "FIELD" not in live and "** *EXPANSION, FIELD=1\n** 1e-3" in body
+        assert conv.reduced_physics == [] and "so its strain is 0. Commented out (exact)" in rep.text()
+        assert "_FIELD<k>" not in rep.text() and "a field expansion (*EXPANSION, FIELD=) is 0" in rep.text()
+    # a step changes the field: the strain is lost, and the field cards no longer absorbed
+    body, conv, rep = convert_str(field_expansion_cube(step="*Field, variable=1\nALLN, 1.\n"))
+    assert "*EXPANSION, FIELD (field expansion)" in conv.reduced_physics
+    assert "*INITIAL CONDITIONS" in conv.reduced_physics and "a step changes field variable 1" in rep.text()
+    # a temperature-dependent coefficient: 0 only where the initial field is its ZERO
+    tdep = "*Expansion, field=1{}\n1e-3, 0.\n2e-3, 100."
+    _, conv, rep = convert_str(field_expansion_cube(tdep.format(""), f0="1."))
+    assert "*EXPANSION, FIELD (field expansion)" in conv.reduced_physics and "starts away from its ZERO" in rep.text()
+    _, conv, _ = convert_str(field_expansion_cube(tdep.format(", zero=1."), f0="1."))
+    assert conv.reduced_physics == []
+    # user code sets the fields: lost
+    _, conv, rep = convert_str(field_expansion_cube(step="*Field, variable=1, user\nALLN\n"))
+    assert "*EXPANSION, FIELD (field expansion)" in conv.reduced_physics
+    # a field expansion that depends on field variables is no field-dependent material data
+    body, conv, rep = convert_str(field_expansion_cube("*Expansion, field=1, dependencies=1\n1e-3, 0., 0.\n"
+                                                       "2e-3, 0., 1."))
+    assert "field-variable dependence" not in rep.text() and conv.reduced_physics == []
+    # no field card at all: the field is 0 all along
+    _, conv, _ = convert_str(field_expansion_cube().replace("*Initial Conditions, type=FIELD, variable=1\nALLN, 0.\n", ""))
+    assert conv.reduced_physics == []
+    # the thermal card decides what ccx gets: an ANISO one without shear stays TYPE=ORTHO
+    body, _, _ = convert_str(field_expansion_cube().replace("*Expansion\n1e-5", "*Expansion, type=ANISO\n1e-5, 2e-5, 3e-5, 0., 0., 0."))
+    assert "*EXPANSION, TYPE=ORTHO\n1e-5, 2e-5, 3e-5" in body
 
 
 def test_depvar_delete_and_labels():
@@ -19846,6 +19950,52 @@ def test_upgraded_shells_midside_nodes_lie_on_the_curved_surface():
     assert "*ELEMENT, TYPE=S8R" in body
     new = [p for k, p in conv.geom.nodes.items() if k > corners]
     assert new and max(abs(math.hypot(p[0], p[1]) - 1.0) for p in new) < 1e-12
+
+
+def test_beams_along_upgraded_curved_shell_edges_stay_straight():
+    # code check G2-5: a 2-node beam along an upgraded shell edge becomes a 3-node beam through
+    # the edge's new node; the Abaqus beam is straight, so that node stays on the chord (it
+    # made the beam a circular arc), the shells' other new nodes on the cylinder
+    deck, corners = _cylinder_panel(8, 90.0)
+    deck += ("*Element, type=B31, elset=RING\n" + "".join(f"{100 + i}, {19 + i}, {20 + i}\n" for i in range(8)) +
+             "*Beam Section, elset=RING, material=STEEL, section=RECT\n0.02, 0.02\n0., 0., 1.\n"
+             "*Material, name=STEEL\n*Elastic\n2e5, 0.3\n")
+    _, conv, rep = convert_str(deck)
+    nodes = conv.geom.nodes
+    ring = set()
+    for i in range(8):
+        typ, (a, m, c) = conv.geom.elements[100 + i]
+        assert typ == "B32R" and nodes[m] == tuple((x + y) / 2 for x, y in zip(nodes[a], nodes[c]))
+        ring.add(m)
+    new = {k: p for k, p in nodes.items() if k > corners and k not in ring}
+    assert len(new) == 8 * 2 + 9 * 2 and max(abs(math.hypot(p[0], p[1]) - 1.0) for p in new.values()) < 1e-12
+    assert "on the straight edge there (Abaqus' beam is straight)" in rep.text()
+
+
+def test_upgraded_shells_midside_nodes_at_a_shallow_fold():
+    # code check G2-5: two flat composite S4 plates meeting at a 10 degree fold, under Abaqus'
+    # 20 degrees, so it averages the normals at the fold nodes. A node whose shells are
+    # coplanar keeps their normal, as Abaqus does (the normal-field fit leaned it towards the
+    # fold beyond: those edges sagged 0.0086 at the free edges and 0.0096 inside): every edge
+    # into the fold sags alike, by the arc between those normals; the others stay straight
+    h = math.tan(math.radians(5.0))
+    nodes = "".join(f"{1 + i + 5 * j}, {i - 2}., {j}., {abs(i - 2) * h:.15g}\n" for j in range(3) for i in range(5))
+    els = "".join(f"{1 + i + 4 * j}, {1 + i + 5 * j}, {2 + i + 5 * j}, {7 + i + 5 * j}, {6 + i + 5 * j}\n"
+                  for j in range(2) for i in range(4))
+    _, conv, _ = convert_str("*Node\n" + nodes + "*Element, type=S4, elset=SH\n" + els + COMPOSITE_MAT +
+                             "*Shell Section, elset=SH, composite\n0.05, 3, CFRP, 0.\n0.05, 3, CFRP, 90.\n"
+                             "*Boundary\n1, ENCASTRE\n*Step\n*Static\n*Cload\n15, 3, 1.\n*End Step\n")
+    P = conv.geom.nodes
+    sag = {}
+    for a, c, m in {x for e in conv._quad_edges.values() for x in e}:
+        d = A.vnorm(A.vsub(P[m], tuple((x + y) / 2 for x, y in zip(P[a], P[c]))))
+        sag[(min(a, c), max(a, c))] = d
+    fold = {k: d for k, d in sag.items() if (P[k[0]][0] == 0.0) != (P[k[1]][0] == 0.0)}   # into x = 0
+    want = A.vnorm(A.vsub(A.surface_midpoint(P[2], P[3], A.vunit((h, 0., 1.)), (0., 0., 1.)),
+                          tuple((x + y) / 2 for x, y in zip(P[2], P[3]))))
+    assert len(fold) == 6 and abs(want - 0.010941) < 1e-6
+    assert all(abs(d - want) < 1e-12 for d in fold.values()), fold
+    assert all(d < 1e-12 for k, d in sag.items() if k not in fold)
 
 
 def test_surface_midpoint_is_exact_on_cylinders_and_spheres():

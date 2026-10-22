@@ -30,6 +30,9 @@ physics.
   of step 1 included); warned as reduced physics where the nodes differ (their mean), a shell
   or beam section varies through its thickness, or a step changes the values (those at the
   end of step 1). User-set fields (USDFLD, `*FIELD, USER`, `FILE=`) keep the field-0 collapse.
+  `*EXPANSION, FIELD=n` (field expansion), which ccx read as a thermal expansion (100 times the
+  thermal strain), is commented out: exact where field n keeps its initial values, else reduced
+  physics, and the field cards then count as reduced physics too.
 * **`*IMPERFECTION` converted** — it was commented out (reduced physics). Data lines and an
   `INPUT=` file (node and shift, `SYSTEM=R`, `C` or `S`) now move the `*NODE` coordinates: the
   deck's own geometry. `FILE=job, STEP=n` takes modes or a static solution from another job's
@@ -43,7 +46,7 @@ physics.
   deck runs on its perfect geometry. Without `--run` the card stays commented out and names the
   deck to supply.
 * **OFFSET TO NODES orientations, value distributions, integrated output** — three cards that
-  were commented out now convert exactly. `*ORIENTATION, DEFINITION=OFFSET TO NODES` (a
+  were commented out now convert, the first two exactly. `*ORIENTATION, DEFINITION=OFFSET TO NODES` (a
   rectangular or cylindrical system) becomes a `*DISTRIBUTION` orientation with each element's
   own axes from its local nodes; ccx stopped on the sections that named it. A `*DISTRIBUTION` of
   a shell's thickness or offset, a composite layer's thickness or angle, a membrane's thickness,
@@ -51,8 +54,10 @@ physics.
   its own element set, with a material copy per distinct property values; ccx used the
   data-line thickness, or stopped on the distribution name. `*INTEGRATED OUTPUT` (with its
   `*INTEGRATED OUTPUT SECTION`) becomes `*SECTION PRINT` on the surface: the total force, the
-  moment about the origin and the area in global axes. A reference node's moment, an
-  orientation's axes and `SOCF` are noted: ccx prints none of them.
+  moment about the origin and the area in global axes. ccx integrates the stresses extrapolated
+  to the face's nodes, Abaqus the elements' internal forces: the same on a uniform stress,
+  0.004 % low on 2 × 2 × 2-point elements, further off where the stress varies sharply. A
+  reference node's moment, an orientation's axes and `SOCF` are noted: ccx prints none of them.
 * **Recorded suspects probed** — a heat load of an earlier step from another source (a node,
   element or set as written) on the node DOFs or faces a later step loads is given again
   there, as Abaqus adds the two (ccx kept only the later value: 14-67 % off); two film
@@ -176,8 +181,10 @@ physics.
   cylinder, R/t 1000, 8 × 8 cells: u_r −2.9 to 7.6 times the membrane value). The new node now
   lies on the surface the shells' averaged nodal normals define (exact on cylinder and sphere
   meshes, free and symmetry edges included: 0.999–1.003), and stays on the straight edge where
-  the shell is flat or folds (Abaqus' 20° rule for averaging normals). Flat meshes are
-  unchanged.
+  the shell is flat or folds (Abaqus' 20° rule for averaging normals), or where a 2-node beam
+  runs along the edge (it becomes a 3-node beam through that node, straight as in Abaqus). A
+  node whose shells are coplanar keeps their normal, as Abaqus does, so the edges into a shallow
+  fold sag alike. Flat meshes are unchanged.
 * **General contact under `--approximate`** — Abaqus general contact (`*CONTACT` with
   `*CONTACT INCLUSIONS`, `ALL EXTERIOR` or named surfaces, `*CONTACT EXCLUSIONS` and
   `*CONTACT PROPERTY ASSIGNMENT`), which ccx lacks, is written as node-to-surface `*CONTACT
@@ -268,7 +275,10 @@ physics.
   pressure, as Abaqus keeps it in contact: ccx read it against pressure (no heat flow across the
   pressed cubes for Abaqus' 49.75); beside a `PRESSURE` card it is left out. ccx 2.23's
   face-to-face contact reads no TABULAR table (no contact force): a straight line through the
-  origin becomes `LINEAR` there, other curves and `EXPONENTIAL` there are reduced physics. So
+  origin becomes `LINEAR` there, other curves and `EXPONENTIAL` there are reduced physics. On
+  node-to-surface pairs ccx makes springs only to a clearance of 1e-3 √A (A: a slave node's
+  area): an `EXPONENTIAL` or `TABULAR` curve with pressure at larger clearances (two cubes 0.002
+  apart: no force for Abaqus' 800) is reduced physics there. So
   are conduction across open gaps, which ccx does not model, and a `PRESSURE` conductance table
   on a node-to-surface pair, which ccx 2.23 reads at a pressure of its own.
 * **Energy, volume and contact output mapped** — output requests that were dropped now reach
@@ -292,8 +302,8 @@ physics.
   every material at the last one's values. Values that every material with mass (`ALPHA`) or
   stiffness (`BETA`) shares are now written as that pair, both given (a missing one is Abaqus'
   0); a value that differs, also against a point mass (ccx damps it, Abaqus only by the `*MASS`'s
-  own `ALPHA`) or a spring or contact (ccx's `BETA` damps them, Abaqus' does not), is left out as
-  reduced physics (`--approximate`: the materials' value). `BETA` with an explicit step is left
+  own `ALPHA`) or a spring (the deck's, a connector's, a gap element) or contact (ccx's `BETA`
+  damps them, Abaqus' does not; a `TIED` pair is a tie), is left out as reduced physics (`--approximate`: the materials' value). `BETA` with an explicit step is left
   out too (ccx's explicit solver stops on it; mode-based steps: see `*MODAL DAMPING`).
   `STRUCTURAL` stays per material; a zero one and `COMPOSITE` are not written.
 * **`--run` streams ccx's output** — it held all of ccx's output in memory and showed it only
