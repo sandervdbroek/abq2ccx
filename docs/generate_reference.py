@@ -403,8 +403,8 @@ TRANSLATED = {
         "moves with the coupling nodes' weighted mean motion plus the rotation of their weighted "
         "least-squares fit, and turns with it (a `ROT NODE`, or a shell/beam node's own rotations); "
         "weights from tributary areas, a node surface's areas, `WEIGHTING METHOD` and an `INFLUENCE "
-        "RADIUS`. Kept as ccx's card (warned) on axisymmetric faces (Abaqus' pages do not say whether "
-        "their tributary areas take the radius) and under NLGEOM where the equations turn, unless "
+        "RADIUS` (axisymmetric faces: areas of revolution, as Abaqus' verification decks place the "
+        "reference node). Kept as ccx's card (warned) under NLGEOM where the equations turn, unless "
         "`--approximate`; `COUPLING=STRUCTURAL` is written as the default coupling (reduced physics).",
     "*DISTRIBUTING COUPLING": "the `DCOUP2D` / `DCOUP3D` element is Abaqus' distributing constraint "
         "(Theory Guide): written as the same `*EQUATION`s, DOFs 1-6 (`DCOUP2D` 1, 2, 6) with the "
@@ -550,7 +550,9 @@ TRANSLATED = {
         "`DEFINITION=USER` (Abaqus `UAMP`) commented, naming ccx's `uamplitude.f`. (`*AMP` alias "
         "accepted.)",
     "*RESTART": "keeps `WRITE`/`READ`/`FREQUENCY`/`STEP`; other params dropped.",
-    "*SURFACE": "only `NAME`/`TYPE` kept; shell edges `E1..E4` → `S3..S6` (plane elements "
+    "*SURFACE": "only `NAME`/`TYPE` kept; a line without a face label → its continuum elements' faces "
+        "on the model's exterior, trimmed as Abaqus trims an open free surface (`TRIM`); shell edges "
+        "`E1..E4` → `S3..S6` (plane elements "
         "`S1..S4`); `ANALYTICAL RIGID` / `COMBINE` commented; `SPOS`/`SNEG` kept (ccx reads them as the "
         "expanded shell's top and bottom face, as Abaqus); `CPS4I`/`CPE4I` edges `S1..S4` → "
         "`S3..S6` of their slabs; faces of rigid elements → the matching faces of their skins "

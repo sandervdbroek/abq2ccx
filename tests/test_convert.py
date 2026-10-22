@@ -20619,6 +20619,129 @@ def test_rigid_body_coupling_leaves_its_surface_and_internal_set_out():
     assert "*ELSET, ELSET=_TOP_S2\n1\n" in body and "*SURFACE" not in body
 
 
+
+def _grid2d(nx, ny, typ="CPS4"):
+    """An nx x ny grid of unit squares (nodes 1 + i + (nx + 1) j), as quads or as two
+    triangles each (the diagonal from the square's first node: its bottom triangle first)."""
+    nodes = "".join(f"{1 + i + (nx + 1) * j}, {float(i)}, {float(j)}\n" for j in range(ny + 1) for i in range(nx + 1))
+    els, e = [], 0
+    for j in range(ny):
+        for i in range(nx):
+            a, b = 1 + i + (nx + 1) * j, 2 + i + (nx + 1) * j
+            c, d = b + nx + 1, a + nx + 1
+            if typ == "CPS4":
+                e += 1
+                els.append(f"{e}, {a}, {b}, {c}, {d}\n")
+            else:
+                els += [f"{e + 1}, {a}, {b}, {c}\n", f"{e + 2}, {a}, {c}, {d}\n"]
+                e += 2
+    return f"*Node\n{nodes}*Element, type={typ}, elset=E\n" + "".join(els)
+
+
+def test_free_surface_trimmed_as_abaqus_trims():
+    # a *SURFACE line without a face label takes its elements' faces on the model's exterior,
+    # which Abaqus trims (Model Guide 'Element-based surface definition': trimming the perimeter
+    # of an open surface; Verification Guide 'Automatic surface definition and surface trimming',
+    # decks ele_trim2d / ele_trim3d / ele_trimdef): a face with an end on the perimeter goes when
+    # another of its nodes is a corner of an element of the surface, or when its normal turns
+    # more than 30 degrees from a neighbour's, until none goes.  A row of quads: its bottom faces
+    # stay, its two end faces go (they took the coupling's and the loads' weight before)
+    deck = _grid2d(3, 2) + "*Elset, elset=ROW\n1, 2, 3\n*Surface, name=S{}\nROW,\n"
+    _, conv, rep = convert_str(deck.format(""))
+    assert conv.surfaces["S"][1] == [("1", "S1"), ("2", "S1"), ("3", "S1")]
+    assert "2 of the 5 faces its lines without a face label take are trimmed off" in rep.text()
+    _, conv, _ = convert_str(deck.format(", trim=NO"))
+    assert sorted(conv.surfaces["S"][1]) == [("1", "S1"), ("1", "S4"), ("2", "S1"), ("3", "S1"), ("3", "S2")]
+    # triangles: the end faces belong to other elements than the corner's, so the 30-degree
+    # rule takes them (both end faces of the bottom-left square: none left, warned, as the
+    # deck ele_trim2d says Abaqus stops on such a surface)
+    tri = _grid2d(2, 2, "CPS3")
+    _, conv, rep = convert_str(tri + "*Elset, elset=ROW\n1, 2, 3, 4\n*Surface, name=S\nROW,\n")
+    assert conv.surfaces["S"][1] == [("1", "S1"), ("3", "S1")]
+    _, conv, rep = convert_str(tri + "*Elset, elset=SQ\n1, 2\n*Surface, name=S\nSQ,\n")
+    assert conv.surfaces["S"][1] == [] and "trimming leaves none of its faces" in rep.text()
+    # bricks: the top layer of a 2 x 2 x 2 block keeps its top faces only
+    nodes = "".join(f"{1 + i + 3 * j + 9 * k}, {float(i)}, {float(j)}, {float(k)}\n"
+                    for k in range(3) for j in range(3) for i in range(3))
+    els = ""
+    for k in range(2):
+        for j in range(2):
+            for i in range(2):
+                n = 1 + i + 3 * j + 9 * k
+                els += f"{1 + i + 2 * j + 4 * k}, {n}, {n + 1}, {n + 4}, {n + 3}, {n + 9}, {n + 10}, {n + 13}, {n + 12}\n"
+    _, conv, _ = convert_str(f"*Node\n{nodes}*Element, type=C3D8, elset=E\n{els}*Elset, elset=TOP\n5, 6, 7, 8\n"
+                             "*Surface, name=S\nTOP,\n")
+    assert conv.surfaces["S"][1] == [(str(e), "S2") for e in (5, 6, 7, 8)]
+
+
+def test_free_surface_trimming_follows_its_contact_pairs():
+    # Abaqus trims every surface by default but the master of a finite-sliding contact pair
+    # (Keywords *SURFACE, TRIM; ele_trimdef): there TRIM=YES trims it, and small sliding does
+    deck = _grid2d(3, 2) + ("*Elset, elset=ROW\n1, 2, 3\n*Elset, elset=TOPROW\n4, 5, 6\n"
+                            "*Surface, name=M{}\nROW,\n*Surface, name=SL\nTOPROW, S3\n"
+                            "*Surface Interaction, name=I\n*Contact Pair, interaction=I{}\nSL, M\n")
+    ends = lambda conv: ("1", "S4") in conv.surfaces["M"][1]
+    assert ends(convert_str(deck.format("", ""))[1])
+    assert not ends(convert_str(deck.format(", trim=YES", ""))[1])
+    assert not ends(convert_str(deck.format("", ", small sliding"))[1])
+
+
+def test_distributing_weights_on_axisymmetric_faces_take_the_radius():
+    # an axisymmetric face's tributary area is one of revolution, 2 pi r N_i ds (Abaqus'
+    # xcouplingd_std_tarea_cax4 puts the reference node at the centroid of those weights, and
+    # its displacements equal a uniform pressure's; the coupling stayed ccx's card, 20 % off).
+    # Edges r 1-2 and 2-4: w = 4, 5 + 16, 20 over 45
+    deck = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 4., 0.\n4, 1., 1.\n5, 2., 1.\n6, 4., 1.\n100, 3., -1.\n"
+            "*Element, type=CAX4, elset=E\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*Solid Section, elset=E, material=M\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Surface, name=B\nE, S1\n"
+            "*Coupling, constraint name=C, ref node=100, surface=B\n*Distributing\n"
+            "*Boundary\n4, 2, 2\n5, 2, 2\n6, 2, 2\n*Step\n*Static\n*Cload\n100, 2, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    row = [r for r in _equation_terms(body) if r[0][:2] == (100, 1)][0]
+    got = {n: c for n, d, c in row[1:] if d == 1}
+    assert all(abs(got[n] + w / 45.0) < 1e-12 for n, w in ((1, 4.0), (2, 21.0), (3, 20.0))), got
+    assert "kept as ccx's card" not in rep.text()
+
+
+def test_blank_time_period_by_procedure():
+    # a steady-state step's blank period becomes 1. (ccx read it as 0: '*ERROR ... step size is
+    # negative', step time NaN; Abaqus' benchmark radiationfinnedsurf leaves it blank); in the
+    # other procedures Abaqus documents no default and none of its decks leaves it out: warned,
+    # as is a *MODAL DYNAMIC without a data line
+    heat = (HEX.replace("C3D8", "DC3D8") + "*Material, name=MH\n*Conductivity\n1.\n*Specific Heat\n1.\n"
+            "*Density\n1.\n*Solid Section, elset=EALL, material=MH\n*Initial Conditions, type=temperature\n"
+            "EALL, 0.\n*Step\n{}\n*Boundary\n1, 11, 11, 1.\n*End Step\n")
+    body, conv, rep = convert_str(heat.format("*Heat Transfer, steady state\n1.0,"))
+    assert "*HEAT TRANSFER, STEADY STATE\n1.0, 1.\n" in body and conv.steps.steps[0].ccx_period == 1.0
+    assert "STEADY STATE with a blank time period -> 1." in rep.text()
+    body, conv, rep = convert_str(heat.format("*Heat Transfer, steady state"))
+    assert "*HEAT TRANSFER, STEADY STATE\n*BOUNDARY" in body and "blank time period" not in rep.text()
+    _, _, rep = convert_str(heat.format("*Heat Transfer\n0.1,"))
+    assert "[WARNING] *HEAT TRANSFER with a blank time period" in rep.text()
+    _, _, rep = convert_str(HEX_MODEL + "*Step\n*Visco\n0.1,\n*Cload\n7, 3, 1.\n*End Step\n")
+    assert "[WARNING] *VISCO with a blank time period" in rep.text()
+    _, _, rep = convert_str(HEX_MODEL.replace("1000., 0.3\n", "1000., 0.3\n*Density\n1.\n") +
+                            "*Step\n*Frequency\n2\n*End Step\n*Step\n*Modal Dynamic\n*End Step\n")
+    assert "*MODAL DYNAMIC without a data line" in rep.text()
+
+
+def test_elcopy_reflect_brick_faces_as_abaqus_labels_them():
+    # Abaqus' bolted pipe flange (boltpipeflange_3d_cyclsym) copies its C3D20R gasket by *ELCOPY,
+    # REFLECT and names the copy's contact faces S6 and S2 where the original's are S3 and S2:
+    # the order reversed about node 1 gives exactly that (the copy's S6 is the mirror of S3)
+    nodes20 = HEX.split("*ELEMENT")[0] + "".join(
+        f"{9 + k}, {x}, {y}, {z}\n" for k, (x, y, z) in enumerate(
+            [(.5, 0, 0), (1, .5, 0), (.5, 1, 0), (0, .5, 0), (.5, 0, 1), (1, .5, 1), (.5, 1, 1), (0, .5, 1),
+             (0, 0, .5), (1, 0, .5), (1, 1, .5), (0, 1, .5)]))
+    deck = (nodes20 + "*Element, type=C3D20R, elset=E\n1, " + ", ".join(str(n) for n in range(1, 21)) +
+            "\n*Nset, nset=N, generate\n1, 20, 1\n*Ncopy, old set=N, change number=100, reflect=mirror\n"
+            "0., 0., 0., 0., 1., 0., 0., 0., 1.\n*Elcopy, old set=E, element shift=100, shift nodes=100, reflect\n")
+    _, conv, _ = convert_str(deck)
+    orig, copy = conv._continuum_faces(1), conv._continuum_faces(101)
+    shift = lambda f: frozenset(n + 100 for n in f)
+    assert copy[6] == shift(orig[3]) and copy[2] == shift(orig[2]) and copy[3] == shift(orig[6])
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

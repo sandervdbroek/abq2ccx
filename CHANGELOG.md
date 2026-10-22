@@ -14,6 +14,17 @@ physics.
   times smaller (a GRAV set holding several factors split into a set per factor): Abaqus'
   scaled mass matrix. A section of two factors, a user material or a factor that changes
   between steps stay dropped, with the reason.
+* **Checked against Abaqus' own decks** — a `*SURFACE` line without a face label now takes its
+  faces trimmed as Abaqus trims an open free surface (a face at the perimeter goes where it turns
+  an element's corner or more than 30°; not with `TRIM=NO` or on the master of a finite-sliding
+  contact pair), as Abaqus' trimming verification decks show: a distributing coupling or load on
+  such a surface took the faces at its ends too (0.28 off a uniform pressure on a `C3D8` layer). A
+  distributing coupling on axisymmetric faces becomes equations weighted by areas of revolution,
+  where Abaqus' `xcouplingd_std_tarea_cax4` puts its reference node (it stayed ccx's card, 0.26
+  off). A steady-state heat transfer or temperature-displacement step with a blank time period
+  gets `1.` (ccx read 0: `*ERROR`, step time NaN); a blank one elsewhere, and a `*MODAL DYNAMIC`
+  without a data line, are warned. The `*ELCOPY, REFLECT` brick order is the one Abaqus' bolted
+  pipe flange decks label the copies' faces by.
 * **ccx stops the conversion now avoids** — a `*TIE` line naming one surface as slave and master
   is left out (Abaqus ties nothing there; ccx 2.23 looped without end), and a solid or node slave
   surface that shares nodes with its master becomes a node surface of its other nodes (Abaqus

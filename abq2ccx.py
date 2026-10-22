@@ -3454,7 +3454,10 @@ def expand_elgen(block: Block, geom: Geometry, report: Report) -> List[int]:
 
 # *ELCOPY, REFLECT: the node order of a copied continuum element, by (dimension, node count),
 # reversed about its first node as Abaqus documents it for a quadrilateral (1, 2, 3, 4 ->
-# 1, 4, 3, 2: "Element definition", copying elements), each midside node following its edge
+# 1, 4, 3, 2: "Element definition", copying elements), each midside node following its edge.
+# Bricks as Abaqus' bolted pipe flange (boltpipeflange_3d_cyclsym) takes its C3D20R copies:
+# their face S6 is the mirror of the original's S3, S2 of S2.  No Abaqus deck reflects a
+# tetrahedron or wedge: theirs follow the same reversal of the first face.
 ELCOPY_REFLECT_ORDER = {
     (2, 3): (0, 2, 1), (2, 4): (0, 3, 2, 1), (2, 6): (0, 2, 1, 5, 4, 3),
     (2, 8): (0, 3, 2, 1, 7, 6, 5, 4),
@@ -3509,7 +3512,8 @@ def expand_elcopy(block: Block, geom: Geometry, report: Report) -> List[int]:
     if flipped:
         report.note("*ELCOPY, REFLECT: the copies' node order reversed about their first node "
                     "(1, 2, 3, 4 -> 1, 4, 3, 2, as Abaqus documents it; 1, 4, 3, 2, 5, 8, 7, 6 for "
-                    "a brick, the midside nodes following their edges).", once=True)
+                    "a brick, as Abaqus' own decks label its faces, the midside nodes following "
+                    "their edges).", once=True)
     solid = [t for t, c in kept.items() if c]
     if solid:
         report.warn(f"*ELCOPY, REFLECT on {', '.join(solid)} elements: the converter reverses "
@@ -3701,6 +3705,71 @@ def plane_edge(conn: Sequence[int], k: int) -> List[int]:
     n = len(conn)
     edges = PLANE_EDGE_NODES[3 if n in (3, 6) else 4] if n in (3, 4, 6, 8) else {}
     return [conn[p - 1] for p in edges.get(k, ()) if p <= n]
+
+
+def trim_open_surface(faces: Sequence[Tuple[int, Sequence[int], Vec]], xyz: Dict[int, Vec]) -> set:
+    """The faces Abaqus' surface trimming removes (Abaqus 2017 'Element-based surface
+    definition', trimming the perimeter of an open surface): a face with an end node on the
+    surface's perimeter goes if another of its nodes lies on two faces of one element of the
+    surface (an element corner), or if its normal turns more than 30 degrees from that of a
+    face it adjoins; repeated until none goes.  ``faces``: (element, corner nodes in order
+    round the face — two for an edge of a plane element —, the element's centroid); returns
+    the positions removed.  A closed surface has no perimeter and keeps every face."""
+    def outward(i: int) -> Vec:
+        _, c, cen = faces[i]
+        p = [xyz[n] for n in c]
+        mid = tuple(sum(q[k] for q in p) / len(p) for k in range(3))
+        if len(p) == 2:
+            t = vsub(p[1], p[0])
+            nrm: Vec = (t[1], -t[0], 0.0)
+        else:
+            nrm = (0.0, 0.0, 0.0)
+            for j in range(len(p)):                 # Newell's normal of the polygon
+                a, b = p[j], p[(j + 1) % len(p)]
+                nrm = (nrm[0] + (a[1] - b[1]) * (a[2] + b[2]), nrm[1] + (a[2] - b[2]) * (a[0] + b[0]),
+                       nrm[2] + (a[0] - b[0]) * (a[1] + b[1]))
+        if vnorm(nrm) <= 0.0:
+            return (0.0, 0.0, 0.0)
+        nrm = vscale(nrm, 1.0 / vnorm(nrm))
+        return nrm if vdot(nrm, vsub(mid, cen)) >= 0.0 else vscale(nrm, -1.0)
+
+    def sides(i: int) -> List[frozenset]:
+        c = faces[i][1]
+        if len(c) == 2:                             # an edge: its ends
+            return [frozenset((c[0],)), frozenset((c[1],))]
+        return [frozenset((c[j], c[(j + 1) % len(c)])) for j in range(len(c))]
+    normals = [outward(i) for i in range(len(faces))]
+    cos30 = math.cos(math.radians(30.0))
+    alive = set(range(len(faces)))
+    removed: set = set()
+    while True:
+        owners: Dict[frozenset, List[int]] = {}
+        for i in alive:
+            for s in sides(i):
+                owners.setdefault(s, []).append(i)
+        perimeter = {n for s, fs in owners.items() if len(fs) == 1 for n in s}
+        by_elem: Dict[int, List[int]] = {}
+        for i in alive:
+            by_elem.setdefault(faces[i][0], []).append(i)
+        corner: set = set()
+        for fs in by_elem.values():
+            if len(fs) > 1:
+                count = Counter(n for i in fs for n in set(faces[i][1]))
+                corner.update(n for n, k in count.items() if k > 1)
+        gone = set()
+        for i in alive:
+            nodes = set(faces[i][1])
+            ends = nodes & perimeter
+            if not ends:
+                continue
+            if any(q in corner for q in nodes if ends - {q}) or \
+                    any(j != i and vdot(normals[i], normals[j]) < cos30
+                        for s in sides(i) for j in owners[s]):
+                gone.add(i)
+        if not gone:
+            return removed
+        alive -= gone
+        removed |= gone
 
 # Abaqus planar (2-D) beams and trusses.  ccx has no planar beam: B21 "is internally replaced
 # by a B31 element and is treated as such", T2D2 likewise by a T3D2 (manual 6.2.31, 6.2.34),
@@ -9275,16 +9344,22 @@ class _Mesh:
     def _continuum_faces(self, e: int) -> Optional[Dict[int, frozenset]]:
         """Face label -> corner nodes of continuum element ``e`` (3-D solids, plane and
         axisymmetric elements; not cohesive or gasket ones), or None for any other element."""
+        faces = self._continuum_face_corners(e)
+        return None if faces is None else {k: frozenset(c) for k, c in faces.items()}
+
+    def _continuum_face_corners(self, e: int) -> Optional[Dict[int, Tuple[int, ...]]]:
+        """_continuum_faces' corner nodes in order round each face (a plane element's edge:
+        its two ends)."""
         typ, conn = self.geom.elements.get(e, ("", []))
         cc, n = ccx_type(typ), len(conn)
         if typ.upper().startswith(("COH", "GK")):
             return None
         if cc.startswith(CCX_SOLID_PREFIXES) and n in self._CONTINUUM_FACES:
             nc = {4: 4, 10: 4, 6: 6, 15: 6}.get(n, 8)
-            return {k: frozenset(conn[p - 1] for p in pos if p <= nc)
+            return {k: tuple(conn[p - 1] for p in pos if p <= nc)
                     for k, pos in self._CONTINUUM_FACES[n].items()}
         if cc.startswith(PLANE_ELEM_PREFIXES) and n in (3, 4, 6, 8):
-            return {k: frozenset(conn[p - 1] for p in pos[:2])
+            return {k: tuple(conn[p - 1] for p in pos[:2])
                     for k, pos in PLANE_EDGE_NODES[4 if n in (4, 8) else 3].items()}
         return None
 
@@ -9299,8 +9374,9 @@ class _Mesh:
         data line (read_blocks: "") is Abaqus/Explicit's surface of every exterior face of the
         model, of all its elements but cohesive ones (Keywords Reference *SURFACE; not
         documented for Abaqus/Standard): the exterior faces of its continuum elements, the
-        other elements' facets and edges left out, warned.  Other lines are left to
-        handle_surface."""
+        other elements' facets and edges left out, warned.  The faces a *SURFACE's lines take
+        so are trimmed as Abaqus trims an open free surface (_trims_free_surface,
+        trim_open_surface).  Other lines are left to handle_surface."""
         def faceless(b: Block) -> bool:
             return b.keyword == "SURFACE" and (b.uparam("TYPE") or "ELEMENT") == "ELEMENT" and \
                 not b.has("COMBINE") and any(len(trimmed_fields(r)) <= 1 for r in merged_data_records(b))
@@ -9316,6 +9392,7 @@ class _Mesh:
                 out.append(b)
                 continue
             data = []
+            free: List[Tuple[int, int]] = []         # the faces its faceless lines take
             name = b.param("NAME") or ""
             for rec in merged_data_records(b):
                 g = trimmed_fields(rec)
@@ -9337,6 +9414,7 @@ class _Mesh:
                     continue
                 lines = [f"{e}, S{k}" for e, f in faces for k, key in f.items() if count[key] == 1]
                 data += lines
+                free += [(e, k) for e, f in faces for k, key in f.items() if count[key] == 1]
                 self.report.note("*SURFACE line without a face label on continuum elements -> "
                                  "their faces on the exterior of the model, as Abaqus takes them "
                                  "(ccx stops on the line).", once=True)
@@ -9344,9 +9422,55 @@ class _Mesh:
                     self.report.warn(f"*SURFACE {name}: the elements of '{g[0]}' "
                                      f"have no face on the exterior of the model, so the surface "
                                      f"gets none of their faces.", once=True)
+            if free and self._trims_free_surface(b, blocks):
+                cut = self._trimmed_free_faces(free)
+                if cut:
+                    gone = {f"{e}, S{k}" for e, k in cut}
+                    data = [ln for ln in data if ln not in gone]
+                    self.report.note(f"*SURFACE {name}: {len(cut)} of the {len(free)} faces its lines "
+                                     f"without a face label take are trimmed off, as Abaqus trims an "
+                                     f"open free surface (TRIM=YES, the default): faces at its "
+                                     f"perimeter that turn a corner of an element or more than 30 "
+                                     f"degrees.", once=False)
+                    if not data:
+                        self.report.warn(f"*SURFACE {name}: trimming leaves none of its faces, and "
+                                         f"Abaqus stops on such a surface (TRIM=NO keeps them).",
+                                         once=False)
             out.append(Block(b.keyword, b.params, data))
             self._register_surface(out[-1])
         return out
+
+    def _trims_free_surface(self, b: Block, blocks: List[Block]) -> bool:
+        """Whether Abaqus trims the free surface *SURFACE ``b`` generates (Keywords Reference
+        *SURFACE, TRIM): TRIM=YES, the default but for the master surface of a finite-sliding
+        contact pair in Abaqus/Standard; never in a contact pair of Abaqus/Explicit, where it
+        has no effect."""
+        trim = b.uparam("TRIM")
+        if trim == "NO":
+            return False
+        name = b.uparam("NAME")
+        for c in blocks:
+            if c.keyword != "CONTACT PAIR":
+                continue
+            for rec in merged_data_records(c):
+                g = [x.strip().upper() for x in rec]
+                if self._explicit_deck and name in g[:2]:
+                    return False
+                if trim != "YES" and g[1:2] == [name] and not c.has("SMALL SLIDING"):
+                    return False
+        return True
+
+    def _trimmed_free_faces(self, free: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """The faces (element, label) of ``free`` that trimming removes (trim_open_surface)."""
+        faces = []
+        for e, k in free:
+            conn = self.geom.elements[e][1]
+            pts = [self.geom.nodes[n] for n in conn if n in self.geom.nodes]
+            cen = tuple(sum(p[j] for p in pts) / max(len(pts), 1) for j in range(3))
+            faces.append((e, self._continuum_face_corners(e)[k], cen))
+        if any(n not in self.geom.nodes for _, c, _ in faces for n in c):
+            return []
+        return [free[i] for i in sorted(trim_open_surface(faces, self.geom.nodes))]
 
     def _whole_model_faces(self, b: Block, count: Dict[frozenset, int], used: bool) -> List[str]:
         """The lines of *SURFACE ``b``'s blank data line (_free_face_surfaces): the faces of
@@ -21327,9 +21451,6 @@ class _Constraints:
                 surf.upper() not in self.surfaces:
             return None
         weights, why = self._distributing_weights(b, dist, ref)
-        if not why and any(expanded.get(n) == "axi" for n in weights):
-            why = ("it couples an axisymmetric surface (Abaqus' pages do not say whether the "
-                   "tributary areas there take the radius)")
         listed: set = set()
         for rec in merged_data_records(dist):
             f = [x for x in rec if x != ""]
@@ -21539,26 +21660,28 @@ class _Constraints:
                      ) -> Tuple[List[Tuple[int, float]], Optional[str]]:
         """(node, tributary area) of facet ``face`` of element ``e`` — integral N_i dA over a
         solid's face or a shell's or membrane's reference surface, N_i ds times the thickness
-        along a plane element's edge, N_i ds along a shell or membrane edge — or why there is
-        none to take.  (*EQUATION terms on membrane nodes are exact: ccx hinges a membrane's
-        expanded nodes to the node, which keeps its DOFs; probed on an M3D4 / M3D3 skin.)"""
+        along a plane element's edge, 2 pi r N_i ds along an axisymmetric one (Abaqus' coupling
+        verification deck xcouplingd_std_tarea_cax4: the reference node at the centroid of
+        those weights; exact against a uniform pressure), N_i ds along a shell or membrane edge
+        — or why there is none to take.  (*EQUATION terms on membrane nodes are exact: ccx
+        hinges a membrane's expanded nodes to the node, which keeps its DOFs; probed on an
+        M3D4 / M3D3 skin.)"""
         info = self.geom.elements.get(e)
         if info is None:
             return [], f"its surface names element {e}, which is not defined"
         cc, label = ccx_type(info[0]), (face or "").upper()
         if (cc in SHELL_TYPES or cc.startswith("M3D")) and re.fullmatch(r"E[1-4]|S[3-6]", label):
             nodes, _ = self._facet(e, label, types)
-            kind, scale = "line", 1.0
+            kind, scale, axi = "line", 1.0, False
         else:
             got, why = self._load_faces([e], label, shell_reference=True)
             if why:
                 return [], why
             nodes, kind, scale, axi = got[0][:4]
-            if axi:
-                return [], "it couples an axisymmetric surface (Abaqus' weights there not verified)"
         if any(n not in self.geom.nodes for n in nodes):
             return [], f"element {e} has an undefined node"
-        f = consistent_nodal_forces(kind, [self.geom.nodes[n] for n in nodes], lambda p, nn, t: (1.0, 0.0, 0.0))
+        f = consistent_nodal_forces(kind, [self.geom.nodes[n] for n in nodes], lambda p, nn, t: (1.0, 0.0, 0.0),
+                                    axisymmetric=axi)
         return [(n, scale * v[0]) for n, v in zip(nodes, f)], None
 
     def _plan_distributing_rows(self) -> None:
@@ -35758,6 +35881,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             blocks = flatten_assembly(blocks, self.report, self.opt)
         blocks = self._move_between_cards(blocks)     # before anything splits the deck into steps
         blocks = self._sp_amplitudes(blocks)          # before anything reads load amplitudes
+        blocks = self._blank_periods(blocks)          # before the step model reads the periods
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
         blocks = self._plan_self_contact(blocks)      # before anything reads contact pairs
         self._plan_deck_facts(blocks)
@@ -36126,6 +36250,45 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
     # the first value field of a data line (*TEMPERATURE: the temperature, then a shell's
     # gradients)
     _VALUE_FIELD = {"BOUNDARY": 3, "CLOAD": 2, "DLOAD": 2, "TEMPERATURE": 1}
+
+    # what ccx 2.23 does with a blank time period, by procedure (CCX_PERIODS; probed)
+    _BLANK_PERIOD = {"VISCO": "runs no time ('step size is negative')",
+                     "HEAT TRANSFER": "stops on ('step size is negative')",
+                     "COUPLED TEMPERATURE-DISPLACEMENT": "stops on ('step size is negative')",
+                     "UNCOUPLED TEMPERATURE-DISPLACEMENT": "stops on ('step size is negative')",
+                     "DYNAMIC": "stops on ('step size is nonpositive')"}
+
+    def _blank_periods(self, blocks: List[Block]) -> List[Block]:
+        """The time period (2nd field) of a procedure's data line left blank.  A steady-state
+        *HEAT TRANSFER or temperature-displacement step gets 1. there, the period the converter
+        takes for it (Step.period): ccx 2.23 reads the blank as 0 ('step size is negative',
+        step time NaN), and a steady-state solution does not depend on it (Abaqus' own decks:
+        radiationfinnedsurf, Benchmarks 'Radiation analysis of a plane finned surface').  In
+        the other procedures, and a *MODAL DYNAMIC without a data line, Abaqus documents no
+        default (an omitted number reads as zero, Input Syntax Rules) and none of its 2017
+        decks leaves it out: warned, as ccx stops or runs no time there."""
+        out: List[Block] = []
+        for b in blocks:
+            kw = b.keyword
+            f = [x.strip() for x in b.data[0].split(",")] + [""] if b.data else []
+            if kw == "MODAL DYNAMIC" and not merged_data_records(b):
+                self.report.warn("*MODAL DYNAMIC without a data line: Abaqus documents no default time "
+                                 "increment or period, and ccx 2.23 stops on it ('definition not "
+                                 "complete'): give the step its data line.", once=True)
+            elif kw in self._BLANK_PERIOD and f and not f[1]:
+                if b.has("STEADY STATE") and kw not in ("DYNAMIC", "VISCO"):
+                    f[1] = "1."
+                    b = Block(b.keyword, b.params, [", ".join(f[:max(2, len(f) - 1)])] + list(b.data[1:]))
+                    self.report.note(f"*{kw}, STEADY STATE with a blank time period -> 1. (ccx 2.23 "
+                                     f"reads the blank as 0, step time NaN; a steady-state solution "
+                                     f"does not depend on it).", once=True)
+                else:
+                    self.report.warn(f"*{kw} with a blank time period: Abaqus documents no default "
+                                     f"(an omitted number reads as zero), and ccx 2.23 "
+                                     f"{self._BLANK_PERIOD[kw]}: give the step its time period.",
+                                     once=True)
+            out.append(b)
+        return out
 
     def _sp_amplitudes(self, blocks: List[Block]) -> List[Block]:
         """A static perturbation or *BUCKLE step's loads, BCs and temperatures on an amplitude:

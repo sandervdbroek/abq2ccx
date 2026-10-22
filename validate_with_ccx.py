@@ -4086,6 +4086,101 @@ def elcopy_reflect_deck(written=False):
             "103, 1, -1.\n106, 1, -1.\n107, 1, -1.\n*NODE PRINT, NSET=OUT\nU\n*END STEP\n")
 
 
+C3D20_CUBE = CUBE_CORNERS + ((.5, 0, 0), (1, .5, 0), (.5, 1, 0), (0, .5, 0), (.5, 0, 1), (1, .5, 1),
+                             (.5, 1, 1), (0, .5, 1), (0, 0, .5), (1, 0, .5), (1, 1, .5), (0, 1, .5))
+
+
+def elcopy_reflect_faces_deck():
+    """A C3D20R unit cube (nodes 1-20) and its *ELCOPY, REFLECT mirror about x = 0 (*NCOPY,
+    REFLECT=MIRROR: nodes 101-120), each pressed on its y = 0 face by a face label: the cube's
+    P3, the copy's P6 (as Abaqus' bolted pipe flange deck names the mirror of an S3 face), each
+    held at y = 1 in y, x = 0 in x and z = 0 in z."""
+    xyz = {k: c for k, c in enumerate(C3D20_CUBE, 1)}
+    xyz.update({100 + k: (-c[0], c[1], c[2]) for k, c in enumerate(C3D20_CUBE, 1)})
+    held = lambda d, v: ", ".join(str(n) for n in sorted(xyz) if abs(xyz[n][d] - v) < 1e-9)
+    return ("*NODE, NSET=ALLN\n" + "".join(f"{k}, {x}, {y}, {z}\n" for k, (x, y, z) in xyz.items() if k < 100) +
+            "*ELEMENT, TYPE=C3D20R, ELSET=E\n1, " + ", ".join(str(n) for n in range(1, 21)) + "\n"
+            "*NCOPY, OLD SET=ALLN, CHANGE NUMBER=100, REFLECT=MIRROR\n0., 0., 0., 0., 1., 0., 0., 0., 1.\n"
+            "*ELCOPY, OLD SET=E, ELEMENT SHIFT=100, SHIFT NODES=100, NEW SET=E2, REFLECT\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*SOLID SECTION, ELSET=E, MATERIAL=M\n"
+            "*SOLID SECTION, ELSET=E2, MATERIAL=M\n*NSET, NSET=COPIES, GENERATE\n101, 120, 1\n"
+            f"*NSET, NSET=Y1\n{held(1, 1.0)}\n*NSET, NSET=X0\n{held(0, 0.0)}\n*NSET, NSET=Z0\n{held(2, 0.0)}\n"
+            "*BOUNDARY\nY1, 2, 2\nX0, 1, 1\nZ0, 3, 3\n*STEP\n*STATIC\n*DLOAD\n1, P3, 10.\n101, P6, 10.\n"
+            "*NODE PRINT, NSET=ALLN\nU\n*NODE PRINT, NSET=COPIES\nU\n*END STEP\n")
+
+
+AXI_R = (2.0, 3.0, 5.0, 8.0, 11.0)
+AXI_Z = (0.0, 1.0, 2.0, 4.0)
+
+
+def axi_coupling_deck(pressure=False):
+    """A CAX4 annulus (r 2-11, z 0-4, 4 x 3 elements, unequal), its top held in z, its bottom
+    row's free surface (*SURFACE line without a face label) coupled by *DISTRIBUTING to a
+    reference node at the centroid of the areas of revolution, loaded by 1000 along z
+    (Abaqus' xcouplingd_std_tarea_cax4 in other numbers: its displacements equal those of the
+    uniform pressure); ``pressure``: that pressure on the row instead."""
+    nr = len(AXI_R)
+    nodes = "".join(f"{1 + i + nr * j}, {r}, {z}\n" for j, z in enumerate(AXI_Z) for i, r in enumerate(AXI_R))
+    els = "".join(f"{1 + i + (nr - 1) * j}, {1 + i + nr * j}, {2 + i + nr * j}, {2 + i + nr * (j + 1)}, "
+                  f"{1 + i + nr * (j + 1)}\n" for j in range(len(AXI_Z) - 1) for i in range(nr - 1))
+    a, b = AXI_R[0], AXI_R[-1]
+    cen = 2.0 * (b ** 3 - a ** 3) / (3.0 * (b * b - a * a))
+    held = "".join(f"{1 + i + nr * (len(AXI_Z) - 1)}, 2, 2\n" for i in range(nr))
+    load = (f"*DLOAD\nROW, P1, {1000.0 / (math.pi * (b * b - a * a)):.12g}\n" if pressure else
+            "*CLOAD\n100, 2, 1000.\n")
+    coup = "" if pressure else ("*SURFACE, NAME=BOT\nROW,\n*COUPLING, CONSTRAINT NAME=C, REF NODE=100, "
+                                "SURFACE=BOT\n*DISTRIBUTING\n")
+    return (f"*NODE, NSET=ALLN\n{nodes}*NODE\n100, {cen:.12g}, -2.\n*ELEMENT, TYPE=CAX4, ELSET=E\n{els}"
+            f"*ELSET, ELSET=ROW\n1, 2, 3, 4\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            f"*SOLID SECTION, ELSET=E, MATERIAL=M\n{coup}*BOUNDARY\n{held}"
+            f"*STEP\n*STATIC\n{load}*NODE PRINT, NSET=ALLN\nU\n*END STEP\n")
+
+
+def free_surface_coupling_deck(pressure=False):
+    """A C3D8 block (x 0-2, y 0-1-2.5-4, z 0-1-3; 2 x 3 x 2 elements), its top held, its bottom
+    layer's free surface (*SURFACE line without a face label: Abaqus trims the layer's side
+    faces off) coupled by *DISTRIBUTING to a reference node below the bottom's centroid,
+    loaded by 100 along z (Abaqus' xcouplingd_std_tarea_c3d8 in other numbers); ``pressure``:
+    the uniform pressure on the bottom faces instead."""
+    xs, ys, zs = (0.0, 1.0, 2.0), (0.0, 1.0, 2.5, 4.0), (0.0, 1.0, 3.0)
+    nid = lambda i, j, k: 1 + i + 3 * j + 12 * k
+    nodes = "".join(f"{nid(i, j, k)}, {x}, {y}, {z}\n" for k, z in enumerate(zs) for j, y in enumerate(ys)
+                    for i, x in enumerate(xs))
+    els, low = "", []
+    for k in range(2):
+        for j in range(3):
+            for i in range(2):
+                e = 1 + i + 2 * j + 6 * k
+                n = nid(i, j, k)
+                els += f"{e}, {n}, {n + 1}, {n + 4}, {n + 3}, {n + 12}, {n + 13}, {n + 16}, {n + 15}\n"
+                low += [e] if k == 0 else []
+    top = ", ".join(str(nid(i, j, 2)) for j in range(4) for i in range(3))
+    load = "*DLOAD\nLOW, P1, 12.5\n" if pressure else "*CLOAD\n100, 3, 100.\n"
+    coup = "" if pressure else ("*SURFACE, NAME=BOT\nLOW,\n*COUPLING, CONSTRAINT NAME=C, REF NODE=100, "
+                                "SURFACE=BOT\n*DISTRIBUTING\n")
+    return (f"*NODE, NSET=ALLN\n{nodes}*NODE\n100, 1., 2., -1.\n*ELEMENT, TYPE=C3D8, ELSET=E\n{els}"
+            f"*ELSET, ELSET=LOW\n{', '.join(map(str, low))}\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            f"*SOLID SECTION, ELSET=E, MATERIAL=M\n{coup}*NSET, NSET=TOP\n{top}\n*BOUNDARY\nTOP, 1, 3\n"
+            f"*STEP\n*STATIC\n{load}*NODE PRINT, NSET=ALLN\nU\n*END STEP\n")
+
+
+def steady_blank_period_deck(written=False):
+    """A DC3D8 bar of two elements: a *HEAT TRANSFER, STEADY STATE step whose data line leaves
+    the period blank (Abaqus' benchmark radiationfinnedsurf does), its ends at 100 and 0, then
+    a transient step with the hot end at 50.  ``written``: the period given as 1."""
+    return ("*NODE, NSET=ALLN\n" + "".join(f"{1 + i + 3 * k}, {float(x)}, {float(y)}, {float(z)}\n"
+                                        for i, x in enumerate((0, 1, 2)) for k, (y, z) in
+                                        enumerate(((0, 0), (1, 0), (0, 1), (1, 1)))) +
+            "*ELEMENT, TYPE=DC3D8, ELSET=E\n1, 1, 2, 5, 4, 7, 8, 11, 10\n2, 2, 3, 6, 5, 8, 9, 12, 11\n"
+            "*MATERIAL, NAME=M\n*CONDUCTIVITY\n2.\n*SPECIFIC HEAT\n1.\n*DENSITY\n1.\n"
+            "*SOLID SECTION, ELSET=E, MATERIAL=M\n*NSET, NSET=HOT\n1, 4, 7, 10\n*NSET, NSET=COLD\n3, 6, 9, 12\n"
+            "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nALLN, 0.\n"
+            f"*STEP\n*HEAT TRANSFER, STEADY STATE\n1.0,{' 1.' if written else ''}\n*BOUNDARY\nHOT, 11, 11, 100.\n"
+            "COLD, 11, 11, 0.\n*NODE PRINT, NSET=ALLN\nNT\n*END STEP\n"
+            "*STEP\n*HEAT TRANSFER, DELTMX=50.\n0.1, 1.\n*BOUNDARY\nHOT, 11, 11, 50.\n*NODE PRINT, NSET=ALLN\nNT\n"
+            "*END STEP\n")
+
+
 def after_pert_model(plastic=False):
     """after_pert_deck's column model alone (``plastic``: with its *PLASTIC, yield 1e3)."""
     text = after_pert_deck("modal", not plastic)
@@ -13768,6 +13863,59 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  elcopy_reflect (a C3D8 cube and its *ELCOPY, REFLECT mirror, "
               f"pulled apart): the copy as written out ({err:.1e} apart) and mirroring the cube "
               f"({mirror:.1e}; ux {got[2][0]:.6g}; before: ccx stopped)")
+    failures += 0 if ok else 1
+
+    # *ELCOPY, REFLECT of a C3D20R brick: the copy's face labels as Abaqus' bolted pipe flange
+    # deck (boltpipeflange_3d_cyclsym) names them, its S6 the mirror of the original's S3
+    got = review_run(elcopy_reflect_faces_deck(), "elcopy_reflect_faces", dat_displacements)
+    ok = bool(got) and all(n in got for n in range(1, 21)) and all(100 + n in got for n in range(1, 21))
+    if ok:
+        mirror = max(abs(got[100 + n][0] + got[n][0]) + abs(got[100 + n][1] - got[n][1]) +
+                     abs(got[100 + n][2] - got[n][2]) for n in range(1, 21))
+        uy = max(abs(v[1]) for v in got.values())
+        ok = mirror <= 1e-9 * uy and uy > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  elcopy_reflect_faces (a C3D20R cube and its *ELCOPY, REFLECT "
+              f"mirror, each pressed by its P3 / the copy's P6): the copy mirrors the cube "
+              f"({mirror:.1e}; |uy| {uy:.6g})")
+    failures += 0 if ok else 1
+
+    # distributing couplings on free surfaces (*SURFACE lines without a face label, trimmed as
+    # Abaqus trims them) of axisymmetric (weights: areas of revolution) and solid elements:
+    # Abaqus' verification decks xcouplingd_std_tarea_cax4 / _c3d8 ("the displacements are equal
+    # to the displacements obtained if the model were loaded with a uniform pressure load")
+    for tag, build, dof, tol in (("distributing_axi_weights", axi_coupling_deck, 1, 1e-3),
+                                 ("free_surface_trimmed", free_surface_coupling_deck, 2, 1e-6)):
+        runs = [review_run(build(p), tag + ("_ref" if p else ""), dat_displacements) for p in (False, True)]
+        ok = all(runs)
+        if ok:
+            got, ref = runs
+            peak = max(abs(v[dof]) for v in ref.values())
+            err = max(abs(got[n][dof] - v[dof]) for n, v in ref.items()) / peak
+            ok = err <= tol and peak > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (*COUPLING, *DISTRIBUTING on the free surface "
+                  f"of a {'CAX4 annulus' if dof == 1 else 'C3D8 layer'} against the uniform pressure): "
+                  f"{err:.1e} of |u| {peak:.6g} apart")
+        failures += 0 if ok else 1
+
+    # a steady-state step whose period is blank (Abaqus' benchmark radiationfinnedsurf): ccx
+    # read it as 0 ('*ERROR ... step size is negative', step time NaN)
+    outs = []
+    for w in (False, True):
+        tag = "steady_blank_period" + ("_ref" if w else "")
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(steady_blank_period_deck(w))
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = open(os.path.join(d, "job.dat"), errors="replace").read() if status == "solved" else ""
+        shutil.rmtree(d, ignore_errors=True)
+        outs.append((status, out, dat))
+    (st, out, dat), (_, _, ref) = outs
+    times = re.findall(r"and time\s+(\S+)", dat)
+    ok = st == "solved" and dat == ref and "*ERROR" not in out and bool(times) and "NaN" not in times
+    print(f"{'PASS' if ok else 'FAIL'}  steady_blank_period (*HEAT TRANSFER, STEADY STATE with a blank "
+          f"period, then a transient step): as with the period written out (times {', '.join(times[:2])}; "
+          f"before: '*ERROR ... step size is negative', step time NaN)")
     failures += 0 if ok else 1
 
     # --- explicit mass scaling ------------------------------------------------------------
