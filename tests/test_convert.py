@@ -7527,6 +7527,215 @@ def test_self_contact_pairs_commented_out():
     assert conv.reduced_physics == ["*CONTACT PAIR self-contact"]
 
 
+def _cubes(origins, tail, typ="C3D8"):
+    """One unit cube per origin (x, y, z), element k and nodes 8k-7..8k, a section, then
+    ``tail``."""
+    corners = ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))
+    nodes = [f"{8 * k + i + 1}, {x + dx!r}, {y + dy!r}, {z + dz!r}"
+             for k, (x, y, z) in enumerate(origins) for i, (dx, dy, dz) in enumerate(corners)]
+    elems = [f"{k + 1}, " + ", ".join(str(8 * k + i) for i in range(1, 9)) for k in range(len(origins))]
+    return ("*NODE\n" + "\n".join(nodes) + f"\n*ELEMENT, TYPE={typ}, ELSET=EALL\n" + "\n".join(elems) +
+            "\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n1e-9\n*SOLID SECTION, ELSET=EALL, "
+            "MATERIAL=M\n" + tail)
+
+
+GC_FLAG = "--approximate: general contact (*CONTACT) written as generated *CONTACT PAIR cards"
+
+
+def _gc_lines(body):
+    """The data lines of the *CONTACT PAIR cards in ``body``, and each *SURFACE's lines."""
+    pairs, surfs, cur = [], {}, None
+    for ln in body.splitlines():
+        if ln.startswith("*"):
+            cur = ln.split(",")[1].split("=")[1].strip() if ln.startswith("*SURFACE, NAME=") else \
+                "PAIR" if ln.startswith("*CONTACT PAIR") else None
+            if cur and cur != "PAIR":
+                surfs[cur] = []
+        elif cur == "PAIR":
+            pairs.append(tuple(x.strip() for x in ln.split(",")))
+        elif cur:
+            surfs[cur].append(ln)
+    return pairs, surfs
+
+
+def test_general_contact_approximate_pairs():
+    # Abaqus general contact (ALL EXTERIOR) under --approximate: the bodies' exterior faces, a
+    # node-to-surface pair with the struck lower cube the slave of the driven upper one, the
+    # assigned property; the general-contact cards commented out (validate_with_ccx
+    # general_contact_approx: the same force as a hand-written pair)
+    def cubes(z, prop=" , , I\n"):
+        return _cubes([(0, 0, 0), (0.1, 0.1, z)], (
+            "*SURFACE INTERACTION, NAME=I\n*FRICTION\n0.1,\n*CONTACT\n*CONTACT INCLUSIONS, ALL "
+            "EXTERIOR\n" + ("*CONTACT PROPERTY ASSIGNMENT\n" + prop if prop else "") +
+            "*BOUNDARY\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*STEP\n*STATIC\n*BOUNDARY\n"
+            "13, 3, 3, -0.01\n14, 3, 3, -0.01\n15, 3, 3, -0.01\n16, 3, 3, -0.01\n*END STEP\n"))
+    deck = cubes(1)
+    body, conv, rep = convert_str(deck, approximate=True)
+    pairs, surfs = _gc_lines(body)
+    assert "*CONTACT PAIR, INTERACTION=I, TYPE=NODE TO SURFACE\n" in body and \
+        pairs == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1B2")]
+    assert surfs["ABQ2CCX_GC1B1"] == [f"ABQ2CCX_GC1B1S{k}, S{k}" for k in range(1, 7)]
+    assert body.index("*CONTACT PAIR") < body.index("*STEP") and "ADJUST" not in body
+    assert "\n** *CONTACT INCLUSIONS, ALL EXTERIOR\n" in body and conv.reduced_physics == [GC_FLAG]
+    assert "[APPROX] general contact (*CONTACT) written as generated *CONTACT PAIR cards: 1 line" in rep.text()
+    assert "the self-contact of 2 bodies is left out" in rep.text()
+    body, conv, rep = convert_str(deck)
+    assert "\n*CONTACT PAIR" not in body and "--approximate writes it as node-to-surface" in rep.text()
+    assert "*CONTACT" in conv.reduced_physics
+    # the default property (hard, frictionless); a pair that starts overclosed is adjusted
+    body, _, rep = convert_str(cubes(0.99, ""), approximate=True)
+    assert ("*SURFACE INTERACTION, NAME=ABQ2CCX_GC1HARD\n*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD\n"
+            "*CONTACT PAIR, INTERACTION=ABQ2CCX_GC1HARD, TYPE=NODE TO SURFACE, ADJUST=0.\n") in body
+    assert "start overclosed get ADJUST=0." in rep.text()
+
+
+def test_general_contact_reach_and_roles():
+    # only bodies that can meet over the analysis get a pair: their boxes within four times
+    # the largest prescribed travel (an amplitude's peak times the BC; any load: unbounded)
+    def run(peak, load=""):
+        deck = _cubes([(0, 0, 0), (0, 0, 2)], (
+            f"*AMPLITUDE, NAME=A\n0., 0., 1., {peak}\n*CONTACT\n*CONTACT INCLUSIONS, ALL EXTERIOR\n"
+            "*BOUNDARY\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*STEP\n*STATIC\n*BOUNDARY, AMPLITUDE=A\n"
+            "13, 3, 3, -0.2\n" + load + "*END STEP\n"))
+        return convert_str(deck, approximate=True)
+    body, conv, rep = run(2.)                     # travel 0.2 x 2 x sqrt(3): reach 2.77 > 1
+    assert _gc_lines(body)[0] == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1B2")]
+    body, conv, rep = run(0.1)                    # reach 0.14: the cubes 1 apart cannot meet
+    assert "\n*CONTACT PAIR" not in body and "no two bodies of the general contact domain can " \
+        "meet" in rep.text() and conv.reduced_physics == [GC_FLAG]
+    body, _, _ = run(0.1, "*CLOAD\n9, 3, -1.\n")
+    assert _gc_lines(body)[0] == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1B2")]
+    # four touching cubes in a row, all within reach: each body only a slave or only a master,
+    # one line per slave against the union of its masters (ccx 2.23 loses or diverges on a
+    # body that is both, probed); the pair of two slaves left out, warned
+    deck = _cubes([(0, 0, 0), (1, 0, 0), (2, 0, 0), (3, 0, 0)], (
+        "*CONTACT\n*CONTACT INCLUSIONS, ALL EXTERIOR\n*BOUNDARY\n1, 1, 3\n*STEP\n*STATIC\n"
+        "*CLOAD\n25, 1, -1.\n*END STEP\n"))
+    body, conv, rep = convert_str(deck, approximate=True)
+    pairs, surfs = _gc_lines(body)
+    slaves = [s for s, _m in pairs]
+    masters = {re.sub(r"(S[1-6]|[PN])$", "", ln.split(",")[0]) for _s, m in pairs for ln in surfs[m]}
+    assert len(slaves) == len(set(slaves)) and len(pairs) <= 4 and masters and not set(slaves) & masters
+    assert "pair(s) left out whose bodies are both slaves or both masters" in rep.text()
+
+
+def test_general_contact_many_bodies():
+    # past _GC_MANY bodies an unbounded travel (a load) pairs only bodies within four times the
+    # largest body's size, and at most _GC_MAX_PAIRS pairs, the closest, are written
+    many, most = A.Converter._GC_MANY, A.Converter._GC_MAX_PAIRS
+    try:
+        A.Converter._GC_MANY = 3
+        deck = _cubes([(3 * k, 0, 0) for k in range(6)], (
+            "*CONTACT\n*CONTACT INCLUSIONS, ALL EXTERIOR\n*BOUNDARY\n1, 1, 3\n*STEP\n*STATIC\n"
+            "*CLOAD\n9, 1, -1.\n*END STEP\n"))
+        body, conv, rep = convert_str(deck, approximate=True)
+        assert "only those within 6.928 (four times the largest body's size)" in rep.text()
+        pairs, surfs = _gc_lines(body)
+        met = {(s, re.sub(r"(S[1-6]|[PN])$", "", ln.split(",")[0])) for s, m in pairs for ln in surfs[m]}
+        assert met and all(abs(int(a[-1]) - int(b[-1])) <= 2 for a, b in met)   # gaps 2 and 5, not 8
+        A.Converter._GC_MAX_PAIRS = 3
+        body, conv, rep = convert_str(deck, approximate=True)
+        assert "9 pairs of bodies can meet; the 3 closest are written" in rep.text()
+    finally:
+        A.Converter._GC_MANY, A.Converter._GC_MAX_PAIRS = many, most
+
+
+def test_general_contact_named_surfaces():
+    # named inclusion lines pair the deck's own surfaces; a slave with two masters gets one line
+    # against their union (their own lines), and the deck's property per pair
+    deck = _cubes([(0, 0, 0), (0, 0, 1), (1, 0, 0)], (
+        "*SURFACE, NAME=SA\n1, S2\n1, S4\n*SURFACE, NAME=SB\n2, S1\n*SURFACE, NAME=SC\n3, S6\n"
+        "*SURFACE INTERACTION, NAME=I\n*CONTACT\n*CONTACT INCLUSIONS\nSA, SB\nSA, SC\n"
+        "*CONTACT PROPERTY ASSIGNMENT\nSA, SC, I\n*BOUNDARY\n1, 1, 3\n*STEP\n*STATIC\n"
+        "*CLOAD\n13, 3, -1.\n21, 1, -1.\n*END STEP\n"))
+    body, conv, rep = convert_str(deck, approximate=True)
+    pairs, surfs = _gc_lines(body)
+    assert pairs == [("SA", "ABQ2CCX_GC1M1")] and surfs["ABQ2CCX_GC1M1"] == ["2, S1", "3, S6"]
+    assert "*CONTACT PAIR, INTERACTION=ABQ2CCX_GC1HARD, TYPE=NODE TO SURFACE\nSA," in body
+    assert "pair(s) take the contact property of their slave body's first pair" in rep.text()
+    assert conv.reduced_physics == [GC_FLAG]
+
+
+def test_general_contact_review_cases():
+    # a shell blank between a rigid punch and die: the slave blank both sides, each tool's facet
+    # the side facing the blank (the nearest body it meets)
+    deck = ("*NODE\n1, 0., 0., -0.1\n2, 1., 0., -0.1\n3, 1., 1., -0.1\n4, 0., 1., -0.1\n"
+            "5, 0., 0., 0.1\n6, 1., 0., 0.1\n7, 1., 1., 0.1\n8, 0., 1., 0.1\n9, 0.5, 0.5, -1.\n"
+            "10, 0.5, 0.5, 1.\n11, 0.2, 0.2, 0.\n12, 0.8, 0.2, 0.\n13, 0.8, 0.8, 0.\n14, 0.2, 0.8, 0.\n"
+            "*ELEMENT, TYPE=R3D4, ELSET=DIE\n1, 1, 2, 3, 4\n*ELEMENT, TYPE=R3D4, ELSET=PUNCH\n"
+            "2, 5, 6, 7, 8\n*ELEMENT, TYPE=S4, ELSET=BLANK\n3, 11, 12, 13, 14\n"
+            "*RIGID BODY, REF NODE=9, ELSET=DIE\n*RIGID BODY, REF NODE=10, ELSET=PUNCH\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*SHELL SECTION, ELSET=BLANK, MATERIAL=M\n0.05\n"
+            "*CONTACT\n*CONTACT INCLUSIONS, ALL EXTERIOR\n*BOUNDARY\n9, 1, 6\n10, 1, 6\n11, 1, 2\n"
+            "*STEP\n*STATIC\n*BOUNDARY\n10, 3, 3, -0.2\n*END STEP\n")
+    body, conv, rep = convert_str(deck, approximate=True)
+    pairs, surfs = _gc_lines(body)
+    assert pairs == [("ABQ2CCX_GC1B3", "ABQ2CCX_GC1M1")]
+    assert surfs["ABQ2CCX_GC1B3"] == ["ABQ2CCX_GC1B3T, SPOS", "ABQ2CCX_GC1B3T, SNEG"]
+    assert surfs["ABQ2CCX_GC1B1"] == ["ABQ2CCX_RS1, S2"] and surfs["ABQ2CCX_GC1B2"] == ["ABQ2CCX_RS2, S1"]
+    # self-contact of a surface that spans two bodies: contact between them
+    two = _cubes([(0, 0, 0), (0, 0, 1)], (
+        "*SURFACE, NAME=BOTH\nEALL\n*CONTACT\n*CONTACT INCLUSIONS\nBOTH,\n*BOUNDARY\n1, 1, 3\n"
+        "*STEP\n*STATIC\n*CLOAD\n13, 3, -1.\n*END STEP\n"))
+    body, conv, rep = convert_str(two, approximate=True)
+    assert _gc_lines(body)[0] == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1B2")]
+    assert "spans several bodies is written as contact between those bodies" in rep.text()
+    # a node surface is not paired with its own body
+    body, conv, rep = convert_str(two.replace("*SURFACE, NAME=BOTH\nEALL\n", "*NSET, NSET=N2\n9, 10, 11, "
+                                              "12\n*SURFACE, NAME=NS, TYPE=NODE\nN2\n").replace(
+                                                  "BOTH,\n", ", NS\n"), approximate=True)
+    assert _gc_lines(body)[0] == [("NS", "ABQ2CCX_GC1B1")]
+    # surface elements are no body (they leave the ccx mesh)
+    sfm = _cubes([(0, 0, 0)], (
+        "*NODE\n101, 0., 0., 1.5\n102, 1., 0., 1.5\n103, 1., 1., 1.5\n104, 0., 1., 1.5\n"
+        "*ELEMENT, TYPE=SFM3D4, ELSET=F\n11, 101, 102, 103, 104\n*SURFACE SECTION, ELSET=F\n"
+        "*CONTACT\n*CONTACT INCLUSIONS, ALL EXTERIOR\n*BOUNDARY\n1, 1, 3\n101, 1, 3\n*STEP\n"
+        "*STATIC\n*CLOAD\n5, 3, 1.\n*END STEP\n"))
+    body, conv, rep = convert_str(sfm, approximate=True)
+    assert "\n*CONTACT PAIR" not in body and "1 SFM3D4 elements are not in the contact surfaces" in rep.text()
+    # a VALUE=ABSOLUTE amplitude moves the BC by its own values, whatever the magnitude
+    gap = _cubes([(0, 0, 0), (0, 0, 2)], (
+        "*AMPLITUDE, NAME=A, VALUE=ABSOLUTE\n0., 0., 1., -1.5\n*CONTACT\n*CONTACT INCLUSIONS, ALL "
+        "EXTERIOR\n*BOUNDARY\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*STEP\n*STATIC\n"
+        "*BOUNDARY, AMPLITUDE=A\n13, 3, 3, 1e-3\n*END STEP\n"))
+    body, conv, rep = convert_str(gap, approximate=True)
+    assert _gc_lines(body)[0] == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1B2")]
+
+
+def test_general_contact_rigid_and_unwritable():
+    # two rigid bodies (R3D4 skins) and a cube between them: the cube the slave of each, the
+    # pair of the two rigid bodies left out (ccx sizes no explicit increment for it, probed)
+    deck = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+            "5, 0., 0., 3.\n6, 1., 0., 3.\n7, 1., 1., 3.\n8, 0., 1., 3.\n9, 0.5, 0.5, -1.\n"
+            "10, 0.5, 0.5, 4.\n11, 0.2, 0.2, 1.\n12, 0.8, 0.2, 1.\n13, 0.8, 0.8, 1.\n14, 0.2, 0.8, 1.\n"
+            "15, 0.2, 0.2, 2.\n16, 0.8, 0.2, 2.\n17, 0.8, 0.8, 2.\n18, 0.2, 0.8, 2.\n"
+            "*ELEMENT, TYPE=R3D4, ELSET=R1\n1, 1, 2, 3, 4\n*ELEMENT, TYPE=R3D4, ELSET=R2\n2, 5, 6, 7, 8\n"
+            "*ELEMENT, TYPE=C3D8, ELSET=C\n3, 11, 12, 13, 14, 15, 16, 17, 18\n"
+            "*RIGID BODY, REF NODE=9, ELSET=R1\n*RIGID BODY, REF NODE=10, ELSET=R2\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*SOLID SECTION, ELSET=C, MATERIAL=M\n"
+            "*CONTACT\n*CONTACT INCLUSIONS, ALL EXTERIOR\n*BOUNDARY\n9, 1, 6\n10, 1, 6\n11, 1, 2\n"
+            "*STEP\n*STATIC\n*BOUNDARY\n10, 3, 3, -1.1\n*END STEP\n")
+    body, conv, rep = convert_str(deck, approximate=True)
+    pairs, surfs = _gc_lines(body)
+    assert pairs == [("ABQ2CCX_GC1B3", "ABQ2CCX_GC1M1")] and len(surfs["ABQ2CCX_GC1M1"]) == 2
+    assert "1 pair(s) of two rigid bodies left out" in rep.text()
+    # the facets face the cube: the lower plate's SPOS (up), the upper one's SNEG (down)
+    assert surfs["ABQ2CCX_GC1B1"] == ["ABQ2CCX_RS1, S2"] and surfs["ABQ2CCX_GC1B2"] == ["ABQ2CCX_RS2, S1"]
+    # general contact that changes in a later step, or beside the deck's own surface-to-surface
+    # pairs (ccx takes one TYPE), is not written: commented out as without --approximate
+    cubes = _cubes([(0, 0, 0), (0, 0, 1)], (
+        "*SURFACE, NAME=S\n1, S2\n*SURFACE, NAME=T\n2, S1\n*SURFACE INTERACTION, NAME=I\n"
+        "*CONTACT\n*CONTACT INCLUSIONS, ALL EXTERIOR\n*BOUNDARY\n1, 1, 3\n*STEP\n*STATIC\n"
+        "*CLOAD\n13, 3, -1.\n*END STEP\n*STEP\n*STATIC\n*CONTACT, OP=NEW\n*CONTACT INCLUSIONS\nS, T\n"
+        "*END STEP\n"))
+    for deck, why in ((cubes, "it changes in step 2"),
+                      (cubes.replace("*CONTACT\n", "*CONTACT PAIR, INTERACTION=I, TYPE=SURFACE TO "
+                                                   "SURFACE\nT, S\n*CONTACT\n", 1).replace(
+                          "*CONTACT, OP=NEW\n*CONTACT INCLUSIONS\nS, T\n", ""), "the deck's own are")):
+        body, conv, rep = convert_str(deck, approximate=True)
+        assert "ABQ2CCX_GC" not in body and why in rep.text() and "*CONTACT" in conv.reduced_physics
+
+
 def test_self_contact_approximate_and_tied():
     # --approximate: the self-contact lines as ccx's 'S, S' with TYPE=SURFACE TO SURFACE, a card
     # of their own after the card's other lines ([APPROX]; measured on a strip folding onto

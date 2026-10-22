@@ -86,7 +86,8 @@ problem.
 as a close equivalent, each flagged `[APPROX]` — a Riks step as plain static, ν ≥ 0.5 as
 0.475, an I-section in space as ccx's `U1` beam with too stiff a torsion (or an equivalent
 rectangle where `U1` cannot run), NLGEOM follower tractions as fixed nodal
-forces, a curved analytical rigid surface as flat facets, and a few more
+forces, a curved analytical rigid surface as flat facets, general contact as contact pairs
+between the model's bodies, and a few more
 ([full list](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/user-guide.md#--approximate)). Without it those cards are commented out
 with the reason, so ccx never silently runs a different model.
 
@@ -153,9 +154,10 @@ The [architecture guide](https://github.com/sandervdbroek/abq2ccx/blob/main/docs
   commented out, naming the ccx subroutine to port; a UMAT runs in a ccx built with it
   (`--abaqus-umat`), a VUMAT has no ccx interface.
 * Cohesive and gasket elements run as thin continua (their traction-separation law is lost;
-  warned). Abaqus general contact (`*CONTACT`), connector behaviours, inertia relief and
-  materials such as viscoelasticity and concrete damaged plasticity have no equivalent and
-  are flagged for remodelling; a deck that runs without them is flagged as reduced physics.
+  warned). Abaqus general contact (`*CONTACT`; `--approximate`: contact pairs between the
+  bodies), connector behaviours, inertia relief and materials such as viscoelasticity and
+  concrete damaged plasticity have no equivalent and are flagged for remodelling; a deck that
+  runs without them is flagged as reduced physics.
 * ccx's own first-order elements are not Abaqus': its `CPE4`/`C3D8`/`CAX4` are plain 2×2(×2)
   integration, without Abaqus' selectively reduced volume terms (on a coarse bending mesh
   Abaqus' `CPE4` deflects 9–19 % more for ν 0–0.3), and its `CPS4` is a 3-D slab with a free

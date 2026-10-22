@@ -3198,6 +3198,46 @@ def clearance_deck(roles):
             "*Node Print, nset=UTOP, totals=only\nRF\n*Node Print, nset=LTOP\nU\n*End Step\n")
 
 
+def general_contact_deck(form):
+    """Two elastic blocks (C3D8) touching in z, the lower one 4 x 4 x 1 elements over 1 x 1 x
+    0.5 held at its base, the upper one 3 x 3 x 1 elements over 0.8 x 0.8 x 0.5 with its top
+    pushed down 0.01: Abaqus general contact (``form`` "general": *CONTACT, ALL EXTERIOR, the
+    default hard frictionless property), a hand-written node-to-surface pair of the lower
+    top (slave) on the upper base ("pair", hard), or no contact ("none")."""
+    nodes, elems, n, e = [], [], 0, 0
+
+    def block(x0, w, z0, m):
+        nonlocal n, e
+        ids = {}
+        for k in range(2):
+            for j in range(m + 1):
+                for i in range(m + 1):
+                    n += 1
+                    ids[i, j, k] = n
+                    nodes.append(f"{n}, {x0 + w * i / m!r}, {x0 + w * j / m!r}, {z0 + 0.5 * k!r}")
+        for j in range(m):
+            for i in range(m):
+                e += 1
+                c = [ids[i, j, 0], ids[i + 1, j, 0], ids[i + 1, j + 1, 0], ids[i, j + 1, 0],
+                     ids[i, j, 1], ids[i + 1, j, 1], ids[i + 1, j + 1, 1], ids[i, j + 1, 1]]
+                elems.append(f"{e}, " + ", ".join(map(str, c)))
+        return ids
+    low, up = block(0.0, 1.0, 0.0, 4), block(0.1, 0.8, 0.5, 3)
+    base = ", ".join(str(v) for (i, j, k), v in low.items() if k == 0)
+    top = ", ".join(str(v) for (i, j, k), v in up.items() if k == 1)
+    contact = {"general": "*Contact\n*Contact Inclusions, all exterior\n",
+               "pair": ("*Surface, name=LTOP\n" + "".join(f"{k}, S2\n" for k in range(1, 17)) +
+                        "*Surface, name=UBASE\n" + "".join(f"{k}, S1\n" for k in range(17, 26)) +
+                        "*Surface Interaction, name=I\n*Surface Behavior, pressure-overclosure=HARD\n"
+                        "*Contact Pair, interaction=I, type=NODE TO SURFACE\nLTOP, UBASE\n"),
+               "none": ""}[form]
+    return ("*Node\n" + "\n".join(nodes) + "\n*Element, type=C3D8, elset=E\n" + "\n".join(elems) +
+            "\n*Solid Section, elset=E, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            f"*Nset, nset=BASE\n{base}\n*Nset, nset=UTOP\n{top}\n" + contact +
+            "*Boundary\nBASE, 1, 3\nUTOP, 1, 2\n*Step, nlgeom\n*Static\n0.25, 1.\n*Boundary\n"
+            "UTOP, 3, 3, -0.01\n*Node Print, nset=UTOP, totals=only\nRF\n*End Step\n")
+
+
 def follower_turning_deck(form, steps=6, step_deg=15.0):
     """A unit cube (C3D8, ``form`` "3d": *DSLOAD TRVEC on its face x = 1) or square (CPE4,
     "2d": element-based *DLOAD TRVEC2 on its edge x = 1) whose face x = 0 is turned about z in
@@ -14315,6 +14355,25 @@ def main():
               f"VALUE=0 on a surface-to-surface pair of two cubes 0.01 apart, one pushed 0.005): force "
               f"{-f_main[2]:.7g} = the series closed form {want:.7g} ({err:.1e}), the struck cube's top "
               f"{u_main[0][3]:.4g}; as SLAVE= / MASTER= ({apart:.1e} apart); without it {f_none[2]:.1e}")
+    failures += 0 if ok else 1
+
+    # --- general contact under --approximate: Abaqus' *CONTACT, ALL EXTERIOR written as a
+    # node-to-surface pair of the two blocks' exterior faces (the struck lower block the slave);
+    # it carries what a hand-written pair of the touching faces carries (without --approximate
+    # the pushed block meets nothing)
+    runs = {tag: review_run(general_contact_deck(form), f"general_contact_{tag}",
+                            lambda dat: dat_totals(dat)[-1:], approximate=ap)
+            for tag, form, ap in (("approx", "general", True), ("pair", "pair", False),
+                                  ("plain", "general", False))}
+    ok = all(runs.values())
+    if ok:
+        got, want, plain = (runs[k][0][2] for k in ("approx", "pair", "plain"))
+        err = abs(got / want - 1)
+        ok = err < 1e-6 and abs(want) > 1.0 and abs(plain) < 1e-6 * abs(want)
+        print(f"{'PASS' if ok else 'FAIL'}  general_contact_approx (two touching C3D8 blocks, 4 x 4 "
+              f"under 3 x 3 elements, the upper one pushed down 0.01; *CONTACT, ALL EXTERIOR under "
+              f"--approximate): reaction {got:.7g} vs {want:.7g} with a hand-written node-to-surface "
+              f"pair ({err:.1e} apart); {plain:.2g} with it commented out (no --approximate)")
     failures += 0 if ok else 1
 
     # --- cards ccx 2.23 stopped or crashed on as they were written (code review 2, R20) ---

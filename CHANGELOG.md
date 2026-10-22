@@ -87,6 +87,17 @@ physics.
   meshes, free and symmetry edges included: 0.999–1.003), and stays on the straight edge where
   the shell is flat or folds (Abaqus' 20° rule for averaging normals). Flat meshes are
   unchanged.
+* **General contact under `--approximate`** — Abaqus general contact (`*CONTACT` with
+  `*CONTACT INCLUSIONS`, `ALL EXTERIOR` or named surfaces, `*CONTACT EXCLUSIONS` and
+  `*CONTACT PROPERTY ASSIGNMENT`), which ccx lacks, is written as node-to-surface `*CONTACT
+  PAIR` cards between the model's bodies (their exterior faces) that can meet over the analysis
+  (boxes within four times the largest prescribed travel plus 5 % of the model's size, a
+  heuristic; any load: all): one line per slave body (the struck, yielding or finer-meshed one)
+  against the union of its masters, the assigned property or Abaqus' hard frictionless default,
+  `ADJUST` where a pair starts overclosed. Self-contact, edge-to-edge contact and pairs of two
+  rigid bodies are left out (warned). Two blocks pressed together carry what a hand-written
+  pair carries, to all digits. Without the option the cards stay commented out, and the
+  warning names `--approximate`.
 * **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the

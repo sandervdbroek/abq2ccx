@@ -200,7 +200,8 @@ The converter keeps these as `**` comments with guidance:
 * **Gaskets** → a thin soft solid or a `*SPRING`; **cohesive elements and debonding** →
   contact or a nonlinear `*SPRING` (by default they run as a bonded thin continuum, warned).
 * **Abaqus general contact** (`*CONTACT`) → `*CONTACT PAIR`s between the surfaces that can
-  touch (rigid elements and analytical surfaces convert, so they can be part of them).
+  touch (rigid elements and analytical surfaces convert, so they can be part of them);
+  `--approximate` writes node-to-surface pairs between the model's bodies for you.
 * **Inertia relief** → soft springs to ground or a 3-2-1 constraint.
 * **Unsupported materials** (`*VISCOELASTIC`, `*CONCRETE …`, `*DAMAGE EVOLUTION`, …) → the
   nearest supported model.

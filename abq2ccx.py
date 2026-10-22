@@ -930,7 +930,7 @@ KEYWORD_ALIASES = {"AMP": "AMPLITUDE"}
 # The multi-word parameter names the converter reads.  Abaqus (like ccx) ignores blanks in
 # parameter names, so parse_keyword_line maps ``REFNODE=`` / ``POSITIONTOLERANCE=`` to these.
 MULTIWORD_PARAMS = (
-    "ABSOLUTE EXTERIOR TOLERANCE",
+    "ABSOLUTE EXTERIOR TOLERANCE", "ALL EXTERIOR",
     "ANALYTICAL SURFACE", "CHANGE NUMBER", "CONSTANT RESULTANT", "CONSTRAINT NAME",
     "CONTACT ELEMENTS", "CONVERSION CRITERION", "CYCLIC SYMMETRY", "DAMPING PROJECTION",
     "DIRECT USER CONTROL", "DISTORTION CONTROL", "DRILL STIFFNESS", "ELEMENT BY ELEMENT",
@@ -4085,6 +4085,11 @@ NUMERICAL_KEYWORDS = {
     "CONTACT CONTROLS": "contact algorithm settings; ccx uses its own",
 }
 
+# Abaqus general contact's cards (written as contact pairs under --approximate:
+# Converter._plan_general_contact)
+GENERAL_CONTACT_CARDS = ("CONTACT", "CONTACT INCLUSIONS", "CONTACT EXCLUSIONS",
+                         "CONTACT PROPERTY ASSIGNMENT")
+
 # Abaqus keywords with NO ccx equivalent: commented out with targeted guidance.
 SPECIAL_UNSUPPORTED = {
     "VISCOELASTIC": "time-domain viscoelasticity is unsupported (ccx *VISCO is a creep STEP, not a "
@@ -4111,11 +4116,13 @@ SPECIAL_UNSUPPORTED = {
        for k in ("ELASTICITY", "DAMPING", "STOP", "LOCK", "FRICTION", "PLASTICITY", "HARDENING",
                  "DAMAGE INITIATION", "DAMAGE EVOLUTION", "CONSTITUTIVE REFERENCE",
                  "DERIVED COMPONENT", "POTENTIAL", "UNIAXIAL BEHAVIOR", "FAILURE")},
-    "CONTACT": "Abaqus general contact has no ccx equivalent; define explicit pairs instead: "
-               "*CONTACT PAIR, INTERACTION=<name>, TYPE=SURFACE TO SURFACE with two element "
+    "CONTACT": "Abaqus general contact has no ccx equivalent; --approximate writes it as "
+               "node-to-surface *CONTACT PAIR cards between the model's bodies; or define explicit "
+               "pairs: *CONTACT PAIR, INTERACTION=<name>, TYPE=SURFACE TO SURFACE with two element "
                "surfaces (+ *SURFACE INTERACTION / *SURFACE BEHAVIOR).",
-    "CONTACT INCLUSIONS": "general-contact inclusion list (ALL EXTERIOR is not translatable); "
-                          "create the two surfaces and a *CONTACT PAIR instead.",
+    "CONTACT INCLUSIONS": "general-contact inclusion list (--approximate writes ALL EXTERIOR as "
+                          "contact pairs between the model's bodies); or create the two surfaces "
+                          "and a *CONTACT PAIR instead.",
     "CONTACT EXCLUSIONS": "general-contact exclusion list; not applicable to ccx *CONTACT PAIR.",
     "CONTACT PROPERTY ASSIGNMENT": "assigns a general-contact property; in ccx name the "
                                    "*SURFACE INTERACTION via *CONTACT PAIR, INTERACTION= instead.",
@@ -9999,6 +10006,788 @@ class _Mesh:
             out.append(b)
         return out
 
+    # -- Abaqus general contact under --approximate -------------------------
+    # rigid elements with a surface of their own (their sides SPOS / SNEG; RB3D2 has none)
+    _GC_RIGID_SHEETS = ("R3D3", "R3D4", "R2D2", "RB2D2", "RAX2")
+    # general contact of many bodies: past _GC_MANY bodies an unbounded travel pairs only near
+    # ones, and at most _GC_MAX_PAIRS pairs (the closest) are written
+    _GC_MANY = 200
+    _GC_MAX_PAIRS = 2000
+    # material cards of a body that yields or is hyperelastic (a slave rather than a master)
+    _GC_YIELDING = frozenset(("PLASTIC", "DEFORMATION PLASTICITY", "DRUCKER PRAGER", "MOHR COULOMB",
+                              "CAP PLASTICITY", "CRUSHABLE FOAM", "CLAY PLASTICITY",
+                              "CAST IRON PLASTICITY", "CONCRETE", "CONCRETE DAMAGED PLASTICITY",
+                              "HYPERELASTIC", "HYPERFOAM", "USER MATERIAL"))
+
+    def _plan_general_contact(self, blocks: List[Block]) -> List[Block]:
+        """Under --approximate, ``blocks`` with Abaqus general contact (*CONTACT and its
+        *CONTACT INCLUSIONS / EXCLUSIONS / PROPERTY ASSIGNMENT; ccx 2.23 has none) as ccx
+        contact pairs written before the first *STEP ([APPROX]); its cards are then
+        commented out (handle_general_contact, _gc_cards).
+
+        Abaqus' contact domain (Interactions Guide, general contact in Abaqus/Standard and
+        Abaqus/Explicit): ALL EXTERIOR, or a blank inclusion line, is self-contact of the
+        all-inclusive surface of every exterior face of the model — contact between every
+        two bodies and of each body with itself, rigid bodies' self-contact excluded, and the
+        surfaces a contact pair or tie joins left to it; a named line contacts its two
+        surfaces (a surface's self-contact: contact between the bodies it spans).  Here a
+        body is a connected mesh of continuum, shell, membrane and rigid elements (a *RIGID
+        BODY's elements one body), with the surface of its exterior faces (_gc_bodies).
+        Only bodies that can meet get a pair: their bounding boxes come within four times
+        the largest travel the deck prescribes (_gc_travel; any load: every pair, or past
+        _GC_MANY bodies four times the largest body's size) plus 0.05 of the model's span —
+        a heuristic: the bodies they strike move at most twice as far, but a lever or a
+        buckling body can move further.  Each slave body gets one line against the union of
+        the bodies it can meet, so a deck has at most one line per body, not one per pair
+        (and at most _GC_MAX_PAIRS pairs); which body is the slave, and the pairs left out,
+        see the roles below.  The property is the last *CONTACT PROPERTY ASSIGNMENT line that
+        covers the pair (Abaqus' default: hard, frictionless); exclusions and assignments act
+        on the whole bodies their surfaces touch.  A pair that starts overclosed gets ADJUST
+        (_gc_overclosed).
+
+        The pairs are node-to-surface — Abaqus/Explicit's general contact is node-to-face
+        penalty contact (weighted both ways); Abaqus/Standard's is surface-to-surface, but
+        ccx's surface-to-surface contact between whole bodies matches a slave face to a
+        master behind its body too and loses the contact (probed: three stacked blocks), and
+        it ran 13 times slower on a bullet striking a plate.  So a deck whose own pairs are
+        of another TYPE (ccx takes one for all) is left as it is.  Self-contact is left out:
+        ccx's node-to-surface 'S, S' is not usable (two bars striking each other gained 7
+        times their energy), its surface-to-surface one spoils the body's other pairs."""
+        if not self._approx or not any(b.keyword in GENERAL_CONTACT_CARDS for b in blocks):
+            return blocks
+        defn = self._gc_definition(blocks)
+        if isinstance(defn, str):
+            self.report.warn(f"*CONTACT (--approximate): Abaqus general contact not written as "
+                             f"contact pairs: {defn} (ccx's contact pairs hold for the whole analysis); "
+                             f"commented out.", once=True)
+            return blocks
+        incl, excl, props = defn
+        own = {(b.param("TYPE") or "NODE TO SURFACE").replace(" ", "").upper() for b in blocks
+               if b.keyword == "CONTACT PAIR" and not b.has("TIED")} - {"NODETOSURFACE"}
+        if own:
+            self.report.warn(f"*CONTACT (--approximate): Abaqus general contact not written as "
+                             f"contact pairs: ccx takes one TYPE for all of a deck's pairs, the "
+                             f"deck's own are {', '.join(sorted(own))}, the generated ones node-to-surface "
+                             f"(ccx's surface-to-surface contact between whole bodies loses the "
+                             f"contact where another body lies behind the slave: probed); commented "
+                             f"out.", once=True)
+            return blocks
+        for b in blocks:
+            if b.keyword in GENERAL_CONTACT_CARDS:
+                self._gc_cards.add(id(b))
+        known = {b.uparam("NAME") for b in blocks if b.keyword == "SURFACE INTERACTION"}
+        for p in dedup(p for _x1, _x2, p in props if p and p not in known):
+            self.report.warn(f"*CONTACT PROPERTY ASSIGNMENT (--approximate) names *SURFACE "
+                             f"INTERACTION {p}, which the deck does not define (Abaqus stops on "
+                             f"it); its pairs get "
+                             f"Abaqus' default property (hard, frictionless).", once=True)
+        props = [(x1, x2, p if p in known else "") for x1, x2, p in props]
+        bodies, why = self._gc_bodies(blocks)
+        named: Dict[str, dict] = {}
+
+        def group(name: str) -> Optional[dict]:
+            if name not in named:
+                named[name] = self._gc_named_group(name, bodies)
+            return named[name]
+
+        span = self._model_span()
+        travel = self._gc_travel(blocks)
+        reach = 4.0 * travel + 0.05 * span
+        if not math.isfinite(reach) and len(bodies) > self._GC_MANY:
+            reach = 4.0 * max(vnorm(vsub(g["hi"], g["lo"])) for g in bodies)
+            self.report.warn(f"*CONTACT (--approximate): a load leaves the travel unbounded, and of "
+                             f"the model's {len(bodies)} bodies only those within "
+                             f"{short_real(reach, 4)} (four times the largest body's size) get "
+                             f"pairs.", once=True)
+        # the candidate interactions: (group, group), a self-contact as (g, g); the bodies'
+        # pairs by a sweep along x over their boxes (not every pair: many-body decks)
+        cand: List[Tuple[dict, dict]] = []
+        spans = 0
+        everything = ("", "") in incl
+        if everything:
+            cand += [(a, a) for a in bodies] + self._gc_sweep(bodies, reach)
+        for s1, s2 in incl:
+            if (s1, s2) == ("", ""):
+                continue
+            g1, g2 = group(s1) if s1 else None, group(s2)
+            if g2 is None or (s1 and g1 is None):
+                continue
+            if everything and not any(g["node_based"] or not g["elems"] for g in (g1, g2) if g):
+                continue                        # (the all-inclusive surface has them)
+            if not s1:
+                cand += [(a, g2) for a in bodies if not (a["elems"] & g2["elems"]) and
+                         not (g2["node_based"] and a["nodes"] & g2["nodes"])]
+            elif g1 is g2 and g1["elems"]:
+                # self-contact of a surface spanning several bodies is contact between them
+                own = [b for b in bodies if b["elems"] & g1["elems"]]
+                cand += [(a, a) for a in own] + [(a, b) for i, a in enumerate(own) for b in own[i + 1:]]
+                spans += len(own) > 1
+            else:
+                cand.append((g1, g2))
+
+        def covers(g: dict, name: str) -> bool:
+            if not name:
+                return True
+            other = group(name)
+            return other is not None and (other is g or bool(other["elems"] & g["elems"]) or
+                                          bool(other["nodes"] & g["nodes"] and other["node_based"]))
+
+        def hits(a: dict, b: dict, x1: str, x2: str) -> bool:
+            return (covers(a, x1) and covers(b, x2)) or (covers(a, x2) and covers(b, x1))
+
+        joined = []                       # the deck's own pairs and ties: Abaqus leaves them out
+        for b in blocks:
+            if b.keyword in ("CONTACT PAIR", "TIE"):
+                for rec in merged_data_records(b):
+                    f = [x.strip().upper() for x in rec[:2] if x.strip()]
+                    if len(f) == 2 and f[0] != f[1]:
+                        joined.append((f[0], f[1]))
+        skipped_self = 0
+        pairs: List[Tuple[dict, dict]] = []
+        seen: set = set()
+        for a, b in cand:
+            key = (id(a), id(b)) if id(a) <= id(b) else (id(b), id(a))
+            if key in seen or any(hits(a, b, x1, x2) for x1, x2 in excl):
+                continue
+            seen.add(key)
+            if a is b:
+                skipped_self += not (a["rigid"] or a["node_based"])
+                continue
+            elif (a["node_based"] and b["node_based"]) or \
+                    any(hits(a, b, x1, x2) for x1, x2 in joined):
+                continue
+            elif self._gc_distance(a, b) > reach:
+                continue
+            pairs.append((a, b))
+        pairs.sort(key=lambda ab: self._gc_distance(*ab))
+        if len(pairs) > self._GC_MAX_PAIRS:
+            self.report.warn(f"*CONTACT (--approximate): {len(pairs)} pairs of bodies can meet; the "
+                             f"{self._GC_MAX_PAIRS} closest are written, the rest left out.", once=True)
+            del pairs[self._GC_MAX_PAIRS:]
+        # roles: each body is the slave or the master of all its pairs — ccx 2.23 loses the
+        # contact, or diverges, where one body's surface is the slave of one line and the master
+        # of another, or the slave of two (probed: three stacked blocks) — and slave of one line
+        # against the union of its masters.  The closest pairs pick first: a node surface is a
+        # slave; the master is a rigid body, else the body the deck drives (the striker: as
+        # slave it crashed ccx or bounced off, probed), else one that does not yield (a yielding
+        # surface distorts and traps the other's nodes), else the coarser mesh where the two
+        # meet, else the earlier body (Abaqus/Standard: the lower-numbered component is the
+        # master).  A pair whose bodies already have the same role, or of two rigid bodies
+        # (ccx sizes no explicit increment for their springs: probed, a rigid plate dropped at 5
+        # m/s onto another bounced off at 7 km/s), is left out.
+        driven = self._gc_driven_nodes(blocks)
+        for g in bodies + list(named.values()):
+            if g is not None:
+                g["driven"] = bool(g["nodes"] & driven)
+        lines_of: "OrderedDict[Optional[str], List[Tuple[dict, List[dict]]]]" = OrderedDict()
+        masters: "OrderedDict[Tuple[int, Optional[str]], Tuple[dict, List[dict]]]" = OrderedDict()
+        role: Dict[int, str] = {}
+        prop_of: Dict[int, Optional[str]] = {}
+        rigid_rigid = clash = mixed = 0
+        for a, b in pairs:
+            if a["rigid"] and b["rigid"]:
+                rigid_rigid += 1
+                continue
+            if a["node_based"] or b["node_based"]:
+                first = a if a["node_based"] else b
+            else:
+                ka = (a["rigid"], a["driven"], not a["yields"], self._gc_size_near(a, b), -a["order"])
+                kb = (b["rigid"], b["driven"], not b["yields"], self._gc_size_near(b, a), -b["order"])
+                first = a if ka < kb else b
+            ra, rb = role.get(id(a)), role.get(id(b))
+            if ra is None and rb is None:
+                ra, rb = ("S", "M") if first is a else ("M", "S")
+            elif ra is None:
+                ra = "M" if rb == "S" else "S"
+            elif rb is None:
+                rb = "M" if ra == "S" else "S"
+            if ra == rb or any(r == ("M" if g["node_based"] else "S" if g["rigid"] else "")
+                               for g, r in ((a, ra), (b, rb))):
+                clash += 1
+                continue
+            role[id(a)], role[id(b)] = ra, rb
+            slave, master = (a, b) if ra == "S" else (b, a)
+            prop: Optional[str] = None
+            for x1, x2, p in props:
+                if hits(a, b, x1, x2):
+                    prop = p or None
+            if id(slave) in prop_of and prop_of[id(slave)] != prop:
+                mixed += 1                  # one line per slave: its first pair's property
+            prop = prop_of.setdefault(id(slave), prop)
+            masters.setdefault((id(slave), prop), (slave, []))[1].append(master)
+        self._gc_adjust = set()
+        for (_, prop), (slave, ms) in masters.items():
+            lines_of.setdefault(prop, []).append((slave, ms))
+            if self._gc_overclosed(slave, ms):
+                self._gc_adjust.add(prop)
+        self._gc_write(blocks, bodies, lines_of)
+        new = self._gc_blocks
+        n_lines = sum(len(v) for v in lines_of.values())
+        form = "two-way (balanced) weighting" if self._explicit_deck else "surface-to-surface formulation"
+        where = (f"bounding boxes within {short_real(reach, 4)}: four times the largest travel "
+                 f"the deck prescribes, plus 0.05 of the model's span — a heuristic: a lever or a "
+                 f"buckling body can move further" if math.isfinite(travel) else
+                 f"bounding boxes within {short_real(reach, 4)}: four times the largest body's size, "
+                 f"as a load leaves the travel unbounded" if math.isfinite(reach) else
+                 "any two: a load leaves the travel unbounded")
+        if incl:
+            self.report.warn(f"[APPROX] general contact (*CONTACT) written as generated *CONTACT "
+                             f"PAIR cards: {n_lines} line(s), TYPE=NODE TO SURFACE, over the exterior "
+                             f"faces of the model's {len(bodies)} bodies (a master's shell, membrane or "
+                             f"rigid facet: the side facing the nearest body it meets), between the "
+                             f"bodies that can meet ({where}): one line per slave body against the "
+                             f"union of its masters, each body only slave or only master, the struck, "
+                             f"yielding or finer-meshed one the slave. Abaqus' self-contact of each "
+                             f"body, edge-to-edge contact and {form} have no ccx form here.", once=True)
+        for msg in why:
+            self.report.warn(f"*CONTACT (--approximate): {msg}", once=True)
+        if skipped_self:
+            self.report.note(f"*CONTACT (--approximate): the self-contact of {skipped_self} bodies is "
+                             f"left out: ccx's node-to-surface 'S, S' is not usable (probed: two bars "
+                             f"striking each other gain 7 times their energy), and its surface-to-"
+                             f"surface 'S, S' spoils the body's other pairs (probed).", once=True)
+        if rigid_rigid or clash:
+            self.report.warn("*CONTACT (--approximate): "
+                             + (f"{rigid_rigid} pair(s) of two rigid bodies left out (ccx 2.23 sizes "
+                                f"no explicit increment for their springs: probed, a rigid plate "
+                                f"dropped at 5 m/s onto another bounced off at 7 km/s)"
+                                if rigid_rigid else "")
+                             + ("; " if rigid_rigid and clash else "")
+                             + (f"{clash} pair(s) left out whose bodies are both slaves or both "
+                                f"masters of other pairs (ccx 2.23 loses or diverges on a body that "
+                                f"is both: probed)" if clash else "")
+                             + " — those bodies can pass through each other.", once=True)
+        if mixed:
+            self.report.warn(f"*CONTACT (--approximate): {mixed} pair(s) take the contact property "
+                             f"of their slave body's first pair, not their own (one line per slave "
+                             f"body, one property per line).", once=True)
+        if spans:
+            self.report.note("*CONTACT (--approximate): the self-contact of a surface that spans "
+                             "several bodies is written as contact between those bodies (all their "
+                             "exterior faces).", once=True)
+        if (excl or any(x1 or x2 for x1, x2, _p in props)) and everything:
+            self.report.note("*CONTACT (--approximate): exclusions and property assignments act on "
+                             "the whole bodies their surfaces touch.", once=True)
+        if not incl:
+            self.report.note("*CONTACT (--approximate): the general contact domain has no "
+                             "inclusion, so no contact pair is written.", once=True)
+        elif not n_lines:
+            self.report.note("*CONTACT (--approximate): no two bodies of the general contact domain "
+                             "can meet over the analysis (" + where + "), so no contact pair is "
+                             "written.", once=True)
+        k = next((i for i, b in enumerate(blocks) if b.keyword == "STEP"), len(blocks))
+        return blocks[:k] + new + blocks[k:]
+
+    def _gc_definition(self, blocks: List[Block]
+                       ) -> Union[str, Tuple[List[Tuple[str, str]], List[Tuple[str, str]],
+                                             List[Tuple[str, str, str]]]]:
+        """The general contact domain of the analysis ((inclusions, exclusions, property
+        assignments) as upper-case surface names, "" for Abaqus' all-inclusive surface): the
+        model data's, then the first step's (OP=NEW replaces it, OP=MOD adds to it).  A
+        definition first given in a later step, or changed there, cannot be written as ccx's
+        contact pairs, which are model data: why, as a string."""
+        segs: Dict[int, List[dict]] = {}
+        step, cur = 0, None
+        for b in blocks:
+            if b.keyword in ("STEP", "END STEP"):
+                step += b.keyword == "STEP"
+                cur = None
+                continue
+            if b.keyword not in GENERAL_CONTACT_CARDS:
+                continue
+            if b.keyword == "CONTACT" or cur is None:
+                cur = {"new": b.keyword == "CONTACT" and b.uparam("OP") == "NEW" and step > 0,
+                       "incl": [], "excl": [], "prop": []}
+                segs.setdefault(step, []).append(cur)
+            if b.keyword == "CONTACT PROPERTY ASSIGNMENT":
+                for ln in b.data:
+                    if ln.strip() or "," in ln:
+                        f = [x.strip().upper() for x in ln.split(",")] + ["", "", ""]
+                        cur["prop"].append((f[0], f[1] or f[0], f[2]))
+            elif b.keyword in ("CONTACT INCLUSIONS", "CONTACT EXCLUSIONS"):
+                to = cur["incl" if b.keyword == "CONTACT INCLUSIONS" else "excl"]
+                if b.has("ALL EXTERIOR"):
+                    to.append(("", ""))
+                for ln in b.data:
+                    if ln.strip() or "," in ln:
+                        f = [x.strip().upper() for x in ln.split(",")] + ["", ""]
+                        to.append((f[0], f[1] or f[0]))
+
+        def merged(given: dict, seg: dict) -> dict:
+            return {k: (seg[k] if seg["new"] else given[k] + seg[k]) for k in ("incl", "excl", "prop")}
+
+        eff: dict = {"incl": [], "excl": [], "prop": []}
+        for s in (0, 1):
+            for seg in segs.get(s, []):
+                eff = merged(eff, seg)
+        if not segs.get(0) and not segs.get(1):
+            return f"it is first defined in step {min(segs)}"
+        first = eff
+        for s in sorted(k for k in segs if k > 1):
+            for seg in segs[s]:
+                eff = merged(eff, seg)
+            if (set(eff["incl"]), set(eff["excl"]), eff["prop"]) != \
+                    (set(first["incl"]), set(first["excl"]), first["prop"]):
+                return f"it changes in step {s}"
+        return dedup(first["incl"]), dedup(first["excl"]), first["prop"]
+
+    def _gc_bodies(self, blocks: List[Block]) -> Tuple[List[dict], List[str]]:
+        """The bodies of Abaqus' all-inclusive general-contact surface: the connected meshes
+        (shared nodes) of continuum, shell, membrane and rigid elements, a *RIGID BODY's
+        elements one body; each with its exterior faces — the continuum faces no other
+        continuum element shares (cohesive elements left out: Abaqus generates the surface
+        "as if cohesive elements were not present"; an axisymmetric edge on the axis left
+        out, as ccx asks), its shells, membranes and rigid facets — its nodes, bounding box,
+        mean exterior edge length (``size``) and whether it is rigid.  Also what the surface
+        leaves out (beams, trusses, axisymmetric shells, surface elements — which leave the
+        ccx mesh, _drop_surface_elements), as warnings."""
+        elems, nodes = self.geom.elements, self.geom.nodes
+        rigid_el: set = set()
+        for b in blocks:
+            if b.keyword == "RIGID BODY" and (b.param("ELSET") or "").strip():
+                rigid_el.update(self.geom.elset(b.param("ELSET").strip()))
+        yielding: set = set()                   # the materials that yield or are hyperelastic
+        for group in self._material_groups(blocks):
+            if any(c.keyword in self._GC_YIELDING for c in group[1:]):
+                yielding.add(group[0].uparam("NAME"))
+        soft = {e for b in blocks if b.keyword.endswith("SECTION") and b.uparam("MATERIAL") in yielding
+                for e in self.geom.elset((b.param("ELSET") or "").strip())}
+        kind: Dict[int, str] = {}
+        left: Dict[str, int] = {}
+        for e, (t, c) in elems.items():
+            u = t.upper()
+            if u in self._GC_RIGID_SHEETS:
+                kind[e] = "sheet"
+                rigid_el.add(e)
+            elif self._continuum_faces(e) is not None:
+                kind[e] = "solid"
+            elif (ccx_type(u) in SHELL_TYPES or u.startswith("M3D")) and \
+                    not u.startswith(("SFM", "SAX", "MAX")):
+                kind[e] = "sheet"
+            elif not re.match(r"(MASS|ROTARYI|SPRING|DASHPOT|CONN|JOINT|GAP|DCOUP|COH|GK|RB3D2|"
+                              r"U\d|VU\d|ITS|DRAG|IRS|ISL|CIN|ACIN)", u):
+                left[u] = left.get(u, 0) + 1     # beams, trusses, surface elements, ...
+        parent: Dict[int, int] = {}
+
+        def find(x: int) -> int:
+            while parent.setdefault(x, x) != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        owner: Dict[int, int] = {}
+        for e in kind:
+            for n in elems[e][1]:
+                if n in owner:
+                    parent[find(e)] = find(owner[n])
+                else:
+                    owner[n] = e
+        for b in blocks:
+            if b.keyword == "RIGID BODY" and (b.param("ELSET") or "").strip():
+                ids = [e for e in self.geom.elset(b.param("ELSET").strip()) if e in kind]
+                for e in ids[1:]:
+                    parent[find(e)] = find(ids[0])
+        members: Dict[int, List[int]] = {}
+        for e in kind:
+            members.setdefault(find(e), []).append(e)
+        count: Dict[frozenset, int] = {}
+        for e in kind:
+            if kind[e] == "solid":
+                for key in self._continuum_faces(e).values():
+                    count[key] = count.get(key, 0) + 1
+        span = self._model_span()
+        bodies: List[dict] = []
+        for k, ids in enumerate(sorted(members.values(), key=min)):
+            faces: Dict[str, List[int]] = {}
+            corners: List[Tuple[int, ...]] = []
+            solid: List[Tuple[Tuple[int, ...], int]] = []      # (face corners, element)
+            sheets: List[int] = []
+            for e in sorted(ids):
+                if kind[e] == "sheet":
+                    sheets.append(e)
+                    c = elems[e][1]
+                    corners.append(tuple(c[:2 if elems[e][0].upper() in ("R2D2", "RB2D2", "RAX2") else
+                                           3 if len(c) in (3, 6) else 4]))
+                    continue
+                axi = elems[e][0].upper().startswith(AXISYMMETRIC_PREFIXES)
+                for lab, cs in self._continuum_face_corners(e).items():
+                    if count[frozenset(cs)] != 1:
+                        continue
+                    if axi and all(abs(nodes[n][0]) <= 1e-9 * span for n in cs if n in nodes):
+                        continue
+                    faces.setdefault(f"S{lab}", []).append(e)
+                    corners.append(cs)
+                    solid.append((cs, e))
+            facets = []                     # (centroid, mean edge length) per exterior face
+            for cs in corners:
+                q = [nodes[n] for n in cs if n in nodes]
+                m = len(q) if len(q) > 2 else 1     # (a 2-node edge: one length)
+                if len(q) == len(cs):
+                    facets.append((vscale(functools.reduce(vadd, q), 1.0 / len(q)),
+                                   sum(vnorm(vsub(q[i], q[i - 1])) for i in range(m)) / m))
+            if not facets:
+                continue
+            pts = [nodes[n] for cs in corners for n in cs if n in nodes]
+            bodies.append({"order": k, "elems": set(ids), "nodes": {n for e in ids for n in elems[e][1]},
+                           "faces": faces, "sheets": sheets, "node_based": False,
+                           "rigid": all(e in rigid_el for e in ids), "facets": facets, "solid": solid,
+                           "yields": any(e in soft for e in ids), "driven": False,
+                           "lo": tuple(min(p[a] for p in pts) for a in range(3)),
+                           "hi": tuple(max(p[a] for p in pts) for a in range(3)),
+                           "size": sum(f[1] for f in facets) / len(facets)})
+        why = [f"the model's {', '.join(f'{n} {t}' for t, n in sorted(left.items()))} elements are "
+               f"not in the contact surfaces (their edges or faces, which Abaqus' general contact "
+               f"takes, have no form here)"] if left else []
+        return bodies, why
+
+    def _gc_named_group(self, name: str, bodies: List[dict]) -> Optional[dict]:
+        """A deck surface a general-contact line names, as a group of _plan_general_contact:
+        its elements or nodes, bounding box (an analytical surface: everywhere), mean edge
+        length and whether it is rigid; None (warned) where the deck has no such surface."""
+        sd = self.surfaces.get(name)
+        if sd is None:
+            self.report.warn(f"*CONTACT (--approximate): surface {name} of a general-contact line is not "
+                             f"defined in the deck; the line is left out.", once=True)
+            return None
+        typ, entries = sd
+        g = {"name": name, "order": -1, "elems": set(), "nodes": set(), "node_based": typ.startswith("NODE"),
+             "rigid": typ in ANALYTIC_SURFACES, "size": 0.0, "yields": False, "driven": False}
+        if g["rigid"]:
+            g.update(lo=(-math.inf,) * 3, hi=(math.inf,) * 3)
+            return g
+        for tok, _f in entries:
+            if g["node_based"]:
+                g["nodes"].update(self._resolve_nodes(tok))
+            else:
+                g["elems"].update(e for e in self._resolve_elements(tok) if e in self.geom.elements)
+        if not g["node_based"]:
+            g["nodes"] = {n for e in g["elems"] for n in self.geom.elements[e][1]}
+            g["rigid"] = bool(g["elems"]) and all(any(e in b["elems"] for b in bodies if b["rigid"])
+                                                  for e in g["elems"])
+            sizes = [b["size"] for b in bodies if b["elems"] & g["elems"]]
+            g["size"] = min(sizes) if sizes else 0.0
+            g["yields"] = any(b["yields"] for b in bodies if b["elems"] & g["elems"])
+        pts = [self.geom.nodes[n] for n in g["nodes"] if n in self.geom.nodes]
+        if not pts:
+            self.report.warn(f"*CONTACT (--approximate): surface {name} of a general-contact line "
+                             f"has no element or node of the ccx model (TYPE={typ}); the line is "
+                             f"left out.", once=True)
+            return None
+        g["lo"] = tuple(min(p[a] for p in pts) for a in range(3))
+        g["hi"] = tuple(max(p[a] for p in pts) for a in range(3))
+        return g
+
+    def _gc_size_near(self, a: dict, b: dict) -> float:
+        """The mean exterior edge length of group ``a`` where it can meet group ``b``: of its
+        faces inside the overlap of the two bounding boxes, each grown by their distance and a
+        tenth of the smaller one's diagonal (none there, or a named surface: of all of it)."""
+        grow = self._gc_distance(a, b) + 0.1 * min(vnorm(vsub(g["hi"], g["lo"])) for g in (a, b))
+        lo = [max(a["lo"][i], b["lo"][i]) - grow for i in range(3)]
+        hi = [min(a["hi"][i], b["hi"][i]) + grow for i in range(3)]
+        near = [h for c, h in a.get("facets", ()) if all(lo[i] <= c[i] <= hi[i] for i in range(3))]
+        return sum(near) / len(near) if near else a["size"]
+
+    def _gc_driven_nodes(self, blocks: List[Block]) -> set:
+        """The nodes the deck drives: a nonzero initial velocity, prescribed motion or
+        concentrated force, or a distributed load on their elements."""
+        out: set = set()
+        for b in blocks:
+            kw = b.keyword
+            if kw == "INITIAL CONDITIONS" and b.uparam("TYPE") in ("VELOCITY", "ROTATING VELOCITY"):
+                at = 1 if b.uparam("TYPE") == "ROTATING VELOCITY" else 2
+            elif kw in ("BOUNDARY", "CLOAD"):
+                at = 3 if kw == "BOUNDARY" else 2
+            elif kw in ("DLOAD", "DSLOAD"):
+                at = 2
+            else:
+                continue
+            for rec in merged_data_records(b):
+                g = trimmed_fields(rec)
+                try:
+                    if len(g) <= at or not g[at] or not pf(g[at]):
+                        continue
+                except ValueError:
+                    continue
+                if kw == "DSLOAD":
+                    sd = self.surfaces.get(g[0].upper())
+                    out.update(n for tok, _f in (sd[1] if sd else []) for e in self._resolve_elements(tok)
+                               for n in self.geom.elements.get(e, ("", []))[1])
+                elif kw == "DLOAD":
+                    if g[1].upper() not in ("GRAV", "CENTRIF", "ROTA", "CORIO"):
+                        out.update(n for e in self._resolve_elements(g[0])
+                                   for n in self.geom.elements.get(e, ("", []))[1])
+                else:
+                    out.update(self._resolve_nodes(g[0]))
+        return out
+
+    @staticmethod
+    def _gc_sweep(groups: List[dict], reach: float) -> List[Tuple[dict, dict]]:
+        """The pairs of ``groups`` whose boxes overlap along x once grown by ``reach``, by a
+        sweep along x (the candidates _plan_general_contact checks for distance)."""
+        out: List[Tuple[dict, dict]] = []
+        active: List[dict] = []
+        for g in sorted(groups, key=lambda h: h["lo"][0]):
+            active = [h for h in active if h["hi"][0] + reach >= g["lo"][0]]
+            out += [(h, g) for h in active]
+            active.append(g)
+        return out
+
+    @staticmethod
+    def _gc_distance(a: dict, b: dict) -> float:
+        """The distance between the bounding boxes of two general-contact groups."""
+        return math.sqrt(sum(max(0.0, b["lo"][i] - a["hi"][i], a["lo"][i] - b["hi"][i]) ** 2
+                             for i in range(3)))
+
+    def _gc_travel(self, blocks: List[Block]) -> float:
+        """An upper bound of how far the deck moves any point it drives over the analysis:
+        its largest initial speed times the analysis time, plus per step the largest
+        prescribed displacement (a rotation times the model's span; a velocity times the
+        step time, an acceleration times its square), with the amplitude's largest magnitude
+        (a VALUE=ABSOLUTE one's alone; an amplitude not given in a table: unbounded).  Unbounded (inf) where a load drives
+        the model — a force, pressure, body force, temperature with *EXPANSION, connector
+        motion or base motion — or initial stresses do."""
+        span = self._model_span()
+
+        def peak(name: str) -> float:              # (piecewise curves peak at a point)
+            c = self._amp_curves.get(name)
+            return math.inf if c is None or c.panel or not c.breaks else \
+                max(abs(c.value(t)) for t in c.breaks)
+        heated = any(b.keyword == "EXPANSION" for b in blocks)
+        loads = ("CLOAD", "DLOAD", "DSLOAD", "CONNECTOR LOAD", "CONNECTOR MOTION", "BASE MOTION") + \
+            (("TEMPERATURE", "CFLUX", "DFLUX", "DSFLUX", "FILM", "SFILM", "RADIATE", "SRADIATE")
+             if heated else ())
+        speed = 0.0
+        time = 0.0
+        moved: Dict[int, float] = {}                # step -> its largest prescribed travel
+        step, period = 0, 0.0
+        for b in blocks:
+            kw = b.keyword
+            if kw == "STEP":
+                step += 1
+                period = 0.0
+            elif kw == "END STEP":
+                time += period
+            elif kw in ("STATIC", "DYNAMIC", "VISCO", "COUPLED TEMPERATURE-DISPLACEMENT",
+                        "DYNAMIC TEMPERATURE-DISPLACEMENT", "GEOSTATIC", "SOILS", "HEAT TRANSFER",
+                        "UNCOUPLED TEMPERATURE-DISPLACEMENT", "COUPLED THERMAL-ELECTRICAL-STRUCTURAL"):
+                recs = merged_data_records(b)
+                try:
+                    period = pf(recs[0][1]) if recs and len(recs[0]) > 1 and recs[0][1] else 1.0
+                except ValueError:
+                    period = math.inf
+            elif kw in loads and any(d for _k, d in _load_entries(b, user_loads=True)):
+                return math.inf
+            elif kw == "INITIAL CONDITIONS" and b.uparam("TYPE") in ("STRESS", "PORE PRESSURE"):
+                return math.inf
+            elif kw == "INITIAL CONDITIONS" and b.uparam("TYPE") in ("VELOCITY", "ROTATING VELOCITY"):
+                for rec in merged_data_records(b):
+                    try:
+                        v = abs(pf(rec[1 if b.uparam("TYPE") == "ROTATING VELOCITY" else 2]))
+                        dof = 4 if b.uparam("TYPE") == "ROTATING VELOCITY" else int(pf(rec[1]))
+                    except (IndexError, ValueError):
+                        continue
+                    speed = max(speed, v * (span if dof > 3 else math.sqrt(3.0)))
+            elif kw == "BOUNDARY":
+                how = b.uparam("TYPE") or "DISPLACEMENT"
+                amp = peak(b.uparam("AMPLITUDE")) if b.uparam("AMPLITUDE") else 1.0
+                curve = self._amp_curves.get(b.uparam("AMPLITUDE"))
+                absolute = bool(curve and curve.absolute)   # (its values replace the magnitude)
+                for rec in merged_data_records(b):
+                    g = trimmed_fields(rec)
+                    try:
+                        d1 = int(pf(g[1]))
+                        d2 = int(pf(g[2])) if len(g) > 2 and g[2] else d1
+                        v = 1.0 if absolute else abs(pf(g[3])) if len(g) > 3 and g[3] else 0.0
+                    except (IndexError, ValueError):
+                        continue                    # a named type: no motion
+                    if not v:
+                        continue
+                    if heated and d1 <= 11 <= d2:
+                        return math.inf
+                    scale = span if max(d1, 4) <= min(d2, 6) or 4 <= d1 <= 6 else math.sqrt(3.0)
+                    reach = v * amp * scale * (period if how == "VELOCITY" else
+                                               period ** 2 if how == "ACCELERATION" else 1.0)
+                    moved[step] = max(moved.get(step, 0.0), reach)
+        travel = speed * time + sum(moved.values())
+        return travel if math.isfinite(travel) else math.inf
+
+    def _gc_write(self, blocks: List[Block], bodies: List[dict],
+                  lines_of: "OrderedDict[Optional[str], List[Tuple[dict, List[dict]]]]") -> None:
+        """The cards of _plan_general_contact's pairs (``lines_of``: interaction -> (slave
+        group, its master groups)), as ``_gc_blocks``: an element set per body and face label
+        (a slave's shells and membranes: both sides, SPOS and SNEG — probed, the same answer
+        as the one side that touches; a master's shell, membrane or rigid facet: the side
+        facing the nearest body it meets, SPOS where it meets none with a finite box), a
+        *SURFACE per body and per union of masters, a hard frictionless *SURFACE INTERACTION
+        where Abaqus' default property applies, and a *CONTACT PAIR per interaction."""
+        self._gc_blocks = []
+        if not lines_of:
+            return
+        base = self._rigid_set_name("ABQ2CCX_GC")
+        partners: Dict[int, List[dict]] = {}
+        for items in lines_of.values():
+            for slave, ms in items:
+                for m in ms:
+                    if m is not slave:
+                        partners.setdefault(id(slave), []).append(m)
+                        partners.setdefault(id(m), []).append(slave)
+        used = {id(g) for items in lines_of.values() for s, ms in items for g in [s] + ms}
+        slaves = {id(s) for items in lines_of.values() for s, _ms in items}
+        nodes = self.geom.nodes
+        surf_lines: Dict[int, List[str]] = {}
+        for k, g in enumerate(bodies, 1):
+            if id(g) not in used:
+                continue
+            g["name"] = f"{base}B{k}"
+            out: List[str] = []
+            for lab, ids in sorted(g["faces"].items()):
+                self.geom.elsets[f"{base}B{k}{lab}"] = ids
+                out.append(f"{base}B{k}{lab}, {lab}")
+            if g["sheets"] and id(g) in slaves:      # a slave: both sides (probed: harmless)
+                self.geom.elsets[f"{base}B{k}T"] = list(g["sheets"])
+                out += [f"{base}B{k}T, SPOS", f"{base}B{k}T, SNEG"]
+            elif g["sheets"]:
+                near = [m for m in partners.get(id(g), []) if math.isfinite(m["lo"][0])]
+                side: Dict[str, List[int]] = {"SPOS": [], "SNEG": []}
+                for e in g["sheets"]:
+                    conn = self.geom.elements[e][1]
+                    pts = [nodes[n] for n in conn if n in nodes]
+                    cen = vscale(functools.reduce(vadd, pts), 1.0 / len(pts))
+                    m = min(near, key=lambda h: sum(max(h["lo"][a] - cen[a], 0.0, cen[a] - h["hi"][a]) ** 2
+                                                    for a in range(3)), default=None)
+                    aim = None if m is None else vscale(vadd(m["lo"], m["hi"]), 0.5)
+                    side["SNEG" if aim is not None and
+                         vdot(self._gc_sheet_normal(e), vsub(aim, cen)) < 0 else "SPOS"].append(e)
+                for lab, ids in side.items():
+                    if ids:
+                        self.geom.elsets[f"{base}B{k}{lab[1]}"] = ids
+                        out.append(f"{base}B{k}{lab[1]}, {lab}")
+            surf_lines[id(g)] = out
+            self._gc_blocks.append(Block("SURFACE", OrderedDict([("NAME", g["name"]),
+                                                                ("TYPE", "ELEMENT")]), out))
+        for items in lines_of.values():         # a deck's element surface: its own lines
+            for _s, ms in items:
+                for m in ms:
+                    sd = self.surfaces.get(m.get("name", ""))
+                    if id(m) not in surf_lines and sd and sd[0] == "ELEMENT":
+                        surf_lines[id(m)] = [", ".join([t] + [f] * bool(f)) for t, f in sd[1]]
+        cards: List[Block] = []
+        unions = twice = 0
+        default = None
+        for prop, items in lines_of.items():
+            data = []
+            for slave, ms in items:
+                if len(ms) == 1:
+                    data.append(f"{slave['name']}, {ms[0]['name']}")
+                    continue
+                named = [m for m in ms if id(m) not in surf_lines]     # analytical surfaces
+                for m in named:
+                    data.append(f"{slave['name']}, {m['name']}")
+                twice += bool(named)
+                rest = [m for m in ms if id(m) in surf_lines]
+                if len(rest) == 1:
+                    data.append(f"{slave['name']}, {rest[0]['name']}")
+                elif rest:
+                    unions += 1
+                    name = f"{base}M{unions}"
+                    self._gc_blocks.append(Block("SURFACE", OrderedDict([("NAME", name),
+                                                                         ("TYPE", "ELEMENT")]),
+                                                 [x for m in rest for x in surf_lines[id(m)]]))
+                    data.append(f"{slave['name']}, {name}")
+            if prop is None:
+                default = default or f"{base}HARD"
+            params = [("INTERACTION", prop or default), ("TYPE", "NODE TO SURFACE")]
+            cards.append(Block("CONTACT PAIR", OrderedDict(params + [("ADJUST", "0.")] *
+                                                           (prop in self._gc_adjust)), data))
+            if prop in self._gc_adjust:
+                self.report.note("*CONTACT (--approximate): general contact pairs that start overclosed get "
+                                 "ADJUST=0.: ccx moves the penetrating slave nodes onto the master "
+                                 "surface strain-free, as Abaqus' general contact does with small "
+                                 "initial overclosures.", once=True)
+        if twice:
+            self.report.warn(f"*CONTACT (--approximate): {twice} slave surface(s) in more than one "
+                             f"line, against an analytical rigid surface and other masters (no union "
+                             f"surface takes it); ccx 2.23 loses or diverges on such a slave "
+                             f"(probed): verify.", once=True)
+        if default:
+            self._gc_blocks.append(Block("SURFACE INTERACTION", OrderedDict([("NAME", default)]), []))
+        self._gc_blocks += cards
+        for b in self._gc_blocks:
+            if b.keyword == "SURFACE":
+                self._register_surface(b)
+        self._gc_pairs = {id(b) for b in cards}
+
+    def _gc_overclosed(self, slave: dict, masters: List[dict]) -> bool:
+        """Whether a node of ``slave``'s exterior faces starts inside a master body: behind
+        the master's 3-D continuum face nearest to it by more than 1e-6 of the model's span
+        and less than that face's size (Abaqus' general contact adjusts small overclosures;
+        the nearest face, as a whole body's surface has faces on all sides).  Masters of
+        shells, membranes, rigid facets and 2-D edges are not checked."""
+        nodes = self.geom.nodes
+        tol = 1e-6 * self._model_span()
+        tris: List[Tuple[Tuple[Vec, ...], Vec, float]] = []
+        for m in masters:
+            for cs, e in m.get("solid", ()):
+                conn = self.geom.elements[e][1]
+                if len(cs) < 3 or any(n not in nodes for n in list(cs) + list(conn)):
+                    continue
+                mid = vscale(functools.reduce(vadd, (nodes[n] for n in conn)), 1.0 / len(conn))
+                p = [nodes[n] for n in cs]
+                size = max(vnorm(vsub(p[i], p[i - 1])) for i in range(len(p)))
+                for q in [(p[0], p[i], p[i + 1]) for i in range(1, len(p) - 1)]:
+                    nrm = vcross(vsub(q[1], q[0]), vsub(q[2], q[0]))
+                    if vnorm(nrm) == 0.0:
+                        continue
+                    nrm = vunit(nrm)
+                    if vdot(nrm, vsub(q[0], mid)) < 0:
+                        nrm = vscale(nrm, -1.0)
+                    tris.append((q, nrm, size))
+        if not tris:
+            return False
+        cell = max(t[2] for t in tris)
+        grid: Dict[Tuple[int, ...], List[int]] = {}
+        for i, (q, _n, _s) in enumerate(tris):
+            lo = [int(math.floor(min(x[a] for x in q) / cell)) for a in range(3)]
+            hi = [int(math.floor(max(x[a] for x in q) / cell)) for a in range(3)]
+            for key in itertools.product(*(range(lo[a], hi[a] + 1) for a in range(3))):
+                grid.setdefault(key, []).append(i)
+        for n in {n for cs, _e in slave.get("solid", ()) for n in cs} | \
+                {n for e in slave.get("sheets", ()) for n in self.geom.elements[e][1]}:
+            if n not in nodes:
+                continue
+            x = nodes[n]
+            c = [int(math.floor(x[a] / cell)) for a in range(3)]
+            best: Optional[Tuple[float, float, float]] = None
+            for key in itertools.product(*((c[a] - 1, c[a], c[a] + 1) for a in range(3))):
+                for i in grid.get(key, ()):
+                    q, nrm, size = tris[i]
+                    v = vsub(x, closest_on_triangle(x, *q))
+                    d = vnorm(v)
+                    if best is None or d < best[0]:
+                        best = (d, vdot(v, nrm), size)
+            if best is not None and -best[2] < best[1] < -tol:
+                return True
+        return False
+
+    def _gc_sheet_normal(self, e: int) -> Vec:
+        """The SPOS normal of a shell, membrane or rigid element; of a 2-node one (R2D2,
+        RAX2) its node 1 -> 2 direction turned 90 degrees counterclockwise."""
+        conn = self.geom.elements[e][1]
+        if len(conn) in (2, 3) and self.geom.elements[e][0].upper() in ("R2D2", "RB2D2", "RAX2"):
+            d = vsub(self.geom.nodes[conn[1]], self.geom.nodes[conn[0]])
+            return (-d[1], d[0], 0.0)
+        return self._shell_normal(e)
+
+    def handle_general_contact(self, b: Block) -> List[str]:
+        """``*CONTACT`` / ``*CONTACT INCLUSIONS`` / ``*CONTACT EXCLUSIONS`` / ``*CONTACT
+        PROPERTY ASSIGNMENT``: written as contact pairs under --approximate
+        (_plan_general_contact), else commented out (SPECIAL_UNSUPPORTED)."""
+        if id(b) in self._gc_cards:
+            return self._comment_out(f"*{b.keyword}: written as the generated *CONTACT PAIR "
+                                     f"cards (--approximate).", [emit_keyword(b.keyword, b.params)] +
+                                     list(b.data), False, warn=False)
+        return self.passthrough(b)
+
     def _contact_pair_lines(self, b: Block) -> List[str]:
         if b.has("TIED"):
             out: List[str] = []
@@ -10703,6 +11492,8 @@ class _Mesh:
         hit: List[str] = []
         why = set()
         for b, slave, master in lines:
+            if id(b) in self._gc_pairs:     # general contact counts it (_plan_general_contact)
+                continue
             given = self._self_approx.get(id(b), b)
             if given.has("NO THICKNESS"):
                 reason = "a pair with NO THICKNESS"
@@ -38850,6 +39641,12 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # the card as given
         self._self_contact: Dict[int, Tuple[Block, List[str]]] = {}
         self._self_approx: Dict[int, Block] = {}
+        # general contact under --approximate (_plan_general_contact): ids of its cards, the
+        # cards written for it, ids of its *CONTACT PAIR cards
+        self._gc_cards: set = set()
+        self._gc_blocks: List[Block] = []
+        self._gc_pairs: set = set()
+        self._gc_adjust: set = set()            # the interactions whose card gets ADJUST=0.
         self._skin_material: Optional[Tuple[float, float, bool]] = None
         self._zero_density = False                 # *DENSITY 0 where none (_plan_massless_materials)
         self._rigid_planar_refs: List[int] = []
@@ -39113,6 +39910,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "KINEMATIC COUPLING": "handle_coupling",
         "FIXED MASS SCALING": "handle_mass_scaling",
         "VARIABLE MASS SCALING": "handle_mass_scaling",
+        **dict.fromkeys(GENERAL_CONTACT_CARDS, "handle_general_contact"),
     }
 
     def translate_one(self, b: Block) -> List[str]:
@@ -39325,6 +40123,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._check_numeric_data(blocks)
         self._plan_heatless_materials(blocks)   # before the planners that copy materials
         self._plan_massless_materials(blocks)   # likewise
+        blocks = self._plan_general_contact(blocks)     # before the surface and rigid planners
         self._drop_surface_elements(raw, blocks)
         blocks = self._free_face_surfaces(blocks)
         # the Abaqus model's highest labels: the nodes and elements the converter adds (knot

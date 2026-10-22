@@ -158,8 +158,8 @@ Any other keyword not in the CalculiX set and without a translator is emitted as
 | `*CONNECTOR POTENTIAL` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
 | `*CONNECTOR UNIAXIAL BEHAVIOR` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
 | `*CONNECTOR FAILURE` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
-| `*CONTACT` | Abaqus general contact has no ccx equivalent; define explicit pairs instead: *CONTACT PAIR, INTERACTION=<name>, TYPE=SURFACE TO SURFACE with two element surfaces (+ *SURFACE INTERACTION / *SURFACE BEHAVIOR). |
-| `*CONTACT INCLUSIONS` | general-contact inclusion list (ALL EXTERIOR is not translatable); create the two surfaces and a *CONTACT PAIR instead. |
+| `*CONTACT` | Abaqus general contact has no ccx equivalent; --approximate writes it as node-to-surface *CONTACT PAIR cards between the model's bodies; or define explicit pairs: *CONTACT PAIR, INTERACTION=<name>, TYPE=SURFACE TO SURFACE with two element surfaces (+ *SURFACE INTERACTION / *SURFACE BEHAVIOR). |
+| `*CONTACT INCLUSIONS` | general-contact inclusion list (--approximate writes ALL EXTERIOR as contact pairs between the model's bodies); or create the two surfaces and a *CONTACT PAIR instead. |
 | `*CONTACT EXCLUSIONS` | general-contact exclusion list; not applicable to ccx *CONTACT PAIR. |
 | `*CONTACT PROPERTY ASSIGNMENT` | assigns a general-contact property; in ccx name the *SURFACE INTERACTION via *CONTACT PAIR, INTERACTION= instead. |
 | `*LATENT HEAT` | ccx has no *LATENT HEAT; approximate with an apparent *SPECIFIC HEAT peak cp + L/(Tliq-Tsol) over the melting interval. |

@@ -128,7 +128,10 @@ a different model without saying so. With it, these reframings are made, each wi
   interference fit → `*STEP, PERTURBATION` (it keeps the contact status, and adds the fit's
   stress stiffness);
 * a last `*BUCKLE` step loaded by a prescribed displacement after a general step → without
-  PERTURBATION, which buckles it without its preload.
+  PERTURBATION, which buckles it without its preload;
+* general contact (`*CONTACT`, `ALL EXTERIOR` or named surfaces) → node-to-surface contact
+  pairs between the bodies that can meet (their exterior faces; the struck, yielding or finer
+  body the slave, one line per slave body), without self-contact and edge-to-edge contact.
 
 ## `--abaqus-umat`
 
