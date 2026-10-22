@@ -5513,11 +5513,13 @@ def dashpot2_dofs_answer(t=2.0):
 RAYLEIGH_COLUMNS = ((1000.0, 1.0), (4000.0, 0.5))      # E, density of materials MA, MB
 
 
-def rayleigh_columns_deck(a="*Damping, alpha=4., beta=1e-3", b="*Damping, beta=1e-3, alpha=4."):
+def rayleigh_columns_deck(a="*Damping, alpha=4., beta=1e-3", b="*Damping, beta=1e-3, alpha=4.",
+                          steps=None):
     """Two one-element columns (C3D8, unit cube, nu = 0) of materials MA and MB
     (RAYLEIGH_COLUMNS) with *DAMPING ``a`` and ``b``: lateral DOFs and the bottom held, the top
     moving up at 1; implicit *DYNAMIC, ALPHA=0 (no numerical damping) over 0.2.  Each column
-    has one mode, k = E, m = rho / 3 (consistent mass): rayleigh_column_answer."""
+    has one mode, k = E, m = rho / 3 (consistent mass): rayleigh_column_answer.  ``steps``: the
+    deck's steps instead (no initial velocity), sets TOP, TOPA (column A's top) and TIPS."""
     corner = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
     nodes = "".join(f"{i + 1 + 10 * k}, {x + 2 * k}., {y}., {z}.\n" for k in (0, 1)
                     for i, (x, y, z) in enumerate(corner))
@@ -5526,13 +5528,78 @@ def rayleigh_columns_deck(a="*Damping, alpha=4., beta=1e-3", b="*Damping, beta=1
             "*Element, type=C3D8, elset=CB\n2, 11, 12, 13, 14, 15, 16, 17, 18\n"
             "*Nset, nset=ALL\n1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18\n"
             "*Nset, nset=BOT\n1, 2, 3, 4, 11, 12, 13, 14\n*Nset, nset=TOP\n5, 6, 7, 8, 15, 16, 17, 18\n"
-            "*Nset, nset=TIPS\n7, 17\n"
+            "*Nset, nset=TIPS\n7, 17\n*Nset, nset=TOPA\n5, 6, 7, 8\n"
             "*Solid Section, elset=CA, material=MA\n*Solid Section, elset=CB, material=MB\n"
             f"*Material, name=MA\n*Elastic\n{ea}, 0.\n*Density\n{ra}\n{a}\n"
             f"*Material, name=MB\n*Elastic\n{eb}, 0.\n*Density\n{rb}\n{b}\n"
-            "*Boundary\nALL, 1, 2\nBOT, 3, 3\n*Initial Conditions, type=VELOCITY\nTOP, 3, 1.\n"
+            "*Boundary\nALL, 1, 2\nBOT, 3, 3\n" + (steps if steps is not None else
+            "*Initial Conditions, type=VELOCITY\nTOP, 3, 1.\n"
             "*Step, inc=100000\n*Dynamic, alpha=0., direct\n1e-4, 0.2\n"
-            "*Node Print, nset=TIPS, frequency=50\nU\n*End Step\n")
+            "*Node Print, nset=TIPS, frequency=50\nU\n*End Step\n"))
+
+
+def modal_columns_steps(kind, cards=""):
+    """Steps for rayleigh_columns_deck(steps=): a *FREQUENCY step (6 modes: column A's
+    uniform one, f = 8.717 Hz, is mode 1, B's mode 5) and
+    * "md": a *MODAL DYNAMIC step over 0.3, both tops loaded by 1 from t = 0, *MODAL DAMPING
+      ``cards`` (modal_column_answer);
+    * "dynamic": "md" over 0.1 with ``cards``, then an implicit *DYNAMIC step (ALPHA=0) over
+      0.2 with the tops loaded by 2;
+    * "ssd": three *STEADY STATE DYNAMICS steps, both tops loaded by 1 (A's alone in the
+      second): 7-10 Hz with *MODAL DAMPING 1, 6, 0.05; 3-6 Hz with none; 7-10 Hz with 1, 1,
+      0.02 (modal_column_ssd)."""
+    freq = "*Step\n*Frequency\n6\n*End Step\n"
+    out = "*Node Print, nset=TIPS\nU\n*End Step\n"
+    if kind == "ssd":
+        ssd = "*Step\n*Steady State Dynamics\n{}\n{}*Cload\n{}, 3, 0.25\n" + out
+        return freq + ssd.format("7., 10., 3, 1.", "*Modal Damping\n1, 6, 0.05\n", "TOP") + \
+            ssd.format("3., 6., 3, 1.", "", "TOPA") + \
+            ssd.format("7., 10., 3, 1.", "*Modal Damping\n1, 1, 0.02\n", "TOP")
+    md = (f"*Step\n*Modal Dynamic\n0.001, {0.1 if kind == 'dynamic' else 0.3}\n{cards}"
+          f"*Cload\nTOP, 3, 0.25\n" + out)
+    return freq + md + ("*Step, inc=100000\n*Dynamic, alpha=0., direct\n1e-4, 0.2\n*Cload\n"
+                        "TOP, 3, 0.5\n*Node Print, nset=TIPS, frequency=20\nU\n*End Step\n"
+                        if kind == "dynamic" else "")
+
+
+def modal_column_answer(e_mod, rho, alpha, beta, t):
+    """A modal_columns_steps("md") column's top at time ``t``: the damped oscillator of
+    rayleigh_column_answer under a step force 1 from rest."""
+    w = math.sqrt(3.0 * e_mod / rho)
+    z = alpha / (2.0 * w) + beta * w / 2.0
+    wd = w * math.sqrt(1.0 - z * z)
+    return (1.0 - math.exp(-z * w * t) * (math.cos(wd * t) + z / math.sqrt(1.0 - z * z) *
+                                          math.sin(wd * t))) / e_mod
+
+
+def modal_column_ssd(e_mod, rho, zeta, f):
+    """(real, imaginary) displacement of a modal_columns_steps("ssd") column's top at ``f``
+    Hz: a force 1 on an oscillator of omega^2 = 3 E / rho, damping ratio ``zeta``."""
+    r = 2.0 * math.pi * f / math.sqrt(3.0 * e_mod / rho)
+    d = (1.0 - r * r) ** 2 + (2.0 * zeta * r) ** 2
+    return (1.0 - r * r) / d / e_mod, -2.0 * zeta * r / d / e_mod
+
+
+def damped_fit(hist, w, u_static, t0):
+    """(zeta, residual / amplitude) of the damped oscillation u_static + e^(-zeta w t) (A cos
+    w_d t + B sin w_d t), t from ``t0``, that fits ``hist`` [(t, u)] best (A, B by least
+    squares, zeta by golden section)."""
+    def misfit(z):
+        wd = w * math.sqrt(1.0 - z * z)
+        rows = [(math.exp(-z * w * (t - t0)) * math.cos(wd * (t - t0)),
+                 math.exp(-z * w * (t - t0)) * math.sin(wd * (t - t0)), u - u_static) for t, u in hist]
+        saa, sbb = sum(a * a for a, _, _ in rows), sum(b * b for _, b, _ in rows)
+        sab = sum(a * b for a, b, _ in rows)
+        sau, sbu = sum(a * u for a, _, u in rows), sum(b * u for _, b, u in rows)
+        det = saa * sbb - sab * sab
+        ca, cb = (sau * sbb - sbu * sab) / det, (saa * sbu - sab * sau) / det
+        return max(abs(a * ca + b * cb - u) for a, b, u in rows) / max(abs(u) for _, _, u in rows)
+    lo, hi = 0.0, 0.6
+    for _ in range(100):
+        a, b = lo + (hi - lo) * 0.382, lo + (hi - lo) * 0.618
+        lo, hi = (lo, b) if misfit(a) < misfit(b) else (a, hi)
+    z = (lo + hi) / 2.0
+    return z, misfit(z)
 
 
 def rayleigh_column_answer(e_mod, rho, alpha, beta, t):
@@ -13264,6 +13331,115 @@ def main():
               f"{u[11][0]:.6f} (1 - e^-2) / 2 = {want:.6f}; {err:.1e} off (undamped: 1)")
     else:
         print("FAIL  rayleigh_explicit: no displacements of the cubes")
+    failures += 0 if ok else 1
+
+    # mode-based steps: ccx 2.23 applies *MODAL DAMPING only. Material Rayleigh damping that
+    # is one pair (Abaqus projects it onto the modes) and Abaqus' VISCOUS=RAYLEIGH (ccx read
+    # its ALPHA as a damping ratio) are now ccx's *MODAL DAMPING, RAYLEIGH, the two added; an
+    # ALPHA that differs stays out (reduced physics, undamped)
+    def step_history(dat):
+        out = {}
+        for step, title, _, t, rows in A.dat_blocks(dat):
+            if title.startswith("displacements") and t is not None:
+                for r in rows:
+                    out.setdefault((step, int(r[0])), []).append((t, r[3]))
+        return out
+    pair_b = "*Damping, alpha=2., beta=5e-4"
+    for tag, a, b, cards, want, reduced in (
+            ("modal_rayleigh_material", "*Damping, alpha=4., beta=1e-3", "*Damping, beta=1e-3, alpha=4.",
+             "", (4.0, 1e-3), False),
+            ("modal_rayleigh_viscous", "", "", "*Modal Damping, viscous=Rayleigh\n1, 6, 4., 1e-3\n",
+             (4.0, 1e-3), False),
+            ("modal_rayleigh_both", pair_b, pair_b, "*Modal Damping, viscous=Rayleigh\n1, 6, 2., 5e-4\n",
+             (4.0, 1e-3), False),
+            ("modal_rayleigh_differs", "*Damping, alpha=4., beta=1e-3", "*Damping, alpha=1., beta=1e-3",
+             "", (0.0, 0.0), True)):
+        deck = rayleigh_columns_deck(a, b, modal_columns_steps("md", cards))
+        src = os.path.join(tmp, f"{tag}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        _, conv = convert(src, os.path.join(tmp, f"{tag}_check.inp"))
+        h = review_run(deck, tag, step_history)
+        ok = bool(h) and all(len(h.get((2, n), ())) > 20 for n in (7, 17))
+        if ok:
+            other = (4.0, 1e-3) if reduced else (0.0, 0.0)
+            errs, off = [], []
+            for n, (e_mod, rho) in zip((7, 17), RAYLEIGH_COLUMNS):
+                amp = max(abs(u) for _, u in h[(2, n)])
+                errs.append(max(abs(u - modal_column_answer(e_mod, rho, *want, t)) for t, u in h[(2, n)]) / amp)
+                off.append(max(abs(u - modal_column_answer(e_mod, rho, *other, t)) for t, u in h[(2, n)]) / amp)
+            flagged = "material damping in mode-based steps" in conv.reduced_physics
+            ok = max(errs) < 5e-4 and min(off) > 0.1 and flagged == reduced and \
+                (reduced or not conv.reduced_physics)
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (two one-mode C3D8 columns, *FREQUENCY, then "
+                  f"*MODAL DYNAMIC under a step load: ALPHA {want[0]:g}, BETA {want[1]:g}"
+                  f"{' (the materials differ: left out)' if reduced else ''}): tip histories "
+                  f"{errs[0]:.1e} / {errs[1]:.1e} of their amplitude from the "
+                  f"{'undamped' if reduced else 'damped'} oscillators, "
+                  f"{min(off):.2f} from {'the damped' if reduced else 'the undamped'} ones; reduced "
+                  f"physics {conv.reduced_physics}")
+        else:
+            print(f"FAIL  {tag}: no tip displacement histories")
+        failures += 0 if ok else 1
+
+    # a step's modal damping is its own in Abaqus, ccx 2.23 keeps it in the later steps and
+    # sizes its table by the deck's last ratio card (an earlier card's higher modes undamped):
+    # now zeros in the second *STEADY STATE DYNAMICS step, and the third's card from mode 1 to 6
+    def ssd_rows(dat):
+        out = {}
+        for step, title, _, t, rows in A.dat_blocks(dat):
+            if title.startswith("displacements") and t is not None:
+                out.setdefault(step, []).append((t, {int(r[0]): r[3] for r in rows}))
+        return out
+    res = review_run(rayleigh_columns_deck("", "", modal_columns_steps("ssd")), "modal_damping_ssd_steps",
+                     ssd_rows)
+    ok = bool(res) and all(len(res.get(st, ())) >= 6 for st in (2, 3, 4))
+    if ok:
+        zetas = {2: (0.05, 0.05), 3: (0.0, 0.0), 4: (0.02, 0.0)}      # column A (mode 1), B (mode 5)
+        errs, imag3 = [], 0.0
+        for st, pts in sorted(res.items()):
+            for (f, re_), (_, im) in zip(pts[0::2], pts[1::2]):
+                for n, (e_mod, rho), z in zip((7, 17), RAYLEIGH_COLUMNS, zetas[st]):
+                    if st == 3 and n == 17:                 # (B unloaded there)
+                        errs.append(max(abs(re_[n]), abs(im[n])) * RAYLEIGH_COLUMNS[0][0])
+                        continue
+                    wr, wi = modal_column_ssd(e_mod, rho, z, f)
+                    errs.append(math.hypot(re_[n] - wr, im[n] - wi) / math.hypot(wr, wi))
+                    imag3 = max(imag3, abs(im[n] / re_[n])) if st == 3 else imag3
+        ok = max(errs) < 1e-4 and imag3 < 1e-9
+        print(f"{'PASS' if ok else 'FAIL'}  modal_damping_ssd_steps (two one-mode C3D8 columns, three "
+              f"*STEADY STATE DYNAMICS steps: *MODAL DAMPING 1, 6, 0.05; none; 1, 1, 0.02): tip "
+              f"amplitudes {max(errs):.1e} from the damped oscillators' (ratios 0.05 / 0.05, 0 / 0, "
+              f"0.02 / 0), the second step's imaginary part {imag3:.1e} of its real one (undamped)")
+    else:
+        print("FAIL  modal_damping_ssd_steps: not every step printed its frequency points")
+    failures += 0 if ok else 1
+
+    # ccx 2.23's *MODAL DAMPING, RAYLEIGH (Abaqus' older spelling too) replaces the model-wide
+    # *DAMPING ALPHA, BETA, which a later *DYNAMIC step uses: the converter gives them back
+    # there.  The *DYNAMIC step starts from the *MODAL DYNAMIC step's end (ccx's, flagged), so
+    # its damping ratio is fitted
+    h = review_run(rayleigh_columns_deck(steps=modal_columns_steps(
+        "dynamic", "*Modal Damping, Rayleigh\n1, 6, 20., 0.\n")), "modal_rayleigh_dynamic_after",
+        step_history)
+    ok = bool(h) and all(len(h.get((3, n), ())) > 20 and h.get((2, n)) for n in (7, 17))
+    if ok:
+        fits, wants, modal = [], [], []
+        for n, (e_mod, rho) in zip((7, 17), RAYLEIGH_COLUMNS):
+            w = math.sqrt(3.0 * e_mod / rho)
+            fits.append(damped_fit(h[(3, n)], w, 2.0 / e_mod, h[(2, n)][-1][0]))
+            wants.append(4.0 / (2.0 * w) + 1e-3 * w / 2.0)
+            modal.append(24.0 / (2.0 * w) + 1e-3 * w / 2.0)
+        err = max(abs(z / zw - 1.0) for (z, _), zw in zip(fits, wants))
+        ok = err < 2e-3 and max(r for _, r in fits) < 2e-3
+        print(f"{'PASS' if ok else 'FAIL'}  modal_rayleigh_dynamic_after (the columns: *FREQUENCY, "
+              f"*MODAL DYNAMIC with *MODAL DAMPING, RAYLEIGH 20, 0 on top of the material "
+              f"ALPHA 4, BETA 1e-3, then *DYNAMIC): the *DYNAMIC step's damping ratios "
+              f"{fits[0][0]:.5f} / {fits[1][0]:.5f} vs the material's {wants[0]:.5f} / {wants[1]:.5f} "
+              f"({err:.1e} off; the modal step's: {modal[0]:.5f} / {modal[1]:.5f}), fit residual "
+              f"{max(r for _, r in fits):.1e}")
+    else:
+        print("FAIL  modal_rayleigh_dynamic_after: no tip histories in both steps")
     failures += 0 if ok else 1
 
     # *MASS, TYPE=ANISOTROPIC: ccx 2.23 read its first value as an isotropic mass (frequencies

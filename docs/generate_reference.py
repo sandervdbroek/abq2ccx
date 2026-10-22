@@ -234,7 +234,17 @@ TRANSLATED = {
         "value where only point masses, springs or contact differ). `BETA` with an explicit step "
         "→ left out (ccx stops on it). `STRUCTURAL` stays per material; `COMPOSITE` and a zero "
         "`STRUCTURAL` are not written. Proved by `validate_with_ccx.py` (`rayleigh_*`).",
-    "*DASHPOT": "of `DASHPOT1` / `DASHPOT2` elements: written without its DOF line, which ccx reads as "
+    "*MODAL DAMPING": "ccx 2.23 keeps one modal damping table for the whole run (a step's "
+        "ratios stay in later steps; after a `RAYLEIGH` card every step is Rayleigh-damped): each "
+        "`*MODAL DYNAMIC` / `*STEADY STATE DYNAMICS` step gets its own damping, ratios (zeros "
+        "where it has none, later cards from mode 1 to the deck's top) or one `*MODAL DAMPING, "
+        "RAYLEIGH` (Abaqus' `VISCOUS=RAYLEIGH` covering every mode, plus the material `*DAMPING` "
+        "pair the SIM architecture projects onto the modes); a later `*DYNAMIC` step gets the "
+        "`*DAMPING` pair back. Per-mode Rayleigh factors, frequency-dependent values, "
+        "`STRUCTURAL`, `COMPOSITE`, ratios together with Rayleigh damping → left out, reduced "
+        "physics; in other steps → commented out. Proved by `validate_with_ccx.py` "
+        "(`modal_rayleigh_*`, `modal_damping_ssd_steps`).",
+    "*DASHPOT":"of `DASHPOT1` / `DASHPOT2` elements: written without its DOF line, which ccx reads as "
         "a coefficient and stops on in a dynamic step, and without `ORIENTATION` (see the elements); "
         "of `DASHPOTA` elements without a DOF line where Abaqus has a blank one (ccx stops on `1, 1`).",
     "*SPRING": "numbers written with a decimal point (`100` → `100.`, `1e-3` → `1.e-3`): ccx 2.23 reads "

@@ -15880,6 +15880,7 @@ class _Materials:
         value where only point masses, springs or contact differ.  STRUCTURAL stays with its
         material (ccx: per material, *STEADY STATE DYNAMICS); COMPOSITE is not written."""
         self._damping = (0.0, 0.0)
+        self._modal_rayleigh, self._modal_rayleigh_why = (0.0, 0.0), ""
         self._damping_carrier = None            # id(*MASS) that writes the card: none else
         cards = [b for b in blocks if b.keyword == "DAMPING"]
         self._composite_damping = any(c.keyword == "MODAL DAMPING" and "COMPOSITE" in (
@@ -15934,15 +15935,15 @@ class _Materials:
                 a = None
             extra_a.append((f"*{b.keyword}, ELSET={b.param('ELSET') or ''}"
                             + ("" if b.has("ALPHA") else " (no ALPHA)"), a))
-        extra_b: List[Tuple[str, Optional[float]]] = []
-        if implicit:
-            if any(b.keyword == "SPRING" and (b.has("NONLINEAR") or any(
-                    pf(x) != 0.0 for x in trimmed_fields((b.data or [""])[-1].split(","))
-                    if re.fullmatch(r"\s*[-+]?(\d+\.?\d*|\.\d+)([eEdD][-+]?\d+)?\s*", x)))
-                   for b in blocks):
-                extra_b.append(("springs (Abaqus damps none)", 0.0))
-            if any(b.keyword in ("CONTACT PAIR", "CONTACT") for b in blocks):
-                extra_b.append(("contact (Abaqus damps none)", 0.0))
+        stiff: List[Tuple[str, Optional[float]]] = []     # stiffness no BETA damps
+        if any(b.keyword == "SPRING" and (b.has("NONLINEAR") or any(
+                pf(x) != 0.0 for x in trimmed_fields((b.data or [""])[-1].split(","))
+                if re.fullmatch(r"\s*[-+]?(\d+\.?\d*|\.\d+)([eEdD][-+]?\d+)?\s*", x)))
+               for b in blocks):
+            stiff.append(("springs (Abaqus damps none)", 0.0))
+        if any(b.keyword in ("CONTACT PAIR", "CONTACT") for b in blocks):
+            stiff.append(("contact (Abaqus damps none)", 0.0))
+        extra_b = stiff if implicit else []
 
         def text(v: Optional[float]) -> str:
             return "temperature-dependent" if v is None else f"{v:g}"
@@ -15994,25 +15995,32 @@ class _Materials:
                              "they agree for linear elastic materials at small strain.", once=True)
         # Abaqus' mode-based steps use material damping projected onto the modes (the SIM
         # architecture of a Lanczos or AMS *FREQUENCY, both defaults), or directly (*STEADY
-        # STATE DYNAMICS, DIRECT / SUBSPACE PROJECTION), but no *MASS, ALPHA (2017 Keywords);
-        # ccx's take *MODAL DAMPING only (and STRUCTURAL in *STEADY STATE DYNAMICS)
+        # STATE DYNAMICS, DIRECT / SUBSPACE PROJECTION), but no *MASS, ALPHA ("ignored in modal
+        # dynamics", 2017 Keywords) and nothing on springs or contact.  Where one ALPHA damps
+        # all the mass and one BETA all the stiffness, C = alpha M + beta K and Phi^T C Phi =
+        # diag(alpha + beta w^2): *MODAL DAMPING, RAYLEIGH in ccx (_plan_modal_damping)
+        if any(v != 0.0 for _, v in alpha_src + beta_src):
+            pair: List[float] = []
+            for own, extra in ((alpha_src, [(label.replace(" (no ALPHA)", "") + " (ALPHA ignored)",
+                                             0.0) for label, _ in extra_a]), (beta_src, stiff)):
+                vals = {v for _, v in own + extra}
+                if len(vals) != 1 or None in vals:
+                    self._modal_rayleigh = None
+                    self._modal_rayleigh_why = ", ".join(f"{label}: {text(v)}"
+                                                         for label, v in own + extra)
+                    break
+                pair.append(vals.pop())
+            else:
+                self._modal_rayleigh = (pair[0], pair[1])
+        # STRUCTURAL ccx applies in *STEADY STATE DYNAMICS only
         modal = [s for s in self.steps if s.proc in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS")]
         proj = any(f.uparam("SIM") != "NO" and f.uparam("DAMPING PROJECTION") != "OFF"
                    for f in blocks if f.keyword == "FREQUENCY")
-        direct = any(s.procedure is not None and s.proc == "STEADY STATE DYNAMICS" and
-                     (s.procedure.has("DIRECT") or s.procedure.has("SUBSPACE PROJECTION"))
-                     for s in modal)
-        rayleigh = any(v != 0.0 for _, v in alpha_src + beta_src)
-        lost = [x for x, on in (("Rayleigh (ALPHA, BETA)", rayleigh),
-                                ("STRUCTURAL", structural and proj and
-                                 any(s.proc == "MODAL DYNAMIC" for s in modal))) if on]
-        if modal and (proj or direct) and lost:
-            self.report.warn(f"Material {' and '.join(lost)} damping with a *MODAL DYNAMIC / *STEADY "
-                             f"STATE DYNAMICS step: Abaqus projects it onto the modes (the SIM "
-                             f"architecture, its *FREQUENCY default) or applies it directly, ccx 2.23 "
-                             f"applies only *MODAL DAMPING there (and STRUCTURAL in *STEADY STATE "
-                             f"DYNAMICS), so those steps run without it. Give it as *MODAL DAMPING.",
-                             once=True)
+        if structural and proj and any(s.proc == "MODAL DYNAMIC" for s in modal):
+            self.report.warn("Material STRUCTURAL damping with a *MODAL DYNAMIC step: Abaqus projects "
+                             "it onto the modes (the SIM architecture, its *FREQUENCY default), ccx "
+                             "2.23 applies it in *STEADY STATE DYNAMICS only, so the *MODAL DYNAMIC "
+                             "steps run without it. Give it as *MODAL DAMPING.", once=True)
             self._reduces("material damping in mode-based steps")
 
     def handle_damping(self, b: Block) -> List[str]:
@@ -16057,6 +16065,297 @@ class _Materials:
             return bool(s) and pf(s) != 0.0
         except ValueError:
             return True
+
+    @staticmethod
+    def _modal_damping_kind(b: Block) -> str:
+        """The damping type of *MODAL DAMPING card ``b``: "fraction" (VISCOUS=FRACTION OF
+        CRITICAL DAMPING, the default, and the older MODAL=DIRECT), "rayleigh" (VISCOUS=RAYLEIGH
+        and the older RAYLEIGH, ccx's spelling), "composite" (VISCOUS=COMPOSITE, MODAL=COMPOSITE)
+        or "structural"."""
+        if b.has("STRUCTURAL"):
+            return "structural"
+        if b.uparam("VISCOUS").startswith("RAY") or b.has("RAYLEIGH"):
+            return "rayleigh"
+        if b.uparam("VISCOUS").startswith("COMP") or b.uparam("MODAL").startswith("COMP"):
+            return "composite"
+        return "fraction"
+
+    def _modal_damping_effect(self, b: Block, kind: str,
+                              modes: Optional[int]) -> Tuple[str, object, str]:
+        """What *MODAL DAMPING card ``b`` of ``kind`` (_modal_damping_kind) gives the modes of a
+        step that has ``modes`` of them (None: unknown), as ccx can write it: ("ratios",
+        [(low, high, ratio text)], "") per mode (ccx's direct form), ("rayleigh", (alpha,
+        beta), "") for every mode, ("none", None, "") for no damping, or ("lost", why, what
+        for the reduced-physics list).
+
+        Abaqus 2017 (Keywords): data per mode range (low, high, ...; a blank high is low) or,
+        with DEFINITION=FREQUENCY RANGE, per frequency (interpolated, constant past the ends):
+        ratio; alpha, beta; mass and stiffness factors (composite); s (structural)."""
+        rows = [trimmed_fields(ln.split(",")) for ln in b.data if ln.strip()]
+        by_freq = b.uparam("DEFINITION").startswith("FREQ")
+        width = (2 if kind in ("rayleigh", "composite") else 1) + (1 if by_freq else 2)
+        try:
+            vals = [[pf(x) if x else 0.0 for x in (r + [""] * width)[:width]] for r in rows]
+            spans: List[Tuple[int, int]] = []
+            for v in ([] if by_freq else vals):
+                if v[0] < 1 or v[0] != int(v[0]) or v[1] != int(v[1]):
+                    raise ValueError
+                spans.append((int(v[0]), int(max(v[0], v[1]))))     # (ccx: a high below low is low)
+        except (ValueError, OverflowError):
+            return "lost", "data the converter cannot read", "*MODAL DAMPING data the converter cannot read"
+        own = [v[1 if by_freq else 2:] for v in vals]
+        if kind == "composite":
+            return "lost", "composite modal damping, which ccx 2.23 lacks", "composite modal damping"
+        if not any(x for v in own for x in v):
+            return "none", None, ""
+        if kind == "structural":
+            return "lost", "structural modal damping, which ccx 2.23 lacks", "structural modal damping"
+        if kind == "fraction" and not by_freq:
+            return "ratios", [(lo, hi, (r + [""] * 3)[2] or "0.") for (lo, hi), r in zip(spans, rows)], ""
+        if len({tuple(v) for v in own}) > 1:
+            if by_freq:
+                return "lost", ("damping that changes with frequency (ccx 2.23 reads modal damping "
+                                "per mode)"), "modal damping that changes with frequency"
+            return "lost", ("Rayleigh factors that differ between modes (ccx's *MODAL DAMPING, "
+                            "RAYLEIGH has one ALPHA, BETA for all)"), \
+                "Rayleigh modal damping that differs between modes"
+        one = own[0]
+        if not by_freq:                         # (Rayleigh) its lines must cover every mode
+            top = 0
+            for lo, hi in sorted(spans):
+                if lo > top + 1:
+                    break
+                top = max(top, hi)
+            if modes is None or top < modes:
+                return "lost", (f"Rayleigh damping of modes 1-{top} only" if top else
+                                f"Rayleigh damping from mode {min(spans)[0]} on") + (
+                    f" (of {modes if modes is not None else 'an unknown number of'} modes; ccx's "
+                    f"*MODAL DAMPING, RAYLEIGH damps all)"), "Rayleigh modal damping of some modes only"
+        if kind == "rayleigh":
+            return "rayleigh", (one[0], one[1]), ""
+        if modes is None:
+            return "lost", ("one damping ratio at all frequencies, for a *FREQUENCY step whose number "
+                            "of modes the converter cannot read"), \
+                "modal damping ratios for an unknown number of modes"
+        return "ratios", [(1, modes, short_real(one[0], 12))], ""
+
+    def _frequency_modes(self, b: Block) -> Optional[int]:
+        """The number of modes *FREQUENCY card ``b`` asks for, as handle_frequency writes it
+        (None: unknown)."""
+        f = [x.strip() for x in ((b.data or [""])[0]).split(",")]
+        try:
+            return int(pf(f[0])) if f[0] else (min(100, max(1, len(self.geom.nodes)))
+                                              if any(f[1:3]) else None)
+        except (ValueError, OverflowError):
+            return None
+
+    def _plan_modal_damping(self, blocks: List[Block]) -> None:
+        """The *MODAL DAMPING cards ccx 2.23 gets, after _plan_damping (_modal_rayleigh,
+        _damping): ``_modal_damping_cards`` (each deck card's lines, or why it is commented
+        out) and ``_modal_damping_add`` (the lines a step gets at its end, where no card of its
+        own takes them).
+
+        Abaqus: modal damping belongs to its *MODAL DYNAMIC / *STEADY STATE DYNAMICS step
+        (none without a card); different types add, a type given twice takes the last card
+        (2017 "Damping in modal superposition procedures"); the SIM architecture adds the
+        projected material damping.  ccx (modaldampings.f, allocation.f, dyna.c,
+        steadystate.c; probed): one table for the whole run — the ratios a card sets stay in
+        later steps; a RAYLEIGH card switches every later step to Rayleigh, with its ALPHA,
+        BETA in the model-wide *DAMPING pair that *DYNAMIC steps use; the table's size is the
+        last ratio card's top mode (a larger earlier card writes past it: lost ratios, a
+        crash).  So each mode-based step gets the damping it has, as ratios or one Rayleigh
+        pair: zeros where an earlier step's would stay, every ratio card after the first
+        covering modes 1 to the deck's top; a *DYNAMIC step after a RAYLEIGH card gets the
+        *DAMPING pair back as one; a card in any other step is commented out."""
+        procs = ("MODAL DYNAMIC", "STEADY STATE DYNAMICS")
+        own = {s.no: [b for b in s.cards if b.keyword == "MODAL DAMPING"] for s in self.steps}
+        if not any(own.values()) and self._modal_rayleigh == (0.0, 0.0):
+            return
+        out = self._modal_damping_cards
+        zero = "*MODAL DAMPING left out: it damps nothing (0)"
+        names = {"fraction": "damping ratios", "rayleigh": "Rayleigh", "composite": "composite",
+                 "structural": "structural"}
+        wants: Dict[int, Tuple[str, object]] = {}
+        kept: Dict[int, List[Block]] = {}         # a step's cards whose damping is written
+        for i, s in enumerate(self.steps):
+            mine = own[s.no]
+            where = f"Step {s.no} (*{s.proc})"
+            if s.proc not in procs:
+                if mine:
+                    complex_ = s.proc == "COMPLEX FREQUENCY"
+                    why = (f"*MODAL DAMPING in a *{s.proc or 'STEP without a procedure'} step "
+                           f"commented out: Abaqus applies modal damping in mode-based steps only "
+                           f"(*MODAL DYNAMIC, *STEADY STATE DYNAMICS), ccx would carry it into "
+                           f"the later ones" + (" (ccx's *COMPLEX FREQUENCY applies none)"
+                                                if complex_ else "") + ".")
+                    out.update((id(b), why) for b in mine)
+                    if complex_:
+                        self.report.warn(why, once=True)
+                        self._reduces("modal damping in *COMPLEX FREQUENCY")
+                    else:
+                        self.report.note(why, once=True)
+                continue
+            src = next((t for t in reversed(self.steps.steps[:i]) if t.proc == "FREQUENCY"), None)
+            modes = self._frequency_modes(src.procedure) if src is not None else None
+            last: Dict[str, Block] = {}
+            for b in mine:
+                if b.uparam("FIELD") == "ACOUSTIC":
+                    out[id(b)] = ("*MODAL DAMPING, FIELD=ACOUSTIC left out: it damps acoustic modes "
+                                  "only, which the ccx model has none of")
+                    self.report.note(out[id(b)] + ".", once=True)
+                    continue
+                kind = self._modal_damping_kind(b)
+                if kind in last:
+                    out[id(last[kind])] = (f"*MODAL DAMPING left out: a later card of {names[kind]} "
+                                           f"damping in the step replaces it (Abaqus)")
+                    self.report.note(f"{where}: two *MODAL DAMPING cards of {names[kind]} damping: "
+                                     f"Abaqus uses the last one.", once=True)
+                last[kind] = b
+            ratios: List[Tuple[int, int, str]] = []
+            pair = [0.0, 0.0]
+            kept[s.no] = []
+            rayleigh_cards: List[Block] = []
+            for kind, b in last.items():
+                what, val, label = self._modal_damping_effect(b, kind, modes)
+                if what == "lost":
+                    out[id(b)] = f"*MODAL DAMPING left out: {val}"
+                    self.report.warn(f"{where}: *MODAL DAMPING ({names[kind]}) left out: {val}. The "
+                                     f"step runs without it.", once=True)
+                    self._reduces(label)
+                elif what == "none":
+                    out[id(b)] = zero
+                elif what == "ratios":
+                    ratios = val
+                    kept[s.no].append(b)
+                    if b.uparam("DEFINITION").startswith("FREQ"):
+                        self.report.note("*MODAL DAMPING, DEFINITION=FREQUENCY RANGE with one damping "
+                                         "ratio at every frequency written for modes 1 to the "
+                                         "*FREQUENCY step's count (ccx reads mode numbers).", once=True)
+                else:
+                    pair = [pair[0] + val[0], pair[1] + val[1]]
+                    rayleigh_cards.append(b)
+            sd = s.procedure
+            projected = s.proc == "STEADY STATE DYNAMICS" and sd is not None and (
+                sd.has("DIRECT") or sd.has("SUBSPACE PROJECTION")) or src is not None and \
+                src.procedure.uparam("SIM") != "NO" and src.procedure.uparam("DAMPING PROJECTION") != "OFF"
+            mat = self._modal_rayleigh
+            if projected and mat is None:
+                self.report.warn(f"Material Rayleigh damping (*DAMPING, ALPHA / BETA) with a *MODAL "
+                                 f"DYNAMIC / *STEADY STATE DYNAMICS step: Abaqus projects it onto the "
+                                 f"modes (the SIM architecture, its *FREQUENCY default) or applies it "
+                                 f"directly; ccx 2.23 takes *MODAL DAMPING only there, whose RAYLEIGH "
+                                 f"is that projection only where one ALPHA damps all the mass and one "
+                                 f"BETA all the stiffness ({self._modal_rayleigh_why}), so those "
+                                 f"steps run without it.", once=True)
+                self._reduces("material damping in mode-based steps")
+            elif projected and mat != (0.0, 0.0):
+                pair = [pair[0] + mat[0], pair[1] + mat[1]]
+                self.report.note("Material Rayleigh damping (*DAMPING, ALPHA / BETA) with a mode-"
+                                 "based step: Abaqus projects it onto the modes (the SIM "
+                                 "architecture, its *FREQUENCY default), ALPHA + BETA w^2 per mode, "
+                                 "which ccx's *MODAL DAMPING, RAYLEIGH writes in that step (with the "
+                                 "step's own Rayleigh modal damping added)"
+                                 + (" — BETA times the stiffness the modes have, Abaqus' times the "
+                                    "elastic one, which a preload changes" if mat[1] and
+                                    src is not None and src.general_before else "") + ".", once=True)
+            if ratios and any(pair):
+                self.report.warn(f"{where}: damping ratios and Rayleigh damping ("
+                                 + ("its Rayleigh *MODAL DAMPING" if rayleigh_cards else
+                                    "the material *DAMPING's, projected") +
+                                 "): Abaqus adds them, ccx 2.23 applies the Rayleigh damping alone "
+                                 "where it has both (probed), so the step is written with its "
+                                 "damping ratios only.", once=True)
+                self._reduces("modal damping ratios and Rayleigh damping in one step")
+                out.update((id(b), "*MODAL DAMPING left out: ccx 2.23 cannot add Rayleigh modal "
+                                   "damping to damping ratios") for b in rayleigh_cards)
+                pair, rayleigh_cards = [0.0, 0.0], []
+            kept[s.no] += rayleigh_cards
+            wants[s.no] = ("ratios", ratios) if ratios else ("rayleigh", tuple(pair)) if any(pair) \
+                else ("none", None)
+        top = max((max(lo, hi) for what, val in wants.values() if what == "ratios"
+                   for lo, hi, _ in val), default=0)
+        # ccx's state as the steps run: the kind of modal damping in force (none, ratios,
+        # Rayleigh), whether a ratio is not 0, its ALPHA, BETA (*DAMPING's to begin with)
+        state, live, ccx_pair, wrote = "none", False, self._damping, False
+        for s in self.steps:
+            lines: List[str] = []
+            if s.proc == "DYNAMIC" and state == "rayleigh" and ccx_pair != self._damping:
+                a, bt = self._damping
+                lines = ["** abq2ccx: the model-wide *DAMPING ALPHA, BETA again (an earlier "
+                         "*MODAL DAMPING, RAYLEIGH replaced them)",
+                         "*MODAL DAMPING, RAYLEIGH", f", , {short_real(a, 12)}, {short_real(bt, 12)}"]
+                ccx_pair = self._damping
+                self.report.note("*MODAL DAMPING, RAYLEIGH written in a *DYNAMIC step after a mode-"
+                                 "based step's: ccx 2.23's RAYLEIGH replaces the model-wide "
+                                 "*DAMPING ALPHA, BETA, which its *DYNAMIC steps use (probed), so "
+                                 "they are given back there.", once=True)
+            elif s.no in wants:
+                what, val = wants[s.no]
+                undamped = what == "none"
+                if what == "ratios" and state == "rayleigh":
+                    self.report.warn(f"Step {s.no}: *MODAL DAMPING ratios after a step with Rayleigh "
+                                     f"modal damping: once ccx 2.23 has read a *MODAL DAMPING, "
+                                     f"RAYLEIGH it applies Rayleigh damping in every later step "
+                                     f"(probed), so the step runs without its damping ratios.",
+                                     once=True)
+                    self._reduces("modal damping ratios after a Rayleigh *MODAL DAMPING")
+                    out.update((id(b), "*MODAL DAMPING left out: ccx 2.23 applies Rayleigh modal "
+                                       "damping in every step after a RAYLEIGH card")
+                               for b in kept[s.no])
+                    kept[s.no], what = [], "none"
+                if what == "ratios":
+                    lines = ["*MODAL DAMPING"]
+                    end = 0
+                    for lo, hi in sorted((lo, hi) for lo, hi, _ in val):
+                        end = max(end, hi) if lo <= end + 1 else end
+                    if wrote and end < top:
+                        lines.append(f"1, {top}, 0.")
+                        self.report.note("*MODAL DAMPING ratios written from mode 1 to the deck's "
+                                         "highest mode, 0 where the step gives none: ccx 2.23 keeps "
+                                         "an earlier step's ratios and sizes its table by the "
+                                         "deck's last card (a larger earlier one loses ratios and "
+                                         "can crash ccx, probed).", once=True)
+                    lines += [f"{lo}, {hi}, {z}" for lo, hi, z in val]
+                    state, live, wrote = "ratios", True, True
+                elif what == "rayleigh":
+                    lines = ["*MODAL DAMPING, RAYLEIGH",
+                             f", , {short_real(val[0], 12)}, {short_real(val[1], 12)}"]
+                    state, ccx_pair = "rayleigh", val
+                    if any(b.uparam("VISCOUS").startswith("RAY") for b in kept[s.no]):
+                        self.report.note("*MODAL DAMPING, VISCOUS=RAYLEIGH written as ccx's *MODAL "
+                                         "DAMPING, RAYLEIGH: ALPHA, BETA in fields 3-4 of one line "
+                                         "for all modes (ccx would read VISCOUS=RAYLEIGH's ALPHA as "
+                                         "a damping ratio, probed).", once=True)
+                elif state == "ratios" and live:
+                    lines, live = ["*MODAL DAMPING", f"1, {top}, 0."], False
+                elif state == "rayleigh" and any(ccx_pair):
+                    lines, ccx_pair = ["*MODAL DAMPING, RAYLEIGH", ", , 0., 0."], (0.0, 0.0)
+                if lines and undamped:
+                    lines.insert(0, "** abq2ccx: no modal damping in this step (ccx would keep an "
+                                    "earlier step's)")
+                    self.report.note("*MODAL DAMPING of 0 written in a mode-based step without "
+                                     "damping after a step with some: Abaqus damps a step by its "
+                                     "own card only, ccx 2.23 keeps the earlier step's (probed).",
+                                     once=True)
+            # the lines go in place of the step's first card written (else of a card of 0)
+            hosts = kept.get(s.no) or [b for b in own[s.no] if out.get(id(b)) == zero][:1]
+            for k, b in enumerate(hosts):
+                out[id(b)] = lines if lines and not k else \
+                    "*MODAL DAMPING written with the step's first one" if lines else zero
+            if lines and not hosts:
+                self._modal_damping_add[s.no] = lines
+
+    def handle_modal_damping(self, b: Block) -> List[str]:
+        """``*MODAL DAMPING``: the lines _plan_modal_damping planned for it, else the card as a
+        comment (its reason there)."""
+        plan = self._modal_damping_cards.get(id(b))
+        if plan is None:
+            return self.passthrough(b)
+        if isinstance(plan, str):
+            self.report.n_commented += 1
+            return [f"** abq2ccx: {plan}"] + ["** " + x for x in [emit_keyword(b.keyword, b.params)]
+                                              + list(b.data)]
+        return list(plan)
 
     def _materials_after_deck(self, blocks: List[Block]) -> Optional[str]:
         """The last material the converter writes after the deck's last *MATERIAL, as words
@@ -27453,6 +27752,7 @@ class _Loads:
                                               "take them off over it (probed).", reduces=False))
                 continue
             out.extend(self.translate_one(b))
+        out.extend(self._modal_damping_add.get(self.emit.no, []))
         out.extend(self._boundary_pieces(self._vel_tail.get(self.emit.no, [])))
         self._dload_op_new_first(out)
         out.extend(self._flush_dloads())
@@ -36546,6 +36846,14 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._card_material: Dict[int, str] = {}
         self._used_materials: set = set()
         self._damping: Tuple[float, float] = (0.0, 0.0)     # (_plan_damping)
+        # the material ALPHA, BETA Abaqus projects onto the modes, None where they are not one
+        # pair for the whole model (then why: the sources); _plan_modal_damping writes them
+        self._modal_rayleigh: Optional[Tuple[float, float]] = (0.0, 0.0)
+        self._modal_rayleigh_why = ""
+        # step no -> the *MODAL DAMPING lines it gets where it has no card of its own; id(card)
+        # -> its lines, or the comment it is left out with (_plan_modal_damping)
+        self._modal_damping_add: Dict[int, List[str]] = {}
+        self._modal_damping_cards: Dict[int, Union[List[str], str]] = {}
         self._damping_carrier: Optional[int] = None
         self._composite_damping = False
         self._copied_materials: set = set()      # the originals _material_copy copied (upper case)
@@ -37124,6 +37432,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "SPECIFIC HEAT": "handle_dependent_material",
         "MASS": "handle_mass",
         "DAMPING": "handle_damping",
+        "MODAL DAMPING": "handle_modal_damping",
         "DASHPOT": "handle_dashpot",
         "SPRING": "handle_spring",
         "CONDUCTIVITY": "handle_dependent_material",
@@ -37406,6 +37715,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._order_material_cards(blocks)      # after the planners that add material cards
         self._plan_material_cards(blocks)
         self._plan_damping(blocks)              # after it: the materials sections use
+        self._plan_modal_damping(blocks)        # after it: _modal_rayleigh, _damping
         self._undefined_parameter_data(blocks)
         self._plan_deformation_plasticity(blocks)
         self._plan_expansion_as_ortho(blocks)

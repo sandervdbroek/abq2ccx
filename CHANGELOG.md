@@ -68,8 +68,7 @@ physics.
   0); a value that differs, also against a point mass (ccx damps it, Abaqus only by the `*MASS`'s
   own `ALPHA`) or a spring or contact (ccx's `BETA` damps them, Abaqus' does not), is left out as
   reduced physics (`--approximate`: the materials' value). `BETA` with an explicit step is left
-  out too (ccx's explicit solver stops on it), and material damping with a `*MODAL DYNAMIC` /
-  `*STEADY STATE DYNAMICS` step is flagged (ccx applies only `*MODAL DAMPING` there).
+  out too (ccx's explicit solver stops on it; mode-based steps: see `*MODAL DAMPING`).
   `STRUCTURAL` stays per material; a zero one and `COMPOSITE` are not written.
 * **`--run` streams ccx's output** — it held all of ccx's output in memory and showed it only
   when ccx ended; ccx 2.23 can print without end (a vanishing pivot in its MPC cascade), and
@@ -100,6 +99,17 @@ physics.
   one per BC DOF at step 1 plus one: they move every such entry past the BCs and hold nothing of
   the model (the decks without their trusses to the last digit). `--run` checks the job's `.12d`
   for a mean-rotation MPC per rotation held at step 1 and reports any it lacks (exit code 1).
+* **`*MODAL DAMPING`** — passed through raw, it ran differently in ccx 2.23: Abaqus'
+  `VISCOUS=RAYLEIGH` alpha was read as a damping ratio, a step's ratios stayed in the later
+  steps (Abaqus: its own step only), a later card for fewer modes left the higher modes of an
+  earlier one undamped and could crash ccx, and a `RAYLEIGH` card replaced the `*DAMPING` pair
+  of later `*DYNAMIC` steps. Each mode-based step now gets its own damping: ratios (zeros where
+  it has none), or one `*MODAL DAMPING, RAYLEIGH` with the step's Rayleigh factors plus the
+  material `ALPHA`, `BETA` that Abaqus projects onto the modes (exact where one pair damps the
+  whole model, which was flagged and left out before); a later `*DYNAMIC` step gets the
+  `*DAMPING` pair back. Rayleigh factors that differ between modes, frequency-dependent values,
+  `STRUCTURAL` and `COMPOSITE` modal damping, and ratios together with Rayleigh damping (ccx
+  applies one kind per step) are left out as reduced physics.
 * **Explicit mass scaling on part of the model** — `*FIXED MASS SCALING, FACTOR=f, ELSET=...`
   on part of the model (a local factor overriding the global one) was dropped (ccx ran the true
   mass); each section whose elements share a factor now gets a copy of its materials with the

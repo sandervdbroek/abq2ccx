@@ -3961,18 +3961,127 @@ def test_damping_structural_tabular_and_composite():
     assert len(conv.reduced_physics) == 1
 
 
-def test_damping_in_mode_based_steps_is_flagged():
-    # Abaqus projects material damping onto the modes (SIM, the *FREQUENCY default); ccx's
-    # modal steps take *MODAL DAMPING only
-    modal = "*Frequency\n4\n*End Step\n*Step\n*Modal Dynamic\n0.01, 1."
-    body, conv, rep = convert_str(damping_deck(step=modal))
-    assert "material damping in mode-based steps" in conv.reduced_physics
-    body, conv, rep = convert_str(damping_deck(step=modal.replace("*Frequency", "*Frequency, sim=NO")))
-    assert "material damping in mode-based steps" not in conv.reduced_physics
-    # a *MASS's ALPHA acts in direct integration only (2017 Keywords *MASS)
+MODE_STEPS = "*Frequency\n4\n*End Step\n*Step\n*Modal Dynamic\n0.01, 1."
+
+
+def modal_lines(body):
+    """The *MODAL DAMPING cards of a converted deck, with their data, per step."""
+    out, cur, on = [], None, False
+    for ln in body.splitlines():
+        if ln.startswith("*STEP"):
+            cur = []
+            out.append(cur)
+        elif ln.startswith("*") and not ln.startswith("**"):
+            on = ln.startswith("*MODAL DAMPING")
+        if on and cur is not None:
+            cur.append(ln)
+    return out
+
+
+def test_damping_in_mode_based_steps():
+    # Abaqus projects material damping onto the modes (SIM, the *FREQUENCY default): one
+    # ALPHA, BETA for all the mass and stiffness is ALPHA + BETA w^2 per mode, ccx's *MODE_STEPS
+    # DAMPING, RAYLEIGH in the step (probed exact); ccx's modal steps take nothing else
+    body, conv, rep = convert_str(damping_deck(step=MODE_STEPS))
+    assert modal_lines(body) == [[], ["*MODAL DAMPING, RAYLEIGH", ", , 2., 0."]]
+    assert conv.reduced_physics == [] and "projects it onto the modes" in rep.text()
+    body, conv, rep = convert_str(damping_deck(step=MODE_STEPS.replace("Modal Dynamic\n0.01, 1.",
+                                                                  "Steady State Dynamics\n1., 10., 3, 1.")))
+    assert modal_lines(body)[1] == ["*MODAL DAMPING, RAYLEIGH", ", , 2., 0."]
+    # the traditional architecture uses none of it (nor does ccx)
+    for f in ("*Frequency, sim=NO", "*Frequency, damping projection=OFF"):
+        body, conv, rep = convert_str(damping_deck(step=MODE_STEPS.replace("*Frequency", f)))
+        assert modal_lines(body) == [[], []] and conv.reduced_physics == []
+    # the step's own Rayleigh modal damping adds; damping ratios cannot (ccx: Rayleigh alone)
+    body, conv, rep = convert_str(damping_deck(
+        step=MODE_STEPS + "\n*Modal Damping, viscous=Rayleigh\n1, 4, 1., 1e-3"))
+    assert modal_lines(body)[1] == ["*MODAL DAMPING, RAYLEIGH", ", , 3., 0.001"]
+    body, conv, rep = convert_str(damping_deck(step=MODE_STEPS + "\n*Modal Damping\n1, 4, 0.05"))
+    assert modal_lines(body)[1] == ["*MODAL DAMPING", "1, 4, 0.05"]
+    assert conv.reduced_physics == ["modal damping ratios and Rayleigh damping in one step"]
+    # an ALPHA that differs between materials, a point mass (its ALPHA "is ignored in modal
+    # dynamics", 2017 Keywords *MASS) or a spring (no BETA in Abaqus): not one pair
     pm = "*Element, type=MASS, elset=PM\n30, 7\n*Mass, elset=PM, alpha=2.\n0.5\n"
-    body, conv, rep = convert_str(damping_deck(a="", b="", step=modal, extra=pm))
-    assert "material damping in mode-based steps" not in conv.reduced_physics
+    spring = "*Element, type=SpringA, elset=S\n31, 7, 17\n*Spring, elset=S\n\n10.\n"
+    beta = "*Damping, alpha=2., beta=1e-3"
+    for deck, why in ((damping_deck(b="*Damping, alpha=3.", step=MODE_STEPS), "material MB: 3"),
+                      (damping_deck(step=MODE_STEPS, extra=pm), "*MASS, ELSET=PM (ALPHA ignored): 0"),
+                      (damping_deck(a=beta, b=beta, step=MODE_STEPS, extra=spring), "springs (Abaqus damps none): 0")):
+        body, conv, rep = convert_str(deck)
+        assert modal_lines(body) == [[], []] and why in rep.text()
+        assert "material damping in mode-based steps" in conv.reduced_physics
+    # a *MASS's ALPHA alone damps nothing there
+    body, conv, rep = convert_str(damping_deck(a="", b="", step=MODE_STEPS, extra=pm))
+    assert modal_lines(body) == [[], []] and "mode-based" not in " ".join(conv.reduced_physics)
+
+
+def test_modal_damping_rayleigh_forms():
+    # Abaqus' VISCOUS=RAYLEIGH (low, high, alpha, beta) is not ccx's RAYLEIGH, which reads
+    # alpha, beta from fields 3-4 of one line for every mode (it read alpha as a ratio, probed)
+    for card in ("*Modal Damping, viscous=Rayleigh\n1, 4, 0.5, 0.002",
+                 "*Modal Damping, visc=ray\n1, 2, 0.5, 0.002\n3, 10, 0.5, 0.002",
+                 "*Modal Damping, Rayleigh\n1, 4, 0.5, 0.002",          # (the older spelling)
+                 "*Modal Damping, viscous=Rayleigh, definition=frequency range\n1., 0.5, 0.002\n9., 0.5, 0.002"):
+        body, conv, rep = convert_str(damping_deck(a="", b="", step=MODE_STEPS + "\n" + card))
+        assert modal_lines(body)[1] == ["*MODAL DAMPING, RAYLEIGH", ", , 0.5, 0.002"], card
+        assert conv.reduced_physics == []
+    for card, why in (("1, 2, 0.5, 0.002", "Rayleigh modal damping of some modes only"),
+                      ("1, 2, 0.5, 0.002\n3, 4, 1., 0.", "Rayleigh modal damping that differs between modes")):
+        body, conv, rep = convert_str(damping_deck(a="", b="", step=MODE_STEPS + "\n*Modal Damping, "
+                                                   "viscous=Rayleigh\n" + card))
+        assert modal_lines(body)[1] == [] and conv.reduced_physics == [why]
+        assert "** abq2ccx: *MODAL DAMPING left out: " in body
+
+
+def test_modal_damping_across_steps():
+    # ccx 2.23 keeps a step's ratios in the later steps (Abaqus: a step's own card only) and
+    # sizes its table by the deck's last ratio card: a larger earlier card loses ratios and
+    # can crash ccx (probed); so zeros where a step has none, later cards from mode 1 on
+    more = "\n*Cload\n7, 3, 1.\n*End Step\n*Step\n*Modal Dynamic\n0.01, 1."
+    step = MODE_STEPS + "\n*Modal Damping\n1, 6, 0.05" + more + more + "\n*Modal Damping\n2, , 0.02"
+    body, conv, rep = convert_str(damping_deck(a="", b="", step=step))
+    assert modal_lines(body) == [[], ["*MODAL DAMPING", "1, 6, 0.05"], ["*MODAL DAMPING", "1, 6, 0."],
+                                 ["*MODAL DAMPING", "1, 6, 0.", "2, 2, 0.02"]]
+    assert "no modal damping in this step" in body and not [
+        r for r in conv.reduced_physics if "damping" in r.lower()]
+    # once ccx has read a RAYLEIGH card it applies Rayleigh damping in every later step
+    step = MODE_STEPS + "\n*Modal Damping, viscous=Rayleigh\n1, 4, 0.5, 0." + more + more + \
+        "\n*Modal Damping\n1, 4, 0.05"
+    body, conv, rep = convert_str(damping_deck(a="", b="", step=step))
+    assert modal_lines(body) == [[], ["*MODAL DAMPING, RAYLEIGH", ", , 0.5, 0."],
+                                 ["*MODAL DAMPING, RAYLEIGH", ", , 0., 0."], []]
+    assert "modal damping ratios after a Rayleigh *MODAL DAMPING" in conv.reduced_physics
+    # its ALPHA, BETA are the model-wide *DAMPING pair: given back in a later *DYNAMIC step
+    for dyn in ("*Dynamic\n0.01, 1.", "*Dynamic, explicit\n, 1e-3"):
+        step = MODE_STEPS + "\n*Modal Damping, viscous=Rayleigh\n1, 4, 0.5, 0." + \
+            "\n*End Step\n*Step\n" + dyn
+        body, conv, rep = convert_str(damping_deck(step=step))
+        assert modal_lines(body) == [[], ["*MODAL DAMPING, RAYLEIGH", ", , 2.5, 0."],
+                                     ["*MODAL DAMPING, RAYLEIGH", ", , 2., 0."]], dyn
+        assert "the model-wide *DAMPING ALPHA, BETA again" in body
+    # a *DYNAMIC step before it needs nothing
+    step = "*Dynamic\n0.01, 1.\n*End Step\n*Step\n" + MODE_STEPS + "\n*Modal Damping, viscous=Rayleigh\n1, 4, 0.5, 0."
+    body, conv, rep = convert_str(damping_deck(step=step))
+    assert modal_lines(body) == [[], [], ["*MODAL DAMPING, RAYLEIGH", ", , 2.5, 0."]]
+
+
+def test_modal_damping_without_ccx_form():
+    step = MODE_STEPS + "\n"
+    cases = (("*Modal Damping, definition=frequency range\n1., 0.03\n9., 0.03", ["*MODAL DAMPING", "1, 4, 0.03"], []),
+             ("*Modal Damping, definition=frequency range\n1., 0.03\n9., 0.05", [],
+              ["modal damping that changes with frequency"]),
+             ("*Modal Damping, structural\n1, 4, 0.02", [], ["structural modal damping"]),
+             ("*Modal Damping, structural\n1, 4, 0.", [], []),
+             ("*Modal Damping, viscous=composite\n1, 4", [], ["composite modal damping"]),
+             ("*Modal Damping, definition=frequency range, field=acoustic\n1., 0.03", [], []),
+             ("*Modal Damping\n1, 4, 0.05\n*Modal Damping\n1, 2, 0.01", ["*MODAL DAMPING", "1, 2, 0.01"], []))
+    for card, want, reduced in cases:
+        body, conv, rep = convert_str(damping_deck(a="", b="", step=step + card))
+        assert modal_lines(body)[1] == want and conv.reduced_physics == reduced, card
+    # outside a mode-based step: commented out (ccx would carry it on)
+    body, conv, rep = convert_str(damping_deck(a="", b="", step="*Frequency\n4\n*Modal Damping\n1, 4, 0.05"))
+    assert modal_lines(body) == [[]] and "** *Modal Damping".upper() in body.upper()
+    assert conv.reduced_physics == [] and "mode-based steps only" in rep.text()
 
 
 def test_u1_in_space_needs_approximate_for_open_sections():
