@@ -22607,6 +22607,191 @@ def test_elcopy_reflect_brick_faces_as_abaqus_labels_them():
     assert copy[6] == shift(orig[3]) and copy[2] == shift(orig[2]) and copy[3] == shift(orig[6])
 
 
+
+# *EMBEDDED ELEMENT: a unit C3D8 cube and a T3D2 bar from node 101 inside it to node 102 beyond
+# its x = 1 face ({P} = node 102's coordinates)
+EMB_CUBE = (HEX.split("*ELEMENT")[0] + "101, 0.25, 0.5, 0.75\n102, {P}\n*ELEMENT, TYPE=C3D8, ELSET=HOST\n"
+            "1, 1, 2, 3, 4, 5, 6, 7, 8\n*ELEMENT, TYPE=T3D2, ELSET=BAR\n11, 101, 102\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n1000., 0.3\n*SOLID SECTION, ELSET=HOST, MATERIAL=M\n*SOLID SECTION, ELSET=BAR, "
+            "MATERIAL=M\n0.01\n*EMBEDDED ELEMENT{OPT}\n{DATA}\n*STEP\n*STATIC\n*BOUNDARY\n{BC}*END STEP\n")
+
+
+def _emb(p="0.75, 0.5, 0.25", opt=", HOST ELSET=HOST", data="BAR", bc="1, 1, 3\n"):
+    return EMB_CUBE.format(P=p, OPT=opt, DATA=data, BC=bc)
+
+
+def _emb_rows(body):
+    """{(node, DOF): {term node: coefficient}} of the *EQUATIONs after each embedding's comment (the
+    first term, coefficient 1, is the eliminated one)."""
+    rows, lines = {}, body.splitlines()
+    for i in (k for k, ln in enumerate(lines) if ln.startswith("** abq2ccx: *EMBEDDED ELEMENT")):
+        terms, left = [], 0
+        for ln in lines[i + 1:]:
+            if ln.startswith("*"):
+                if ln == "*EQUATION":
+                    continue
+                break
+            f = [x.strip() for x in ln.split(",")]
+            if left == 0:
+                left, terms = int(f[0]), []
+                continue
+            terms += [(int(f[k]), int(f[k + 1]), float(f[k + 2])) for k in range(0, len(f), 3)]
+            left -= len(f) // 3
+            if left == 0:
+                n, d, c = terms[0]
+                assert c == 1.0
+                rows[(n, d)] = {m: c for m, _, c in terms[1:]}
+    return rows
+
+
+def test_embedded_element_ties_the_nodes_to_their_host_interpolation():
+    # each embedded node's translations = the host's shape functions at its natural coordinates
+    body, conv, rep = convert_str(_emb())
+    rows = _emb_rows(body)
+    assert sorted(rows) == [(101, 1), (101, 2), (101, 3), (102, 1), (102, 2), (102, 3)]
+    corner = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+    for n, (x, y, z) in ((101, (0.25, 0.5, 0.75)), (102, (0.75, 0.5, 0.25))):
+        want = {k + 1: (x if a else 1 - x) * (y if b else 1 - y) * (z if c else 1 - z)
+                for k, (a, b, c) in enumerate(corner)}
+        assert all(abs(rows[(n, 2)][m] + w) < 1e-12 for m, w in want.items())
+    assert "*EMBEDDED ELEMENT -> *EQUATIONs" in rep.text() and not conv.reduced_physics
+    assert "*EMBEDDED ELEMENT" not in [ln.split(",")[0] for ln in body.splitlines()]
+    # the default host search (no HOST ELSET); a node of a host is no embedded node
+    body, conv, _ = convert_str(_emb(opt="", data="BAR").replace("11, 101, 102", "11, 101, 7"))
+    assert sorted(_emb_rows(body)) == [(101, 1), (101, 2), (101, 3)] and not conv.reduced_physics
+    # EMBED NODES: the data line's nodes
+    body, _, _ = convert_str(_emb(opt=", EMBED NODES", data="102"))
+    assert sorted(_emb_rows(body)) == [(102, 1), (102, 2), (102, 3)]
+    # every embedded node a host node: nothing to tie
+    body, conv, _ = convert_str(_emb(data="BAR").replace("11, 101, 102", "11, 1, 7"))
+    assert "** *EMBEDDED ELEMENT, HOST ELSET=HOST" in body and not conv.reduced_physics
+
+
+def test_embedded_element_natural_coordinates_of_every_host_family():
+    # Newton's inversion (embed_natural) and the nearest point (embed_nearest) on distorted,
+    # curved hosts of each family, against the shape functions themselves
+    shapes = {"C3D8": ("hex", 8), "C3D20R": ("hex", 20), "C3D4": ("tet", 4), "C3D10": ("tet", 10),
+              "C3D10M": ("tet", 4), "C3D6": ("wedge", 6), "C3D15": ("wedge", 15), "CPS4R": ("quad", 4),
+              "CAX8": ("quad", 8), "CPE3": ("tri", 3), "CPS6": ("tri", 6)}
+    for typ, want in shapes.items():
+        assert A.embed_host_shape(typ) == want
+    assert A.embed_host_shape("S4") is None and A.embed_host_shape("CPEG4") is None
+    ref = {"hex": [(-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1), (-1, -1, 1), (1, -1, 1), (1, 1, 1),
+                   (-1, 1, 1)], "tet": [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)],
+           "wedge": [(0, 0, -1), (1, 0, -1), (0, 1, -1), (0, 0, 1), (1, 0, 1), (0, 1, 1)],
+           "quad": [(-1, -1), (1, -1), (1, 1), (-1, 1)], "tri": [(0, 0), (1, 0), (0, 1)]}
+    for kind, n in (("hex", 8), ("hex", 20), ("tet", 4), ("tet", 10), ("wedge", 6), ("wedge", 15),
+                    ("quad", 4), ("quad", 8), ("tri", 3), ("tri", 6)):
+        dim = len(ref[kind][0])
+        # the node points: the reference element's (midside nodes at the edge middles) mapped by a
+        # skewed linear map, then moved off it a little (curved edges)
+        edges = {20: [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6),
+                      (3, 7)], 10: [(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)],
+                 15: [(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3), (0, 3), (1, 4), (2, 5)],
+                 8: [(0, 1), (1, 2), (2, 3), (3, 0)], 6: [(0, 1), (1, 2), (2, 0)]}
+        nat = ref[kind] + [tuple(0.5 * (a + b) for a, b in zip(ref[kind][i], ref[kind][j]))
+                           for i, j in (edges[n] if n > len(ref[kind]) else [])]
+        pts = [tuple(1.3 * q[k] + 0.4 * q[(k + 1) % dim] + 0.05 * ((i * 7 + k * 3) % 5 - 2) for k in range(dim))
+               for i, q in enumerate(nat)]
+        xi = [0.3, -0.2, 0.1][:dim] if kind in ("hex", "quad") else [0.2, 0.3, 0.1][:dim]
+        if kind == "wedge":
+            xi = [0.2, 0.3, -0.4]
+        w = A.embed_weights(kind, n, xi)
+        p = [sum(wi * q[k] for wi, q in zip(w, pts)) for k in range(dim)]
+        got = A.embed_natural(kind, n, pts, p)
+        assert abs(sum(w) - 1.0) < 1e-12 and max(abs(a - b) for a, b in zip(got, xi)) < 1e-9, (kind, n)
+        # a point off the domain: the nearest point lies on its boundary, no nearer than any point
+        far = [v + 2.0 for v in p]
+        xn, d = A.embed_nearest(kind, n, pts, far)
+        assert abs(A.embed_excess(kind, xn)) < 1e-9 and d > 0.0
+        assert all(d <= math.dist(far, [sum(wi * q[k] for wi, q in zip(A.embed_weights(kind, n, z), pts))
+                                        for k in range(dim)]) + 1e-12
+                   for z in (A.EMBED_DOMAINS[kind][2], xi, got))
+
+
+def test_embedded_element_tolerances_move_nodes_onto_the_host():
+    # outside by 0.03 (the cube's size is 1: Abaqus' default 0.05) -> moved onto the face
+    body, conv, rep = convert_str(_emb(p="1.03, 0.5, 0.25"))
+    assert "102, 1, 0.5, 0.25" in body.splitlines() and not conv.reduced_physics
+    assert "1 embedded node(s) moved onto their host element (at most 0.03, node 102)" in rep.text()
+    # outside by 0.08: free, warned (Abaqus stops on it) unless PARTIAL EMBED=YES; or a larger tolerance
+    body, conv, rep = convert_str(_emb(p="1.08, 0.5, 0.25"))
+    assert (102, 1) not in _emb_rows(body) and "102, 1.08, 0.5, 0.25" in body.splitlines()
+    assert conv.reduced_physics == ["*EMBEDDED ELEMENT nodes outside every host"]
+    assert "lie farther than the exterior tolerance (0.05) from every host element" in rep.text()
+    _, conv, rep = convert_str(_emb(p="1.08, 0.5, 0.25", opt=", PARTIAL EMBED=YES"))
+    assert not conv.reduced_physics and "as Abaqus does with PARTIAL EMBED=YES" in rep.text()
+    for opt in (", EXTERIOR TOLERANCE=0.1", ", ABSOLUTE EXTERIOR TOLERANCE=0.09",
+                ", EXTERIOR TOLERANCE=0.5, ABSOLUTE EXTERIOR TOLERANCE=0.09"):
+        body, conv, _ = convert_str(_emb(p="1.08, 0.5, 0.25", opt=opt))
+        assert (102, 1) in _emb_rows(body) and "102, 1, 0.5, 0.25" in body.splitlines(), opt
+    _, conv, _ = convert_str(_emb(p="1.08, 0.5, 0.25", opt=", EXTERIOR TOLERANCE=0.5, "
+                                                          "ABSOLUTE EXTERIOR TOLERANCE=0.07"))
+    assert conv.reduced_physics == ["*EMBEDDED ELEMENT nodes outside every host"]    # the smaller
+    # a weight below ROUNDOFF TOLERANCE is zeroed, the rest scaled, the node moved to match
+    body, _, _ = convert_str(_emb(p="0.99999999, 0.5, 0.25"))
+    assert set(_emb_rows(body)[(102, 1)]) == {2, 3, 6, 7} and "102, 1, 0.5, 0.25" in body.splitlines()
+    body, _, _ = convert_str(_emb(p="0.99, 0.5, 0.25", opt=", ROUNDOFF TOLERANCE=0.02"))
+    assert set(_emb_rows(body)[(102, 1)]) == {2, 3, 6, 7} and "102, 1, 0.5, 0.25" in body.splitlines()
+
+
+def test_embedded_element_bc_on_an_embedded_node_is_neglected():
+    # Abaqus: 'the embedded element definition always takes precedence' -> taken off, warned
+    body, conv, rep = convert_str(_emb(bc="1, 1, 3\n101, 2, 2, 0.01\n102, 1, 3\n"))
+    assert _card_at(body, "*BOUNDARY") == ["1, 1, 3", "102, 1, 3"] or \
+        _card_at(body, "*BOUNDARY") == ["1, 1, 3"]
+    assert "*BOUNDARY on 4 DOF(s) of embedded nodes (e.g. node 101 DOF 2) taken off" in rep.text()
+    assert (101, 2) in _emb_rows(body)
+
+
+def test_embedded_element_hosts_abaqus_accepts():
+    # shells cannot host: left out of HOST ELSET (warned); without any host the constraint is missing
+    deck = _emb(opt=", HOST ELSET=SH").replace("*MATERIAL", "*ELEMENT, TYPE=S4, ELSET=SH\n21, 1, 2, 3, 4\n"
+                                                           "*SHELL SECTION, ELSET=SH, MATERIAL=M\n0.1\n*MATERIAL", 1)
+    body, conv, rep = convert_str(deck)
+    assert "element type(s) S4 cannot host embedded elements" in rep.text()
+    assert conv.reduced_physics == ["*EMBEDDED ELEMENT without a host element"]
+    assert "** *EMBEDDED ELEMENT, HOST ELSET=SH" in body
+    # 2-D hosts tie DOFs 1-2; a node in two cards keeps the first
+    plane = ("*NODE\n1, 0., 0.\n2, 1., 0.\n3, 1., 1.\n4, 0., 1.\n101, 0.25, 0.5\n102, 0.75, 0.5\n"
+             "*ELEMENT, TYPE=CPS4, ELSET=HOST\n1, 1, 2, 3, 4\n*ELEMENT, TYPE=T2D2, ELSET=BAR\n11, 101, 102\n"
+             "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*SOLID SECTION, ELSET=HOST, MATERIAL=M\n1.\n"
+             "*SOLID SECTION, ELSET=BAR, MATERIAL=M\n0.01\n*EMBEDDED ELEMENT\nBAR\n*EMBEDDED ELEMENT, EMBED NODES\n"
+             "102\n*STEP\n*STATIC\n*BOUNDARY\n1, 1, 2\n4, 1, 2\n*END STEP\n")
+    body, conv, rep = convert_str(plane)
+    assert sorted(_emb_rows(body)) == [(101, 1), (101, 2), (102, 1), (102, 2)]
+    assert "node(s) 102 also embedded by an earlier *EMBEDDED ELEMENT; kept there" in rep.text()
+    want = {1: 0.375, 2: 0.125, 3: 0.125, 4: 0.375}
+    assert all(abs(c + want[m]) < 1e-12 for m, c in _emb_rows(body)[(101, 1)].items())
+
+
+def test_embedded_element_in_an_assembly():
+    # assembly level (instance-qualified sets) and part level: the instances' node numbers
+    part = ("*PART, NAME=P\n" + _emb().split("*MATERIAL")[0] + "*SOLID SECTION, ELSET=HOST, MATERIAL=M\n"
+            "*SOLID SECTION, ELSET=BAR, MATERIAL=M\n0.01\n{EMB}*END PART\n")
+    tail = ("*ASSEMBLY, NAME=A\n*INSTANCE, NAME=I1, PART=P\n*END INSTANCE\n*INSTANCE, NAME=I2, PART=P\n"
+            "1., 0., 0.\n*END INSTANCE\n{ASM}*END ASSEMBLY\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n")
+    for emb, asm in (("", "*EMBEDDED ELEMENT, HOST ELSET=I2.HOST\nI2.BAR\n"),
+                     ("*EMBEDDED ELEMENT, HOST ELSET=HOST\nBAR\n", "")):
+        body, conv, rep = convert_str(part.format(EMB=emb) + tail.format(ASM=asm))
+        rows = _emb_rows(body)
+        off = conv.report.instances[1]["node_offset"]
+        assert (101 + off, 1) in rows and set(rows[(101 + off, 1)]) <= {n + off for n in range(1, 9)}
+        assert not conv.reduced_physics
+
+
+def test_embedded_element_on_transformed_nodes_ties_global_translations():
+    # Abaqus ties the global displacements; ccx reads a transformed node's terms in its local axes
+    deck = _emb().replace("*STEP", "*NSET, NSET=T\n2, 102\n*TRANSFORM, NSET=T\n0.6, 0.8, 0., -0.8, 0.6, 0.\n"
+                                   "*STEP")
+    body, conv, rep = convert_str(deck)
+    rows = _emb_rows(body)
+    twin = conv._twins[2]                                       # u_twin = u_2: node 2's DOFs eliminated
+    assert sorted(rows) == [(2, 1), (2, 2), (2, 3), (101, 1), (101, 2), (101, 3), (102, 1), (102, 2), (102, 3)]
+    assert twin in rows[(101, 1)] and 2 not in rows[(101, 1)]      # host node 2 through its twin
+    # node 102 has node 2's axes: its rows along them take node 2's local DOFs as they are
+    assert 2 in rows[(102, 1)] and twin not in rows[(102, 1)] and not conv.reduced_physics
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

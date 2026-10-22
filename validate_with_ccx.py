@@ -7424,6 +7424,209 @@ def shell_tie_deck(kind, typ="S4"):
     raise ValueError(kind)
 
 
+_EMB_EDGES = {"hex": ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6),
+                      (3, 7)),
+              "tet": ((0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)),
+              "wedge": ((0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3), (0, 3), (1, 4), (2, 5)),
+              "quad": ((0, 1), (1, 2), (2, 3), (3, 0)), "tri": ((0, 1), (1, 2), (2, 0))}
+
+
+def embed_host_mesh(typ, n, size, warp=0.0, bend=0.0, origin=(0.0, 0.0, 0.0)):
+    """Nodes {id: (x, y, z)} and elements {id: nodes} of a box ``size`` (two sizes: a plane in z =
+    0) meshed ``n`` bricks (squares) of host type ``typ``: each brick a C3D8 / C3D20, 6
+    tetrahedra or 2 wedges, each square a quadrilateral or 2 triangles, with the midside nodes of
+    a quadratic type.  ``warp`` moves the inner corner nodes, ``bend`` the inner midside nodes
+    (curved edges), by fractions of a cell."""
+    kind, nn = A.embed_host_shape(typ)
+    dim = len(n)
+    nid = {}
+    nodes = {}
+    for idx in itertools.product(*[range(k + 1) for k in reversed(n)]):
+        idx = idx[::-1]
+        p = [origin[k] + size[k] * idx[k] / n[k] for k in range(dim)]
+        if warp and all(0 < idx[k] < n[k] for k in range(dim)):
+            p = [p[k] + warp * size[k] / n[k] * ((sum(idx) * (7, 3, 5)[k] + idx[k]) % 5 - 2) / 4 for k in range(dim)]
+        nid[idx] = len(nodes) + 1
+        nodes[nid[idx]] = tuple(p) + (0.0,) * (3 - dim)
+    corners = []
+    for idx in itertools.product(*[range(k) for k in n]):
+        def at(*d):
+            return nid[tuple(i + j for i, j in zip(idx, d))]
+        if dim == 3:
+            c = [at(0, 0, 0), at(1, 0, 0), at(1, 1, 0), at(0, 1, 0), at(0, 0, 1), at(1, 0, 1), at(1, 1, 1), at(0, 1, 1)]
+            if kind == "tet":           # around the diagonal 0-6: a conforming split
+                corners += [[c[0], c[a], c[b], c[6]] for a, b in ((1, 2), (2, 3), (3, 7), (7, 4), (4, 5), (5, 1))]
+            elif kind == "wedge":
+                corners += [[c[0], c[1], c[2], c[4], c[5], c[6]], [c[0], c[2], c[3], c[4], c[6], c[7]]]
+            else:
+                corners.append(c)
+        else:
+            c = [at(0, 0), at(1, 0), at(1, 1), at(0, 1)]
+            corners += [[c[0], c[1], c[2]], [c[0], c[2], c[3]]] if kind == "tri" else [c]
+    mids = {}
+    elements = {}
+    for e, c in enumerate(corners, 1):
+        conn = list(c)
+        for a, b in (_EMB_EDGES[kind] if nn > len(c) else ()):
+            key = tuple(sorted((c[a], c[b])))
+            if key not in mids:
+                mids[key] = max(nodes) + 1
+                m = [0.5 * (u + v) for u, v in zip(nodes[c[a]], nodes[c[b]])]
+                if bend and all(origin[k] + 1e-9 < m[k] < origin[k] + size[k] - 1e-9 for k in range(dim)):
+                    m = [m[k] + bend * size[k] / n[k] * 0.1 * ((mids[key] * (7, 3, 11)[k]) % 5 - 2) for k in range(dim)] + \
+                        m[dim:]
+                nodes[mids[key]] = tuple(m)
+            conn.append(mids[key])
+        elements[e] = conn
+    return nodes, elements
+
+
+def _emb_lines(nodes, elements, typ, elset):
+    """*NODE and *ELEMENT cards of ``nodes`` / ``elements`` (16 entries a line)."""
+    out = ["*NODE"] + [f"{k}, {x!r}, {y!r}, {z!r}" for k, (x, y, z) in nodes.items()]
+    out.append(f"*ELEMENT, TYPE={typ}, ELSET={elset}")
+    for e, c in elements.items():
+        f = [str(e)] + [str(m) for m in c]
+        out += [", ".join(f[i:i + 16]) + ("," if i + 16 < len(f) else "") for i in range(0, len(f), 16)]
+    return out
+
+
+def _emb_set(name, ids):
+    return [f"*NSET, NSET={name}"] + [", ".join(map(str, ids[i:i + 16])) for i in range(0, len(ids), 16)]
+
+
+EMB_FIELD = ((0.002, 0.001, -0.0005), (0.0003, -0.001, 0.0008), (0.0006, 0.0002, 0.0015))
+EMB_SHIFT = (0.01, -0.02, 0.005)
+
+
+def embedded_bar_deck(kind, typ, emb="T3D2", proc="static"):
+    """Decks of task 141: *EMBEDDED ELEMENT as host-interpolation *EQUATIONs.
+
+    * embedded / merged: a beam of host elements ``typ`` (4 x 2 x 2 on 4 x 1 x 1; a plane one 4
+      x 2 on 4 x 1), fixed at x = 0 and loaded at its far end and on the bar, with a bar
+      ``emb`` (T3D2, B31, T2D2) along the mid line of corner nodes: embedded with nodes of its
+      own there, or on the host's nodes (``proc`` "frequency": the first six modes instead);
+      sheet / sheet_merged: an ``emb`` (S4, M3D4, C3D8) layer in z = 1 of a 4 x 2 x 2 box on 4 x 2 x 2;
+    * affine: distorted, curved hosts on 3 x 2 x 2 (3 x 2), a bar ``emb`` from (0.13, 0.27,
+      0.41) to (2.83, 1.61, 1.77) through them (off their nodes), every host node prescribed
+      u = EMB_SHIFT + EMB_FIELD X (the bar's nodes follow it exactly, its stress E t.B.t);
+      turn: the same under NLGEOM with u = (R - I) X, R 1 rad about (1, 1, 1) (2-D: about z):
+      the bar turns unstrained;
+    * coarse / fine (bare: without the bar): a C3D20 cantilever 10 x 1 x 1 under its weight,
+      a steel bar off its nodes at y = z = 0.25 in 10 x 2 x 2 elements, on them in 20 x 4 x 4."""
+    plane = typ.startswith(("CPS", "CPE", "CAX"))
+    out = ["*HEADING", f"task 141 {kind} {typ} {emb}"]
+    mats = ["*MATERIAL, NAME=CONC", "*ELASTIC", "30000., 0.2", "*DENSITY", "2.4e-9",
+            "*MATERIAL, NAME=STEEL", "*ELASTIC", "210000., 0.3", "*DENSITY", "7.8e-9"]
+    thick = ["0.5"] if typ.startswith(("CPS", "CPE")) else []
+
+    def bar_section(name="BAR"):
+        if emb.startswith("T"):
+            return [f"*SOLID SECTION, ELSET={name}, MATERIAL=STEEL", "0.02"]
+        if emb.startswith("B"):
+            return [f"*BEAM SECTION, ELSET={name}, MATERIAL=STEEL, SECTION=RECT", "0.1, 0.15"] + \
+                ([] if emb == "B21" else ["0., 1., 0."])
+        if emb.startswith("S"):
+            return [f"*SHELL SECTION, ELSET={name}, MATERIAL=STEEL", "0.05"]
+        if emb.startswith("M"):
+            return [f"*MEMBRANE SECTION, ELSET={name}, MATERIAL=STEEL", "0.05"]
+        return [f"*SOLID SECTION, ELSET={name}, MATERIAL=STEEL"]
+    if kind in ("embedded", "merged", "sheet", "sheet_merged"):
+        sheet = kind.startswith("sheet")
+        nodes, els = embed_host_mesh(typ, (4, 2) if plane else (4, 2, 2), (4.0, 1.0) if plane else
+                                     (4.0, 2.0 if sheet else 1.0, 2.0 if sheet else 1.0))
+        out += _emb_lines(nodes, els, typ, "HOST")
+        if sheet:                         # the z = 1 grid of corner nodes (C3D8: also z = 2)
+            grid = {(round(x), round(y), round(z)): k for k, (x, y, z) in nodes.items()
+                    if all(abs(c - round(c)) < 1e-9 for c in (x, y, z)) and z >= 1.0}
+            if emb != "C3D8":
+                grid = {k: v for k, v in grid.items() if k[2] == 1}
+        else:
+            yb, zb = 0.5, 0.0 if plane else 0.5
+            grid = {(round(x), 0, 0): k for k, (x, y, z) in nodes.items()
+                    if abs(x - round(x)) < 1e-9 and abs(y - yb) < 1e-9 and abs(z - zb) < 1e-9}
+        if kind in ("embedded", "sheet"):
+            own = {key: 5000 + i for i, key in enumerate(sorted(grid))}
+            out += ["*NODE"] + [f"{own[key]}, {nodes[grid[key]][0]!r}, {nodes[grid[key]][1]!r}, "
+                                f"{nodes[grid[key]][2]!r}" for key in sorted(grid)]
+            grid = own
+        if not sheet:
+            line = [grid[key] for key in sorted(grid)]
+            out += [f"*ELEMENT, TYPE={emb}, ELSET=BAR"] + [f"{9000 + i}, {a}, {b}" for i, (a, b) in
+                                                           enumerate(zip(line, line[1:]))]
+        elif emb == "C3D8":
+            g = grid
+            out += ["*ELEMENT, TYPE=C3D8, ELSET=BAR"] + [
+                f"{9000 + 2 * i + j}, {g[(i, j, 1)]}, {g[(i + 1, j, 1)]}, {g[(i + 1, j + 1, 1)]}, {g[(i, j + 1, 1)]}, "
+                f"{g[(i, j, 2)]}, {g[(i + 1, j, 2)]}, {g[(i + 1, j + 1, 2)]}, {g[(i, j + 1, 2)]}"
+                for i in range(4) for j in range(2)]
+        else:
+            g = grid
+            out += [f"*ELEMENT, TYPE={emb}, ELSET=BAR"] + [
+                f"{9000 + 2 * i + j}, {g[(i, j, 1)]}, {g[(i + 1, j, 1)]}, {g[(i + 1, j + 1, 1)]}, {g[(i, j + 1, 1)]}"
+                for i in range(4) for j in range(2)]
+        out += ["*SOLID SECTION, ELSET=HOST, MATERIAL=CONC"] + thick + bar_section() + mats
+        if kind in ("embedded", "sheet"):
+            out += ["*EMBEDDED ELEMENT, HOST ELSET=HOST", "BAR"]
+        fix = [k for k, p in nodes.items() if p[0] == 0.0]
+        tip = sorted(k for k, p in nodes.items() if p[0] == 4.0)
+        own = sorted(grid.values())
+        out += _emb_set("FIX", fix) + _emb_set("TIP", tip) + _emb_set("BARN", own)
+        if proc == "frequency":
+            return "\n".join(out + ["*STEP", "*FREQUENCY", "6", "*BOUNDARY", "FIX, 1, 3", "*END STEP"]) + "\n"
+        out += ["*STEP", "*STATIC", "*BOUNDARY", f"FIX, 1, {2 if plane else 3}", "*CLOAD",
+                f"{tip[0]}, 2, -20.", f"{tip[-1]}, 1, 15."]
+        loaded = [grid[k] for k in sorted(grid)]
+        out += [f"{loaded[2]}, 2, 30.", f"{loaded[1]}, 1, -20."] + ([] if plane else [f"{loaded[3]}, 3, 25."])
+        return "\n".join(out + ["*NODE PRINT, NSET=BARN", "U", "*NODE PRINT, NSET=TIP", "U", "*END STEP"]) + "\n"
+    if kind in ("affine", "turn"):
+        dim = 2 if plane else 3
+        nodes, els = embed_host_mesh(typ, (3, 2, 2)[:dim], (3.0, 2.0, 2.0)[:dim], warp=0.6,
+                                     bend=0.2 if typ.startswith("C3D10") else 0.4,
+                                     origin=(1.0, 0.0, 0.0) if typ.startswith("CAX") else (0.0, 0.0, 0.0))
+        a, b = (0.13, 0.27, 0.41), (2.83, 1.61, 1.77)
+        if plane:
+            a, b = (a[0] + (1 if typ.startswith("CAX") else 0), a[1], 0.0), (b[0] + (1 if typ.startswith("CAX") else 0), b[1], 0.0)
+        bar = {7000 + i: tuple(u + (v - u) * i / 6 for u, v in zip(a, b)) for i in range(7)}
+        out += _emb_lines(nodes, els, typ, "HOST") + ["*NODE"] + [f"{k}, {x!r}, {y!r}, {z!r}" for k, (x, y, z) in bar.items()]
+        out += [f"*ELEMENT, TYPE={emb}, ELSET=BAR"] + [f"{9000 + i}, {7000 + i}, {7001 + i}" for i in range(6)]
+        out += ["*SOLID SECTION, ELSET=HOST, MATERIAL=CONC"] + thick + bar_section() + mats + \
+            ["*EMBEDDED ELEMENT, HOST ELSET=HOST", "BAR"] + _emb_set("BARN", sorted(bar))
+        out += ["*STEP" + (", NLGEOM" if kind == "turn" else ""), "*STATIC", "1., 1.", "*BOUNDARY"]
+        for k, x in nodes.items():
+            u = embedded_field(kind, x, dim)
+            out += [f"{k}, {i + 1}, {i + 1}, {u[i]!r}" for i in range(dim)]
+        return "\n".join(out + ["*NODE PRINT, NSET=BARN", "U", "*EL PRINT, ELSET=BAR", "S", "*END STEP"]) + "\n"
+    fine = kind.startswith("fine")
+    n = (20, 4, 4) if fine else (10, 2, 2)
+    nodes, els = embed_host_mesh("C3D20", n, (10.0, 1.0, 1.0))
+    out += _emb_lines(nodes, els, "C3D20", "HOST")
+    if fine:
+        line = sorted((k for k, (x, y, z) in nodes.items() if abs(y - 0.25) < 1e-9 and abs(z - 0.25) < 1e-9 and
+                       abs(x * 2 - round(x * 2)) < 1e-9), key=lambda k: nodes[k][0])
+    else:
+        line = [5000 + i for i in range(21)]
+        out += ["*NODE"] + [f"{5000 + i}, {0.5 * i}, 0.25, 0.25" for i in range(21)]
+    if not kind.endswith("bare"):
+        out += ["*ELEMENT, TYPE=T3D2, ELSET=BAR"] + [f"{90000 + i}, {a}, {b}" for i, (a, b) in enumerate(zip(line, line[1:]))]
+        out += ["*SOLID SECTION, ELSET=BAR, MATERIAL=STEEL", "0.02"] + \
+            ([] if fine else ["*EMBEDDED ELEMENT, HOST ELSET=HOST", "BAR"])
+    out += ["*SOLID SECTION, ELSET=HOST, MATERIAL=CONC"] + mats
+    out += _emb_set("FIX", [k for k, p in nodes.items() if p[0] == 0.0])
+    out += _emb_set("TIP", sorted(k for k, p in nodes.items() if p[0] == 10.0))
+    return "\n".join(out + ["*STEP", "*STATIC", "*BOUNDARY", "FIX, 1, 3", "*DLOAD", "HOST, GRAV, 9810., 0., 0., -1.",
+                            "*NODE PRINT, NSET=TIP", "U", "*END STEP"]) + "\n"
+
+
+def embedded_field(kind, x, dim):
+    """The displacement embedded_bar_deck prescribes at ``x``: affine, EMB_SHIFT + EMB_FIELD x;
+    turn, (R - I) x for R 1 rad about (1, 1, 1) (2-D: about z)."""
+    if kind == "affine":
+        return [EMB_SHIFT[i] + sum(EMB_FIELD[i][j] * x[j] for j in range(dim)) for i in range(dim)]
+    axis = _unit((1.0, 1.0, 1.0)) if dim == 3 else (0.0, 0.0, 1.0)
+    return [a - b for a, b in zip(_rotate(tuple(x), axis, 1.0), x)][:dim]
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -15730,6 +15933,147 @@ def main():
                   f"S8R, its far edge's {what}): the edge's midside node at {mid:.7g} (0.05, the "
                   f"mean; before: {before}), every node as the twin's whose card gives both ends "
                   f"({err:.1e} apart; free nodes moved up to {moved:.4g})")
+        failures += 0 if ok else 1
+
+    # --- task 141: *EMBEDDED ELEMENT as host-interpolation *EQUATIONs ------------------------
+    def t141_run(tag, deck):
+        """(the .dat's displacement blocks, its last stress table, the converted deck's node
+        coordinates, the report text, the eigenfrequencies) of ``deck`` converted (no reduced
+        physics) and solved, or None (FAIL printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        res = None
+        if status == "solved":
+            coords, card = {}, False
+            for ln in open(inp, encoding="utf-8"):
+                if ln.startswith("*"):
+                    card = ln.strip().upper() == "*NODE"
+                elif card and not ln.startswith("**"):
+                    f = ln.split(",")
+                    coords[int(f[0])] = tuple(float(x) for x in f[1:4])
+            res = (dat_node_blocks(dat), (dat_tables(dat, "stresses") or [[]])[-1], coords, rep.text(),
+                   dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T"))
+        shutil.rmtree(d, ignore_errors=True)
+        if res is None or conv.reduced_physics:
+            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if res is None else
+                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return res
+
+    def t141_by_place(res):
+        """{rounded coordinates: displacement} of every node printed in the last blocks of ``res``."""
+        return {tuple(round(c, 6) for c in res[2][k]): v for blk in res[0][-2:] for k, v in blk.items()}
+    twins = [("embedded", t, "T3D2", "") for t in ("C3D8", "C3D20", "C3D4", "C3D10", "C3D6", "C3D15")] + \
+        [("embedded", "C3D20", "B31", ""), ("embedded", "CPE4", "T2D2", ""), ("embedded", "CPS8", "T2D2", ""),
+         ("embedded", "CPS3", "T2D2", ""), ("sheet", "C3D8", "S4", ""), ("sheet", "C3D10", "M3D4", ""),
+         ("sheet", "C3D8", "C3D8", ""), ("embedded", "C3D10", "T3D2", "frequency")]
+    for kind, typ, emb, proc in twins:
+        tag = f"t141_{kind}_{typ}_{emb}" + (f"_{proc}" if proc else "")
+        runs = [t141_run(tag, embedded_bar_deck(kind, typ, emb, proc or "static")),
+                t141_run(tag + "_ref", embedded_bar_deck("merged" if kind == "embedded" else "sheet_merged",
+                                                         typ, emb, proc or "static"))]
+        ok = all(runs)
+        if ok and proc:
+            got, want = runs[0][4], runs[1][4]
+            err = max(abs(ccx_ratio(a, b) - 1) for a, b in zip(got, want)) if len(got) == len(want) == 6 else math.inf
+            ok = err <= 1e-9 and want[0] > 1.0
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a T3D2 bar embedded in a {typ} beam at its own nodes on the "
+                  f"host's): the first six frequencies as the bar on the host's nodes ({err:.1e} apart; "
+                  f"f1 {want[0]:.6g})")
+        elif ok:
+            a, b = t141_by_place(runs[0]), t141_by_place(runs[1])
+            err = max(abs(x - y) for p, v in b.items() for x, y in zip(a.get(p, [math.inf] * 3), v))
+            moved = max(abs(x) for v in b.values() for x in v)
+            ok = err <= 1e-9 * moved and moved > 1e-4 and len(a) == len(b) > 6
+            part = "layer" if kind == "sheet" else "bar"
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a{'n' if emb[0] in 'SM' else ''} {emb} {part} embedded "
+                  f"in {typ} hosts at nodes of its own on the host's, loaded on it and the host): the {part} "
+                  f"and the host's end as the merged mesh ({err:.1e} apart; |u| {moved:.6g}; before: "
+                  f"commented out, the {part} loose)")
+        failures += 0 if ok else 1
+    for kind, typ, emb in [("affine", t, "T3D2") for t in ("C3D8", "C3D20", "C3D4", "C3D10", "C3D6", "C3D15")] + \
+            [("affine", t, "T2D2") for t in ("CPS4", "CPS8", "CPE3", "CPE6")] + \
+            [("turn", t, "B31") for t in ("C3D8", "C3D20", "C3D10", "C3D15")] + [("turn", "CPS8", "T2D2")]:
+        tag = f"t141_{kind}_{typ}_{emb}"
+        res = t141_run(tag, embedded_bar_deck(kind, typ, emb))
+        ok = res is not None
+        if ok:
+            dim = 2 if typ.startswith("CP") else 3
+            disp, coords = res[0][-1], res[2]
+            want = {k: embedded_field(kind, coords[k], dim) for k in range(7000, 7007)}
+            err = max(abs(x - y) for k, w in want.items() for x, y in zip(disp.get(k, [math.inf] * 3), w))
+            scale = max(abs(x) for w in want.values() for x in w)
+            t = _unit([b - a for a, b in zip(coords[7000], coords[7006])])
+            # (ccx's *EL PRINT S row: element, point, xx, yy, zz, xy, xz, yz)
+            axial = [sum(t[i] * ((r[2], r[5], r[6]), (r[5], r[3], r[7]), (r[6], r[7], r[4]))[i][j] * t[j]
+                         for i in range(3) for j in range(3)) for r in res[1] if len(r) == 8]
+            if kind == "affine":
+                sig = 210000.0 * sum(t[i] * EMB_FIELD[i][j] * t[j] for i in range(dim) for j in range(dim))
+                serr = max(abs(x - sig) for x in axial) if axial else math.inf
+                ok = err <= 1e-6 * scale and serr <= 1e-6 * abs(sig) and abs(sig) > 100.0
+                what = f"the bar's stress {sig:.6g} = E t.B.t to {serr:.1e}"
+            else:
+                serr = max(abs(x) for r in res[1] if len(r) == 8 for x in r[2:]) if res[1] else math.inf
+                ok = err <= 1e-6 * scale and serr <= 1e-6 * 210000.0 and scale > 0.5
+                what = f"its largest stress {serr:.1e} (E 210000)"
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a {emb} bar through distorted, curved {typ} hosts off "
+                  f"their nodes, every host node prescribed {'an affine field' if kind == 'affine' else 'a 1 rad turn under NLGEOM'}): "
+                  f"the bar's nodes at the field of their place ({err:.1e} apart; |u| {scale:.4g}), {what}")
+        failures += 0 if ok else 1
+    # an off-node bar in a coarse mesh vs the bar on the nodes of a fine one: its stiffening
+    tips = {}
+    for kind in ("coarse", "coarse_bare", "fine", "fine_bare"):
+        res = t141_run(f"t141_{kind}", embedded_bar_deck(kind, "C3D20"))
+        tips[kind] = sum(v[2] for v in res[0][-1].values()) / len(res[0][-1]) if res else None
+    ok = all(v is not None for v in tips.values())
+    if ok:
+        rc, rf = tips["coarse"] / tips["coarse_bare"], tips["fine"] / tips["fine_bare"]
+        ok = abs(rc - rf) <= 1e-3 and rf < 0.95
+        print(f"{'PASS' if ok else 'FAIL'}  t141_coarse (a C3D20 cantilever under its weight, a steel bar at "
+              f"y = z = 0.25 embedded off the nodes of 10 x 2 x 2 elements, vs on the nodes of 20 x 4 x 4): the "
+              f"bar's stiffening, tip deflection with / without it, {rc:.5f} vs {rf:.5f} ({abs(rc - rf):.1e} apart)")
+    failures += 0 if ok else 1
+    # Abaqus' rules: a BC on an embedded node neglected, a node just outside moved onto the host, a
+    # point load on an embedded point (EMBED NODES) = its consistent loads, transformed nodes
+    base = embedded_bar_deck("embedded", "C3D8", "T3D2")
+    step = base.index("*NODE PRINT")
+    point = base.replace("*EMBEDDED ELEMENT, HOST ELSET=HOST\nBAR\n", "*EMBEDDED ELEMENT, HOST ELSET=HOST\nBAR\n"
+                         "*NODE\n7000, 1.3, 0.35, 0.7\n*EMBEDDED ELEMENT, EMBED NODES\n7000\n")
+    xi, eta, zeta = 0.3, 0.7, 0.4                      # its place in the cell x 1-2, y 0-0.5, z 0.5-1
+    host = embed_host_mesh("C3D8", (4, 2, 2), (4.0, 1.0, 1.0))[0]
+    cell = {k: p for k, p in host.items() if 1.0 <= p[0] <= 2.0 and p[1] <= 0.5 and p[2] >= 0.5}
+    consistent = "".join(f"{k}, 1, {3.0 * w!r}\n{k}, 3, {-4.0 * w!r}\n" for k, p in cell.items() for w in [
+        (xi if p[0] == 2.0 else 1 - xi) * (eta if p[1] == 0.5 else 1 - eta) * (zeta if p[2] == 1.0 else 1 - zeta)])
+    rules = (("bc", base[:step] + "*BOUNDARY\n5002, 1, 3, 0.01\n" + base[step:], base,
+              "*BOUNDARY on a bar node, neglected (Abaqus: the embedding takes precedence)", "taken off"),
+             ("outside", base.replace("5004, 4.0, 0.5, 0.5", "5004, 4.03, 0.5, 0.5"), base,
+              "the bar's end 0.03 beyond the host's end (within Abaqus' tolerance, 0.0315), moved onto it",
+              "moved onto their host"),
+             ("point", point[:step + point.index("*NODE PRINT") - base.index("*NODE PRINT")] +
+              "*CLOAD\n7000, 1, 3.\n7000, 3, -4.\n" + point[point.index("*NODE PRINT"):],
+              base[:step] + "*CLOAD\n" + consistent + base[step:],
+              "a loaded point embedded by EMBED NODES, vs its trilinear consistent loads", "EQUATIONs"),
+             ("transform", base.replace("*STEP", "*NSET, NSET=TR\n7, 12, 5000, 5004\n*TRANSFORM, NSET=TR\n"
+                                                 "0.6, 0.8, 0., -0.8, 0.6, 0.\n*STEP", 1).replace(
+                 "*NSET, NSET=BARN\n5000, 5001, 5002, 5003, 5004", "*NSET, NSET=BARN\n5001, 5002, 5003"), base,
+              "a *TRANSFORM on host and bar nodes (none loaded or held; ccx prints those in their axes)",
+              "EQUATIONs"))
+    for kind, deck, ref, what, said in rules:
+        runs = [t141_run(f"t141_rule_{kind}", deck), t141_run(f"t141_rule_{kind}_ref", ref)]
+        ok = all(runs)
+        if ok:
+            a, b = t141_by_place(runs[0]), t141_by_place(runs[1])
+            common = [p for p in b if p in a]
+            err = max(abs(x - y) for p in common for x, y in zip(a[p], b[p]))
+            moved = max(abs(x) for v in b.values() for x in v)
+            ok = err <= 1e-9 * moved and moved > 1e-4 and len(common) >= len(b) - 2 and said in runs[0][3]
+            print(f"{'PASS' if ok else 'FAIL'}  t141_rule_{kind} ({what}): as its twin ({err:.1e} apart at "
+                  f"{len(common)} nodes; |u| {moved:.6g})")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

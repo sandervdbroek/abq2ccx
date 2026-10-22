@@ -416,6 +416,12 @@ TRANSLATED = {
         "reference point → its `ROT NODE`'s DOFs 1-3 (ccx ignores DOFs 4-6 of the REF NODE); an "
         "equation with a term on DOFs 4-6 of any other node with a `*TRANSFORM` is commented out "
         "(ccx 2.23 misreads such terms). Each equation of a card is resolved on its own.",
+    "*EMBEDDED ELEMENT": "→ `*EQUATION`s: each embedded node's translations are its host element's "
+        "interpolation at the node's natural coordinates (rotations, temperatures free), exact under "
+        "`NLGEOM` too; Abaqus' rules for `HOST ELSET`, `EMBED NODES`, nodes shared with hosts, the "
+        "exterior and roundoff tolerances (nodes moved onto their host) and `PARTIAL EMBED`; a BC on "
+        "an embedded node's translations is taken off, as Abaqus neglects it. Proved by "
+        "`validate_with_ccx.py` (`t141_*`: merged-node twins, prescribed affine fields and turns).",
     "*KINEMATIC COUPLING": "node-surface `*COUPLING` + `*KINEMATIC` per set of coupled DOFs, a "
         "member's lines joined (ccx 2.23 exits on two couplings of one node; the reference node's "
         "DOFs 4-6 then take BCs and moments natively); rotation lines on shell/beam nodes "

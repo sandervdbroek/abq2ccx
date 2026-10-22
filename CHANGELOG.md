@@ -63,6 +63,18 @@ physics.
   expanded 3-D model: both flagged as reduced physics. The six corpus decks with such a step
   now write their matrices; the solve judge has a "matrices" verdict for this run, which exits
   without "Job finished".
+* **`*EMBEDDED ELEMENT`** — rebar, fibres and other embedded elements were commented out (the
+  embedded mesh hung loose). Each embedded node's translations are now tied by `*EQUATION`s to
+  its host element's interpolation at the node's natural coordinates, as Abaqus constrains them
+  (rotations and temperatures stay free): exact, under `NLGEOM` too. Hosts of every continuum
+  type the converter writes (`C3D4/6/8/10/15/20`, plane and axisymmetric elements; a modified
+  tetrahedron by its corners), from `HOST ELSET` or the whole model; `EMBED NODES`; nodes shared
+  with a host are not embedded; a node outside its host within the exterior tolerance
+  (`EXTERIOR TOLERANCE`, `ABSOLUTE EXTERIOR TOLERANCE`) is moved onto it, and weights below
+  `ROUNDOFF TOLERANCE` are zeroed, as Abaqus does; a node farther out is warned unless `PARTIAL
+  EMBED=YES`. A BC on an embedded node's translations is taken off, as Abaqus neglects it. Part,
+  instance and assembly level. An embedded bar on its own nodes matches the merged mesh exactly;
+  under a prescribed affine field or a 1 rad turn its nodes and stress are exact.
 * **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the

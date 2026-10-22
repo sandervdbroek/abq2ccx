@@ -929,18 +929,21 @@ KEYWORD_ALIASES = {"AMP": "AMPLITUDE"}
 # The multi-word parameter names the converter reads.  Abaqus (like ccx) ignores blanks in
 # parameter names, so parse_keyword_line maps ``REFNODE=`` / ``POSITIONTOLERANCE=`` to these.
 MULTIWORD_PARAMS = (
+    "ABSOLUTE EXTERIOR TOLERANCE",
     "ANALYTICAL SURFACE", "CHANGE NUMBER", "CONSTANT RESULTANT", "CONSTRAINT NAME",
     "CONTACT ELEMENTS", "CONVERSION CRITERION", "CYCLIC SYMMETRY", "DAMPING PROJECTION",
     "DIRECT USER CONTROL", "DISTORTION CONTROL", "DRILL STIFFNESS", "ELEMENT BY ELEMENT",
     "ELEMENT CONVERSION", "ELEMENT DELETION",
-    "ELEMENT SHIFT", "EXPONENTIAL DECAY", "FILLET RADIUS", "FIXED INTERVAL", "FRICTION DAMPING",
+    "ELEMENT SHIFT", "EMBED NODES", "EXPONENTIAL DECAY", "EXTERIOR TOLERANCE",
+    "FILLET RADIUS", "FIXED INTERVAL", "FRICTION DAMPING", "HOST ELSET",
     "HYBRID FORMULATION", "IMPROVED DT METHOD", "INFLUENCE RADIUS", "INITIAL GAP OPENING",
     "KINEMATIC SPLIT", "LAST ITERATIONS", "LAST MODE", "LENGTH RATIO", "LOAD CASE", "MAX DEGRADATION",
     "MEMBRANE THICKNESS", "MODE LIST", "NEO HOOKE", "NEW SET", "NO ROTATION", "NO SEPARATION",
     "NO THICKNESS", "NODAL THICKNESS", "NUMBER INTERVAL", "OLD SET", "OUTPUT ALL",
-    "PARTICLE THICKNESS", "PIN NSET", "POSITION TOLERANCE", "PROPERTY EVALUATION", "PUBLIC NODES",
-    "RAMP INITIAL STRESS",
-    "REDUCED POLYNOMIAL", "REF NODE", "RELATIVE TO ABSOLUTE", "ROT NODE", "SCALE FACTOR",
+    "PARTIAL EMBED", "PARTICLE THICKNESS", "PIN NSET", "POSITION TOLERANCE", "PROPERTY EVALUATION",
+    "PUBLIC NODES", "RAMP INITIAL STRESS",
+    "REDUCED POLYNOMIAL", "REF NODE", "RELATIVE TO ABSOLUTE", "ROT NODE", "ROUNDOFF TOLERANCE",
+    "SCALE FACTOR",
     "SCALE STRESS", "SECOND ORDER ACCURACY", "SECTION FORCES", "SECTION POINTS", "SHELL THICKNESS",
     "SHIFT NODES", "SHOCK SMOOTHING", "SMALL SLIDING", "SOLID INFINITE FORMULATION",
     "SPH FORMULATION", "SPH SMOOTHING LENGTH", "SPH TENSILE INSTABILITY CONTROL",
@@ -4011,8 +4014,6 @@ SPECIAL_UNSUPPORTED = {
                                    "*SURFACE INTERACTION via *CONTACT PAIR, INTERACTION= instead.",
     "LATENT HEAT": "ccx has no *LATENT HEAT; approximate with an apparent *SPECIFIC HEAT peak "
                    "cp + L/(Tliq-Tsol) over the melting interval.",
-    "EMBEDDED ELEMENT": "no ccx equivalent; mesh the reinforcement conformally or tie the "
-                        "embedded nodes with *EQUATION constraints.",
     # Newer Abaqus keywords (2024/2025) with no ccx equivalent (calculix/new_keywords#4).
     "ALLOWABLE STRESS": "Abaqus 2024 optimisation stress limit; ccx has no equivalent — express a "
                         "stress constraint via *DESIGN RESPONSE/*CONSTRAINT in a *SENSITIVITY run.",
@@ -4852,6 +4853,158 @@ def _solid_shape(n: int, x: float, y: float, z: float) -> List[float]:
         [l * ((2 * l - 1) * (1 + z) - (1 - z * z)) / 2 for l in L] + \
         [2 * L[i] * L[j] * (1 - z) for i, j in edges] + [2 * L[i] * L[j] * (1 + z) for i, j in edges] + \
         [l * (1 - z * z) for l in L]
+
+
+# *EMBEDDED ELEMENT hosts (Converter._plan_embedded): the natural-coordinate domain of each
+# element family as linear constraints A xi <= b, and its centre
+EMBED_DOMAINS: Dict[str, Tuple[Tuple[Tuple[float, ...], ...], Tuple[float, ...], Tuple[float, ...]]] = {
+    "hex": (((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)), (1, 1, 1, 1, 1, 1),
+            (0.0, 0.0, 0.0)),
+    "tet": (((-1, 0, 0), (0, -1, 0), (0, 0, -1), (1, 1, 1)), (0, 0, 0, 1), (0.25, 0.25, 0.25)),
+    "wedge": (((-1, 0, 0), (0, -1, 0), (1, 1, 0), (0, 0, 1), (0, 0, -1)), (0, 0, 1, 1, 1),
+              (1 / 3, 1 / 3, 0.0)),
+    "quad": (((1, 0), (-1, 0), (0, 1), (0, -1)), (1, 1, 1, 1), (0.0, 0.0)),
+    "tri": (((-1, 0), (0, -1), (1, 1)), (0, 0, 1), (1 / 3, 1 / 3)),
+}
+
+
+def embed_host_shape(typ: str) -> Optional[Tuple[str, int]]:
+    """(family of EMBED_DOMAINS, number of its first nodes interpolated) of an Abaqus element
+    type as an *EMBEDDED ELEMENT host, or None where it cannot be one: hosts are continuum
+    elements with translations only ('Embedded elements': no rotations, no generalized plane
+    strain or twist).  A modified tetrahedron constrains its embedded nodes by its corner
+    nodes only (ibid.)."""
+    t = typ.upper()
+    n = ELEMENT_NNODES.get(t)
+    if t.startswith("C3D") and n in (4, 6, 8, 10, 15, 20):
+        if n == 10 and t.startswith("C3D10M"):
+            return "tet", 4
+        return {4: "tet", 10: "tet", 6: "wedge", 15: "wedge"}.get(n, "hex"), n
+    if t.startswith(("CPS", "CPE", "CAX")) and not t.startswith("CPEG") and n in (3, 4, 6, 8):
+        return ("tri" if n in (3, 6) else "quad"), n
+    return None
+
+
+def embed_weights(kind: str, n: int, xi: Sequence[float]) -> List[float]:
+    """The shape functions of an *EMBEDDED ELEMENT host (embed_host_shape) at ``xi``."""
+    return _solid_shape(n, *xi) if len(xi) == 3 else _shape("area", n, xi[0], xi[1])[0]
+
+
+def small_solve(m: Sequence[Sequence[float]], rhs: Sequence[float]) -> Optional[List[float]]:
+    """x with m x = rhs for a small dense matrix ``m`` (Gaussian elimination, partial
+    pivoting), or None where m is singular."""
+    k = len(rhs)
+    a = [list(map(float, m[i])) + [float(rhs[i])] for i in range(k)]
+    scale = max([abs(x) for r in a for x in r[:k]] or [0.0])
+    for c in range(k):
+        p = max(range(c, k), key=lambda r: abs(a[r][c]))
+        if abs(a[p][c]) <= 1e-13 * scale:
+            return None
+        a[c], a[p] = a[p], a[c]
+        for r in range(c + 1, k):
+            f = a[r][c] / a[c][c]
+            if f:
+                a[r] = [x - f * y for x, y in zip(a[r], a[c])]
+    x = [0.0] * k
+    for c in range(k - 1, -1, -1):
+        x[c] = (a[c][k] - sum(a[c][j] * x[j] for j in range(c + 1, k))) / a[c][c]
+    return x
+
+
+def _embed_map(kind: str, n: int, cols: Sequence[Sequence[float]], xi: Sequence[float]
+               ) -> Tuple[List[float], List[List[float]]]:
+    """X(xi) of a host whose nodes' coordinates are ``cols`` (one sequence per coordinate, as
+    many as the family has) and its Jacobian dX/dxi, by central differences: exact for shape
+    functions of degree 2 or less in each coordinate, as every host family's are."""
+    dim = len(xi)
+
+    def at(q: Sequence[float]) -> List[float]:
+        w = embed_weights(kind, n, q)
+        return [sum(map(operator.mul, w, c)) for c in cols]
+    h = 1e-4
+    jac = [[0.0] * dim for _ in range(dim)]
+    for j in range(dim):
+        hi, lo = list(xi), list(xi)
+        hi[j] += h
+        lo[j] -= h
+        for i, (a, b) in enumerate(zip(at(hi), at(lo))):
+            jac[i][j] = (a - b) / (2 * h)
+    return at(xi), jac
+
+
+def _embed_size(cols: Sequence[Sequence[float]]) -> float:
+    """The diagonal of the box of a host's nodes (coordinate columns ``cols``), 1 if none."""
+    return math.sqrt(sum((max(c) - min(c)) ** 2 for c in cols)) or 1.0
+
+
+def embed_natural(kind: str, n: int, pts: Sequence[Sequence[float]], p: Sequence[float]
+                  ) -> Optional[Tuple[float, ...]]:
+    """The natural coordinates of point ``p`` in a host (embed_host_shape) on nodes ``pts``,
+    by Newton's method — outside the domain too, where the mapping extends — or None where it
+    does not converge.  A tetrahedron's or triangle's start: the volume (area) coordinates of
+    its corners, exact where its edges are straight."""
+    cols = list(zip(*pts))
+    dim = len(cols)
+    size = _embed_size(cols)
+    xi: List[float] = list(EMBED_DOMAINS[kind][2])
+    if kind in ("tet", "tri"):
+        o = pts[0]
+        lin = small_solve([[pts[j + 1][i] - o[i] for j in range(dim)] for i in range(dim)],
+                          [p[i] - o[i] for i in range(dim)])
+        xi = lin if lin is not None else xi
+    for _ in range(30):
+        w = embed_weights(kind, n, xi)
+        r = [pk - sum(map(operator.mul, w, c)) for pk, c in zip(p, cols)]
+        if max(map(abs, r)) <= 1e-13 * size:
+            return tuple(xi)
+        d = small_solve(_embed_map(kind, n, cols, xi)[1], r)
+        if d is None or max(map(abs, xi)) > 1e3:
+            return None
+        xi = [a + b for a, b in zip(xi, d)]
+    return tuple(xi) if math.dist(_embed_map(kind, n, cols, xi)[0], p) <= 1e-9 * size else None
+
+
+def embed_excess(kind: str, xi: Sequence[float]) -> float:
+    """How far natural point ``xi`` lies outside its family's domain (A xi - b at most; 0 or
+    less inside)."""
+    a, b, _ = EMBED_DOMAINS[kind]
+    return max(sum(c * x for c, x in zip(row, xi)) - bi for row, bi in zip(a, b))
+
+
+def embed_nearest(kind: str, n: int, pts: Sequence[Sequence[float]], p: Sequence[float]
+                  ) -> Tuple[Tuple[float, ...], float]:
+    """The point of a host (embed_host_shape) on nodes ``pts`` nearest to ``p``: (its natural
+    coordinates, its distance from p), by Gauss-Newton steps from the domain's centre, each
+    solving the linearised least-squares problem over the domain exactly — the least of the
+    minima on every set of its faces, edges and corners (at most as many constraints as
+    coordinates) that lie in the domain."""
+    a, b, centre = EMBED_DOMAINS[kind]
+    dim = len(centre)
+    xi = list(centre)
+    cols = list(zip(*pts))
+    subsets = [s for k in range(dim + 1) for s in itertools.combinations(range(len(a)), k)]
+    for _ in range(50):
+        x, jac = _embed_map(kind, n, cols, xi)
+        r = [pk - xk for pk, xk in zip(p, x)]
+        jtj = [[sum(jac[k][i] * jac[k][j] for k in range(dim)) for j in range(dim)] for i in range(dim)]
+        jtr = [sum(jac[k][i] * r[k] for k in range(dim)) for i in range(dim)]
+        best: Optional[Tuple[float, List[float]]] = None
+        for s in subsets:
+            kkt = [jtj[i] + [float(a[c][i]) for c in s] for i in range(dim)] + \
+                [[float(v) for v in a[c]] + [0.0] * len(s) for c in s]
+            rhs = jtr + [b[c] - sum(a[c][k] * xi[k] for k in range(dim)) for c in s]
+            sol = small_solve(kkt, rhs)
+            if sol is None or embed_excess(kind, [u + v for u, v in zip(xi, sol)]) > 1e-12:
+                continue
+            f = sum((r[k] - sum(jac[k][j] * sol[j] for j in range(dim))) ** 2 for k in range(dim))
+            if best is None or f < best[0]:
+                best = (f, sol[:dim])
+        if best is None:
+            break
+        xi = [u + v for u, v in zip(xi, best[1])]
+        if max(map(abs, best[1])) <= 1e-14:
+            break
+    return tuple(xi), math.dist(_embed_map(kind, n, cols, xi)[0], p)
 
 
 # ccx 2.23's integration points in its order, the first natural coordinate fastest (probed:
@@ -21690,13 +21843,16 @@ class _Dofs:
 
     def _plan_equation_twins(self, blocks: List[Block]) -> None:
         """The twins (_mpc_twin) of the nodes with a *TRANSFORM whose local translations a
-        deck's *EQUATION holds so that ccx would repeat a global DOF (_ccx_equation_terms),
-        made before the mesh is written."""
+        deck's *EQUATION holds so that ccx would repeat a global DOF (_ccx_equation_terms), or
+        an *EMBEDDED ELEMENT's equations (_embed_eq_rows), made before the mesh is written."""
         if self._transformed:
             for b in blocks:
                 if b.keyword == "EQUATION":
                     for eq in self._expanded_equations(b)[0]:
                         self._ccx_equation_terms(eq, plan=True)
+            for rows in self._embed_rows.values():          # (*EMBEDDED ELEMENT)
+                for n, ws, dofs in rows:
+                    self._embed_eq_rows(n, ws, dofs, plan=True)
 
     def _ccx_equation_terms(self, eq: Sequence[Tuple[str, str, str]], plan: bool = False
                             ) -> Optional[Tuple[List[Tuple[str, str, str]], bool, bool]]:
@@ -22550,6 +22706,329 @@ class _Constraints:
                 out.append([(str(nodes[i] if len(nodes) > 1 else nodes[0]), dof, coef)
                             for nodes, dof, coef in resolved])
         return out, ""
+
+    # -- *EMBEDDED ELEMENT ---------------------------------------------------------------
+    def _plan_embedded(self, blocks: List[Block]) -> None:
+        """*EMBEDDED ELEMENT: Abaqus constrains each embedded node's translations to the
+        interpolated values of its host element's, u = sum N_i(xi) u_i at the node's natural
+        coordinates xi (Analysis User's Guide, 'Embedded elements'; rotations, temperatures and
+        other DOFs stay free): linear, so *EQUATIONs (handle_embedded_element), and exact under
+        NLGEOM too — with the node at X = sum N_i X_i its position X + u is the host's
+        interpolated position at xi.  Abaqus' rules, as read here:
+        * embedded: the nodes of the data lines' elements (EMBED NODES: the nodes), but the
+          hosts' own nodes ('will not be considered to be embedded nodes');
+        * hosts: HOST ELSET, else every element no *EMBEDDED ELEMENT embeds; continuum elements
+          with translations only (embed_host_shape; others in HOST ELSET, and hosts that are
+          embedded themselves, are left out, warned: Abaqus rejects them).  A node in several
+          (a shared face) takes the one it lies deepest in, then the lowest label — on a
+          conforming mesh the weights are the same;
+        * a node outside every host by at most the exterior tolerance — ABSOLUTE EXTERIOR
+          TOLERANCE, or EXTERIOR TOLERANCE (default 0.05) times the mean size of the elements
+          no card embeds (_embed_mean_size), the smaller where both are given — is moved onto
+          the nearest host point (embed_nearest); farther out it stays free, warned unless
+          PARTIAL EMBED=YES (Abaqus stops on it);
+        * weights below ROUNDOFF TOLERANCE (default 1e-6) in magnitude are zeroed, the rest
+          scaled to sum to 1, and the node moved to match.
+        The moved nodes are written so (Abaqus moves them at the start: no strain).  ->
+        _embed_rows, _embedded_nodes; a node in two cards keeps the first (warned)."""
+        cards = [b for b in blocks if b.keyword == "EMBEDDED ELEMENT"]
+        if not cards:
+            return
+        els, pts = self.geom.elements, self.geom.nodes
+
+        def tokens(b: Block) -> List[str]:
+            return [t.strip() for rec in merged_data_records(b) for t in rec if t.strip()]
+        embedded = {e for b in cards if not b.has("EMBED NODES") for t in tokens(b)
+                    for e in self._resolve_elements(t)}
+        free = [e for e in els if e not in embedded]
+        grids: Dict[Optional[str], tuple] = {}
+        mean: List[float] = []                      # the mean element size, once needed
+        moved: List[Tuple[float, int]] = []
+        for b in cards:
+            what = "*EMBEDDED ELEMENT" + (f", HOST ELSET={b.param('HOST ELSET').strip()}"
+                                          if b.param("HOST ELSET") else "")
+            nodes_kw = b.has("EMBED NODES")
+            lost = [t for t in tokens(b) if not (self._resolve_nodes(t) if nodes_kw else
+                                                 [e for e in self._resolve_elements(t) if e in els])]
+            if lost:
+                self.report.warn(f"{what}: {', '.join(lost[:4])} name(s) no {'node' if nodes_kw else 'element'} "
+                                 f"of the model; left out.", once=True)
+            hname = (b.param("HOST ELSET") or "").strip().upper() or None
+            if hname is not None:
+                given = [e for e in dedup(self.geom.elset(hname)) if e in els]
+                bad = dedup(els[e][0] for e in given if not embed_host_shape(els[e][0]))
+                if bad:
+                    self.report.warn(f"{what}: element type(s) {', '.join(bad)} cannot host embedded "
+                                     f"elements (Abaqus: continuum elements with translations only); "
+                                     f"left out of the hosts.", once=True)
+                if any(e in embedded for e in given):
+                    self.report.warn(f"{what}: host elements that an *EMBEDDED ELEMENT embeds (Abaqus: "
+                                     f"'host elements cannot be embedded themselves'); left out of the "
+                                     f"hosts.", once=True)
+                hosts = [e for e in given if embed_host_shape(els[e][0]) and e not in embedded]
+            else:
+                hosts = [e for e in free if embed_host_shape(els[e][0])]
+            if hname not in grids:
+                grids[hname] = self._embed_grid(hosts)
+            boxes, grid, cell, own = grids[hname]
+            if nodes_kw:
+                cand = [n for t in tokens(b) for n in self._resolve_nodes(t)]
+            else:
+                cand = [n for t in tokens(b) for e in self._resolve_elements(t) if e in els
+                        for n in els[e][1]]
+            cand = [n for n in dedup(cand) if n in pts and n not in own]
+            if cand and not boxes:
+                self.report.warn(f"{what}: no host element (a continuum element with translations "
+                                 f"only) to embed {len(cand)} node(s) in; commented out — the "
+                                 f"constraint is missing.", once=True)
+                self._reduces("*EMBEDDED ELEMENT without a host element")
+            twice = [n for n in cand if n in self._embedded_nodes]
+            if twice:
+                self.report.warn(f"{what}: node(s) {', '.join(map(str, twice[:4]))} also embedded by an "
+                                 f"earlier *EMBEDDED ELEMENT; kept there.", once=True)
+            rows = self._embed_rows.setdefault(id(b), [])
+            out: List[int] = []
+            tol: Optional[float] = None
+            rtol = self._embed_param(b, "ROUNDOFF TOLERANCE", 1e-6)
+            for n in cand:
+                if n in self._embedded_nodes or not boxes:
+                    continue
+                p = pts[n]
+                hit = self._embed_host(p, boxes, grid, cell, 1e-9 * cell, inside=True)
+                if hit is None:
+                    if tol is None:
+                        tol = self._embed_tolerance(b, free, mean)
+                    hit = self._embed_host(p, boxes, grid, cell, tol, inside=False)
+                    if hit is None:
+                        out.append(n)
+                        continue
+                e, xi = hit
+                kind, nn, _, _, _ = boxes[e]
+                conn = els[e][1]
+                w = embed_weights(kind, nn, xi)
+                keep = [(conn[i], w[i]) for i in range(nn) if abs(w[i]) >= rtol]
+                s = sum(x for _, x in keep)
+                if abs(s) < 1e-3:                   # (a tolerance that zeroes them all)
+                    keep, s = [(conn[i], w[i]) for i in range(nn)], 1.0
+                keep = [(m, x / s) for m, x in keep]
+                dim = 3 if kind in ("hex", "tet", "wedge") else 2
+                q = tuple(sum(x * pts[m][k] for m, x in keep) for k in range(dim)) + tuple(p[dim:])
+                if q != p:
+                    d = math.dist(q, p)
+                    if d > 1e-9 * cell:
+                        moved.append((d, n))
+                    pts[n] = q
+                dofs = (1, 2, 3) if dim == 3 else (1, 2)
+                rows.append((n, keep, dofs))
+                self._embedded_nodes[n] = dofs
+            if out:
+                far = f"{len(out)} node(s) (e.g. node {out[0]}) lie farther than the exterior tolerance " \
+                      f"({short_real(tol or 0.0, 4)}) from every host element"
+                if b.uparam("PARTIAL EMBED") == "YES":
+                    self.report.note(f"{what}: {far}; left free, as Abaqus does with PARTIAL EMBED=YES.",
+                                     once=True)
+                else:
+                    self.report.warn(f"{what}: {far}: Abaqus stops on them (without PARTIAL EMBED=YES); "
+                                     f"left free here.", once=True)
+                    self._reduces("*EMBEDDED ELEMENT nodes outside every host")
+        if moved:
+            d, n = max(moved)
+            self.report.note(f"*EMBEDDED ELEMENT: {len(moved)} embedded node(s) moved onto their host "
+                             f"element (at most {short_real(d, 4)}, node {n}), as Abaqus moves them: nodes "
+                             f"outside it within the exterior tolerance, weights below the roundoff "
+                             f"tolerance zeroed.", once=True)
+
+    def _embed_param(self, b: Block, key: str, default: Optional[float]) -> Optional[float]:
+        """A real parameter of *EMBEDDED ELEMENT ``b``, ``default`` where absent or unreadable
+        (warned)."""
+        v = (b.param(key) or "").strip()
+        if not v:
+            return default
+        try:
+            return abs(pf(v))
+        except ValueError:
+            self.report.warn(f"*EMBEDDED ELEMENT, {key}={v} does not read as a number; "
+                             f"{'its default' if default is not None else 'left out'}.", once=True)
+            return default
+
+    def _embed_tolerance(self, b: Block, free: List[int], mean: List[float]) -> float:
+        """How far outside its hosts *EMBEDDED ELEMENT ``b`` embeds a node: ABSOLUTE EXTERIOR
+        TOLERANCE (a positive one), EXTERIOR TOLERANCE (default 0.05 without the absolute one)
+        times the mean size of the elements ``free`` (once, into ``mean``), the smaller where
+        both are given (Keywords Reference)."""
+        absolute = self._embed_param(b, "ABSOLUTE EXTERIOR TOLERANCE", None) or None
+        frac = self._embed_param(b, "EXTERIOR TOLERANCE", None if absolute else 0.05)
+        if frac is None:
+            return absolute or 0.0
+        if not mean:
+            mean.append(self._embed_mean_size(free))
+        return min(frac * mean[0], absolute) if absolute else frac * mean[0]
+
+    def _embed_mean_size(self, elements: List[int]) -> float:
+        """The mean size of ``elements`` (Abaqus' 'average size of all non-embedded elements'):
+        a solid's volume to the 1/3 (corner tetrahedra), a face element's area to the 1/2 (its
+        corners), a line element's length."""
+        els, pts = self.geom.elements, self.geom.nodes
+        sizes = []
+        for e in elements:
+            typ, conn = els[e]
+            ps = [pts[n] for n in conn if n in pts]
+            if len(ps) != len(conn) or len(ps) < 2:
+                continue
+            host = embed_host_shape(typ)
+            if host and host[0] in ("hex", "tet", "wedge"):
+                c = ps[:{"hex": 8, "tet": 4, "wedge": 6}[host[0]]]
+                tets = {4: ((0, 1, 2, 3),), 6: ((0, 1, 2, 3), (1, 2, 3, 4), (2, 3, 4, 5)),
+                        8: ((0, 1, 2, 6), (0, 2, 3, 6), (0, 3, 7, 6), (0, 7, 4, 6), (0, 4, 5, 6),
+                            (0, 5, 1, 6))}[len(c)]
+                size = sum(_tet_volume(*(c[i] for i in t)) for t in tets) ** (1 / 3)
+            elif host or (len(ps) >= 3 and typ.upper().startswith(("S", "M3D", "R3D", "SFM"))):
+                size = math.sqrt(_face_area(ps[:3] if len(ps) in (3, 6) else ps[:4]))
+            elif typ.upper().startswith(("B", "T", "PIPE", "R2D")):
+                size = math.dist(ps[0], ps[-1])
+            else:
+                continue
+            if size > 0:
+                sizes.append(size)
+        return sum(sizes) / len(sizes) if sizes else 0.0
+
+    def _embed_grid(self, hosts: List[int]) -> tuple:
+        """The host search of _plan_embedded: (element -> (family, nodes interpolated, their
+        points in the family's dimension, box low, box high), (a grid of the boxes, their
+        dimensions), its cell size, the hosts' nodes)."""
+        els, pts = self.geom.elements, self.geom.nodes
+        boxes: Dict[int, tuple] = {}
+        for e in hosts:
+            typ, conn = els[e]
+            kind, nn = embed_host_shape(typ) or ("", 0)
+            dim = 3 if kind in ("hex", "tet", "wedge") else 2
+            if len(conn) < nn or any(m not in pts for m in conn[:nn]):
+                continue
+            ps = [pts[m][:dim] for m in conn[:nn]]
+            boxes[e] = (kind, nn, ps, tuple(min(p[k] for p in ps) for k in range(dim)),
+                        tuple(max(p[k] for p in ps) for k in range(dim)))
+        cell = sum(max(h - lo for lo, h in zip(v[3], v[4])) for v in boxes.values()) / len(boxes) \
+            if boxes else 1.0
+        cell = cell or 1.0
+        grid: Dict[Tuple[int, ...], List[int]] = {}
+        for e, (_, _, _, lo, hi) in boxes.items():
+            for key in itertools.product(*[range(math.floor(lo[k] / cell), math.floor(hi[k] / cell) + 1)
+                                           for k in range(len(lo))]):
+                grid.setdefault(key, []).append(e)
+        own = {m for e in hosts for m in els[e][1]}
+        return boxes, (grid, sorted({len(v[3]) for v in boxes.values()})), cell, own
+
+    @staticmethod
+    def _embed_host(p: Vec, boxes: Dict[int, tuple], grid: Tuple[Dict[Tuple[int, ...], List[int]], List[int]],
+                    cell: float, reach: float, inside: bool) -> Optional[Tuple[int, Tuple[float, ...]]]:
+        """(host, natural coordinates) of point ``p`` among the boxes within ``reach``: with
+        ``inside`` the host it lies deepest in (embed_natural; 1e-9 out at most), else the one
+        whose nearest point (embed_nearest) is nearest, within ``reach``; the lower label on a
+        tie.  None where none is."""
+        best: Optional[Tuple[float, int, Tuple[float, ...]]] = None
+        seen: set = set()
+        cells, dims = grid
+        for dim in dims:
+            q = p[:dim]
+            for key in itertools.product(*[range(math.floor((q[k] - reach) / cell),
+                                                 math.floor((q[k] + reach) / cell) + 1) for k in range(dim)]):
+                for e in cells.get(key, ()):
+                    kind, nn, ps, lo, hi = boxes[e]
+                    if e in seen or len(lo) != dim or \
+                            not all(lo[k] - reach <= q[k] <= hi[k] + reach for k in range(dim)):
+                        continue
+                    seen.add(e)
+                    if inside:
+                        xi = embed_natural(kind, nn, ps, q)
+                        if xi is None:
+                            continue
+                        score = embed_excess(kind, xi)
+                        if score > 1e-9:
+                            continue
+                    else:
+                        xi, score = embed_nearest(kind, nn, ps, q)
+                        if score > reach:
+                            continue
+                    if best is None or (score, e) < best[:2]:
+                        best = (score, e, xi)
+        return None if best is None else (best[1], best[2])
+
+    def _embed_eq_rows(self, n: int, ws: List[Tuple[int, float]], dofs: Tuple[int, ...],
+                       plan: bool = False) -> Optional[List[List[Tuple[int, int, float]]]]:
+        """The equations u_n = sum w u_host of embedded node ``n`` (_embed_rows) in the DOFs
+        ccx reads, the node's DOF first: one per DOF of ``dofs``; where a node has a *TRANSFORM
+        (Abaqus ties the global displacements) the components along n's local axes — the
+        global ones where n has none — with the other nodes' terms from _dir_terms (local DOFs,
+        or a twin's global ones: made when ``plan``), as _tie_rows writes u_a = u_b.  None
+        where a node's local axes are undefined, or a 2-D one has a *TRANSFORM."""
+        if not self._transformed or not any(m in self._transformed for m in [n] + [h for h, _ in ws]):
+            return [[(n, d, 1.0)] + [(h, d, -w) for h, w in ws] for d in dofs]
+        if len(dofs) < 3 or any(isinstance(self._mpc_frame(m), str) for m in [n] + [h for h, _ in ws]):
+            return None
+        fa = self._mpc_frame(n)
+        axes = fa if isinstance(fa, tuple) else ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        rows = [self._dir_terms(n, axes[j], plan) +
+                [t for h, w in ws for t in self._dir_terms(h, vscale(axes[j], -w), plan)] for j in range(3)]
+        return self._ccx_dependent_order(rows, fa) if isinstance(fa, tuple) else rows
+
+    def _plan_embedded_bcs(self, blocks: List[Block]) -> None:
+        """A *BOUNDARY on a DOF that embedding eliminates (_embedded_nodes) is taken off its card:
+        'If a boundary condition is applied to an embedded node, the embedded element definition
+        always takes precedence. The boundary condition will be neglected' (Analysis User's
+        Guide, 'Embedded elements'; ccx would stop on a BC on an equation's dependent DOF, or
+        _settle_dependents hold the host with it).  Warned, as Abaqus warns."""
+        if not self._embedded_nodes:
+            return
+        held: List[Tuple[int, int]] = []
+        for b in blocks:
+            if b.keyword != "BOUNDARY":
+                continue
+            for ns, dofs, _ in self._bc_records(b):
+                for m in ns:
+                    for d in dofs:
+                        if d in self._embedded_nodes.get(m, ()):
+                            self._bc_drop.setdefault(id(b), set()).add((m, d))
+                            held.append((m, d))
+            if id(b) in self._bc_drop:          # (_plan_coupled_bcs redoes its own cards)
+                self._bc_lines[id(b)] = self._bc_lines_without(b, self._bc_drop[id(b)])
+        if held:
+            self.report.warn(f"*BOUNDARY on {len(set(held))} DOF(s) of embedded nodes (e.g. node "
+                             f"{held[0][0]} DOF {held[0][1]}) taken off: Abaqus neglects a boundary "
+                             f"condition on an embedded node's translations (the embedding takes "
+                             f"precedence; it warns too).", once=True)
+
+    def handle_embedded_element(self, b: Block) -> List[str]:
+        """*EMBEDDED ELEMENT -> the *EQUATIONs of its embedded nodes (_plan_embedded,
+        _embed_eq_rows): exact, under NLGEOM too.  A card that embeds no node is a comment."""
+        rows = self._embed_rows.get(id(b), [])
+        if not rows:                            # (_plan_embedded warned where it matters)
+            return self._commented(b, "*EMBEDDED ELEMENT embeds no node (its nodes are host nodes, "
+                                      "or lie outside every host); commented out.", reduces=False)
+        if not self._mechanical:
+            self.report.note("*EMBEDDED ELEMENT ties translations only; a heat-transfer-only deck has "
+                             "none, so it was left out.", once=True)
+            return ["** abq2ccx: *EMBEDDED ELEMENT left out: it ties translations only"]
+        eqs: List[List[Tuple[int, int, float]]] = []
+        refused: List[int] = []
+        for n, ws, dofs in rows:
+            got = self._embed_eq_rows(n, ws, dofs)
+            if got is None:
+                refused.append(n)
+            else:
+                eqs += got
+        if refused:
+            self.report.warn(f"*EMBEDDED ELEMENT: {len(refused)} embedded node(s) (e.g. node {refused[0]}) "
+                             f"with a host or own *TRANSFORM whose local axes are undefined there (or a "
+                             f"2-D one) left free — their constraint is missing.", once=True)
+            self._reduces("*EMBEDDED ELEMENT nodes with undefined *TRANSFORM axes")
+        self.report.note("*EMBEDDED ELEMENT -> *EQUATIONs: each embedded node's translations are its "
+                         "host element's interpolation at the node's natural coordinates, as Abaqus "
+                         "constrains them (rotations and temperatures free; BCs on them neglected); "
+                         "exact, under NLGEOM too.", once=True)
+        hosts = len({h for _, ws, _ in rows for h, _ in ws})
+        return [f"** abq2ccx: *EMBEDDED ELEMENT: {len(rows)} embedded node(s) on {hosts} host node(s), "
+                f"u = sum N_i(xi) u_i"] + self._twin_lines(eqs) + \
+            ["*EQUATION"] + [x for rw in eqs for x in equation_rows(rw, "{:.12g}".format)]
 
     def _split_coupling_refs(self, blocks: List[Block]) -> List[Block]:
         """``blocks`` with each *COUPLING whose REF NODE= names a set of several nodes written
@@ -37842,6 +38321,10 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # the twins whose equations are written
         self._twins: "OrderedDict[int, int]" = OrderedDict()
         self._twins_out: set = set()
+        # *EMBEDDED ELEMENT (_plan_embedded): id(card) -> its embedded nodes as (node, [(host
+        # node, weight)], DOFs), and node -> the DOFs embedding eliminates
+        self._embed_rows: Dict[int, List[Tuple[int, List[Tuple[int, float]], Tuple[int, ...]]]] = {}
+        self._embedded_nodes: Dict[int, Tuple[int, ...]] = {}
         self._gen_ties: set = set()                # the rotation ties the converter writes
         # id(*PRE-TENSION SECTION of a truss / beam cut) -> {elem, node (its last node), copy
         # (that node's copy, the element's end now), pt (pre-tension node), normal, line}
@@ -38237,6 +38720,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "NORMAL": "handle_normal",
         "NODAL THICKNESS": "handle_nodal_thickness",
         "EQUATION": "handle_equation",
+        "EMBEDDED ELEMENT": "handle_embedded_element",
         "STATIC": "handle_static",
         "COMPLEX FREQUENCY": "handle_complex_frequency",
         "DYNAMIC": "handle_dynamic",
@@ -38475,6 +38959,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_deck_facts(blocks)
         self.build_geometry(blocks)
         blocks = self._split_coupling_refs(blocks)
+        self._plan_embedded(blocks)             # before anything reads node coordinates
         self._warn_undefined_element_nodes()
         self._warn_degenerate_elements()
         self._check_sections(blocks)            # the deck's own mesh: before any planner retypes it
@@ -38526,6 +39011,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_distributing_rows()          # after the ROT NODEs' axes
         self._plan_rigid_twins(blocks)          # after the ROT NODE axes
         self._plan_connector_rows(blocks)
+        self._plan_embedded_bcs(blocks)         # before _plan_coupled_bcs, which redoes its cards
         self._plan_coupled_bcs(blocks)
         self._warn_rigid_mpc_steps(blocks)      # after the constraint plans (_rigid_constraints)
         self._plan_velocity_bcs(blocks)         # after _plan_coupled_bcs: reads its card rewrites
@@ -39186,7 +39672,7 @@ PART_PER_INSTANCE = {"SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", 
 # they would constrain only one instance — or the wrong nodes after renumbering).
 PART_CONSTRAINT_KW = {"EQUATION", "MPC", "RIGID BODY", "NODAL THICKNESS", "TRANSFORM",
                       "COUPLING", "KINEMATIC", "DISTRIBUTING", "KINEMATIC COUPLING", "NORMAL",
-                      "DISTRIBUTING COUPLING", "PRE-TENSION SECTION"}
+                      "DISTRIBUTING COUPLING", "PRE-TENSION SECTION", "EMBEDDED ELEMENT"}
 
 
 # Keywords whose members are elements, so a bare instance-qualified id (``I2.7``) takes
@@ -39212,7 +39698,7 @@ REF_PARAMS = {"NSET", "ELSET", "SURFACE", "SLAVE", "MASTER", "REF NODE", "ROT NO
               "TIE NSET", "ANALYTICAL SURFACE"}
 # ... and those that do so on one card only: the pre-tension node and the truss or beam
 # element of a *PRE-TENSION SECTION (a number or a one-member set).
-CARD_REF_PARAMS = {"PRE-TENSION SECTION": ("NODE", "ELEMENT")}
+CARD_REF_PARAMS = {"PRE-TENSION SECTION": ("NODE", "ELEMENT"), "EMBEDDED ELEMENT": ("HOST ELSET",)}
 
 
 def _split_instance_ref(tok: str, maps) -> Optional[Tuple[str, str]]:
@@ -39426,8 +39912,9 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
     for k in ("NSET", "PIN NSET", "TIE NSET", "SURFACE", "ANALYTICAL SURFACE"):
         if p.get(k):
             p[k] = namer(prefix, p[k].strip())
-    if p.get("ELSET"):
-        p["ELSET"] = namer(prefix, p["ELSET"].strip())
+    for k in ("ELSET", "HOST ELSET"):
+        if p.get(k):
+            p[k] = namer(prefix, p[k].strip())
     if kw == "COUPLING" and p.get("CONSTRAINT NAME"):
         p["CONSTRAINT NAME"] = namer(prefix, p["CONSTRAINT NAME"].strip())
     if kw in ("COUPLING", "KINEMATIC COUPLING") and p.get("ORIENTATION"):
@@ -39478,6 +39965,9 @@ def _remap_part_constraint(b: Block, prefix: str, namer, node_off: int, elem_off
         except ValueError:
             data = list(b.data[:1])
         data += list(b.data[1:])
+    elif kw == "EMBEDDED ELEMENT":
+        ref = node if b.has("EMBED NODES") else elem
+        data = [", ".join(ref(x.strip()) for x in ln.split(",")) for ln in b.data]
     elif kw == "TRANSFORM" and b.data:
         move = rotv if (b.param("TYPE") or "R").strip().upper().startswith("R") else rotp
         try:
@@ -40168,7 +40658,8 @@ def _resolve_qualified_refs(out: List[Block], maps, namer) -> None:
         else:
             entity = "elem" if blk.keyword in ELEM_REF_KW or (
                 blk.keyword == "INITIAL CONDITIONS" and blk.uparam("TYPE") in ELEM_IC_TYPES) or (
-                blk.keyword == "MODEL CHANGE") else "node"
+                blk.keyword == "MODEL CHANGE") or (
+                blk.keyword == "EMBEDDED ELEMENT" and not blk.has("EMBED NODES")) else "node"
         # (a) parameters that name a set/surface.  Only dotted values whose prefix is a
         #     known instance are touched, so a definition's own name (LOADED, I2_BODY) and
         #     unrelated params (MATERIAL=, NAME=) are left untouched.
