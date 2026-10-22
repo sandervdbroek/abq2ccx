@@ -3937,7 +3937,7 @@ UMAT_ARGUMENT_NOTES = (
 # Abaqus output / diagnostics requests ccx has no card for: commented out, the solution is
 # unchanged.
 OUTPUT_ONLY_KEYWORDS = {
-    "ENERGY OUTPUT", "ENERGY PRINT", "ENERGY FILE", "INCREMENTATION OUTPUT", "FILE FORMAT",
+    "INCREMENTATION OUTPUT", "FILE FORMAT",
     "FILE OUTPUT", "MONITOR", "PRINT", "DIAGNOSTICS", "CONTOUR INTEGRAL", "RADIATION OUTPUT",
     "RADIATION PRINT", "RADIATION FILE", "USER OUTPUT VARIABLES", "ELEMENT MATRIX OUTPUT",
     "MODAL OUTPUT", "MODAL PRINT", "MODAL FILE", "SECTION FILE", "INTEGRATED OUTPUT",
@@ -4024,7 +4024,8 @@ ABQ_DROP_VARS = {"MISES", "PRESS", "TRESC", "A", "NE", "IE", "CF", "NFORC", "COO
                  "DUCTCRT"}
 # Renamed / folded onto a ccx identifier.
 ABQ_MAP_VARS = {"LE": "E", "PE": "PEEQ", "PEMAG": "PEEQ", "CEEQ": "PEEQ", "EE": "ME",
-                "NE11": "E", "NT11": "NT", "UT": "U", "UR": "U", "RT": "RF", "RM": "RF"}
+                "NE11": "E", "NT11": "NT", "UT": "U", "UR": "U", "RT": "RF", "RM": "RF",
+                "SENER": "ENER", "SVOL": "EVOL"}
 # What a remap above does NOT preserve (shown in the conversion note).
 ABQ_MAP_CAVEATS = {"LE": "ccx E is the Lagrangian (Green-Lagrange) strain under NLGEOM, not "
                          "the logarithmic strain",
@@ -4034,7 +4035,28 @@ ABQ_MAP_CAVEATS = {"LE": "ccx E is the Lagrangian (Green-Lagrange) strain under 
                    "EE": "ccx ME is the mechanical strain (total minus thermal), which includes "
                          "plastic strain — not the elastic strain",
                    "UR": "ccx U holds translations only, no rotations",
-                   "RM": "ccx RF holds reaction forces only, no moments"}
+                   "RM": "ccx RF holds reaction forces only, no moments",
+                   "SENER": "ccx's ENER is the stress work per unit volume, sigma : d(mechanical "
+                            "strain) summed over the increments: the elastic strain energy density "
+                            "of an elastic material, with plasticity or creep plus the dissipated "
+                            "energy (SENER + PENER + CENER); under NLGEOM per undeformed volume",
+                   "SVOL": "the element's volume, which ccx prints"}
+# What ccx's whole-element *EL PRINT labels hold (probed on 2.23), against Abaqus' namesakes:
+# ELSE the stress work of the element (as ENER), ELKE rho v^2 / 2 integrated with the velocity
+# interpolated over the element (Abaqus sums lumped nodal masses), EVOL its undeformed volume
+# (printoutelem.f reads the nodes' coordinates only; probed: 1.0 for a unit cube stretched 50 %
+# under NLGEOM).  The values of an axisymmetric element are those of ccx's 2-degree sector.
+EL_PRINT_CAVEATS = {
+    "ELSE": "ccx's ELSE is the stress work sigma : d(mechanical strain) summed over the increments: "
+            "the elastic strain energy of an elastic material (Abaqus' ELSE / ALLSE), with plasticity "
+            "or creep plus the dissipated energy (ALLSE + ALLPD + ALLCD: Abaqus' ALLIE without the "
+            "artificial strain energy ALLAE of hourglass control and drill stiffness, which ccx's "
+            "leaves out)",
+    "ELKE": "ccx's ELKE integrates rho v^2 / 2 with the velocity interpolated over each element; "
+            "Abaqus sums its lumped nodal masses (the same for a rigid motion, close for a smooth "
+            "velocity field)",
+    "EVOL": "ccx's EVOL is the undeformed element volume, Abaqus' EVOL and SVOL the current one: "
+            "the same without NLGEOM"}
 # ccx identifiers that are valid only on *EL PRINT / *NODE PRINT (.dat), not *EL FILE.
 EL_PRINT_ONLY_VARS = {"ELSE", "ELKE", "EVOL", "CELS"}
 # Output labels ccx accepts, per card (ccx sources elprints.f / nodeprints.f / noelfiles.f;
@@ -4043,11 +4065,11 @@ EL_PRINT_ONLY_VARS = {"ELSE", "ELKE", "EVOL", "CELS"}
 # other cards — so labels outside these sets are dropped.
 CCX_EL_PRINT_LABELS = {"S", "E", "ME", "EVOL", "EMAS", "COOR", "CENT", "ENER", "ELSE", "ELKE",
                        "PEEQ", "SDV", "HFL", "SVF", "SF", "HFLF", "EBHE", "DUCT"}
-CCX_NODE_PRINT_LABELS = {"U", "NT", "TS", "RF", "RFL", "PS", "PN", "MF", "V", "A", "VF", "PSF",
+CCX_NODE_PRINT_LABELS = {"U", "NT", "TS", "RF", "RFL", "PS", "PN", "MF", "V", "VF", "PSF",
                          "TSF", "MACH", "DEPF", "TTF", "PTF", "CP", "TURB", "RECU"}
 CCX_FILE_LABELS = {"U", "NT", "RF", "RFL", "TT", "MF", "PT", "TS", "PU", "PNT", "MAXU", "V", "PS",
                    "MACH", "CP", "TURB", "VF", "PSF", "TSF", "PTF", "TTF", "CSTR", "CDIS", "CELS",
-                   "DEPT", "HCRI", "PRF", "POT", "SEN", "A", "S", "E", "PEEQ", "SDV", "ENER",
+                   "DEPT", "HCRI", "PRF", "POT", "SEN", "S", "E", "PEEQ", "SDV", "ENER",
                    "HFL", "HER", "ZZS", "ERR", "NOE", "PHS", "MAXS", "MAXE", "ME", "SF", "HFLF",
                    "SVF", "DEPF", "DTF", "ECD", "EMFE", "EMFB", "PCON", "SNEG", "SMID", "SPOS",
                    "KEQ", "THE", "DUCT"}
@@ -4059,6 +4081,24 @@ CCX_FILE_LABELS = {"U", "NT", "RF", "RFL", "TT", "MF", "PT", "TS", "PU", "PNT", 
 # CONTACT_OUTPUT_ISSUES.
 CCX_CONTACT_FILE_LABELS = {"CDIS", "CSTR", "CELS", "PCON"}
 ABQ_CONTACT_MAP = {"CDISP": "CDIS", "CSTRESS": "CSTR"}
+# Abaqus contact variables ccx writes as components of CSTR (CPRESS, CSHEAR1, CSHEAR2) and
+# CDIS (COPEN, CSLIP1, CSLIP2), the entities of its .frd CONTACT block and the columns of its
+# *CONTACT PRINT (2.23 manual, *CONTACT FILE / *CONTACT PRINT), with what differs (the .frd's
+# opening is negative for a penetration and 0 when open, the .dat's positive overlap).
+ABQ_CONTACT_FOLD = {"CPRESS": "CSTR", "CSHEAR": "CSTR", "CSHEAR1": "CSTR", "CSHEAR2": "CSTR",
+                    "COPEN": "CDIS", "CSLIP": "CDIS", "CSLIP1": "CDIS", "CSLIP2": "CDIS"}
+ABQ_CONTACT_FOLD_CAVEATS = {
+    "CSTR": "ccx's contact stress: the pressure (CPRESS) and two shear stresses (CSHEAR1, "
+            "CSHEAR2) along ccx's own tangent directions, the first the master surface's "
+            "projection of the global x-axis",
+    "CDIS": "ccx's relative contact displacement: the opening (COPEN) holds a penetration only "
+            "(an open gap reads 0, where Abaqus gives its size; *CONTACT PRINT prints the overlap "
+            "as a positive value) and the two slips (CSLIP1, CSLIP2) the relative tangential "
+            "displacement along ccx's tangent directions, computed only under *FRICTION"}
+# Abaqus' whole-surface contact variables ccx prints per face-to-face pair (*CONTACT PRINT CF,
+# CFN, CFS: the force with its moments, centre and contact area): CFT the total force, CFN /
+# CFS its normal and shear parts; their components (1-3) and magnitudes (M) are in them.
+ABQ_CONTACT_SURFACE = re.compile(r"(CF[NST])[123M]?")
 # *CONTACT PRINT (probed on 2.23): CDIS, CSTR, CELS and CNUM for every contact element (the
 # first four characters compared: CDISP and CSTRESS too), and the whole-surface CF, CFN and CFS
 # (total force, its normal and shear parts, each with its moments, centre and contact area)
@@ -4078,6 +4118,16 @@ CCX_CONTACT_FORCE_STOPS = {"FREQUENCY", "BUCKLE", "MODAL DYNAMIC", "STEADY STATE
 # (Converter._energy_from_step_one).
 CCX_ENERGY_LABELS = {"EL FILE": ("ENER",), "EL PRINT": ("ENER", "ELSE", "ELKE"),
                      "CONTACT FILE": ("CELS",), "CONTACT PRINT": ("CELS",)}
+# Abaqus' whole-model energy history (*OUTPUT, HISTORY, VARIABLE=PRESELECT / ALL, *ENERGY
+# OUTPUT / PRINT / FILE; "Whole and partial model variables"; none in an eigenvalue step) as
+# ccx's totals over an element set, *EL PRINT, TOTALS=ONLY (Converter._energy_requests; probed
+# on 2.23: the solution is the same with them): ELSE for ALLIE and ALLSE, ELKE for ALLKE in
+# a *DYNAMIC step (zero in the others, and ccx 2.23 segfaults computing it in a linear one)
+# — EL_PRINT_CAVEATS says what they hold.  The other whole-model energies have no ccx label.
+ABQ_ENERGY_TOTALS = {"ALLIE": "ELSE", "ALLSE": "ELSE", "ALLKE": "ELKE"}
+ENERGY_TOTAL_PROCS = {"STATIC", "VISCO", "DYNAMIC", "COUPLED TEMPERATURE-DISPLACEMENT",
+                      "UNCOUPLED TEMPERATURE-DISPLACEMENT"}
+ENERGY_CARDS = ("ENERGY OUTPUT", "ENERGY PRINT", "ENERGY FILE")
 # The procedures after which ccx 2.23 iterates the later steps, as under NLGEOM, up to a
 # *FREQUENCY or *BUCKLE step (probed: a *STATIC step after them is a nonlinear one; after an
 # uncoupled one "Newton-Raphson iterative procedure is active"), for
@@ -33033,12 +33083,21 @@ class _Output:
         parameters and variables are given here, where the card stands)."""
         p = self._out_plan[id(b)]
         if p["cc"] == "CONTACT FILE":
-            self._contact_card(p.get("src", b), self.report)
+            self._contact_card(p.get("src", b), self.report, [])
         elif p["cc"] == "CONTACT PRINT":
             self._contact_print_card(p.get("src", b), self.report)
         elif p["cc"]:
-            self._output_card(p.get("src", b), p["cc"], self.report)
+            self._output_card(p.get("src", b), p["cc"], self.report, [])
         return self._anchored_output(b, p)
+
+    def handle_energy_output(self, b: Block) -> List[str]:
+        """*ENERGY OUTPUT / PRINT / FILE -> the *EL PRINT, TOTALS=ONLY _energy_requests planned
+        at it, or the card commented out where there is none (its notes say why)."""
+        for msg in self._out_notes.get(id(b), []):
+            self.report.note(msg, once=True)
+        return self._anchored_output(b) or self._commented(
+            b, f"*{b.keyword}: commented out (no whole-model energy ccx can print there) — the "
+               f"solution is the same.", reduces=False)
 
     def _anchored_output(self, b: Block, p: Optional[dict] = None) -> List[str]:
         """The ccx output cards (and their notes) _plan_output placed at block ``b``."""
@@ -33065,10 +33124,12 @@ class _Output:
             return "EL PRINT" if hist and b.param("ELSET") else "EL FILE"
         return b.keyword
 
-    def _output_card(self, b: Block, cc: str, report: "Report"):
+    def _output_card(self, b: Block, cc: str, report: "Report", twin: Optional[List[str]] = None):
         """(parameters, ccx labels) of output card ``b`` written as ``*cc``, with notes on
         what is dropped or renamed; labels None when nothing of the card is left.  Its
-        FREQUENCY / TIME POINTS are left to the step's output control (_plan_output)."""
+        FREQUENCY / TIME POINTS are left to the step's output control (_plan_output).  The
+        whole-element labels ccx prints only (ELSE, ELKE, EVOL) of an *EL FILE go to ``twin``,
+        for an *EL PRINT beside it (_output_request), where one is given."""
         members = self.geom.elset((b.param("ELSET") or "").strip()) if b.param("ELSET") else []
         if members and all(e in self._conn for e in members):
             report.note(f"*{b.keyword} on connector elements dropped: they are constraints in "
@@ -33128,14 +33189,18 @@ class _Output:
             {"S", "E", "U", "V", "RF", "NT", "ME", "PEEQ", "THE", "SDV", "HFL", "ENER"}
         for v in invars:
             vu = v.upper()
-            # per-component identifiers (S11, EE12, THE33...) collapse to their base tensor
-            # name — ccx output identifiers are whole quantities, and a long component list
-            # also overflows ccx's 16-entries-per-line reader
-            mcomp = re.fullmatch(r"([A-Z]+?)(\d{1,2})", vu)
+            # per-component identifiers (S11, EE12, THE33, SDV123...) collapse to their base
+            # name — ccx output identifiers are whole quantities (each SDV label prints every
+            # state variable once more)
+            mcomp = re.fullmatch(r"(SDV)(\d+)", vu) or re.fullmatch(r"([A-Z]+?)(\d{1,2})", vu)
             if vu not in known_bases and mcomp and mcomp.group(1) in known_bases:
                 report.note("Per-component output identifiers (e.g. S11, EE12) collapsed to "
                             "their base quantity (ccx writes whole tensors).", once=True)
                 vu = mcomp.group(1)
+            if vu == "A":
+                report.note("Output variable A (acceleration) dropped: ccx 2.23 writes no "
+                            "accelerations (*NODE FILE / *NODE PRINT have no such label).", once=True)
+                continue
             if vu in ABQ_DROP_VARS:
                 report.note(f"Output variable {vu} dropped (no ccx equivalent; derive in "
                             f"post-processing).", once=True)
@@ -33152,7 +33217,14 @@ class _Output:
             if mapped != vu:
                 why = ABQ_MAP_CAVEATS.get(vu, "CalculiX naming")
                 report.note(f"Output variable {vu} -> {mapped} ({why}).", once=True)
+            if mapped in EL_PRINT_CAVEATS and cc in ("EL FILE", "EL PRINT"):
+                report.note(f"Output variable {mapped}: {EL_PRINT_CAVEATS[mapped]}.", once=True)
+                if self._out_contact.get("axi"):
+                    report.note(self._AXI_TOTALS, once=True)
             if not is_print and mapped in EL_PRINT_ONLY_VARS:
+                if twin is not None and cc == "EL FILE" and mapped in EL_PRINT_CAVEATS:
+                    twin.append(mapped)
+                    continue
                 report.note(f"Output variable {mapped} is valid only on *EL PRINT/*NODE PRINT; "
                             f"dropped from *{cc} (.frd).", once=True)
                 continue
@@ -33176,13 +33248,11 @@ class _Output:
                         f"selection has no ccx equivalent); dropped.", once=True)
             return params, None
         if not outvars and not is_print:
+            if twin:                    # all of it goes to the *EL PRINT beside it
+                return params, None
             outvars = ["U"] if cc == "NODE FILE" else ["S"]
             report.note(f"*{cc}: no explicit variables -> default '{outvars[0]}'.", once=True)
         final = dedup(outvars)
-        if len(final) > 16:                       # ccx reads at most 16 entries per line
-            report.warn(f"*{cc}: more than 16 output identifiers after mapping; keeping "
-                        f"the first 16 (ccx line limit).", once=True)
-            final = final[:16]
         freq = next((v for k, v in b.params.items() if k in ("F", "FREQ", "FREQUENCY")), None)
         if cc == "EL PRINT" and final and (freq or "").strip() not in ("0", "0.") and \
                 self._b32r_rows.intersection(self.geom.elset((params.get("ELSET") or "").strip())):
@@ -33192,22 +33262,34 @@ class _Output:
                         f"point; the .frd is not affected.", once=True)
         return params, final
 
-    def _contact_card(self, b: Block, report: "Report"):
+    def _contact_card(self, b: Block, report: "Report", twin: Optional[List[str]] = None):
         """``*CONTACT OUTPUT`` / ``*CONTACT FILE`` -> ccx ``*CONTACT FILE``: Abaqus contact
-        variables fold onto ccx's CDIS (opening/slip) and CSTR (pressure/shear); others
-        (forces, areas, status) are dropped; Abaqus-only parameters too.  Returns
-        (parameters, labels), labels None when no ccx contact variable is left."""
+        variables fold onto ccx's CDIS (opening/slip) and CSTR (pressure/shear); whole-surface
+        forces (CFN, CFS, CFT and their parts) go to ``twin``, for *CONTACT PRINT cards beside
+        it (_output_request), where one is given; others (nodal forces, areas, status) are
+        dropped; Abaqus-only parameters too.  Returns (parameters, labels), labels None when no
+        ccx contact variable is left."""
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         for k, v in b.params.items():
             if k in ("LAST ITERATIONS", "CONTACT ELEMENTS", "FREQUENCYF"):
                 keep[k] = v
-            elif k not in ("FREQ", "FREQUENCY", "TIME POINTS"):  # the step's output control
+            elif k not in ("FREQ", "FREQUENCY", "TIME POINTS") and \
+                    not (twin is not None and k in ("SLAVE", "MASTER")):    # (the twin's)
                 report.note(f"*{b.keyword} parameter {k} dropped (not read by ccx).", once=True)
         labels: List[str] = []
         for rec in merged_data_records(b):
             for v in (x.upper() for x in rec if x != ""):
                 m = ABQ_CONTACT_MAP.get(v, v)
-                if ccx_label_ok(m, CCX_CONTACT_FILE_LABELS):
+                if v in ABQ_CONTACT_FOLD:
+                    m = ABQ_CONTACT_FOLD[v]
+                    report.note(f"Contact output variable {v} -> {m} "
+                                f"({ABQ_CONTACT_FOLD_CAVEATS[m]}).", once=True)
+                if twin is not None and ABQ_CONTACT_SURFACE.fullmatch(v):
+                    twin.append(v)
+                elif v == "CAREA":
+                    report.note("Contact output variable CAREA: ccx prints the contact area with the "
+                                "whole-surface forces CF, CFN and CFS (*CONTACT PRINT) only.", once=True)
+                elif ccx_label_ok(m, CCX_CONTACT_FILE_LABELS):
                     labels.append(m[:4])
                 else:
                     report.note(f"Contact output variable {v} dropped (ccx writes CDIS, CSTR "
@@ -33216,8 +33298,9 @@ class _Output:
         if not labels:
             had = any(x != "" for rec in merged_data_records(b) for x in rec)
             if had:                                 # every requested variable was dropped
-                report.note(f"*{b.keyword}: no ccx contact variable requested; card dropped.",
-                            once=True)
+                if not twin:                        # (or went to *CONTACT PRINT)
+                    report.note(f"*{b.keyword}: no ccx contact variable requested; card dropped.",
+                                once=True)
                 return keep, None
             labels = ["CDIS", "CSTR"]
         return keep, dedup(labels)
@@ -33238,10 +33321,13 @@ class _Output:
         whole: List[str] = []
         given = [x.strip().upper() for rec in merged_data_records(b) for x in rec if x.strip()]
         for v in given:
-            m = re.fullmatch(r"(CF[NST])[123]", v)
-            lab = m.group(1) if m else v
+            m = ABQ_CONTACT_SURFACE.fullmatch(v)
+            lab = m.group(1) if m else ABQ_CONTACT_FOLD.get(v, v)
             lab = "CF" if lab == "CFT" else lab
-            if lab != v:
+            if v in ABQ_CONTACT_FOLD:
+                report.note(f"Contact print variable {v} -> {lab} ({ABQ_CONTACT_FOLD_CAVEATS[lab]}).",
+                            once=True)
+            elif lab != v:
                 report.note(f"Contact print variable {v} -> {lab} (ccx's whole-surface "
                             f"{'total force' if lab == 'CF' else lab}, all components).", once=True)
             if lab in CCX_CONTACT_SURFACE_LABELS:
@@ -33311,8 +33397,9 @@ class _Output:
                         params[ctl[0]] = ctl[1]
                         self.emit.out_ctl_now = ctl
             out.append(emit_keyword(kw, params))
-            if labels:
-                out.append(", ".join(labels))
+            # ccx stops on a data line of more than 16 entries ('*ERROR in splitline'), and
+            # reads the labels of every data line (probed)
+            out += [", ".join(labels[j:j + 16]) for j in range(0, len(labels or ()), 16)]
         return out
 
     # -- output planning ----------------------------------------------------
@@ -33391,6 +33478,7 @@ class _Output:
         self._contact_force_stops(steps)
         self._el_file_stops(blocks, steps)
         self._dynamic_energy_offsets(steps)
+        self._eigen_energy_offsets(blocks, steps)
         # the steps ccx solves in one increment: linear, and no contact pair (ccx iterates any)
         linear = self._ccx_linear_steps(blocks, steps) if not self._out_contact["pairs"] \
             else [False] * len(steps)
@@ -33442,15 +33530,15 @@ class _Output:
                     add = add or x.uparam("OP") in ("ADD", "REPLACE")
                     var = x.uparam("VARIABLE")
                     if not x.has("FIELD"):
-                        if var in ("PRESELECT", "ALL"):
-                            self._out_notes.setdefault(id(x), []).append(
-                                f"*OUTPUT, HISTORY, VARIABLE={var}: Abaqus' preselected history "
-                                f"output (whole-model energies ALLIE, ALLKE, ...) has no ccx "
-                                f"counterpart; dropped.")
+                        if var in ("PRESELECT", "ALL"):     # Abaqus' whole-model energies
+                            reqs += self._energy_requests(x, None, timing)
                         continue
                     if var in ("PRESELECT", "ALL"):
                         own.append((x, None))
                         reqs += self._preselect_requests(x, x, timing, var, quiet, k)
+                elif x.keyword in ENERGY_CARDS:
+                    reqs += self._energy_requests(x, ctx if x.keyword == "ENERGY OUTPUT" else None,
+                                                  timing)
                 elif x.keyword in OUTPUT_CARDS:
                     sub = x.keyword in ("NODE OUTPUT", "ELEMENT OUTPUT", "CONTACT OUTPUT")
                     if sub and ctx is not None and ctx.has("FIELD") and \
@@ -33470,9 +33558,7 @@ class _Output:
                         continue
                     if sub and ctx is not None and ctx.has("FIELD"):
                         own.append((x, ctx))
-                    r = self._output_request(src, ctx, timing, quiet)
-                    r["anchor"] = x
-                    reqs.append(r)
+                    reqs += self._at_anchor(self._output_request(src, ctx, timing, quiet), x)
             if odb and not add:
                 carried[pert] = own
             else:
@@ -33488,6 +33574,80 @@ class _Output:
             prev_pert = pert
             steps.append((k, timing, reqs))
         return steps
+
+    def _energy_requests(self, b: Block, ctx: Optional[Block], timing: dict) -> List[dict]:
+        """Abaqus' whole-model (or element set) energy history — ``b`` an *OUTPUT, HISTORY,
+        VARIABLE=PRESELECT / ALL, an *ENERGY OUTPUT (under *OUTPUT ``ctx``), *ENERGY PRINT or
+        *ENERGY FILE — as an *EL PRINT, TOTALS=ONLY of ELSE and, in a *DYNAMIC step, ELKE over
+        its element set, written where ``b`` stands (ABQ_ENERGY_TOTALS; none in a linear
+        perturbation step or one without mechanical energies, as in Abaqus).  The request has
+        no say in its step's output control: ccx has one for all output of a step, whose TIME
+        POINTS would move the increments of the solve.  ccx carries it into the later steps
+        that give no *EL PRINT, as Abaqus carries history requests."""
+        what = (f"*OUTPUT, HISTORY, VARIABLE={b.uparam('VARIABLE')}" if b.keyword == "OUTPUT"
+                else f"*{b.keyword}")
+        wanted = self._energies_wanted(b)
+        proc = timing["proc"]
+        labels = [lab for lab, names in (("ELSE", {"ALLIE", "ALLSE"}), ("ELKE", {"ALLKE"}))
+                  if (wanted is None or wanted & names) and (lab == "ELSE" or proc == "DYNAMIC")]
+        rest = ("the other whole-model energies (ALLAE, ALLPD and ALLCD apart, ALLVD, ALLFD, ALLWK, "
+                "ETOTAL, ...)" if wanted is None else
+                ", ".join(sorted(wanted - set(ABQ_ENERGY_TOTALS))))
+        notes: List[str] = []
+        ctl = self._requested_control(b, ctx, timing)[0]
+        elset = (b.param("ELSET") or "").strip()
+        if ctl[0] == "OFF":
+            notes.append(f"{what} with {ctl[1]}=0: Abaqus writes none of it; nothing written.")
+        elif timing["pert"] or proc not in ENERGY_TOTAL_PROCS:
+            notes.append(f"{what} in a {'linear perturbation ' if timing['pert'] else ''}"
+                         f"*{proc or 'step without a procedure'} step: no whole-model energies "
+                         f"written (Abaqus has none in an eigenvalue step, and those of a "
+                         f"perturbation step are of the perturbation alone).")
+        elif elset and (not self.geom.elset(elset) or self._only_carriers(elset)):
+            notes.append(f"{what}, ELSET={elset}: the element set is not in the ccx mesh; dropped.")
+        elif not labels:
+            notes.append(f"{what}: " + "; ".join(
+                ([f"ccx has no counterpart for {rest}"] if rest else []) +
+                (["ALLKE is zero outside a dynamic step"] if wanted and "ALLKE" in wanted else [])) +
+                "; nothing written.")
+        if notes:
+            self._out_notes.setdefault(id(b), []).extend(notes)
+            return []
+        if not elset:
+            elset = ALL_ELEMENTS_SET
+            self.geom.elsets.setdefault(ALL_ELEMENTS_SET, list(self.geom.elements))
+        r = self._added_el_file(OrderedDict([("ELSET", elset), ("TOTALS", "ONLY")]), labels, b,
+                                "EL PRINT")
+        r["energy"] = True
+        names = " and ".join(
+            {"ELSE": "ELSE, the total internal energy (Abaqus' ALLIE; ALLSE for elastic materials)",
+             "ELKE": "ELKE, the total kinetic energy (ALLKE)"}[lab] for lab in labels)
+        clauses = [f"{what} -> *EL PRINT, ELSET={elset}, TOTALS=ONLY: {names}"]
+        if "ELKE" not in labels and not (wanted and "ALLKE" not in wanted):
+            clauses.append("ALLKE is zero outside a dynamic step")
+        if rest:
+            clauses.append(f"no ccx counterpart for {rest}")
+        r["notes"] += [
+            "; ".join(clauses) + ". ccx prints them at the step's output frequency (one for all "
+            "output of a step).",
+            *[f"Output variable {lab}: {EL_PRINT_CAVEATS[lab]}." for lab in labels]]
+        if self._out_contact["axi"]:
+            r["notes"].append(self._AXI_TOTALS)
+        return [r]
+
+    @staticmethod
+    def _energies_wanted(b: Block) -> Optional[set]:
+        """The whole-model energies energy request ``b`` names (*ENERGY OUTPUT's data lines),
+        None for all of them (no data lines, VARIABLE=ALL / PRESELECT, *ENERGY PRINT / FILE,
+        preselected history output)."""
+        given = [x.strip().upper() for rec in merged_data_records(b) for x in rec if x.strip()] \
+            if b.keyword == "ENERGY OUTPUT" else []
+        return set(given) if given and b.uparam("VARIABLE") not in ("ALL", "PRESELECT") else None
+
+    # (probed: a CAX4's ELSE is 1/180 of the work of its loads, which Abaqus and ccx give for
+    # the whole ring)
+    _AXI_TOTALS = ("ccx's energies and volumes of axisymmetric elements are those of the 2-degree "
+                   "sector ccx models them by: 1/180 of Abaqus' (the full ring).")
 
     def _join_frd_sets(self, steps: List[Tuple[int, dict, List[dict]]]) -> None:
         """The .frd node sets of each step's *NODE FILE requests (``frd_sets``): one node
@@ -33856,6 +34016,37 @@ class _Output:
                     f"offset.")
                 return
 
+    def _eigen_energy_offsets(self, blocks: List[Block], steps: List[Tuple[int, dict, List[dict]]]) -> None:
+        """A warning on the first element energy request (ELSE, ENER; the step's own or one ccx
+        carries in) of a step ccx 2.23 iterates after a *FREQUENCY or *BUCKLE step: ccx starts
+        its element energies from the strain energy of that step's last eigenmode there and
+        keeps it, whatever the eigen step printed (probed: a held 0.38 reads 1.03e13 after a
+        *FREQUENCY step, 1.26 after a *BUCKLE step, also in a *DYNAMIC step); a step ccx runs
+        linearly computes them anew, and ends it."""
+        held: Dict[str, List[dict]] = {}
+        eig = 0
+        lins = self._ccx_linear_steps(blocks, steps) if not self._out_contact["pairs"] \
+            else [False] * len(steps)               # (ccx iterates any contact pair)
+        for (k, timing, reqs), linear in zip(steps, lins):
+            for cc in ("EL PRINT", "EL FILE"):
+                held[cc] = [r for r in reqs if r["live"] and r["cc"] == cc] or held.get(cc, [])
+            if timing["proc"] in ("FREQUENCY", "BUCKLE"):
+                eig = k
+                continue
+            if linear or timing["proc"] in PERTURBATION_PROCS:
+                eig = 0 if linear else eig
+                continue
+            hit = next(((r, lab) for rs in held.values() for r in rs for lab in r["labels"]
+                        if lab[:4] in ("ELSE", "ENER")), None) if eig else None
+            if hit:
+                hit[0]["warnings"].append(
+                    f"*{hit[0]['cc']} {hit[1]} in step {k}: ccx 2.23 starts the element energies of a "
+                    f"step it iterates after a *FREQUENCY or *BUCKLE step (step {eig}) from the strain "
+                    f"energy of that step's last eigenmode and keeps it (probed: a held 0.38 reads "
+                    f"1.03e13 after a *FREQUENCY step) — ccx's bookkeeping: the energies it prints from "
+                    f"step {k} on are not the deck's, up to a step ccx runs linearly.")
+                return
+
     # what ccx 2.23 segfaults on in a modal or steady-state dynamics step of a model with a
     # plastic or creeping material (probed on both builds; U, V, PU, RFL, contact PCON and
     # CNUM run): every element output label (S, E, PEEQ, ENER, ...), RF, which it computes
@@ -33954,16 +34145,19 @@ class _Output:
         ctx = ctx if sub else None
         cc = self._output_route(b, ctx)
         surface: List[tuple] = []
+        twin: List[str] = []
         if cc == "CONTACT FILE":
-            params, labels = self._contact_card(b, quiet)
+            params, labels = self._contact_card(b, quiet, twin)
         elif cc == "CONTACT PRINT":
             params, labels, surface = self._contact_print_card(b, quiet)
         else:
-            params, labels = self._output_card(b, cc, quiet)
+            params, labels = self._output_card(b, cc, quiet, twin)
         ctl, default = self._requested_control(b, ctx, timing)
         nset = (params.get("NSET") or "").strip().upper() or None if cc == "NODE FILE" else None
         r = self._request(b, cc, params, labels, set=nset, ctl=ctl, default=default,
-                          live=labels is not None and ctl[0] != "OFF", surface=surface)
+                          live=labels is not None and ctl[0] != "OFF", surface=surface,
+                          hist=ctx is not None and ctx.has("HISTORY"))
+        r["twins"] = [self._twin_request(b, cc, dedup(twin), ctl, default)] if twin else []
         if labels is not None and ctl[0] == "OFF":
             r["notes"].append(f"*{b.keyword} with {ctl[1]}=0 dropped (output suppressed)." if ctx is None
                               else f"*OUTPUT with {ctl[1]}=0: Abaqus writes none of its requests; "
@@ -33987,6 +34181,49 @@ class _Output:
                     "would replace the step's field output, and it has no values at beam or "
                     "shell nodes or at reference points.")
         return r
+
+    def _twin_request(self, b: Block, cc: str, labels: List[str], ctl: tuple, default: bool) -> dict:
+        """The .dat request beside .frd card ``b`` (written as ccx card ``cc``) for its labels
+        ccx prints only, at ``b``'s output control: an *EL PRINT of whole-element values (ELSE,
+        ELKE, EVOL) per element of its element set or the whole model, or *CONTACT PRINT cards
+        of whole-surface contact forces, one per face-to-face pair (_contact_print_card); not
+        live when there is nothing to print."""
+        live = ctl[0] != "OFF"
+        if cc == "CONTACT FILE":
+            tb = mkblock("CONTACT PRINT", [(k, b.params[k]) for k in ("SLAVE", "MASTER") if b.param(k)],
+                         [", ".join(labels)])
+            rep = Report()
+            _params, _node, cards = self._contact_print_card(tb, rep)
+            r = self._request(tb, "CONTACT PRINT", OrderedDict(), [], set=None, ctl=ctl,
+                              default=default, live=live and bool(cards), surface=cards)
+            for kind, msg in rep.entries:       # (its own note says why a card is left out)
+                if not msg.startswith("*CONTACT PRINT: none of its variables"):
+                    (r["warnings"] if kind == "WARNING" else r["notes"]).append(msg)
+            if cards:
+                r["notes"].append(f"*{b.keyword} {', '.join(labels)} -> *CONTACT PRINT (.dat): ccx "
+                                  f"prints whole-surface contact forces there only.")
+            return r
+        name = (b.param("ELSET") or "").strip()
+        gone = bool(name) and (not self.geom.elset(name) or self._only_carriers(name))
+        elset = name or ALL_ELEMENTS_SET
+        if not gone and live and not name:
+            self.geom.elsets.setdefault(ALL_ELEMENTS_SET, list(self.geom.elements))
+        r = self._request(mkblock("EL PRINT", [("ELSET", elset)], [", ".join(labels)]), "EL PRINT",
+                          OrderedDict([("ELSET", elset)]), labels, set=None, ctl=ctl, default=default,
+                          live=live and not gone)
+        r["notes"].append(f"*{b.keyword}, ELSET={name}: {', '.join(labels)} dropped (the element set "
+                          f"is not in the ccx mesh)." if gone else
+                          f"*{b.keyword} {', '.join(labels)} -> *EL PRINT, ELSET={elset} (.dat, per "
+                          f"element): ccx prints these whole-element values only.")
+        return r
+
+    @staticmethod
+    def _at_anchor(r: dict, anchor: Block) -> List[dict]:
+        """Request ``r`` and the .dat requests beside it (_twin_request), written at ``anchor``."""
+        reqs = [r] + r.pop("twins", [])
+        for x in reqs:
+            x["anchor"] = anchor
+        return reqs
 
     def _contact_output_issues(self) -> List[str]:
         """Why ccx 2.23 cannot write the model's contact output, as CONTACT_OUTPUT_ISSUES
@@ -34047,9 +34284,8 @@ class _Output:
         for kw, labels in (("NODE OUTPUT", node), ("ELEMENT OUTPUT", elem),
                            ("CONTACT OUTPUT", contact)):
             if labels:
-                r = self._output_request(mkblock(kw, None, [", ".join(labels)]), ctx, timing, quiet)
-                r["anchor"] = anchor
-                reqs.append(r)
+                reqs += self._at_anchor(self._output_request(mkblock(kw, None, [", ".join(labels)]),
+                                                             ctx, timing, quiet), anchor)
         proc = f"*{timing['proc']}" if timing["proc"] else "an unknown"
         cards = " and ".join(f"*{cc} {', '.join(labels)}" for cc, labels in
                              (("NODE FILE", node), ("EL FILE", elem), ("CONTACT FILE", contact))
@@ -34136,9 +34372,11 @@ class _Output:
             else:
                 src = self._preselect_card(x, ctx, timing)
                 if src is not None:
+                    # (not the .dat requests beside it: ccx carries those on with the step's
+                    # other print cards, which a print card written again would end)
                     r = self._output_request(src, ctx, timing, quiet)
-                    r["anchor"] = anchor
-                    listed.append(r)
+                    r.pop("twins")
+                    listed += self._at_anchor(r, anchor)
         written = [r for r in listed if r["live"]]
         if written:
             written[0]["notes"].append(
@@ -34292,8 +34530,10 @@ class _Output:
         live = [r for r in reqs if r["live"] and r["ctl"]]
         if not live or timing["kind"] == "untimed":
             return None
-        frd = [r for r in live if r["frd"]]
-        dat = [r for r in live if not r["frd"]]
+        # (a history request ccx writes to the .frd, contact output, follows them as the .dat
+        # ones do)
+        frd = [r for r in live if r["frd"] and not r.get("hist")]
+        dat = [r for r in live if not r["frd"] or r.get("hist")]
         groups = [live] if all(r["ctl"][0] == "F" for r in live) and all(r["default"] for r in frd) else \
             [frd, dat] if frd and dat else [frd or dat]
         msgs = live[0]["notes"]
@@ -36270,6 +36510,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "SECTION CONTROLS": "handle_section_controls",
         "PRE-TENSION SECTION": "handle_pretension_section",
         **dict.fromkeys(OUTPUT_CARDS, "handle_output"),
+        **dict.fromkeys(ENERGY_CARDS, "handle_energy_output"),
         "KINEMATIC COUPLING": "handle_coupling",
         "FIXED MASS SCALING": "handle_mass_scaling",
         "VARIABLE MASS SCALING": "handle_mass_scaling",

@@ -3494,6 +3494,37 @@ def contact_print_deck():
     return deck[:i] + "*CONTACT PRINT\nCFN, CPRESS\n" + deck[i:]
 
 
+def energy_history_deck(case):
+    """energy_steps_deck's one-DOF cube (k = E A / L = 1000, the top face's consistent mass 0.1,
+    omega 100) with Abaqus' energy output: 'static', pulled to u0 = 1e-3 by 4 x 0.25 in a *STATIC
+    step with the preselected history output (ALLIE = k u0^2 / 2 = 5e-4); 'dynamic', the load
+    applied at once in an implicit *DYNAMIC step of half a period with *ENERGY OUTPUT ALLIE, ALLKE
+    (u = u0 (1 - cos 100 t): ALLIE 5e-4 (1 - cos 100 t)^2, ALLKE 5e-4 sin^2 100 t); 'field', the
+    static step with field output S, SENER, ELSE, EVOL (strain energy density and ELSE 5e-4,
+    volume 1)."""
+    out = {"static": "*OUTPUT, HISTORY, VARIABLE=PRESELECT\n",
+           "dynamic": "*OUTPUT, HISTORY\n*ENERGY OUTPUT\nALLIE, ALLKE\n",
+           "field": "*OUTPUT, FIELD\n*ELEMENT OUTPUT\nS, SENER, ELSE, EVOL\n"}[case]
+    proc = ("*STEP, INC=1000\n*DYNAMIC, DIRECT\n2.51327412287E-4, 0.0314159265359\n" if case == "dynamic"
+            else "*STEP\n*STATIC\n")
+    return (CUBE8 + "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.\n*DENSITY\n0.3\n*BOUNDARY\nBOT, 1, 3\n"
+            "TOP, 1, 2\n" + proc + "*CLOAD\nTOP, 3, 0.25\n" + out + "*OUTPUT, HISTORY, FREQUENCY=1\n"
+            "*NODE OUTPUT, NSET=TOP\nU\n*END STEP\n").replace(
+                "*OUTPUT, HISTORY\n*ENERGY OUTPUT\nALLIE, ALLKE\n*OUTPUT, HISTORY, FREQUENCY=1\n",
+                "*OUTPUT, HISTORY, FREQUENCY=1\n*ENERGY OUTPUT\nALLIE, ALLKE\n")
+
+
+def contact_output_deck():
+    """rigid_punch_deck's block pressed by 0.01 with Abaqus' contact output: the pressure CPRESS as
+    field output (ccx's CSTR, whose .frd CONTACT block holds CPRESS) and the total normal force's
+    components and magnitude CFN1, CFN2, CFN3, CFNM as history output (ccx's *CONTACT PRINT CFN of
+    the face-to-face pair), which the punch's reference node holds."""
+    deck = rigid_punch_deck(tool="elements", d=0.01)
+    i = deck.rindex("*END STEP")
+    return deck[:i] + ("*OUTPUT, FIELD\n*CONTACT OUTPUT\nCPRESS\n*OUTPUT, HISTORY\n*CONTACT OUTPUT\n"
+                       "CFN1, CFN2, CFN3, CFNM\n") + deck[i:]
+
+
 def el_file_stops_deck(case, sdv=True):
     """Decks with *EL FILE output that stopped or crashed ccx 2.23 before (the converter's
     _el_file_stops).  'u1': a B31 cantilever (length 1000, A 1000, I11 4e5 about n1 = z, ten
@@ -11037,6 +11068,87 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  contact_print_cfn (a rigid flat punch pressed by 0.01, "
               f"*CONTACT PRINT CFN, CPRESS for every pair): total normal contact force {cfn:.7g} vs "
               f"the punch's reference-node force {ref:.7g} (before: ccx stopped reading the card)")
+    failures += 0 if ok else 1
+    # Abaqus' energy output, dropped before: the whole-model energies (preselected history,
+    # *ENERGY OUTPUT) as ccx's totals over all elements (*EL PRINT, TOTALS=ONLY ELSE / ELKE), and
+    # SENER, ELSE, EVOL as field output (.frd ENER, an *EL PRINT per element), against the
+    # one-DOF cube's k u^2 / 2 and m v^2 / 2; its top's displacement shows the solve
+    def totals(dat):
+        return ({title: [(t, rows[0][-1]) for _, tt, _s, t, rows in A.dat_blocks(dat)
+                         if tt.startswith(title) and rows]
+                 for title in ("total internal energy", "total kinetic energy", "displacements")},
+                dat_tables(dat, "internal energy"), dat_tables(dat, "volume"),
+                frd_last(dat[:-4] + ".frd", "ENER"))
+    res = review_run(energy_history_deck("static"), "energy_history_static", totals)
+    ok = False
+    if res:
+        (tab, _e, _v, _f) = res
+        internal, top = tab["total internal energy"], tab["displacements"]
+        ok = (len(internal) == 1 and abs(internal[0][1] / 5e-4 - 1.0) < 1e-6 and bool(top) and
+              abs(top[-1][1] / 1e-3 - 1.0) < 1e-6)
+        print(f"{'PASS' if ok else 'FAIL'}  energy_history_static (the one-DOF cube pulled to u0 by "
+              f"4 x 0.25, *OUTPUT, HISTORY, VARIABLE=PRESELECT): total internal energy "
+              f"{internal[0][1] if internal else math.nan:.7g} vs k u0^2 / 2 = 5e-4, the top at "
+              f"{top[-1][1] if top else math.nan:.7g} vs u0 = 1e-3 (before: dropped)")
+    failures += 0 if ok else 1
+    res = review_run(energy_history_deck("dynamic"), "energy_history_dynamic", totals)
+    ok = False
+    if res:
+        (tab, _e, _v, _f) = res
+        internal, kinetic = dict(tab["total internal energy"]), dict(tab["total kinetic energy"])
+        disp = tab["displacements"]
+        both = [t for t in internal if t in kinetic and t > 0.0]
+        ok = len(both) >= 100 and len(disp) >= 100
+        if ok:
+            err = max(max(abs(internal[t] - 5e-4 * (1.0 - math.cos(100.0 * t)) ** 2),
+                          abs(kinetic[t] - 5e-4 * math.sin(100.0 * t) ** 2)) / 5e-4 for t in both)
+            swing = max(abs(u / 1e-3 - (1.0 - math.cos(100.0 * t))) for t, u in disp)
+            ok = err < 2e-2 and swing < 2e-2
+            print(f"{'PASS' if ok else 'FAIL'}  energy_history_dynamic (the one-DOF cube under 4 x 0.25 "
+                  f"from rest in an implicit *DYNAMIC step of half a period, *ENERGY OUTPUT ALLIE, "
+                  f"ALLKE): {len(both)} total internal and kinetic energies within {err:.1e} x 5e-4 of "
+                  f"5e-4 (1 - cos 100 t)^2 and 5e-4 sin^2 100 t, the top within {swing:.1e} x u0 of "
+                  f"u0 (1 - cos 100 t) (before: commented out)")
+        else:
+            print(f"FAIL  energy_history_dynamic: {len(both)} energy totals, {len(disp)} displacements")
+    failures += 0 if ok else 1
+    res = review_run(energy_history_deck("field"), "energy_field_output", totals)
+    ok = False
+    if res:
+        (tab, elem, vol, ener) = res
+        top = tab["displacements"]
+        else_ = elem[-1][0][1] if elem and elem[-1] else math.nan
+        evol = vol[-1][0][1] if vol and vol[-1] else math.nan
+        dens = [v[0] for v in ener.values()] if ener else []
+        # (the .frd's nodal values: ccx's extrapolation from the integration points, 4e-5 off
+        # here, where the .dat prints 5e-4 at every point)
+        ok = (bool(dens) and max(abs(d / 5e-4 - 1.0) for d in dens) < 1e-4 and
+              abs(else_ / 5e-4 - 1.0) < 1e-6 and abs(evol - 1.0) < 1e-12 and bool(top) and
+              abs(top[-1][1] / 1e-3 - 1.0) < 1e-6)
+        print(f"{'PASS' if ok else 'FAIL'}  energy_field_output (the one-DOF cube pulled to u0, field "
+              f"output S, SENER, ELSE, EVOL): .frd ENER {min(dens, default=math.nan):.7g} .. "
+              f"{max(dens, default=math.nan):.7g} at {len(dens)} nodes vs k u0^2 / 2 V = 5e-4, the "
+              f"element's ELSE {else_:.7g} and EVOL {evol:.7g} (*EL PRINT), the top at "
+              f"{top[-1][1] if top else math.nan:.7g} (before: SENER, ELSE, EVOL dropped)")
+    failures += 0 if ok else 1
+    # Abaqus' contact output CPRESS (field) and CFN1-3 / CFNM (history), dropped before: ccx's CSTR
+    # (.frd CONTACT block) and *CONTACT PRINT CFN of the face-to-face pair, against the punch's
+    # reference-node force
+    res = review_run(contact_output_deck(), "contact_output_cpress_cfn", lambda dat: (
+        dat_tables(dat, "statistics"), dat_history(dat, "forces", "REF"),
+        frd_last(dat[:-4] + ".frd", "CONTACT")))
+    ok = False
+    if res:
+        stats, rf, contact = res
+        cfn = stats[-1][0][2] if stats and stats[-1] else math.nan
+        ref = rf[-1][1][0][2] if rf and rf[-1][1] else math.nan
+        press = [v[3] for v in (contact or {}).values() if len(v) > 3]
+        ok = abs(ccx_ratio(cfn, ref) - 1.0) < 1e-6 and bool(press) and max(press) > 0.0
+        print(f"{'PASS' if ok else 'FAIL'}  contact_output_cpress_cfn (a rigid flat punch pressed by "
+              f"0.01, *CONTACT OUTPUT CPRESS and history CFN1-3, CFNM): total normal contact force "
+              f"{cfn:.7g} vs the punch's reference-node force {ref:.7g}, .frd contact pressure up to "
+              f"{max(press, default=math.nan):.5g} at {sum(p > 0.0 for p in press)} nodes (before: "
+              f"both dropped)")
     failures += 0 if ok else 1
     # a SYMMETRIC layup's thickness in a tie to a rigid plate (counted half, ccx got the tie)
     strips = [review_run(tied_strip_deck(sym), "rigid_tie_symmetric_layup" + ("" if sym else "_ref"),

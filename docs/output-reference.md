@@ -17,6 +17,8 @@ How Abaqus field/history output identifiers map to CalculiX `*NODE FILE` / `*EL 
 | `PEMAG` | `PEEQ` |
 | `RM` | `RF` |
 | `RT` | `RF` |
+| `SENER` | `ENER` |
+| `SVOL` | `EVOL` |
 | `UR` | `U` |
 | `UT` | `U` |
 

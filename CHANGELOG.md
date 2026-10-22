@@ -45,6 +45,23 @@ physics.
   origin becomes `LINEAR` there, other curves and `EXPONENTIAL` there are reduced physics. So
   are conduction across open gaps, which ccx does not model, and a `PRESSURE` conductance table
   on a node-to-surface pair, which ccx 2.23 reads at a pressure of its own.
+* **Energy, volume and contact output mapped** — output requests that were dropped now reach
+  ccx 2.23's labels, with what differs said in a note; none changes the solution (probed on
+  static, NLGEOM, plastic, implicit and explicit dynamic runs) or a step's output control:
+  * whole-model energies (`*OUTPUT, HISTORY, VARIABLE=PRESELECT`, `*ENERGY OUTPUT / PRINT /
+    FILE`; about 600 corpus decks) -> `*EL PRINT, TOTALS=ONLY` over the model or the element
+    set: ELSE for ALLIE / ALLSE (ccx's stress work: ALLSE + ALLPD + ALLCD, without ALLAE), in
+    `*DYNAMIC` steps ELKE for ALLKE; none in eigenvalue and perturbation steps, as in Abaqus.
+    A step ccx iterates after a `*FREQUENCY` / `*BUCKLE` step is warned: ccx starts its
+    energies from the last eigenmode's;
+  * SENER -> ENER; ELSE, ELKE, EVOL and SVOL as field output -> an `*EL PRINT` per element
+    beside the `*EL FILE` (ccx prints them only; its EVOL is the undeformed volume);
+  * CPRESS, CSHEAR, COPEN, CSLIP -> ccx's CSTR / CDIS; CFN, CFS, CFT and their components on
+    `*CONTACT OUTPUT` -> `*CONTACT PRINT` per face-to-face pair;
+  * labels past 16 wrap onto another data line (they were cut: ccx stops on a 17-entry line),
+    and SDV<n> of three digits is SDV like shorter ones (each printed every state variable
+    again). Node output A stays dropped: ccx 2.23 writes no accelerations.
+
 * **Explicit mass scaling on part of the model** — `*FIXED MASS SCALING, FACTOR=f, ELSET=...`
   on part of the model (a local factor overriding the global one) was dropped (ccx ran the true
   mass); each section whose elements share a factor now gets a copy of its materials with the

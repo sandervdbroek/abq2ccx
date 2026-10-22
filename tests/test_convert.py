@@ -5833,10 +5833,15 @@ def test_contact_output_maps_to_ccx_labels():
     body, _, _ = convert_str(_contact() + "*Step\n*Static\n*Output, field\n*Contact Output\nCDISP, "
                              "CSTRESS, CFORCE\n*End Step\n")
     assert "*CONTACT FILE\nCDIS, CSTR" in body
-    # names ccx does not know itself are dropped, not folded onto CSTR
-    body, _, _ = convert_str(_contact() + "*Step\n*Static\n*Output, field\n*Contact Output\nCPRESS\n"
-                             "*End Step\n")
-    assert "*CONTACT FILE" not in body
+    # Abaqus' components fold onto the ccx label that holds them (the .frd CONTACT block's
+    # CPRESS, COPEN, ...), with what differs
+    body, _, rep = convert_str(_contact() + "*Step\n*Static\n*Output, field\n*Contact Output\n"
+                               "CPRESS, CSHEAR1\n*End Step\n")
+    assert "*CONTACT FILE\nCSTR\n" in body
+    assert "Contact output variable CPRESS -> CSTR (ccx's contact stress: the pressure" in rep.text()
+    body, _, rep = convert_str(_contact() + "*Step\n*Static\n*Output, field\n*Contact Output\n"
+                               "COPEN, CSLIP1\n*End Step\n")
+    assert "*CONTACT FILE\nCDIS\n" in body and "holds a penetration only" in rep.text()
 
 
 def test_contact_print_checked_against_ccx_labels():
@@ -5847,7 +5852,7 @@ def test_contact_print_checked_against_ccx_labels():
     step = "*Step\n*Static\n{}*End Step\n"
     body, _, rep = convert_str(f2f + step.format("*Contact Print\nCSTRESS, CPRESS, CDISP, CAREA\n"))
     assert "*CONTACT PRINT\nCSTR, CDIS\n" in body
-    assert "Contact print variable CPRESS dropped" in rep.text() and "CAREA dropped" in rep.text()
+    assert "Contact print variable CPRESS -> CSTR" in rep.text() and "CAREA dropped" in rep.text()
     # whole-surface forces: one card per face-to-face pair the card covers (Abaqus: every pair
     # without SLAVE / MASTER), components and CFT folded onto ccx's labels
     two = f2f.replace("A, B\n", "A, B\n*Contact pair, interaction=SI, type=surface to surface\nB, A\n")
@@ -6269,10 +6274,11 @@ def test_preselect_field_output_per_procedure():
                              "*Step\n*Modal Dynamic\n0.001, 0.1\n" + PRESELECT + "*End Step\n")
     assert "*NODE FILE\nU, RF\n*EL FILE\nS, E\n" in _step(body, 2)
     assert "*NODE FILE, FREQUENCY=10\nU, V, RF\n*EL FILE\nS, E\n" in _step(body, 3)
-    # preselected history output (whole-model energies) has no ccx counterpart
+    # preselected history output: the whole-model energies ccx totals (test_energy_history_*)
     body, _, rep = convert_str(HEX + "*Step\n*Static\n*Output, history, variable=PRESELECT\n"
                                "*End Step\n")
-    assert "*NODE FILE" not in body and "has no ccx counterpart; dropped" in rep.text()
+    assert "*NODE FILE" not in body
+    assert "*EL PRINT, ELSET=ABQ2CCX_ALL_ELEMENTS, TOTALS=ONLY\nELSE\n" in _step(body, 1)
 
 
 def test_preselect_peeq_only_where_a_material_yields():
@@ -6359,7 +6365,8 @@ def test_output_requests_ccx_cannot_take_as_given():
     st, text = out("*Node File, global=yes, summary=yes\nU, A, CF\n*El File, position=centroidal\nJCCRT, S\n")
     assert "*NODE FILE, GLOBAL=yes\nU\n*EL FILE\nS\n" in st
     for msg in ("Output parameter SUMMARY dropped", "Output POSITION=... dropped",
-                "Output variable JCCRT dropped: no Johnson-Cook", "Output variable A dropped"):
+                "Output variable JCCRT dropped: no Johnson-Cook",
+                "Output variable A (acceleration) dropped: ccx 2.23 writes no accelerations"):
         assert msg in text, msg
     # requests on connector elements: ccx has no connector output
     body, conv, rep = convert_str(HEX_MODEL + "*Node\n9, 1.,0.,0.\n*Element, type=CONN3D2, elset=W\n20, 2, 9\n"
@@ -6428,7 +6435,8 @@ def test_preselect_output_examples():
     # an explicit bar impact without output requests (FREQUENCY=4: ccx's increment 8.85e-7
     # into 20 intervals of 7.7336e-5)
     body, _, _ = convert(os.path.join(EXAMPLES, "preselect_output_bar.inp"))
-    assert "*CLOAD\nTIP, 1, 250.\n*NODE FILE\nU, RF\n*EL FILE\nS, E\n*END STEP" in body
+    assert "*CLOAD\nTIP, 1, 250.\n*NODE FILE\nU, RF\n*EL FILE\nS, E\n*EL PRINT, ELSET=" \
+           "ABQ2CCX_ALL_ELEMENTS, TOTALS=ONLY\nELSE\n*END STEP" in body
     assert not dangling_refs(reparse(body))
     body, _, _ = convert(os.path.join(EXAMPLES, "explicit_default_output_bar.inp"))
     assert _step(body, 1).endswith("*NODE FILE, FREQUENCY=4\nU, V, RF\n*EL FILE\nS, E\n")
@@ -6436,9 +6444,142 @@ def test_preselect_output_examples():
     # two blocks pressed together: the contact output in step 1 and, carried, in step 2
     body, _, _ = convert(os.path.join(EXAMPLES, "preselect_contact_blocks.inp"))
     for k in (1, 2):
-        assert _step(body, k).endswith("*NODE FILE\nU, RF\n*EL FILE\nS, E\n*CONTACT FILE\nCDIS, CSTR\n")
+        assert "*NODE FILE\nU, RF\n*EL FILE\nS, E\n*CONTACT FILE\nCDIS, CSTR\n" in _step(body, k)
+    # (and step 1's preselected history, the whole-model energy, which ccx carries into step 2)
+    assert _step(body, 1).endswith("*EL PRINT, ELSET=ABQ2CCX_ALL_ELEMENTS, TOTALS=ONLY\nELSE\n")
+    assert "*EL PRINT" not in _step(body, 2)
     assert not dangling_refs(reparse(body))
 
+
+
+def test_energy_history_as_element_totals():
+    # Abaqus' whole-model energies (preselected history output, *ENERGY OUTPUT / PRINT / FILE) ->
+    # ccx's totals over the whole model, *EL PRINT, TOTALS=ONLY: ELSE (ALLIE, ALLSE) and, in a
+    # *DYNAMIC step, ELKE (ALLKE); before, they were dropped or commented out
+    load = "*Cload\n8, 3, 1.\n"
+    tot = "*EL PRINT, ELSET=ABQ2CCX_ALL_ELEMENTS, TOTALS=ONLY\n"
+    body, conv, rep = convert_str(HEX + STEEL + "*Step\n*Static\n" + load +
+                                  "*Output, history, variable=PRESELECT\n*End Step\n")
+    assert _step(body, 1).endswith(tot + "ELSE\n") and "*ELSET, ELSET=ABQ2CCX_ALL_ELEMENTS" in body
+    text = rep.text()
+    assert "*OUTPUT, HISTORY, VARIABLE=PRESELECT -> *EL PRINT, ELSET=ABQ2CCX_ALL_ELEMENTS, " \
+           "TOTALS=ONLY: ELSE, the total internal energy (Abaqus' ALLIE; ALLSE for elastic " \
+           "materials); ALLKE is zero outside a dynamic step; no ccx counterpart for the other " \
+           "whole-model energies" in text
+    assert "Output variable ELSE: ccx's ELSE is the stress work" in text and conv.reduced_physics == []
+    for proc in ("*Dynamic\n0.01, 1.\n", "*Dynamic, explicit\n, 1.e-4\n"):
+        body, _, rep = convert_str(HEX + STEEL + "*Step\n" + proc + load + "*Output, history\n"
+                                   "*Energy Output\nALLIE, ALLKE, ALLWK\n*End Step\n")
+        assert tot + "ELSE, ELKE\n" in _step(body, 1), proc
+        assert "no ccx counterpart for ALLWK" in rep.text() and "Output variable ELKE: ccx's ELKE" \
+            in rep.text()
+    # an element set; *ENERGY PRINT / FILE (all energies); nothing ccx can total
+    cases = {"*Output, history\n*Energy Output, elset=EALL\nALLSE\n":
+                 "*EL PRINT, ELSET=EALL, TOTALS=ONLY\nELSE\n",
+             "*Energy Print\n": tot + "ELSE\n", "*Energy File, frequency=2\n": tot + "ELSE\n",
+             "*Output, history\n*Energy Output\nALLWK, ALLVD\n": None,
+             "*Output, history\n*Energy Output\nALLKE\n": None,
+             "*Energy Print, frequency=0\n": None,
+             "*Output, history\n*Energy Output, elset=NOSUCH\nALLIE\n": None}
+    for cards, want in cases.items():
+        body, _, rep = convert_str(HEX + STEEL + "*Step\n*Static\n" + load + cards + "*End Step\n")
+        if want:
+            assert "8, 3, 1.\n" + want in _step(body, 1), cards
+        else:
+            assert "*EL PRINT" not in _step(body, 1), cards
+    assert "*ENERGY OUTPUT: ALLKE is zero outside a dynamic step; nothing written" in convert_str(HEX + STEEL + "*Step\n*Static\n" + load + "*Output, "
+                                           "history\n*Energy Output\nALLKE\n*End Step\n")[2].text()
+    # none in an eigenvalue step (Abaqus has none there)
+    body, _, rep = convert_str(HEX + STEEL + "*Step\n*Frequency\n3\n*Output, history, "
+                               "variable=PRESELECT\n*End Step\n")
+    assert "*EL PRINT" not in _step(body, 1)
+    assert "in a linear perturbation *FREQUENCY step: no whole-model energies" in rep.text()
+    # the step's output control stays its field output's (TIME POINTS would move ccx's
+    # increments), or ccx's own without one
+    body, _, _ = convert_str(HEX + STEEL + "*Step\n*Static\n0.1, 1.\n" + load + "*Output, field, "
+                             "frequency=2\n*Node Output\nU\n*Output, history, time interval=0.05, "
+                             "variable=PRESELECT\n*End Step\n")
+    assert "*NODE FILE, FREQUENCY=2\nU\n" + tot + "ELSE\n" in _step(body, 1)
+    assert "TIME POINTS" not in body
+    body, _, _ = convert_str(HEX + STEEL + "*Step\n*Static\n0.1, 1.\n" + load + "*Output, history, "
+                             "time interval=0.05, variable=PRESELECT\n*End Step\n")
+    assert _step(body, 1).endswith(tot + "ELSE\n") and "TIME POINTS" not in body
+    # energies asked for from step 2 on in an NLGEOM deck: step 1 requests ENER, as ccx needs
+    body, _, _ = convert_str(HEX + STEEL + "*Step, nlgeom\n*Static\n" + load + PRESELECT +
+                             "*End Step\n*Step, nlgeom\n*Static\n*Output, history, "
+                             "variable=PRESELECT\n*End Step\n")
+    assert "*EL FILE\nS, E, ENER\n" in _step(body, 1) and tot + "ELSE\n" in _step(body, 2)
+
+
+def test_energy_after_an_eigenvalue_step_warned():
+    # ccx 2.23 starts the element energies of a step it iterates after a *FREQUENCY or *BUCKLE
+    # step from the strain energy of that step's last eigenmode (probed: 0.38 -> 1.03e13), up
+    # to a step it runs linearly
+    load = "*Cload\n8, 3, 1.\n"
+    hist = "*Output, history, variable=PRESELECT\n"
+    nl = "*Step, nlgeom\n*Static\n" + load + "*End Step\n"
+    body, _, rep = convert_str(HEX + STEEL + "*Step, nlgeom\n*Static\n" + load + hist + "*End Step\n"
+                               "*Step\n*Frequency\n3\n*End Step\n" + nl)
+    assert "*EL PRINT ELSE in step 3: ccx 2.23 starts the element energies of a step it iterates " \
+           "after a *FREQUENCY or *BUCKLE step (step 2)" in rep.text()
+    # a linear static step in between computes them anew
+    body, _, rep = convert_str(HEX + STEEL + "*Step\n*Static\n" + load + hist + "*End Step\n"
+                               "*Step\n*Frequency\n3\n*End Step\n*Step\n*Static\n" + load +
+                               "*End Step\n")
+    assert "starts the element energies" not in rep.text()
+
+
+def test_whole_element_field_output_printed():
+    # ELSE, ELKE and EVOL (SVOL) ccx prints only: an *EL PRINT per element beside the *EL FILE;
+    # SENER is ccx's ENER (with what differs)
+    load = "*Cload\n8, 3, 1.\n"
+    body, _, rep = convert_str(HEX + STEEL + "*Step\n*Static\n" + load + "*Output, field\n"
+                               "*Element Output\nS, SENER, ELSE, SVOL\n*End Step\n")
+    assert _step(body, 1).endswith("*EL FILE\nS, ENER\n*EL PRINT, ELSET=ABQ2CCX_ALL_ELEMENTS\n"
+                                   "ELSE, EVOL\n")
+    text = rep.text()
+    assert "Output variable SENER -> ENER (ccx's ENER is the stress work per unit volume" in text
+    assert "Output variable SVOL -> EVOL" in text and "ccx's EVOL is the undeformed element " \
+        "volume" in text
+    assert "*ELEMENT OUTPUT ELSE, EVOL -> *EL PRINT, ELSET=ABQ2CCX_ALL_ELEMENTS (.dat, per element)" \
+        in text
+    # an element set of its own; nothing left for the .frd (no default S then); ccx carries the
+    # *EL PRINT into a step without requests (written again, it would end the others)
+    body, _, _ = convert_str(HEX + STEEL + "*Step\n*Static\n" + load + "*Output, field\n"
+                             "*Element Output, elset=EALL\nELSE\n*End Step\n*Step\n*Static\n*End Step\n")
+    assert _step(body, 1).endswith("*CLOAD\n8, 3, 1.\n*EL PRINT, ELSET=EALL\nELSE\n")
+    assert "*EL FILE" not in body and "*EL PRINT" not in _step(body, 2)
+
+
+def test_output_labels_over_16_wrap():
+    # ccx stops on a data line of more than 16 entries ('*ERROR in splitline'; probed) and reads
+    # every data line: the labels wrap, none is lost (before: the first 16 kept)
+    labels = "U, NT, RF, RFL, TT, MF, PT, TS, PU, PNT, MAXU, V, PS, MACH, CP, TURB, VF"
+    body, _, rep = convert_str(HEX_MODEL + "*Step\n*Static\n*Node File\n" + labels + "\n*End Step\n")
+    assert "*NODE FILE\n" + labels.rsplit(", ", 1)[0] + "\nVF\n" in body
+    assert "more than 16" not in rep.text()
+    # SDV<n> of any number of digits is ccx's SDV, which prints every state variable (once: each
+    # SDV label printed them all again)
+    body, _, _ = convert_str(HEX_MODEL + "*Step\n*Static\n*El Print, elset=EALL\nS, SDV1, SDV12, "
+                             "SDV123\n*End Step\n")
+    assert "*EL PRINT, ELSET=EALL\nS, SDV\n" in body
+
+
+def test_contact_output_whole_surface_forces_printed():
+    # Abaqus' whole-surface contact forces (CFN, CFS, CFT and their components / magnitudes) on
+    # *CONTACT OUTPUT -> ccx's *CONTACT PRINT CFN / CFS / CF, one card per face-to-face pair
+    hist = "*Step\n*Static\n*Output, history\n*Contact Output{}\n{}\n*End Step\n"
+    f2f = _contact(", type=surface to surface")
+    body, _, rep = convert_str(f2f + hist.format("", "CSTRESS, CFN1, CFNM, CFS2, CFT3, CAREA"))
+    assert "*CONTACT FILE\nCSTR\n*CONTACT PRINT, SLAVE=A, MASTER=B\nCFN, CFS, CF\n" in body
+    assert "*CONTACT OUTPUT CFN1, CFNM, CFS2, CFT3 -> *CONTACT PRINT (.dat)" in rep.text()
+    assert "CAREA: ccx prints the contact area with the whole-surface forces" in rep.text()
+    body, _, rep = convert_str(f2f + hist.format(", slave=B, master=A", "CFN"))
+    assert "*CONTACT PRINT" not in body and "no ccx contact pair of these surfaces" in rep.text()
+    body, _, rep = convert_str(_contact() + hist.format("", "CFN"))
+    assert "*CONTACT PRINT" not in body and "*CONTACT FILE" not in body
+    assert "left out for node-to-surface contact pairs" in rep.text()
+    assert "no ccx contact variable requested" not in rep.text()
 
 def test_energy_requested_from_the_first_step():
     # ccx 2.23 computes element energies from the first step that needs them on: an implicit
@@ -7015,7 +7156,7 @@ def test_blankless_spellings_of_handled_and_tabled_keywords():
     plain = HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, material=M\n"
     step = "*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n7, 3, 1.\n*EnergyPrint\n*End Step\n"
     _, conv, rep = convert_str(plain + step)
-    assert "*ENERGY PRINT: an output" in rep.text() and conv.reduced_physics == []
+    assert "*ENERGY PRINT -> *EL PRINT" in rep.text() and conv.reduced_physics == []
     sc = plain.replace("material=M\n", "material=M, controls=EC\n") + \
         "*SectionControls, name=EC, second order accuracy=YES\n1., 1., 1.\n" + step
     _, conv, rep = convert_str(sc)
