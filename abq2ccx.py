@@ -23729,8 +23729,10 @@ class _Constraints:
           high, the higher modes of a coarse mesh most — up to 0.7 % (2 x 2) and 0.5 % (3
           points) where the midside nodes lie in the middle of straight edges, 2.7 % and 1.2 %
           with them at a third of each edge, 0.14 % on a 12 x 16 mesh.
-        No card gives ccx another mass matrix: warned, reduced physics, where such elements have
-        mass (their section's material a positive *DENSITY, or one that does not read)."""
+        Where such elements have mass (their section's material a positive *DENSITY, or one that
+        does not read), both are warned; the half mass is reduced physics (no card gives ccx
+        another mass matrix), the integration rule an accuracy that refinement restores (the
+        3-D C3D20R's 2 x 2 x 2 frequency mass is alike)."""
         dyn = [s.no for s in self.steps if s.proc == "DYNAMIC" and not s.explicit]
         freq = [s.no for s in self.steps if s.proc == "FREQUENCY"]
         if not dyn and not freq:
@@ -23773,8 +23775,6 @@ class _Constraints:
                              f"with the midside nodes in the middle of straight edges, 2.7 % / "
                              f"1.2 % with them at a third of each edge; 0.14 % on 12 x 16). A finer "
                              f"mesh reduces it.", once=True)
-            self._reduces(f"element {'/'.join(quad + tri)} in *FREQUENCY (ccx 2.23 integrates "
-                          f"their mass at fewer points than Abaqus)")
 
     def _plan_kinematic_holds(self, blocks: List[Block]) -> None:
         """Model-data BCs on the rotations of kinematic-coupling reference nodes that no

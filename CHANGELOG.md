@@ -39,10 +39,10 @@ physics.
   and under `CENTRIF` on axisymmetric ones, ccx moved part of the load between the nodes
   (0.13–0.38 % of the displacements on 3 × 4 meshes). Such lines now become consistent nodal
   forces; a set's other elements keep the line, and `CENTRIF` under NLGEOM stays, warned. Mass: an implicit `*DYNAMIC` step in ccx 2.23 runs `CPE4` / `CPS4`
-  / `CAX4` / `CPE8R` / `CPS8R` / `CAX8R` with half their mass (vibrating √2 times faster), and
-  `*FREQUENCY` integrates the mass of `CPE8R` / `CPS8R` / `CAX8R` / `CPE6` / `CPS6` / `CAX6` at
-  fewer points than Abaqus (up to 2.7 % higher frequencies on a coarse mesh); no card gives ccx
-  another mass matrix, so both are now flagged reduced physics.
+  / `CAX4` / `CPE8R` / `CPS8R` / `CAX8R` with half their mass (vibrating √2 times faster): no
+  card gives ccx another mass matrix, so that is now flagged reduced physics. `*FREQUENCY`
+  integrates the mass of `CPE8R` / `CPS8R` / `CAX8R` / `CPE6` / `CPS6` / `CAX6` at fewer points
+  than Abaqus (up to 2.7 % higher frequencies on a coarse mesh, 0.14 % on a fine one): warned.
 * **`*DLOAD CENT` and `ROTA`** — ccx 2.23 has neither, and both were dropped. `CENT` (a
   centrifugal load given as ρω²) now becomes ccx's `CENTRIF` of ω² = magnitude / density on a
   set of the elements of each density (`ABQ2CCX_CENT_…`; a `RECT` beam's ρab, as a beam's `CENT`

@@ -9221,13 +9221,16 @@ def test_body_loads_on_two_by_two_elements_kept_where_nodal_forces_are_not_exact
 
 def test_two_d_mass_flagged_where_ccx_differs_from_abaqus():
     # implicit *DYNAMIC: ccx 2.23 runs CPE4 / CPS4 / CAX4 / CPE8R / CPS8R / CAX8R with half their
-    # mass; *FREQUENCY integrates the mass of CPE8R / CPS8R / CAX8R at 2 x 2, of CPE6 / CPS6 / CAX6
-    # at 3 points (Abaqus fully)
+    # mass (reduced physics); *FREQUENCY integrates the mass of CPE8R / CPS8R / CAX8R at 2 x 2, of
+    # CPE6 / CPS6 / CAX6 at 3 points (Abaqus fully; warned)
     dyn, freq = "*Dynamic\n0.1, 1.\n", "*Frequency\n4\n"
-    for t, proc, flag in (("CAX8R", dyn, "implicit *DYNAMIC"), ("CPE8R", freq, "*FREQUENCY"),
-                          ("CPS8R", dyn, "implicit *DYNAMIC"), ("CAX8R", freq, "*FREQUENCY")):
-        body, conv, rep = convert_str(_quad_body(t, m=6.5, load="", proc=proc))
-        assert len(conv.reduced_physics) == 1 and flag in conv.reduced_physics[0], (t, proc)
+    for t in ("CAX8R", "CPS8R"):
+        body, conv, rep = convert_str(_quad_body(t, m=6.5, load="", proc=dyn))
+        assert len(conv.reduced_physics) == 1 and "implicit *DYNAMIC" in conv.reduced_physics[0], t
+    # the frequency step's integration rule: an accuracy refinement restores, warned only
+    for t in ("CAX8R", "CPE8R"):
+        body, conv, rep = convert_str(_quad_body(t, m=6.5, load="", proc=freq))
+        assert not conv.reduced_physics and f"*FREQUENCY (step 1) on {t} elements" in rep.text(), t
     body, conv, rep = convert_str(_quad_body("CPE8R", m=6.5, load="", proc=dyn, mixed=True))
     assert conv.reduced_physics == ["element CPE4/CPE8R in implicit *DYNAMIC (ccx 2.23 runs it with half "
                                     "their mass)"]
@@ -9235,15 +9238,16 @@ def test_two_d_mass_flagged_where_ccx_differs_from_abaqus():
     tri = ("*Node\n1, 0., 0.\n2, 1., 0.\n3, 0., 1.\n4, .5, 0.\n5, .5, .5\n6, 0., .5\n*Element, type=CPS6, "
            "elset=E\n1, 1, 2, 3, 4, 5, 6\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n2.\n"
            "*Solid Section, elset=E, material=M\n1.\n*Boundary\n1, 1, 2\n2, 2\n*Step\n{}*End Step\n")
-    assert "CPS6 in *FREQUENCY" in convert_str(tri.format(freq))[1].reduced_physics[0]
-    assert not convert_str(tri.format(dyn))[1].reduced_physics       # the wedge is integrated whole
+    _, conv, rep = convert_str(tri.format(freq))
+    assert not conv.reduced_physics and "integrates their mass at 3 points" in rep.text()
+    _, conv, rep = convert_str(tri.format(dyn))
+    assert not conv.reduced_physics and "half" not in rep.text()     # the wedge is integrated whole
     # not flagged: explicit dynamics, CPE4 frequencies, CAX8, massless elements
     for t, proc, rho in (("CAX8R", "*Dynamic, explicit\n0.1, 1.\n", "2."), ("CAX8", dyn, "2."),
                          ("CAX8", freq, "2."), ("CAX8R", dyn, "")):
         assert not convert_str(_quad_body(t, m=6.5, load="", proc=proc, rho=rho))[1].reduced_physics, (t, proc)
     body, conv, rep = convert_str(_quad_body("CPE8R", m=6.5, load="", proc=freq, mixed=True))
-    assert conv.reduced_physics == ["element CPE8R in *FREQUENCY (ccx 2.23 integrates their mass at fewer "
-                                    "points than Abaqus)"]
+    assert "*FREQUENCY (step 1) on CPE8R elements" in rep.text()           # CPE4: 2 x 2 is full
 
 
 def test_traction_under_nlgeom_converts_only_when_exact():

@@ -199,8 +199,8 @@ TRANSLATED = {
     "*FREQUENCY": "Abaqus-only params dropped; `EIGENSOLVER=SUBSPACE` max-frequency field blanked "
         "(ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes). "
         "The step's `*CLOAD` / `*DLOAD` / `*DSLOAD` are commented out: Abaqus ignores them. On "
-        "`CPE8R` / `CPS8R` / `CAX8R` / `CPE6` / `CPS6` / `CAX6` flagged reduced physics: ccx 2.23 "
-        "integrates their mass at 2 x 2 / 3 points, Abaqus fully.",
+        "`CPE8R` / `CPS8R` / `CAX8R` / `CPE6` / `CPS6` / `CAX6` warned: ccx 2.23 integrates their "
+        "mass at 2 x 2 / 3 points, Abaqus fully (frequencies up to a few % high on coarse meshes).",
     "*BUCKLE": "`EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads "
         "accuracy/vectors/iterations. A `*BUCKLE` step, or the step after a `*STEP, PERTURBATION` "
         "one, that would hold no body load once an earlier step held one gets a zero `GRAV` line "
