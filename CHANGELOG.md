@@ -79,6 +79,19 @@ physics.
   stops ccx and what it started after that much wall-clock time (status `timeout`; no limit
   by default); `--json`'s `run` gives the log's path. `validate_with_ccx.py` and the corpus
   test run ccx the same way, stopped after their time limit or 100 MB of output.
+* **`*TIE` on conventional shells** — Abaqus ties a shell's nodes, its reference surface; ccx
+  2.23 ties the faces of the solids it expands shells to, half the thickness off. A slave
+  surface on shells whose nodes lie on solid master faces (a skin on a solid, a shell edge on a
+  solid face) now becomes a node surface of those nodes, and with `OFFSET=SPOS` / `SNEG` the face
+  at the reference surface; Abaqus' position tolerance is written out. Against the merged mesh
+  the SPOS / SNEG / both-sides faces were 1–14 % off, a T joint's edge faces 57 % in bending
+  (they clamp the joint the tie hinges), and without a tolerance in the deck ccx tied none of
+  them. A faceless (double-sided) shell line in a tie is no longer dropped, and a slave sharing
+  nodes with the master no longer leaves the tie out. Where no ccx form is exact (shell nodes
+  off the master surface, which Abaqus ties through a rigid offset; a master on shells; shell
+  faces on shells; shell edges at an angle or of other sections; a step solving for
+  temperatures), the deck's surfaces stay, warned, as reduced physics. Also for `*CONTACT PAIR,
+  TIED`. Shell edges tied to coplanar edges of the same section stay as they were: exact.
 * **Explicit mass scaling on part of the model** — `*FIXED MASS SCALING, FACTOR=f, ELSET=...`
   on part of the model (a local factor overriding the global one) was dropped (ccx ran the true
   mass); each section whose elements share a factor now gets a copy of its materials with the

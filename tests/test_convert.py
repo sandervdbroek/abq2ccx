@@ -19551,6 +19551,115 @@ def test_tied_pair_of_a_membrane_on_a_rigid_surface_counts_its_thickness():
     assert "ABQ2CCX_TIED" not in body and conv.geom.nodes[1][2] == 0.0
 
 
+# two S4 (x 0-2, y 0-1, z 0) whose second lies on a C3D8 block (x 1-2, y 0-1, top at z = {Z})
+S4_SKIN = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n6, 2., 1., 0.\n"
+           "11, 1., 0., -1.\n12, 2., 0., -1.\n13, 2., 1., -1.\n14, 1., 1., -1.\n15, 1., 0., {Z}\n16, 2., 0., {Z}\n"
+           "17, 2., 1., {Z}\n18, 1., 1., {Z}\n*Element, type=S4, elset=SH\n1, 1, 2, 5, 4\n2, {N2}, 3, 6, 5\n"
+           "*Element, type=C3D8, elset=BLK\n11, 11, 12, 13, 14, 15, 16, 17, 18\n*Elset, elset=END\n2\n"
+           "*Nset, nset=BASE\n11, 12, 13, 14\n*Material, name=M\n*Elastic\n200000., 0.3\n"
+           "*Shell Section, elset=SH, material=M{OFF}\n0.1\n*Solid Section, elset=BLK, material=M\n"
+           "*Surface, name=SKIN\nEND{FACE}\n*Surface, name=TOP\n11, S2\n")
+S4_SKIN_STEP = "*Boundary\nBASE, 1, 3\n*Step\n*Static\n*Cload\n1, 1, -1.\n4, 3, 0.1\n*End Step\n"
+
+
+def _skin(tie="*Tie, name=T1\nSKIN, TOP\n", z="0.", face=", SPOS", off="", n2="2", step=S4_SKIN_STEP):
+    return S4_SKIN.format(Z=z, FACE=face, OFF=off, N2=n2) + tie + step
+
+
+def test_tie_of_shells_on_solid_faces_ties_their_nodes():
+    # Abaqus ties a shell's nodes; ccx ties the faces of the solid it expands the shell to, half
+    # the thickness off (probed: SPOS / SNEG / both 1-14 % off the merged mesh, the node surface
+    # exact) -> a node surface of the slave nodes on the master, Abaqus' tolerance written out
+    for face in (", SPOS", ", SNEG", ""):                    # "": a double-sided surface
+        body, conv, rep = convert_str(_skin(face=face))
+        assert _card_at(body, "*SURFACE, NAME=SKIN_NODES, TYPE=NODE") == ["2", "3", "6", "5"]
+        assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.141421") == ["SKIN_NODES, TOP"]
+        assert "whose nodes lie on the solid master faces" in rep.text() and not conv.reduced_physics
+    assert _card_at(body, "*SURFACE, NAME=SKIN") == ["END, SPOS", "END, SNEG"]     # (ccx stopped on it)
+    # a node surface of shell nodes: those on the master; a master node stays out (ccx loops)
+    nodes = _skin(face="").replace("*Surface, name=SKIN\nEND\n", "*Surface, name=SKIN, type=NODE\nNS\n")
+    body, conv, _ = convert_str(nodes.replace("*Elset, elset=END", "*Nset, nset=NS\n1, 2, 3\n*Elset, elset=END"))
+    assert _card_at(body, "*SURFACE, NAME=SKIN_NODES, TYPE=NODE") == ["2", "3"] and not conv.reduced_physics
+    body, conv, _ = convert_str(_skin(n2="15"))
+    assert _card_at(body, "*SURFACE, NAME=SKIN_NODES, TYPE=NODE") == ["3", "6", "5"]
+    assert not conv.reduced_physics
+    # NO ROTATION is moot on a solid master; a TIED contact pair gets its own tolerance
+    _, conv, _ = convert_str(_skin(tie="*Tie, name=T1, no rotation\nSKIN, TOP\n"))
+    assert not conv.reduced_physics
+    body, conv, _ = convert_str(_skin(tie="*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, "
+                                          "tied\nSKIN, TOP\n"))
+    assert _card_at(body, "*TIE, NAME=ABQ2CCX_TIED1, POSITION TOLERANCE=0.025") == ["SKIN_NODES, TOP"]
+    assert not conv.reduced_physics
+    # a shell edge on a solid face (a T joint): its nodes (the edge faces clamp what Abaqus hinges)
+    tee = ("*Node\n31, 0., 0., 0.\n32, 1., 0., 0.\n33, 1., 0., 1.\n34, 0., 0., 1.\n41, 0., -.5, -1.\n"
+           "42, 1., -.5, -1.\n43, 1., .5, -1.\n44, 0., .5, -1.\n45, 0., -.5, 0.\n46, 1., -.5, 0.\n47, 1., .5, 0.\n"
+           "48, 0., .5, 0.\n*Element, type=S4, elset=SH\n3, 31, 32, 33, 34\n*Element, type=C3D8, elset=BLK\n"
+           "41, 41, 42, 43, 44, 45, 46, 47, 48\n*Material, name=M\n*Elastic\n200000., 0.3\n*Shell Section, "
+           "elset=SH, material=M\n0.1\n*Solid Section, elset=BLK, material=M\n*Surface, name=FOOT\n3, E1\n"
+           "*Surface, name=TOP\n41, S2\n*Tie, name=T1\nFOOT, TOP\n")
+    body, conv, _ = convert_str(tee)
+    assert _card_at(body, "*SURFACE, NAME=FOOT_NODES, TYPE=NODE") == ["31", "32"]
+    assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.141421") == ["FOOT_NODES, TOP"]
+    assert not conv.reduced_physics
+
+
+def test_tie_of_shells_with_a_section_offset_ties_their_reference_face():
+    # a section OFFSET moves the expanded shell off its nodes: ccx's node is its midsurface, the
+    # SPOS / SNEG face at the reference surface is exact (probed: 1e-7 off knotted nodes tied)
+    for off, lab in ((", offset=SPOS", "SPOS"), (", offset=-0.5", "SNEG")):
+        body, conv, _ = convert_str(_skin(face=", SNEG", off=off))
+        assert _card_at(body, f"*SURFACE, NAME=SKIN_{lab}, TYPE=ELEMENT") == [f"2, {lab}"]
+        assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.141421") == [f"SKIN_{lab}, TOP"]
+        assert not conv.reduced_physics
+    body, conv, rep = convert_str(_skin(off=", offset=0.25"))
+    assert _card_at(body, "*TIE, NAME=T1") == ["SKIN, TOP"]
+    assert conv.reduced_physics == ["*TIE on conventional shells: a shell section OFFSET at the master "
+                                    "(Abaqus ties the reference surface, ccx's node its midsurface)"]
+    assert "No ccx form is exact" in rep.text()
+
+
+def test_tie_of_shells_with_no_exact_ccx_form_is_reduced():
+    def why(deck):
+        body, conv, _ = convert_str(deck)
+        assert any(ln == "SKIN, TOP" or ln == "TOP, SKIN" for ln in body.splitlines())    # kept
+        return [r.split(": ", 1)[1] for r in conv.reduced_physics]
+    # the shell's face on the block, its nodes half the thickness above: Abaqus ties them through
+    # a rigid offset (the touching face 0.2-2.6 % off, the node surface 4-8 %); with NO THICKNESS too
+    off = ["slave shell nodes off the master surface (Abaqus ties them through a rigid offset)"]
+    assert why(_skin(z="-0.05")) == off
+    assert why(_skin(z="-0.05", tie="*Tie, name=T1, no thickness\nSKIN, TOP\n")) == off
+    body, conv, _ = convert_str(_skin(z="-0.5"))                # beyond the tolerance: no tie
+    assert _card_at(body, "*TIE, NAME=T1") == ["SKIN, TOP"] and not conv.reduced_physics
+    # a master on shells
+    assert why(_skin(tie="*Tie, name=T1\nTOP, SKIN\n")) == [
+        "a master surface on shells (Abaqus ties to their reference surface, ccx to a face of its "
+        "expanded shells)"]
+    # a step solving for temperatures: ccx's own shell node has none
+    heat = _skin(step="*Boundary\nBASE, 11, 11, 0.\n*Step\n*Heat Transfer, steady state\n1., 1.\n"
+                      "*Boundary\n1, 11, 11, 100.\n*End Step\n").replace(
+        "*Elastic\n200000., 0.3\n", "*Elastic\n200000., 0.3\n*Conductivity\n50.\n")
+    assert why(heat) == ["a step solving for temperatures (ccx's own shell nodes carry none, and its "
+                         "expanded faces lie off the reference surface)"]
+
+
+def test_tie_of_shell_edges_on_shell_edges():
+    # edges in one plane, of one section: ccx's edge faces are the merged mesh exactly (probed)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n5, 1., 1., 0.\n4, 0., 1., 0.\n22, 1., 0., 0.\n"
+            "23, 2., 0., {Z}\n26, 2., 1., {Z}\n25, 1., 1., 0.\n*Element, type=S4, elset=A\n1, 1, 2, 5, 4\n"
+            "*Element, type=S4, elset=B\n2, 22, 23, 26, 25\n*Material, name=M\n*Elastic\n200000., 0.3\n"
+            "*Shell Section, elset=A, material=M\n0.1\n*Shell Section, elset=B, material=M\n{T}\n"
+            "*Surface, name=SB\n2, E4\n*Surface, name=SA\n1, E2\n*Tie, name=T1\nSB, SA\n")
+    body, conv, rep = convert_str(deck.format(Z="0.", T="0.1"))
+    assert _card_at(body, "*TIE, NAME=T1") == ["SB, SA"] and _card_at(body, "*SURFACE, NAME=SB") == ["2, S6"]
+    assert "in one plane, of one section" in rep.text() and not conv.reduced_physics
+    for z, t in (("0.", "0.2"), ("1.", "0.1")):                 # thicker / folded: 20-80 % off
+        body, conv, _ = convert_str(deck.format(Z=z, T=t).replace("2., 0., 1.", "1., 0., 1.").replace(
+            "2., 1., 1.", "1., 1., 1."))
+        assert _card_at(body, "*TIE, NAME=T1") == ["SB, SA"]
+        assert conv.reduced_physics == ["*TIE on conventional shells: shell edges tied to shell edges at "
+                                        "an angle or of another section"]
+
+
 def test_kinematic_couplings_on_membrane_and_shell_faces_take_their_nodes():
     # ccx would couple the expanded faces: 1.2 % off on M3D4, a crash (SIGBUS) on M3D3 and on the
     # shells the converter knots for the coupling (probed); Abaqus couples the surface's nodes
@@ -20439,7 +20548,7 @@ def test_dload_types_ccx_lacks_commented_out():
 
 def test_faceless_shell_surface_line_both_faces_for_couplings():
     # a shell line without a face label is a double-sided surface: both faces where only
-    # couplings use it (they take its nodes), else commented out as before
+    # couplings (they take its nodes) or ties on shells use it, else commented out as before
     deck = ("*Node\n1,0,0,0\n2,1,0,0\n3,2,0,0\n4,0,1,0\n5,1,1,0\n6,2,1,0\n100, 2.5, 0.5, 0.\n"
             "*Element, type=S4, elset=ALL\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*Elset, elset=P\n2\n"
             "*Material, name=M\n*Elastic\n1000., 0.3\n*Shell Section, elset=ALL, material=M\n0.1\n"
@@ -20451,6 +20560,9 @@ def test_faceless_shell_surface_line_both_faces_for_couplings():
     tied = deck.replace("*Coupling, ref node=100, surface=CS, constraint name=C\n*Kinematic\n",
                         "*Tie, name=T\nCS, CS\n")
     body, conv, rep = convert_str(tied)
+    assert "*SURFACE, TYPE=ELEMENT, NAME=CS\nP, SPOS\nP, SNEG" in body and other_reduced(conv) == []
+    loaded = deck.replace("*Coupling, ref node=100, surface=CS, constraint name=C\n*Kinematic\n", "")
+    body, conv, rep = convert_str(loaded.replace("*Cload\n100, 3, 1.\n", "*Dsload\nCS, P, 1.\n"))
     assert "** P\n" in body and "*SURFACE without face labels on structural elements" in conv.reduced_physics
 
 

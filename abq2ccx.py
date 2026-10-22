@@ -8414,10 +8414,7 @@ class _Mesh:
             elif k == "TYPE":
                 self.report.note(f"*TIE TYPE={v} dropped (not a ccx parameter).", once=True)
             elif k == "NO ROTATION":
-                self.report.warn("*TIE, NO ROTATION dropped: ccx ties the surfaces' expanded faces, "
-                                 "which holds the shell / beam rotations Abaqus leaves free.",
-                                 once=True)
-                self._reduces("*TIE, NO ROTATION")
+                pass                                # (below: moot where the master has none)
             else:
                 self.report.note(f"*TIE parameter {k} dropped (unsupported by ccx).", once=True)
         self.report.note("*TIE: in ccx the MASTER (independent, 2nd) surface must be element-based; "
@@ -8430,6 +8427,7 @@ class _Mesh:
             self._reserve_names()
             self._used_names |= self._tie_names
         out: List[str] = []
+        rotation_free = 0                           # lines tying shell nodes to solid faces
         for i, line in enumerate(lines):
             params = OrderedDict(keep)
             if i:
@@ -8449,7 +8447,11 @@ class _Mesh:
                 f[0], "*TIE slave", exclude=set(self._surface_member_nodes(master))) \
                 if plain else (None, [])
             membrane = name is not None
-            if plain and not membrane:
+            shell = self._shell_tie_slave(f[0], master, b, False) if plain and not membrane else None
+            if shell is not None:
+                name, cards = shell[0], shell[1]
+                rotation_free += 1
+            elif plain and not membrane:
                 name, cards = self._shared_tie_slave(f[0], master)
             if name == "?":
                 out += self._comment_out(
@@ -8465,13 +8467,21 @@ class _Mesh:
                 out.append(f"** abq2ccx: *TIE {params.get('NAME') or ''}: every slave node of {f[0]} is a "
                            f"node of {master}, which joins them already")
                 continue
-            if name and not membrane:
+            if name and shell is not None:
+                params["POSITION TOLERANCE"] = short_real(shell[2], 6)
+                line = ", ".join([name] + f[1:])
+            elif name and not membrane:
                 line = ", ".join([name] + f[1:])
             elif name:
                 params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
                     b.param("POSITION TOLERANCE"), f[0], master, b, False), 6)
                 line = ", ".join([name] + f[1:])
             out += cards + [emit_keyword("TIE", params), line]
+        if b.has("NO ROTATION") and rotation_free < len(lines):
+            self.report.warn("*TIE, NO ROTATION dropped: ccx ties the surfaces' expanded faces, "
+                             "which holds the shell / beam rotations Abaqus leaves free.",
+                             once=True)
+            self._reduces("*TIE, NO ROTATION")
         return out + comments
 
     def _shared_tie_slave(self, slave: str, master: str) -> Tuple[Optional[str], List[str]]:
@@ -8576,6 +8586,211 @@ class _Mesh:
                              f"probed).", once=True)
         return name, [f"*SURFACE, NAME={name}, TYPE=NODE"] + [str(n) for n in keep]  # ccx: one per line
 
+    def _shell_tie_slave(self, slave: str, master: str, b: Block, pair: bool) -> \
+            Optional[Tuple[str, List[str], float]]:
+        """A tie ``b`` (a *TIE; with ``pair`` a TIED *CONTACT PAIR) of surfaces on conventional
+        shells (SHEET_SHELLS).  Abaqus ties the slave nodes — a shell's nodes, its reference
+        surface — to the master's reference surface, through a rigid offset where they lie
+        apart, the rotations too where both surfaces have them ('Mesh tie constraints');
+        ccx 2.23 ties the nodes of the faces of the solids it expands shells to, half the
+        thickness off.  Probed on 2.23 (S4 / S4R / S8R, flat and curved, slave and master both
+        ways; in-plane, bending and twisting loads; against the merged mesh, and equations of
+        Abaqus' rigid offset on knotted nodes):
+        * a slave on shells whose nodes lie on solid faces (a skin on a solid, a shell edge on
+          a solid face — a T joint): a node surface of those nodes is the merged mesh
+          exactly, where SPOS / SNEG / both faces were 1-14 % off and a T joint's edge faces
+          53-57 % (bending: they clamp the joint the tie hinges); with a section OFFSET of
+          0.5 / -0.5 the face at the reference surface, SPOS / SNEG (the node surface is ccx's
+          midsurface: 3-7 % off).  -> (that surface's name, its *SURFACE card, the POSITION
+          TOLERANCE: Abaqus', _membrane_tie_tolerance); name "" with no node left to tie (the
+          master's own nodes stay out, as for membranes);
+        * shell edges on shell edges in one plane, of one section: ccx's edge faces are the
+          merged mesh exactly (noted; None: the line stays);
+        * no ccx form is exact (warned, reduced physics; None: the deck's own form stays):
+          slave shell nodes off the master surface (the face touching it 0.2-2.6 % off the rigid
+          offset, the node surface 4-8 %), another OFFSET, a master on shells, shell edges at
+          an angle or of other sections, a slave on shells and other elements, a step solving
+          for temperatures (ccx's shell node carries none: the tied skin kept its own).
+        None also where no conventional shell takes part, or the master is not on solids or
+        shells (membranes: _membrane_node_surface)."""
+        sd, md = self.surfaces.get(slave.upper()), self.surfaces.get(master.upper())
+        els, sec = self.geom.elements, self._shell_sec
+        if sd is None or md is None or md[0].startswith("NODE") or not sec:
+            return None
+        types: Dict[str, str] = {}
+
+        def sheet(e: int) -> bool:
+            return ccx_type(els[e][0]) in SHEET_SHELLS
+
+        def facets(entries: List[Tuple[str, Optional[str]]]) -> List[Tuple[int, List[int], int]]:
+            return [(e,) + self._facet(e, face, types) for token, face in entries
+                    for e in self._resolve_elements(token) if e in els]
+        mf = facets(md[1])
+        sf = None if sd[0].startswith("NODE") else facets(sd[1])
+        shells: Dict[int, List[int]] = {}          # slave node -> its (slave) shells
+        if sf is None:
+            nodes = {n for tok, _ in sd[1] for n in self._resolve_nodes(tok) if n in self.geom.nodes}
+            for n, es in self._elements_at(nodes).items():
+                shells[n] = [e for e in es if sheet(e)]
+        else:
+            for e, fn, _ in sf:
+                for n in fn:
+                    if sheet(e) and n in self.geom.nodes:
+                        shells.setdefault(n, []).append(e)
+        shells = {n: dedup(es) for n, es in shells.items() if es}
+        on_master = [e for e, _, _ in mf if sheet(e)]
+        if not shells and not on_master:
+            return None
+        what = "*CONTACT PAIR, TIED" if pair else f"*TIE {b.param('NAME') or ''}".rstrip()
+        tol = self._membrane_tie_tolerance(b.param("ADJUST" if pair else "POSITION TOLERANCE"),
+                                           slave, master, b, pair, node_based=sf is None)
+        eps = {n: 1e-3 * min([sec[e][0] for e in es if e in sec] or [0.0]) for n, es in shells.items()}
+        solid = bool(mf) and all(ccx_type(els[e][0]).startswith("C3D") and c in (3, 4) for e, _, c in mf)
+        if on_master:
+            edges = bool(shells) and sf is not None and all(sheet(e) and c == 2 for e, _, c in sf + mf)
+            if edges and b.has("NO ROTATION"):
+                return None                         # (handle_tie warns: ccx ties the rotations)
+            if edges and self._coplanar_edges(shells, mf, eps):
+                self.report.note(f"{what}: shell edges tied to shell edges in one plane, of one "
+                                 f"section — ccx ties the edge faces of the solids it expands them to, "
+                                 f"the merged mesh exactly (probed on 2.23, S4 / S4R / S8R). Exact.",
+                                 once=True)
+                return None
+            why = ("shell edges tied to shell edges at an angle or of another section" if edges else
+                   "a master surface on shells (Abaqus ties to their reference surface, ccx to a face "
+                   "of its expanded shells)")
+        elif not solid or not shells:
+            return None
+        elif sf is not None and any(not sheet(e) for e, _, _ in sf):
+            why = "a slave surface on shells and other elements"
+        elif self._mpc_thermal:
+            why = ("a step solving for temperatures (ccx's own shell nodes carry none, and its "
+                   "expanded faces lie off the reference surface)")
+        elif any(e not in sec for es in shells.values() for e in es):
+            why = "a shell thickness the converter does not read"
+        else:
+            reach = {n: max(sec[e][0] * (0.5 + abs(sec[e][1])) for e in es) for n, es in shells.items()}
+            if b.has("NO THICKNESS") or sf is None:     # (a node surface has no thickness)
+                reach = dict.fromkeys(reach, 0.0)
+            gaps = self._surface_gaps(list(shells), mf, tol + max(reach.values()) + max(eps.values()))
+            near = [n for n in shells if gaps[n][0] <= eps[n]]
+            offs = {sec[e][1] for n in near for e in shells[n]}
+            if any(eps[n] < gaps[n][0] <= tol + reach[n] for n in shells):
+                why = ("slave shell nodes off the master surface (Abaqus ties them through a rigid "
+                       "offset)")
+            elif not near:
+                return None                         # (no node within the tolerance)
+            elif offs == {0.0} or (offs <= {0.5, -0.5} and len(offs) == 1 and sf is not None and
+                                   all(c != 2 for _, _, c in sf)):
+                return self._shell_tie_form(slave, master, near, offs.pop(), sf, what, tol)
+            else:
+                why = ("a shell section OFFSET at the master (Abaqus ties the reference surface, "
+                       "ccx's node its midsurface)")
+        self.report.warn(f"{what}: slave {slave} / master {master} on conventional shells — Abaqus "
+                         f"ties the slave nodes (a shell's reference surface) to the master's reference "
+                         f"surface, through a rigid offset where they lie apart, the rotations too "
+                         f"where both have them; ccx ties the faces of the solids it expands shells "
+                         f"to, half the thickness off, or the midsurface of a node surface. No ccx "
+                         f"form is exact for {why}: the deck's surfaces are kept (probed on 2.23: "
+                         f"0.2-8 % off for a shell face on a solid, more for shells on shells).",
+                         once=True)
+        self._reduces(f"*TIE on conventional shells: {why}")
+        return None
+
+    def _shell_tie_form(self, slave: str, master: str, near: List[int], off: float,
+                        sf: Optional[List[Tuple[int, List[int], int]]], what: str,
+                        tol: float) -> Optional[Tuple[str, List[str], float]]:
+        """The exact form of _shell_tie_slave for slave shell nodes ``near`` on solid master
+        faces, their section OFFSET ``off``: OFFSET 0 a node surface of them (but the master's
+        own nodes); 0.5 / -0.5 the SPOS / SNEG face of the slave's shells (None where it
+        shares nodes with the master: _shared_tie_slave)."""
+        shared = set(self._surface_member_nodes(master))
+        if off:
+            if shared.intersection(n for _, fn, _ in sf for n in fn):
+                return None
+            lab = "SPOS" if off > 0 else "SNEG"
+            key: tuple = (slave.upper(), lab)
+            body = [f"{e}, {lab}" for e in dedup(e for e, _, _ in sf)]
+            kind = (f"its {lab} faces, the shells' reference surface (OFFSET={short_real(off, 3)}; "
+                    f"probed on 2.23: 1e-7 off the knotted nodes tied, ccx's node, the midsurface, "
+                    f"3-7 %)")
+        else:
+            keep = [n for n in near if n not in shared]
+            if not keep:
+                return "", [], tol
+            key, body = (slave.upper(), tuple(keep)), [str(n) for n in keep]
+            kind = ("a node surface of the slave nodes on the master (probed on 2.23: the merged "
+                    "mesh exactly, also for a shell edge on a solid face; the faces 1-14 % off, a T "
+                    "joint's edge faces 57 % in bending)")
+        if key not in self._mem_surfaces:
+            self._reserve_names()
+            self._mem_surfaces[key] = self._fresh_name(f"{slave}_{'NODES' if not off else lab}")
+            name = self._mem_surfaces[key]
+            cards = [f"*SURFACE, NAME={name}, TYPE={'ELEMENT' if off else 'NODE'}"] + body
+        else:
+            name, cards = self._mem_surfaces[key], []
+        self.report.note(f"{what}: slave surface {slave} on conventional shells whose nodes lie on "
+                         f"the solid master faces -> {kind}: Abaqus ties the shell nodes, ccx would "
+                         f"tie the faces of the solids it expands shells to, half the thickness off. "
+                         f"Exact.", once=True)
+        return name, cards, tol
+
+    def _coplanar_edges(self, shells: Dict[int, List[int]], mf: List[Tuple[int, List[int], int]],
+                        eps: Dict[int, float]) -> bool:
+        """Whether every slave shell-edge node (``shells``: node -> its slave shells) lies on a
+        master shell edge (``mf``: _facet) whose shell has its section (thickness, OFFSET) and
+        its normal there (ccx's, _shell_node_normal; within 0.05 deg, or reversed without an
+        OFFSET): then the two edge faces of ccx's expanded shells coincide."""
+        sec = self._shell_sec
+        gaps = self._surface_gaps(list(shells), mf, max(eps.values()) * 2.0)
+        for n, es in shells.items():
+            h, i = gaps[n]
+            if h > eps[n] or i is None:
+                return False
+            em, fm, _ = mf[i]
+            q = min(fm, key=lambda m: math.dist(self.geom.nodes[m], self.geom.nodes[n]))
+            nm = self._shell_node_normal(em, q)
+            for e in es:
+                ns = self._shell_node_normal(e, n)
+                if e not in sec or em not in sec or ns is None or nm is None or \
+                        abs(sec[e][0] - sec[em][0]) > 1e-9 * sec[em][0] or sec[e][1] != sec[em][1]:
+                    return False
+                c = vdot(ns, nm)
+                if c < 1.0 - 4e-7 and (c > -1.0 + 4e-7 or sec[e][1]):
+                    return False
+        return True
+
+    def _surface_gaps(self, nodes: Sequence[int], facets: Sequence[Tuple[int, List[int], int]],
+                      reach: float) -> Dict[int, Tuple[float, Optional[int]]]:
+        """Node -> (its distance from the nearest of ``facets`` (_facet: element, nodes,
+        corners; _facet_distance), that facet's index), or (inf, None) beyond ``reach`` of every
+        facet: each node measured against the facets of its cell of a grid only."""
+        pts = self.geom.nodes
+        boxes: List[Tuple[List[float], List[float], int]] = []
+        for i, (_, fn, _) in enumerate(facets):
+            ps = [pts[n] for n in fn if n in pts]
+            if ps:
+                boxes.append(([min(p[k] for p in ps) - reach for k in range(3)],
+                              [max(p[k] for p in ps) + reach for k in range(3)], i))
+        size = max([hi[k] - lo[k] for lo, hi, _ in boxes for k in range(3)] or [0.0]) or 1.0
+        grid: Dict[Tuple[int, ...], List[int]] = {}
+        for j, (lo, hi, _) in enumerate(boxes):
+            for key in itertools.product(*[range(math.floor(lo[k] / size), math.floor(hi[k] / size) + 1)
+                                           for k in range(3)]):
+                grid.setdefault(key, []).append(j)
+        out: Dict[int, Tuple[float, Optional[int]]] = {}
+        for n in nodes:
+            p = pts[n]
+            best: Tuple[float, Optional[int]] = (math.inf, None)
+            for j in grid.get(tuple(math.floor(p[k] / size) for k in range(3)), []):
+                lo, hi, i = boxes[j]
+                if all(lo[k] <= p[k] <= hi[k] for k in range(3)):
+                    d = self._facet_distance(p, facets[i][1], facets[i][2])
+                    if d is not None and d < best[0]:
+                        best = (d, i)
+            out[n] = best
+        return out
+
     def _surface_elements(self, surf: str) -> List[int]:
         """The elements of the faces of element surface ``surf`` (in the mesh)."""
         sd = self.surfaces.get(surf.upper())
@@ -8585,12 +8800,12 @@ class _Mesh:
                       if e in self.geom.elements])
 
     def _membrane_tie_tolerance(self, given: Optional[str], slave: str, master: str, b: Block,
-                                pair: bool) -> float:
+                                pair: bool, node_based: bool = False) -> float:
         """The POSITION TOLERANCE of a tie whose slave surface ``slave`` on membranes became
         their node surface, written out because ccx's default (2.5 % of a master triangle's
         centroid-to-edge distance) is some 20 times smaller than Abaqus': the ``given`` one,
-        else Abaqus' default — a *TIE's 10 % (surface-to-surface) or 5 % (node-to-surface) of
-        the typical master facet diagonal ("Mesh tie constraints"); a tied pair's 2.5 % of the
+        else Abaqus' default — a *TIE's 10 % (surface-to-surface) or 5 % (node-to-surface, a
+        ``node_based`` slave) of the typical master facet diagonal ("Mesh tie constraints"); a tied pair's 2.5 % of the
         master faces' edges, as _plan_rigid_ties takes it.  A *TIE measures it from the
         membrane nodes, as ccx does (Abaqus accounts for shell thickness, "not ... beam or
         membrane thickness"); a tied contact pair's adjustment zone counts the membrane's half
@@ -8609,7 +8824,7 @@ class _Mesh:
                                           if len(q) > 1 for i in range(len(q))])
             else:
                 form = (b.param("TYPE") or "").replace(" ", "").upper()
-                tol = tie_fraction(form, False, self._explicit_deck) * self._mean_diagonal(pts)
+                tol = tie_fraction(form, node_based, self._explicit_deck) * self._mean_diagonal(pts)
         half = 0.0 if not pair or b.has("NO THICKNESS") else \
             0.5 * max([self._mem_thick.get(e, 0.0) for e in self._surface_elements(slave)] or [0.0])
         return tol + half
@@ -9410,11 +9625,15 @@ class _Mesh:
                     pass
                 slave, cards = self._membrane_node_surface(f[0].strip(), "*CONTACT PAIR, TIED slave",
                                                            exclude=set(self._surface_member_nodes(f[1].strip())))
+                shell = None if slave is not None else self._shell_tie_slave(f[0].strip(), f[1].strip(), b, True)
+                if shell is not None:
+                    slave, cards = shell[0], shell[1]
+                    params["POSITION TOLERANCE"] = short_real(shell[2], 6)
                 if slave == "":
                     out.append(f"** abq2ccx: *CONTACT PAIR, TIED: every slave node of {f[0].strip()} is a "
                                f"node of {f[1].strip()}, which joins them already")
                     continue
-                if slave:
+                if slave and shell is None:
                     params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
                         adj, f[0].strip(), f[1].strip(), b, True), 6)
                 out += cards + [emit_keyword("TIE", params), f"{slave or f[0]}, {f[1]}"]
@@ -9583,7 +9802,8 @@ class _Mesh:
         continuum elements, the faces no other continuum element of the model shares.  ccx
         stops on such a line ('*ERROR reading *SURFACE').  On shells and membranes such a line
         is a double-sided surface, both faces (SPOS and SNEG): written so where only couplings
-        use the surface, which take its nodes (probed: the same as a node surface).  A blank
+        use the surface, which take its nodes (probed: the same as a node surface), and ties
+        on conventional shells (_shell_tie_slave writes the form Abaqus ties).  A blank
         data line (read_blocks: "") is Abaqus/Explicit's surface of every exterior face of the
         model, of all its elements but cohesive ones (Keywords Reference *SURFACE; not
         documented for Abaqus/Standard): the exterior faces of its continuum elements, the
@@ -9614,13 +9834,14 @@ class _Mesh:
                     continue
                 eids = self._resolve_elements(g[0]) if len(g) == 1 else []
                 faces = [(e, self._continuum_faces(e)) for e in dedup(eids)]
-                if eids and any(f is None for _, f in faces) and self._sheet_family(g[0]) and \
-                        self._surface_users(blocks, name) <= {"COUPLING"}:
+                family = self._sheet_family(g[0]) if eids and any(f is None for _, f in faces) else None
+                users = self._surface_users(blocks, name) if family else set()
+                if family and (users <= {"COUPLING"} or (family == "shell" and users <= {"COUPLING", "TIE"})):
                     data += [f"{g[0]}, SPOS", f"{g[0]}, SNEG"]
                     self.report.note("*SURFACE line without a face label on shells / membranes (a "
                                      "double-sided surface) -> both faces, SPOS and SNEG: only "
-                                     "couplings use it, which take its nodes (ccx stops on the "
-                                     "line).", once=True)
+                                     "couplings, which take its nodes, or ties on shells use it "
+                                     "(ccx stops on the line).", once=True)
                     continue
                 if not eids or any(f is None for _, f in faces):
                     data.append(", ".join(rec))      # (other elements: handle_surface)
@@ -12994,8 +13215,11 @@ class _Mesh:
         """The plane elements' section thicknesses (a *SOLID SECTION's first data line; 1 where
         it is blank), by element: loads as nodal forces need them, and so do the weights of a
         distributing coupling on plane-element edges (_facet_areas), planned in _plan_rot_nodes
-        — so after the mesh planners (the final element sets) and before that."""
+        — so after the mesh planners (the final element sets) and before that.  Where the deck
+        ties surfaces, also the conventional shells' (thickness, OFFSET) (_shell_tie_slave)."""
         self._section_thick = {}
+        if any(b.keyword == "TIE" or (b.keyword == "CONTACT PAIR" and b.has("TIED")) for b in blocks):
+            self._shell_sec = self._shell_thicknesses(blocks)
         for b in blocks:
             if b.keyword != "SOLID SECTION":
                 continue
@@ -36406,6 +36630,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._sc_damage = False
         self._sc_hyper: set = set()
         self._section_thick: Dict[int, float] = {}  # plane element -> section thickness
+        self._shell_sec: Dict[int, Tuple[float, float]] = {}    # shell -> (thickness, OFFSET); decks with ties
         self._beam_n1: Dict[int, Optional[Vec]] = {}    # beam -> approximate n1 of its section
         self._deck_cloads: Dict[Tuple[int, int], set] = {}   # deck *CLOAD (node, DOF) -> _cload_amp
         self._has_normal = False

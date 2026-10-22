@@ -6899,6 +6899,121 @@ def _t133_axes(kind, p):
     return e1, cross(e3, e1), e3
 
 
+def shell_tie_deck(kind, typ="S4"):
+    """Decks of task 129: *TIE of conventional shells on solid faces, and their twins.
+
+    * skin / skin_shared / skin_merged / offset / offset_ref: a shell strip (x 0-2, y 0-1, 4 x 2
+      elements; S4 or S8R) whose end x 1-2 lies on a block (x 1-2, y 0-1, z -1-0; C3D8 or
+      C3D20), the block's base held, its free edge pulled along x, y and z.  skin: the end
+      tied to the block's top, a faceless slave line (a double-sided surface) on S4, SPOS on
+      S8R; skin_shared: also its x = 1 nodes the block's (S4); skin_merged: the end on the
+      block's top nodes.  offset: the shell's section OFFSET=SPOS, tied with an SNEG surface;
+      offset_ref: Abaqus' tie of those nodes as equations on knotted nodes (knot beams; the
+      knot is the reference surface) (S4).
+    * tjoint / tjoint_merged: an S4 plate (x 0-1, z 0-1 in y = 0) standing on a block (x 0-1,
+      y -0.5-0.5, z -0.5-0), its top edge held in y and pulled along x and z, its middle
+      pushed along y: its bottom edge (E1) tied to the block's top; the plate on the block's
+      nodes."""
+    quad = typ == "S8R"
+    st = 1 if quad else 2
+
+    def cells(nu, nv, node, mids):
+        out = []
+        for j in range(nv):
+            for i in range(nu):
+                a, b = 2 * i, 2 * j
+                c = [node(a, b), node(a + 2, b), node(a + 2, b + 2), node(a, b + 2)]
+                out.append(c + ([node(a + 1, b), node(a + 2, b + 1), node(a + 1, b + 2), node(a, b + 1)]
+                                if mids else []))
+        return out
+
+    def brick(a, b, c, node):
+        conn = [node(a, b, c), node(a + 2, b, c), node(a + 2, b + 2, c), node(a, b + 2, c),
+                node(a, b, c + 2), node(a + 2, b, c + 2), node(a + 2, b + 2, c + 2), node(a, b + 2, c + 2)]
+        if quad:
+            conn += [node(a + 1, b, c), node(a + 2, b + 1, c), node(a + 1, b + 2, c), node(a, b + 1, c),
+                     node(a + 1, b, c + 2), node(a + 2, b + 1, c + 2), node(a + 1, b + 2, c + 2),
+                     node(a, b + 1, c + 2), node(a, b, c + 1), node(a + 2, b, c + 1),
+                     node(a + 2, b + 2, c + 1), node(a, b + 2, c + 1)]
+        return conn
+
+    def block_lines(node, xyz, used):
+        conn = [brick(2 * i, 2 * j, 0, node) for j in range(2) for i in range(2)]
+        pts = sorted({n for c in conn for n in c} - used)
+        rows = "".join(f"{n}, {', '.join(f'{v:g}' for v in xyz[n])}\n" for n in pts)
+        els = "".join(f"{21 + k}, " + ", ".join(map(str, c[:15])) + (",\n" + ", ".join(map(str, c[15:])) if
+                                                                       len(c) > 15 else "") + "\n"
+                      for k, c in enumerate(conn))
+        return rows, f"*ELEMENT, TYPE={'C3D20' if quad else 'C3D8'}, ELSET=BLK\n{els}"
+    if kind in ("skin", "skin_shared", "skin_merged", "offset", "offset_ref"):
+        shell = lambda a, b: 1 + a + 9 * b                                           # noqa: E731
+        xyz = {shell(a, b): (a * 0.25, b * 0.25, 0.0) for a in range(9) for b in range(5)}
+
+        def bnode(a, b, c):
+            if c == 2 and (kind == "skin_merged" or (kind == "skin_shared" and a == 0)):
+                return shell(a + 4, b)
+            n = 101 + a + 5 * b + 25 * c
+            xyz[n] = (1.0 + a * 0.25, b * 0.25, -1.0 + c * 0.5)
+            return n
+        sconn = cells(4, 2, shell, quad)
+        used = {n for c in sconn for n in c}
+        brows, bels = block_lines(bnode, xyz, used)
+        # offset_ref: Abaqus' tie of the knotted shell nodes on the block's top nodes
+        pairs = [(shell(a, b), bnode(a - 4, b, 2)) for a in range(4, 9, st) for b in range(0, 5, st)] \
+            if kind == "offset_ref" else []
+        knots = "".join(f"{900 + k}, {xyz[n][0] + 0.01:g}, {xyz[n][1] + 0.01:g}, 0.01\n" for k, (n, _) in enumerate(pairs))
+        nodes = "*NODE\n" + "".join(f"{n}, {xyz[n][0]:g}, {xyz[n][1]:g}, {xyz[n][2]:g}\n" for n in sorted(used)) + \
+            brows + knots
+        els = f"*ELEMENT, TYPE={typ}, ELSET=SH\n" + "".join(f"{1 + k}, " + ", ".join(map(str, c)) + "\n"
+                                                           for k, c in enumerate(sconn)) + bels
+        edge = [shell(0, b) for b in range(0, 5, st)]
+        base = sorted({bnode(a, b, 0) for a in range(0, 5, st) for b in range(0, 5, st) if not (a % 2 and b % 2)})
+        face = {"skin": "" if not quad else ", SPOS", "skin_shared": ", SPOS", "offset": ", SNEG"}.get(kind)
+        sec = f"*SHELL SECTION, ELSET=SH, MATERIAL=M{', OFFSET=SPOS' if kind.startswith('offset') else ''}\n0.2\n"
+        model = (nodes + els + f"*NSET, NSET=EDGE\n{', '.join(map(str, edge))}\n"
+                 f"*NSET, NSET=BASE\n{', '.join(map(str, base))}\n*ELSET, ELSET=END\n"
+                 f"3, 4, 7, 8\n*MATERIAL, NAME=M\n*ELASTIC\n200000., 0.3\n{sec}*SOLID SECTION, ELSET=BLK, "
+                 f"MATERIAL=M\n")
+        if face is not None:
+            model += (f"*SURFACE, NAME=SKIN\nEND{face}\n*SURFACE, NAME=TOP\n21, S2\n22, S2\n23, S2\n24, S2\n"
+                      "*TIE, NAME=T1, ADJUST=NO\nSKIN, TOP\n")
+        if pairs:
+            model += ("*ELEMENT, TYPE=B31, ELSET=KNOT\n" + "".join(f"{900 + k}, {n}, {900 + k}\n"
+                                                                    for k, (n, _) in enumerate(pairs)) +
+                      "*MATERIAL, NAME=MK\n*ELASTIC\n200000., 0.\n*BEAM SECTION, ELSET=KNOT, MATERIAL=MK, "
+                      "SECTION=RECT\n0.005, 0.005\n1., -1., 0.\n*EQUATION\n" +
+                      "".join(f"2\n{m}, {d}, 1., {n}, {d}, -1.\n" for n, m in pairs for d in (1, 2, 3)) +
+                      "*BOUNDARY\n" + "".join(f"{n}, 6, 6\n" for n, _ in pairs))
+        return (f"*HEADING\nshell tie {kind}\n{model}*BOUNDARY\nBASE, 1, 3\n*STEP\n*STATIC\n*CLOAD\n"
+                f"EDGE, 1, -10.\nEDGE, 2, 10.\nEDGE, 3, 0.5\n*NODE PRINT, NSET=EDGE\nU\n*END STEP\n")
+    if kind in ("tjoint", "tjoint_merged"):
+        plate = lambda a, b: 1 + a + 5 * b                                           # noqa: E731
+        xyz = {plate(a, b): (a * 0.25, 0.0, b * 0.25) for a in range(5) for b in range(5)}
+
+        def bnode(a, b, c):
+            if c == 2 and b == 2 and kind == "tjoint_merged":
+                return plate(a, 0)
+            n = 101 + a + 5 * b + 25 * c
+            xyz[n] = (a * 0.25, -0.5 + b * 0.25, -0.5 + c * 0.25)
+            return n
+        sconn = cells(2, 2, plate, False)
+        used = {n for c in sconn for n in c}
+        brows, bels = block_lines(bnode, xyz, used)
+        nodes = "*NODE\n" + "".join(f"{n}, {xyz[n][0]:g}, {xyz[n][1]:g}, {xyz[n][2]:g}\n" for n in sorted(used)) + brows
+        els = "*ELEMENT, TYPE=S4, ELSET=SH\n" + "".join(f"{1 + k}, " + ", ".join(map(str, c)) + "\n"
+                                                       for k, c in enumerate(sconn)) + bels
+        tie = ("*SURFACE, NAME=FOOT\n1, E1\n2, E1\n*SURFACE, NAME=TOP\n21, S2\n22, S2\n23, S2\n24, S2\n"
+               "*TIE, NAME=T1, ADJUST=NO\nFOOT, TOP\n") if kind == "tjoint" else ""
+        base = sorted({bnode(a, b, 0) for a in range(0, 5, 2) for b in range(0, 5, 2)})
+        return (f"*HEADING\nshell tie {kind}\n{nodes}{els}*NSET, NSET=CREST\n{plate(0, 4)}, {plate(2, 4)}, "
+                f"{plate(4, 4)}\n*NSET, NSET=MID\n{plate(0, 2)}, {plate(2, 2)}, {plate(4, 2)}\n*NSET, NSET=BASE\n"
+                f"{', '.join(map(str, base))}\n*MATERIAL, NAME=M\n*ELASTIC\n200000., 0.3\n*SHELL SECTION, "
+                f"ELSET=SH, MATERIAL=M\n0.1\n*SOLID SECTION, ELSET=BLK, MATERIAL=M\n{tie}*BOUNDARY\nBASE, 1, 3\n"
+                f"CREST, 2, 2\n*STEP\n*STATIC\n*CLOAD\nCREST, 1, 10.\nCREST, 3, -10.\nMID, 2, 0.2\n"
+                f"*NODE PRINT, NSET=CREST\nU\n*NODE PRINT, NSET=MID\nU\n*END STEP\n")
+    raise ValueError(kind)
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -14657,14 +14772,14 @@ def main():
     failures += 0 if ok else 1
 
     # --- task 124: conversions ccx 2.23 stopped or looped on: exact forms ---
-    def t124_run(tag, kind, reduced=()):
+    def t124_run(tag, kind, reduced=(), deck=None):
         """(the .dat path's displacement blocks, buckling factor tables, frequency tables, the
-        report text) of avoidable_stops_deck(kind) converted and solved with exactly the
-        ``reduced`` physics, or None (FAIL printed).  ccx gets 120 s: some of these decks made
-        it loop without end."""
+        report text) of avoidable_stops_deck(kind) (or ``deck``) converted and solved with
+        exactly the ``reduced`` physics, or None (FAIL printed).  ccx gets 120 s: some of these
+        decks made it loop without end."""
         src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(avoidable_stops_deck(kind))
+            fh.write(avoidable_stops_deck(kind) if deck is None else deck)
         rep, conv = convert(src, inp)
         d = tempfile.mkdtemp(prefix="ccxval_")
         shutil.copy(inp, os.path.join(d, "job.inp"))
@@ -14889,6 +15004,31 @@ def main():
                   f"Abaqus' law ({err:.1e} apart; pressed by a force {f:.6g}; before: {before})")
         elif res:
             print(f"FAIL  {tag}: no heat flux printed")
+        failures += 0 if ok else 1
+
+    # --- task 129: *TIE of conventional shells on solid faces: Abaqus ties the shell nodes ---
+    # (the untied nodes compared: ccx prints a tied shell node at another point than a merged one)
+    for kind, typ, ref, what, before in (
+            ("skin", "S4", "skin_merged", "an S4 strip's end on a C3D8 block, tied by a faceless "
+             "(double-sided) slave line", "the line left out, ccx looped"),
+            ("skin_shared", "S4", "skin_merged", "the same tied by its SPOS faces, their first row of "
+             "nodes the block's", "the tie left out: singular"),
+            ("skin", "S8R", "skin_merged", "an S8R strip's end on a C3D20 block, tied by its SPOS faces",
+             "the faces half the thickness off, none tied: singular"),
+            ("offset", "S4", "offset_ref", "an S4 strip of OFFSET=SPOS on a C3D8 block, tied by its "
+             "SNEG faces; vs equations of its knotted nodes", "the faces a thickness off: singular"),
+            ("tjoint", "S4", "tjoint_merged", "an S4 plate's bottom edge E1 tied to a C3D8 block (a T "
+             "joint), bent and sheared", "4.8 % off: the edge faces clamp the joint")):
+        runs = [t124_run(f"t129_{kind}_{typ}", None, deck=shell_tie_deck(kind, typ)),
+                t124_run(f"t129_{kind}_{typ}_ref", None, deck=shell_tie_deck(ref, typ))]
+        ok = all(runs) and len(runs[0][0]) == len(runs[1][0])
+        if ok:
+            err, moved = max(t124_apart(a, b) for a, b in zip(runs[0][0], runs[1][0]))
+            ok = err <= (2e-6 if kind == "offset" else 1e-9) * moved and moved > 1e-3 and \
+                "whose nodes lie on the solid master faces" in " ".join(runs[0][3].split())
+            print(f"{'PASS' if ok else 'FAIL'}  t129_{kind}_{typ} ({what}): the free nodes as the "
+                  f"{'knotted nodes tied' if kind == 'offset' else 'merged mesh'} ({err:.1e} apart; |u| "
+                  f"{moved:.6g}; before: {before})")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
