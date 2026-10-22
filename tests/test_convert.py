@@ -12305,6 +12305,8 @@ def test_attribute_owners():
                           "(_Constraints), tied contact pairs (_Mesh)",
         "_dist_tables": "the *DISTRIBUTION TABLEs of rewritten distributions: the axes' "
                         "(_plan_distributions) and the ply split's",
+        "_mem_thinning": "a membrane material's thinning ratio, which its copies take: the section "
+                         "mass's (_Mesh) and the explicit mass scaling's (_mass_scaled_material)",
     }
     import ast
     with open(A.__file__, encoding="utf-8") as fh:
@@ -15108,13 +15110,14 @@ def test_explicit_mass_scaling_over_steps():
 
 def test_explicit_mass_scaling_element_set():
     # an ELSET holding every element with mass (sections, *MASS, *ROTARY INERTIA) scales the
-    # whole model's; part of it would need per-element densities: not converted
+    # whole model's; part of it is scaled where its masses are written
+    # (test_explicit_mass_scaling_part_of_the_model)
     sets = "*ELSET, ELSET=ALL\n1, 9\n*ELSET, ELSET=SOME\n1\n"
     body, conv, rep = convert_str(EXPLICIT_HEX + sets + _explicit_steps("*FIXED MASS SCALING, FACTOR=4., ELSET=ALL\n"))
     assert conv._mass_scale == 0.25 and _card(body, "*MASS, ELSET=PM") == ["0.008"]
     body, conv, rep = convert_str(EXPLICIT_HEX + sets + _explicit_steps("*FIXED MASS SCALING, FACTOR=4., ELSET=SOME\n"))
     assert conv._mass_scale is None and _card(body, "*MASS, ELSET=PM") == ["0.002"]
-    assert "ELSET=SOME scales the mass of part of the model" in rep.text()
+    assert "*SOLID SECTION, ELSET=EALL, MATERIAL=M_MASS_SCALED" in body
     # a *VARIABLE MASS SCALING on part of the model keeps only its own DT from converting
     body, conv, rep = convert_str(EXPLICIT_HEX + sets + _explicit_steps(
         "*FIXED MASS SCALING, FACTOR=4.\n*VARIABLE MASS SCALING, DT=1e-4, FREQUENCY=1, ELSET=SOME\n"),
@@ -15124,6 +15127,97 @@ def test_explicit_mass_scaling_element_set():
     for bad, why in (("FACTOR=<F>", "FACTOR=<F> does not read as a number"), ("FACTOR=0.", "FACTOR=0. is not positive")):
         _, conv, rep = convert_str(EXPLICIT_HEX + _explicit_steps(f"*FIXED MASS SCALING, {bad}\n"))
         assert conv._mass_scale is None and why in rep.text(), bad
+
+
+def test_explicit_mass_scaling_part_of_the_model():
+    # *FIXED MASS SCALING with an ELSET on part of the model (Abaqus 2017 "Mass scaling": a
+    # local definition overrides the global one; gravity and the thermal response keep the
+    # true mass): each section of one factor f gets a copy of its material with *DENSITY x f
+    # and *SPECIFIC HEAT / f, *MASS values go out x f, and a GRAV line / f, split into a set
+    # per factor where its set holds several
+    sets = "*ELSET, ELSET=ALL\n1, 9\n*ELSET, ELSET=SOME\n1\n"
+    steps = ("*STEP\n*DYNAMIC, EXPLICIT\n, 0.01\n*FIXED MASS SCALING, FACTOR=2.\n"
+             "*FIXED MASS SCALING, FACTOR=4., ELSET=SOME\n*DLOAD\nALL, GRAV, 9810., 0., 0., -1.\n"
+             "PM, GRAV, 9810., 0., 0., -1.\n*END STEP\n")
+    body, conv, rep = convert_str(EXPLICIT_HEX + sets + steps)
+    assert conv._mass_scale is None and not conv.reduced_physics
+    assert "*SOLID SECTION, ELSET=EALL, MATERIAL=M_MASS_SCALED" in body
+    copy = body.split("*MATERIAL, NAME=M_MASS_SCALED\n")[1]
+    assert _card_at(copy, "*DENSITY") == ["3.12e-08, 20.", "3.08e-08, 520."]
+    assert _card_at(copy, "*SPECIFIC HEAT") == ["115000000"] and _card_at(copy, "*ELASTIC") == ["1000., 0.3"]
+    assert _card(body, "*MASS, ELSET=PM") == ["0.004"]
+    assert "ALL_MS1, GRAV, 2452.5, 0., 0., -1.\nALL_MS2, GRAV, 4905, 0., 0., -1.\nPM, GRAV, 4905, 0., 0., -1.\n" in body
+    assert conv.geom.elset("ALL_MS1") == [1] and conv.geom.elset("ALL_MS2") == [9]
+    assert "*FIXED MASS SCALING with ELSET" in rep.text() and "factors 2, 4" in rep.text()
+    # the converter's estimate of ccx's increment sees the copy's density
+    out = "*OUTPUT, FIELD, NUMBER INTERVAL=2\n*NODE OUTPUT\nU\n"
+    freq = [int(re.search(r"\*NODE FILE, FREQUENCY=(\d+)", convert_str(EXPLICIT_HEX + sets + _explicit_steps(
+        c + out))[0]).group(1)) for c in ("", "*FIXED MASS SCALING, FACTOR=100., ELSET=SOME\n")]
+    assert abs(freq[0] / freq[1] - 10.0) < 0.5
+    # a *BEAM GENERAL SECTION's DENSITY=, and a rigid body's rotary inertia with its centre
+    # mass: the point masses that carry it x f; the elements outside the set keep theirs
+    beam = ("*NODE\n20, 3., 0., 0.\n21, 4., 0., 0.\n*ELEMENT, TYPE=B31, ELSET=EB\n11, 20, 21\n"
+            "*BEAM GENERAL SECTION, ELSET=EB, SECTION=RECT, DENSITY=7.8e-9\n0.1, 0.1\n0., 1., 0.\n"
+            "210000., 80769.\n")
+    stars = ("*NODE\n100, 0.5, 0.5, 2.\n*ELEMENT, TYPE=MASS, ELSET=EM\n30, 100\n"
+             "*ELEMENT, TYPE=ROTARYI, ELSET=ER\n31, 100\n*NSET, NSET=RP\n100\n*NSET, NSET=TOP\n5, 6, 7, 8\n"
+             "*RIGID BODY, REF NODE=RP, TIE NSET=TOP\n*MASS, ELSET=EM\n0.01\n*ROTARY INERTIA, ELSET=ER\n1., 2., 3.\n"
+             "*ELSET, ELSET=SC\nEB, EM, ER\n")
+    got = []
+    for f in ("", "*FIXED MASS SCALING, FACTOR=100., ELSET=SC\n"):
+        body, conv, _ = convert_str(EXPLICIT_HEX + beam + stars + _explicit_steps(f))
+        got.append((float(_card_at(body.split("*MATERIAL, NAME=ABQ2CCX_RECT_MATERIAL")[1], "*DENSITY")[0]),
+                    [float(m) for m in re.findall(r"\*MASS, ELSET=ABQ2CCX_STAR\d+\n(\S+)\n", body)],
+                    _card(body, "*MASS, ELSET=EM"), _card(body, "*MASS, ELSET=PM"), _card_at(body, "*DENSITY")))
+    assert got[0][1] and abs(got[1][0] / got[0][0] - 100.0) < 1e-9
+    assert all(abs(b / a - 100.0) < 1e-9 for a, b in zip(got[0][1], got[1][1]))
+    assert got[1][2:] == (["1"], ["0.002"], ["7.8e-9, 20.", "7.7e-9, 520."])
+    # ply materials: a conventional composite's and a split continuum shell's (one solid per ply)
+    mat = COMPOSITE_MAT + "*Density\n1.6e-9\n*Material, name=GLASS\n*Elastic\n70000., 0.22\n*Density\n2.5e-9\n"
+    halves = "*Elset, elset=E1\n1\n*Elset, elset=E2\n2\n"
+    step = ("*Step\n*Dynamic, Explicit\n, 1e-4\n*Fixed Mass Scaling, factor=25., elset=E2\n*Boundary\n"
+            "CLAMP, ENCASTRE\n*Dload\nPLATE, GRAV, 9810., 0., 0., -1.\n*End Step\n")
+    for strip, t in ((S4R_STRIP, "0.1"), (SC8R_STRIP, "1.")):
+        layup = "".join(f"*Shell Section, elset={e}, composite\n{t}, 3, CFRP, 0.\n{t}, 3, GLASS, 90.\n"
+                        for e in ("E1", "E2"))
+        body, conv, rep = convert_str(strip.replace(COMPOSITE_MAT, mat) + halves + layup + step)
+        assert conv._ms_plan["part"] == [25.0], strip
+        assert _card_at(body.split("*MATERIAL, NAME=GLASS_MASS_SCALED")[1], "*DENSITY") == ["6.25e-08"]
+        assert _card_at(body.split("*MATERIAL, NAME=CFRP_MASS_SCALED")[1], "*DENSITY") == ["4e-08"]
+        if strip == S4R_STRIP:
+            assert [x.split(",")[2].strip() for x in _card_at(body, "*SHELL SECTION, ELSET=E2")] == \
+                ["CFRP_MASS_SCALED", "GLASS_MASS_SCALED"]
+            assert [x.split(",")[2].strip() for x in _card_at(body, "*SHELL SECTION, ELSET=E1")] == ["CFRP", "GLASS"]
+        else:                                   # (each element set takes all its plies)
+            assert "*SOLID SECTION, ELSET=E2_PLY2, MATERIAL=GLASS_MASS_SCALED" in body
+            assert "*SOLID SECTION, ELSET=E1_PLY2, MATERIAL=GLASS," in body
+        assert "PLATE_MS1, GRAV, 9810., 0., 0., -1.\nPLATE_MS2, GRAV, 392.4, 0., 0., -1.\n" in body
+    # not converted, with the reason (ccx runs the true mass): a section of elements of two
+    # factors, a user material, a factor that changes for an element, overlapping sets
+    two = EXPLICIT_HEX.replace("*ELEMENT, TYPE=MASS", "*NODE\n11, 0., 0., 2.\n12, 1., 0., 2.\n13, 1., 1., 2.\n"
+                               "14, 0., 1., 2.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n2, 5, 6, 7, 8, 11, 12, 13, 14\n"
+                               "*ELEMENT, TYPE=MASS")
+    umat = EXPLICIT_HEX.replace("*ELASTIC\n1000., 0.3\n", "*USER MATERIAL, CONSTANTS=2\n1000., 0.3\n*DEPVAR\n1\n")
+    fms = "*FIXED MASS SCALING, FACTOR=4., ELSET=SOME\n"
+    for deck, why in (
+            (two + sets + _explicit_steps(fms), "*SOLID SECTION, ELSET=EALL: its elements have different "
+                                                "factors (1, 4), and a material has one density"),
+            (umat + sets + _explicit_steps(fms), "material M of *SOLID SECTION, ELSET=EALL is a user material"),
+            (EXPLICIT_HEX + sets + _explicit_steps(fms, "*FIXED MASS SCALING, FACTOR=4., ELSET=PM\n"),
+             "the factor changes between steps (element 1: 4 in step 1, 1 in step 2)"),
+            (EXPLICIT_HEX + sets + _explicit_steps(fms + "*FIXED MASS SCALING, FACTOR=3., ELSET=ALL\n"),
+             "the element sets of step 1's *FIXED MASS SCALING cards overlap"),
+            (EXPLICIT_HEX + beam + stars + _explicit_steps("*FIXED MASS SCALING, FACTOR=10., ELSET=EM\n"),
+             "the *ROTARY INERTIA and *MASS of a rigid body: its elements have different factors (1, 10)")):
+        body, conv, rep = convert_str(deck)
+        assert why in rep.text() and "commented out, so ccx runs the true mass" in rep.text(), why
+        assert "_MASS_SCALED" not in body and "*DENSITY\n7.8e-9, 20.\n" in body, why
+    # a target increment on part of the model: ccx's selective mass scaling acts on all of it
+    body, conv, rep = convert_str(EXPLICIT_HEX + sets + _explicit_steps(
+        "*FIXED MASS SCALING, FACTOR=4., ELSET=SOME, DT=1e-4\n"), approximate=True)
+    assert not conv._sms_target and "MATERIAL=M_MASS_SCALED" in body
+    assert "ELSET=SOME gives part of the model a target increment" in rep.text()
+    assert "so ccx runs the masses the *FIXED MASS SCALING factors scale per element set" in rep.text()
 
 
 def test_explicit_mass_scaling_target_increment():

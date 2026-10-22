@@ -11402,19 +11402,20 @@ class _Mesh:
         return name
 
     def _material_copy(self, blocks: List[Block], group: List[Block], name: str, drop: set,
-                       extra: Sequence[Block]) -> None:
+                       extra: Sequence[Block]) -> List[Block]:
         """Insert into ``blocks``, after material ``group`` (its card and options,
         _material_options), a copy of it named ``name``: every card but those ``drop`` names,
         then ``extra``.  A copy carries every other card: one left out (a *DEFORMATION
         PLASTICITY, an *ELECTRICAL CONDUCTIVITY) is behaviour the copy's elements lose, and ccx
         stops where it was their elasticity.  The original is recorded (``_copied_materials``:
-        _copied_away)."""
+        _copied_away).  Returns the copy's cards."""
         self._copied_materials.add(group[0].uparam("NAME"))
         clone = [Block(c.keyword, OrderedDict(c.params), list(c.data))
                  for c in group if c is group[0] or c.keyword not in drop]
         clone[0].params["NAME"] = name
         at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
         blocks[at:at] = clone + list(extra)
+        return clone + list(extra)
 
     def _plan_shell_density(self, blocks: List[Block]) -> None:
         """*SHELL SECTION, DENSITY= on continuum shells (SC6R / SC8R), a mass per unit area of
@@ -14176,13 +14177,17 @@ class _Rigid:
         and the in-plane rotation in Abaqus) is not given one — how ccx's 2-degree sector
         would take a whole-circumference inertia is not established — so its ROTARYI is
         dropped where inertia does nothing (no dynamic or frequency step), else only under
-        --approximate."""
+        --approximate.  Each star's set -> the deck's elements whose mass it carries, the
+        body's ROTARYI and the MASS elements at its centre (``_star_sources``), and each set
+        -> the ROTARYI taken out of it (``_rotaryi_members``): their explicit mass scaling
+        factor (_plan_mass_scaling_factors)."""
         want = self._types_where(lambda t: t.upper() == "ROTARYI")
         rot_elems = OrderedDict((e, c[0]) for e, (t, c) in self.geom.elements.items()
                                 if t in want and c)
         if not rot_elems:
             return
         mass_at: Dict[int, float] = {}
+        mass_els: Dict[int, List[int]] = {}         # node -> its MASS elements
         for b in blocks:
             if b.keyword != "MASS":
                 continue
@@ -14194,6 +14199,7 @@ class _Rigid:
                 info = self.geom.elements.get(e)
                 if info and info[0].upper() == "MASS" and info[1]:
                     mass_at[info[1][0]] = mass_at.get(info[1][0], 0.0) + m
+                    mass_els.setdefault(info[1][0], []).append(e)
         owner: Dict[int, Block] = {}
         for b in blocks:
             if b.keyword != "RIGID BODY" or b.param("ANALYTICAL SURFACE"):
@@ -14293,6 +14299,7 @@ class _Rigid:
                 continue
             c = self.geom.nodes[centre]
             star_nodes = []
+            sources = tuple(e for _, e in items) + tuple(mass_els.get(centre, ()))
             for off, m in star:
                 nid += 1
                 self.geom.add_node(nid, vadd(c, off))
@@ -14303,11 +14310,13 @@ class _Rigid:
                     name = self._rigid_set_name("ABQ2CCX_STAR")
                     self.geom.elsets[name] = [eid]
                     self._star_masses.append((name, m))
+                    self._star_sources[name] = sources
             eid += 1
             self.geom.add_element(eid, "MASS", [centre])
             name = self._rigid_set_name("ABQ2CCX_STAR")
             self.geom.elsets[name] = [eid]
             self._star_masses.append((name, -0.5 * m_c))
+            self._star_sources[name] = sources
             p1, m1, p2, m2, p3, m3 = star_nodes
             tets = []
             for a, b2 in ((p1, p2), (p2, m1), (m1, m2), (m2, p1)):
@@ -14334,6 +14343,7 @@ class _Rigid:
                 self._rotary_done.add(id(b))
         for name, ids in self.geom.elsets.items():
             if any(i in done for i in ids):
+                self._rotaryi_members.setdefault(name, []).extend(i for i in ids if i in done)
                 self.geom.elsets[name] = [i for i in ids if i not in done]
 
     def _add_rigid_members(self, body: Block, nodes: List[int]) -> None:
@@ -14404,6 +14414,7 @@ class _Rigid:
                 out += ["*CONDUCTIVITY", "1e-30", "*SPECIFIC HEAT", "0."]
             out += [f"*SOLID SECTION, ELSET={RIGID_SET}, MATERIAL={RIGID_SET}"]
         for name, m in self._star_masses:          # ccx reads 20 characters of a field
+            m *= self._star_scale.get(name, 1.0)    # (_plan_partial_mass_scaling)
             out += [f"*MASS, ELSET={name}", short_real(m / (self._mass_scale or 1.0), 12)]
         return out
 
@@ -16184,13 +16195,16 @@ class _Materials:
                              f"loaded past yield at once stops there, with or without its real "
                              f"density). Check the first increments of the step.", once=True)
 
-    def _mass_scaled(self, b: Block, out: List[str], raw: bool = False) -> List[str]:
+    def _mass_scaled(self, b: Block, out: List[str], raw: bool = False,
+                     scale: Optional[float] = None) -> List[str]:
         """The emitted *DENSITY / *SPECIFIC HEAT / *MASS card ``out`` with its masses divided by
-        self._mass_scale and its specific heats multiplied by it (_plan_coupled_inertia): the
-        first value of each row, every value of a *MASS line.  A row is one line, or with
-        ``raw`` (the deck's DEPENDENCIES= rows, uncollapsed) as many as material_rows reads.
-        Temperatures and field values stay as they are."""
-        if not self._mass_scale or b.keyword not in ("DENSITY", "SPECIFIC HEAT", "MASS"):
+        ``scale`` (default self._mass_scale: _plan_coupled_inertia) and its specific heats
+        multiplied by it: the first value of each row, every value of a *MASS line.  A row is
+        one line, or with ``raw`` (the deck's DEPENDENCIES= rows, uncollapsed) as many as
+        material_rows reads.  Temperatures and field values stay as they are; ValueError where
+        a scaled value does not read."""
+        scale = self._mass_scale if scale is None else scale
+        if not scale or b.keyword not in ("DENSITY", "SPECIFIC HEAT", "MASS"):
             return out
         per_rec = 1
         if raw:
@@ -16198,7 +16212,7 @@ class _Materials:
                 per_rec = -(-(2 + max(0, int(float(b.param("DEPENDENCIES") or "0")))) // 8)
             except ValueError:
                 pass
-        factor = self._mass_scale if b.keyword == "SPECIFIC HEAT" else 1.0 / self._mass_scale
+        factor = scale if b.keyword == "SPECIFIC HEAT" else 1.0 / scale
         lines, row = list(out), 0
         for i, ln in enumerate(lines):
             if ln.lstrip().startswith("*") or not ln.strip():
@@ -16213,29 +16227,23 @@ class _Materials:
             row += 1
         return lines
 
-    def _plan_explicit_mass_scaling(self, blocks: List[Block]) -> None:
+    def _plan_mass_scaling_factors(self, blocks: List[Block]) -> None:
         """Abaqus/Explicit's *FIXED MASS SCALING, FACTOR=f multiplies the original mass of every
         element of its ELSET (all elements without one; *MASS, *ROTARY INERTIA and rigid
         elements too, springs and dashpots have none) once at the start of the step that gives
-        it.  The scaled masses carry into the later steps; a later *FIXED MASS SCALING scales
-        the original masses again (without FACTOR and DT: back to them).  Gravity loads and
-        the thermal response keep the true mass (Abaqus 2017 Analysis guide, "Mass scaling").
-        ccx has one density per material for all steps, so where every explicit step has the
-        same factor for the whole model (an ELSET holding every element with mass counts as
-        it), the masses go out f times larger: self._mass_scale = 1 / f (_mass_scaled: the
-        densities and *MASS values; specific heats over f, so the heat capacity stays; GRAV
-        magnitudes over f; the rotary-inertia stars and a *BEAM GENERAL SECTION's DENSITY=).
-        ccx's mass matrix is then Abaqus' scaled one, and its stable increment sqrt(f) larger.
-
-        A target increment DT (TYPE=BELOW MIN, the default, on either card) scales the
-        elements whose stable increment is below DT up to it; ccx's selective mass scaling
-        does that for the elements whose increment ccx estimates below the minimum increment
-        of a *DYNAMIC, EXPLICIT step (calcstabletimeincvol.f), keeping their translational
-        mass, which Abaqus adds to.  Under --approximate such a step gets DT as its minimum
-        increment (_sms_target, handle_dynamic; [APPROX]).  TYPE=UNIFORM / SET EQUAL DT with
-        DT and ROLLING need Abaqus' own element estimates: no clean form.  What is not
-        converted stays a numerical control, commented out with the reason
-        (_mass_scaling_cards, handle_mass_scaling)."""
+        it.  The scaled masses carry into the later steps; a step's *FIXED MASS SCALING cards
+        scale the original masses again (without FACTOR and DT: back to them), the card with
+        an ELSET overriding the one without on its set (Abaqus 2017 Analysis guide, "Mass
+        scaling": one fixed definition per element set, the sets of a step's definitions do
+        not overlap); an element no card of the step names keeps its original mass.  Gravity
+        loads and the thermal response keep the true mass.  ccx has one density per material
+        for all steps, so each element's factor must be the same in every explicit step.
+        This reads, per explicit step, the factor of each element with mass (MASS_SECTION_
+        CARDS) and the target increment DT, and why either is not converted, into
+        ``_ms_plan``, which _plan_explicit_mass_scaling converts and reports.  Where the
+        elements' factors differ, their masses are scaled where they are written
+        (_plan_partial_mass_scaling): right after _read_steps, before every planner that
+        reads material names, which then sees the material copies."""
         cards = [b for b in blocks if b.keyword in ("FIXED MASS SCALING", "VARIABLE MASS SCALING")]
         if not cards:
             return
@@ -16249,21 +16257,46 @@ class _Materials:
             elif not s.explicit:
                 why = why or (f"a *{b.keyword} in step {s.no}, which is no *DYNAMIC, EXPLICIT step "
                               f"(the card is Abaqus/Explicit's)")
-        massive: Optional[set] = None
+        massive: Optional[List[int]] = None
 
-        def partial(b: Block) -> str:
-            """Why card ``b`` scales only part of the model's mass, or ""."""
+        def members(name: str) -> List[int]:
+            """The elements of set ``name``, the ROTARYI that became stars too."""
+            return self.geom.elset(name) + self._rotaryi_members.get(name.upper(), [])
+
+        def mass_elements() -> List[int]:
+            """The elements with mass: those of the cards that give it (MASS_SECTION_CARDS)."""
             nonlocal massive
+            if massive is None:
+                massive = dedup([e for c in blocks if c.keyword in MASS_SECTION_CARDS and c.param("ELSET")
+                                 for e in members((c.param("ELSET") or "").strip())])
+            return massive
+
+        def partial(b: Block, overridden: bool) -> str:
+            """Why the target increment of card ``b`` acts on part of the model only (its ELSET
+            leaves out elements with mass, or, ``overridden``, local cards override it), or ""."""
             name = (b.param("ELSET") or "").strip()
             if not name:
-                return ""
-            if massive is None:
-                massive = {e for c in blocks if c.keyword in MASS_SECTION_CARDS and c.param("ELSET")
-                           for e in self.geom.elset((c.param("ELSET") or "").strip())}
-            if massive - set(self.geom.elset(name)):
-                return (f"ELSET={name} scales the mass of part of the model (per-element "
-                        f"densities are not written)")
+                return ("a local *FIXED MASS SCALING overrides its target increment on part of the "
+                        "model, and ccx's selective mass scaling acts on the whole model"
+                        if overridden else "")
+            if set(mass_elements()) - set(members(name)):
+                return (f"ELSET={name} gives part of the model a target increment, and ccx's "
+                        f"selective mass scaling acts on the whole model")
             return ""
+
+        def factor_of(b: Block) -> float:
+            """The FACTOR of card ``b`` (1 without one); sets why where it is no factor."""
+            nonlocal why
+            if not b.param("FACTOR"):
+                return 1.0
+            try:
+                f = pf(b.param("FACTOR") or "")
+            except ValueError:
+                why = why or f"FACTOR={b.param('FACTOR')} does not read as a number"
+                return 1.0
+            if not f > 0.0:
+                why = why or f"FACTOR={b.param('FACTOR')} is not positive"
+            return f
 
         def target(b: Block, s: Step) -> Optional[float]:
             """The target increment DT of card ``b`` in step ``s``, None without one; sets
@@ -16291,51 +16324,247 @@ class _Materials:
                 dt_why = dt_why or f"step {s.no} has a fixed increment (DIRECT USER CONTROL)"
             return dt
 
-        factor, dt_var, dt_mass = 1.0, None, None
-        factors: Dict[int, float] = {}              # explicit step -> the factor in force
-        targets: Dict[int, float] = {}              # explicit step -> its target increment
+        # a step's factors: (that of the elements no ELSET names, element -> that of its ELSET)
+        field: Tuple[float, Dict[int, float]] = (1.0, {})
+        dt_var, dt_mass = None, None
+        fields: Dict[int, Tuple[float, Dict[int, float]]] = {}     # explicit step -> its factors
+        targets: Dict[int, float] = {}                              # ... -> its target increment
         for s in self.steps:
             fixed = [b for b in s.cards if b.keyword == "FIXED MASS SCALING"]
             var = [b for b in s.cards if b.keyword == "VARIABLE MASS SCALING"]
-            for group in (fixed, var):
-                if len(group) > 1:
-                    why = why or f"step {s.no} has more than one *{group[0].keyword}"
-            for b in fixed:                         # (it rescales its elements' original masses)
-                why = why or partial(b)
-            for b in var:
-                dt_why = dt_why or partial(b)
+            if sum(not b.param("ELSET") for b in fixed) > 1:
+                why = why or f"step {s.no} has more than one *FIXED MASS SCALING without ELSET"
+            if len(var) > 1:
+                dt_why = dt_why or f"step {s.no} has more than one *VARIABLE MASS SCALING"
             if fixed:                               # the original masses, scaled again
-                b = fixed[-1]
-                factor = 1.0
-                if b.param("FACTOR"):
-                    try:
-                        factor = pf(b.param("FACTOR") or "")
-                    except ValueError:
-                        why = why or f"FACTOR={b.param('FACTOR')} does not read as a number"
-                    else:
-                        if not factor > 0.0:
-                            why = why or f"FACTOR={b.param('FACTOR')} is not positive"
-                dt_mass = target(b, s)
+                default, local = 1.0, {}
+                for b in fixed:
+                    f = factor_of(b)
+                    name = (b.param("ELSET") or "").strip()
+                    if not name:
+                        default = f
+                        continue
+                    for e in dedup(members(name)):
+                        if e in local:
+                            why = why or (f"the element sets of step {s.no}'s *FIXED MASS SCALING "
+                                          f"cards overlap (Abaqus allows one definition per element)")
+                        local[e] = f
+                field = (default, local)
+                ts = [t for t in (target(b, s) for b in fixed) if t is not None]
+                dt_mass = max(ts) if ts else None
+                for b in fixed:
+                    if b.param("DT") or b.uparam("TYPE") == "ROLLING":
+                        dt_why = dt_why or partial(b, len(fixed) > 1)
             if var:                                 # replaces (without DT: ends) the one before
+                for b in var:
+                    if b.param("DT") or b.uparam("TYPE") == "ROLLING":
+                        dt_why = dt_why or partial(b, False)
                 dt_var = target(var[-1], s)
             if dt_var is not None:                  # (and the masses it scales carry on)
                 dt_mass = max(dt_mass or 0.0, dt_var)
             if s.explicit:
-                factors[s.no] = factor
+                fields[s.no] = field
                 if dt_mass is not None:
                     targets[s.no] = dt_mass
-        steps = sorted(factors)
-        if len(set(factors.values())) > 1:
-            why = why or (f"the factor changes between steps ("
-                          f"{', '.join(f'{factors[n]:g} in step {n}' for n in steps)}), and ccx has "
-                          f"one density per material for all steps")
-        f = factors[steps[0]] if steps and not why else 1.0
+        steps = sorted(fields)
+        f = 1.0                                     # the factor of every element with mass
+        part: Dict[int, float] = {}                 # else: element -> its factor other than 1
+        if steps and not why:
+            if not any(local for _d, local in fields.values()):
+                if len({d for d, _l in fields.values()}) > 1:
+                    why = (f"the factor changes between steps ("
+                           f"{', '.join(f'{fields[n][0]:g} in step {n}' for n in steps)}), and ccx "
+                           f"has one density per material for all steps")
+                else:
+                    f = fields[steps[0]][0]
+            else:
+                mass = mass_elements()
+                eff = {n: [local.get(e, d) for e in mass] for n, (d, local) in fields.items()}
+                k = next((i for i in range(len(mass)) if len({eff[n][i] for n in steps}) > 1), None)
+                if k is not None:
+                    why = (f"the factor changes between steps (element {mass[k]}: "
+                           f"{', '.join(f'{eff[n][k]:g} in step {n}' for n in steps)}), and ccx "
+                           f"has one density per material for all steps")
+                elif len(set(eff[steps[0]])) > 1:
+                    part = {e: x for e, x in zip(mass, eff[steps[0]]) if x != 1.0}
+                    why = self._plan_partial_mass_scaling(blocks, part, mass)
+                else:
+                    f = eff[steps[0]][0] if mass else fields[steps[0]][0]
+        self._ms_plan = dict(cards=cards, why=why, dt_why=dt_why, f=f if not why else 1.0,
+                             steps=steps, targets=targets,
+                             part=sorted(set(part.values())) if part and not why else [])
+
+    def _plan_partial_mass_scaling(self, blocks: List[Block], part: Dict[int, float],
+                                   massive: Sequence[int]) -> str:
+        """Explicit mass scaling factors that differ between elements (``part``: element ->
+        its factor other than 1; ``massive``: the elements with mass; _plan_mass_scaling_
+        factors), written where the masses are: for the sections of factor f a copy of each
+        of their materials (a composite's plies' too) with *DENSITY times f and *SPECIFIC HEAT
+        divided by f, so the heat capacity stays (Abaqus' thermal response keeps the true
+        mass), once per material and factor ({material}_MASS_SCALED, _mass_scaled_material);
+        *MASS values, a *BEAM GENERAL SECTION's DENSITY= and the point masses that carry a
+        rigid body's rotary inertia (_star_sources) times f; GRAV / CENTRIF magnitudes divided
+        by the factor of the elements with mass they load (Abaqus' gravity keeps the true
+        mass), a set of several factors split into a set per factor ({set}_MS<k>:
+        _grav_scale, handle_dload); the stars' factors: _star_scale.  Returns why this is not done ("" where it is, nothing
+        changed otherwise): a card whose elements have different factors (a material has one
+        density, a *MASS card one value), a user material (its copy would change the name its
+        routine is called by), U1 beams or C3D8I slabs (materials of their own), a value that
+        does not read, or a rigid body whose rotary inertia and centre mass differ."""
+        opts = self._material_options(blocks)
+        heavy = set(massive)
+
+        def factor(elems: Sequence[int], what: str) -> Tuple[float, str]:
+            fs = sorted({part.get(e, 1.0) for e in elems})
+            if len(fs) > 1:
+                return 1.0, f"{what}: its elements have different factors ({', '.join(f'{x:g}' for x in fs)})"
+            return (fs[0] if fs else 1.0), ""
+
+        sections: List[Tuple[Block, Optional[dict], List[str], float]] = []
+        masses: List[Tuple[Block, float]] = []
+        general: List[Tuple[Block, float]] = []
+        for b in blocks:
+            if b.keyword not in MASS_SECTION_CARDS or b.keyword == "ROTARY INERTIA" or not b.param("ELSET"):
+                continue                            # (ROTARYI: on rigid bodies, the stars below)
+            elset = (b.param("ELSET") or "").strip()
+            f, why = factor(self.geom.elset(elset), f"*{b.keyword}, ELSET={elset}")
+            if why:
+                return why + (", and ccx has one mass per *MASS card" if b.keyword == "MASS" else
+                              ", and a material has one density")
+            if f == 1.0:
+                continue
+            if b.keyword == "MASS":
+                masses.append((b, f))
+                continue
+            if id(b) in self._u1_cards or id(b) in self._slab_sections:
+                return (f"*{b.keyword}, ELSET={elset} becomes ccx "
+                        f"{'U1 beams' if id(b) in self._u1_cards else 'C3D8I slabs'} with a material "
+                        f"of their own")
+            if b.keyword == "BEAM GENERAL SECTION":
+                if b.param("DENSITY"):
+                    try:
+                        pf(b.param("DENSITY") or "")
+                    except ValueError:
+                        return f"*BEAM GENERAL SECTION, DENSITY={b.param('DENSITY')} does not read as a number"
+                    general.append((b, f))
+                continue
+            if id(b) in self._ply_unsplit:
+                continue                            # commented out: no mass in ccx
+            plan = self._ply_sections.get(id(b))
+            mats = dedup([g["mat"].upper() for g in plan["groups"]]) if plan else \
+                dedup([m.upper() for _t, m, _o in self._section_layers(b, strict=True) if m])
+            for m in mats:
+                for c in opts.get(m, []):           # (an undefined one: _check_undefined_materials)
+                    if c.keyword == "USER MATERIAL":
+                        return (f"material {m} of *{b.keyword}, ELSET={elset} is a user material (a "
+                                f"copy would change the name its routine is called by)")
+                    try:
+                        self._mass_scaled(c, list(c.data), raw=True, scale=1.0 / f)
+                    except ValueError:
+                        return f"the *{c.keyword} of material {m} does not read as numbers"
+            sections.append((b, plan, mats, f))
+        stars: Dict[str, float] = {}
+        for name, _m in self._star_masses:
+            f, why = factor(self._star_sources.get(name, ()), "the *ROTARY INERTIA and *MASS of a rigid body")
+            if why:
+                return why + ", and the point masses that carry its rotary inertia scale with both"
+            stars[name] = f
+        grav: "OrderedDict[str, Tuple[str, List[Tuple[float, List[int]]]]]" = OrderedDict()
+        for s in self.steps:
+            for b in s.cards:
+                for rec in merged_data_records(b) if b.keyword == "DLOAD" else ():
+                    g = [x.strip() for x in rec]
+                    if len(g) < 3 or g[1].upper() not in ("GRAV", "CENTRIF") or _is_user_load(b, g):
+                        continue
+                    try:
+                        pf(g[2] or "0")
+                    except ValueError:
+                        return f"the {g[1].upper()} magnitude '{g[2]}' does not read as a number"
+                    token = g[0] or ALL_ELEMENTS_SET        # (handle_dload: the whole model's set)
+                    if token.upper() in grav:
+                        continue
+                    by: "OrderedDict[float, List[int]]" = OrderedDict()
+                    for e in dedup(self._load_elements(g[0]) if g[0] else list(self.geom.elements)):
+                        if e in heavy and e in self.geom.elements:
+                            by.setdefault(part.get(e, 1.0), []).append(e)
+                    grav[token.upper()] = (token, list(by.items()))
+        taken = set(opts) | {n.upper() for n in list(self.geom.elsets) + list(self.geom.nsets)}
+        copies: Dict[Tuple[str, float], str] = {}
+        for b, plan, mats, f in sections:
+            names = {m: self._mass_scaled_material(blocks, opts, m, f, taken, copies) for m in mats if m in opts}
+            if plan is not None:
+                for g in plan["groups"]:
+                    g["mat"] = names.get(g["mat"].upper(), g["mat"])
+            if plan is not None or b.has("COMPOSITE"):
+                self._rename_ply_materials(b, names)    # (_material_uses reads them)
+            elif names:
+                b.params["MATERIAL"] = names[mats[0]]
+        for b, f in masses:
+            b.data[:] = self._mass_scaled(b, list(b.data), scale=1.0 / f)
+        for b, f in general:
+            b.params["DENSITY"] = "%.12g" % (pf(b.param("DENSITY") or "") * f)
+        self._star_scale = {name: x for name, x in stars.items() if x != 1.0}
+        self._reserve_names()
+        for key, (token, groups) in grav.items():
+            if [x for x, _es in groups] in ([], [1.0]):
+                continue
+            if len(groups) == 1:
+                self._grav_scale[key] = [(token, groups[0][0])]
+                continue
+            self._grav_scale[key] = []
+            for k, (x, es) in enumerate(groups, 1):
+                name = self._fresh_name(f"{token}_MS{k}")
+                self.geom.elsets[name] = es
+                self._grav_scale[key].append((name, x))
+        return ""
+
+    def _mass_scaled_material(self, blocks: List[Block], opts: Dict[str, List[Block]], mat: str,
+                              f: float, taken: set, copies: Dict[Tuple[str, float], str]) -> str:
+        """The name of a copy of material ``mat`` (upper case) whose *DENSITY rows are ``f``
+        times and *SPECIFIC HEAT rows 1 / ``f`` times the material's: {mat}_MASS_SCALED
+        (_fresh_name, not in ``taken``), inserted after the material (_material_copy), once
+        per material and factor (``copies``); a membrane material's thinning ratio goes
+        with it (_mem_thinning)."""
+        if (mat, f) in copies:
+            return copies[(mat, f)]
+        name = self._fresh_name(f"{mat}_MASS_SCALED", taken)
+        for c in self._material_copy(blocks, opts[mat], name, set(), ()):
+            c.data[:] = self._mass_scaled(c, list(c.data), raw=True, scale=1.0 / f)
+        if mat in self._mem_thinning:
+            self._mem_thinning[name] = self._mem_thinning[mat]
+        copies[(mat, f)] = name
+        return name
+
+    def _plan_explicit_mass_scaling(self, blocks: List[Block]) -> None:
+        """The explicit mass scaling _plan_mass_scaling_factors read (``_ms_plan``), converted.
+        Where every explicit step has the same factor f for every element with mass, the
+        masses go out f times larger: self._mass_scale = 1 / f (_mass_scaled: the densities
+        and *MASS values; specific heats over f, so the heat capacity stays; GRAV magnitudes
+        over f; the rotary-inertia stars and a *BEAM GENERAL SECTION's DENSITY=).  Where the
+        factors differ between elements, _plan_partial_mass_scaling has written them where
+        the masses are.  ccx's mass matrix is then Abaqus' scaled one, and its stable
+        increment sqrt(f) larger where f scales it.
+
+        A target increment DT (TYPE=BELOW MIN, the default, on either card) scales the
+        elements whose stable increment is below DT up to it; ccx's selective mass scaling
+        does that for the elements whose increment ccx estimates below the minimum increment
+        of a *DYNAMIC, EXPLICIT step (calcstabletimeincvol.f), keeping their translational
+        mass, which Abaqus adds to.  Under --approximate such a step gets DT as its minimum
+        increment (_sms_target, handle_dynamic; [APPROX]).  TYPE=UNIFORM / SET EQUAL DT with
+        DT, ROLLING and a DT on part of the model need Abaqus' own element estimates: no clean
+        form.  What is not converted stays a numerical control, commented out with the reason
+        (_mass_scaling_cards, handle_mass_scaling)."""
+        plan = self._ms_plan
+        if plan is None:
+            return
+        cards, why, dt_why, f, steps, targets, part = (
+            plan[k] for k in ("cards", "why", "dt_why", "f", "steps", "targets", "part"))
         if targets and not why and not dt_why and not self._approx:
             dt_why = ("its target increment DT scales each element by its own stable increment "
                       "(--approximate: ccx's selective mass scaling)")
         for b in cards:
             dt = b.param("DT") or b.uparam("TYPE") == "ROLLING"
-            self._mass_scaling_cards[id(b)] = (f, why or (dt_why if dt else ""))
+            self._mass_scaling_cards[id(b)] = (None if part else f, why or (dt_why if dt else ""))
         if f != 1.0:
             if self._mass_scale:                    # (no explicit step in such a deck)
                 for b in cards:
@@ -16350,6 +16579,17 @@ class _Materials:
                              f"smaller (Abaqus' gravity loads keep it too): ccx's mass matrix is "
                              f"Abaqus' scaled one, and its stable increment {math.sqrt(f):.4g} times "
                              f"larger.", once=True)
+        if part:
+            self.report.note(f"*FIXED MASS SCALING with ELSET (Abaqus/Explicit: the original mass of the "
+                             f"set's elements times its FACTOR from the start of step {steps[0]}, a "
+                             f"local definition overriding the global one; factors "
+                             f"{', '.join(f'{x:g}' for x in part)}) -> per element set of one factor: "
+                             f"copies of its materials (..._MASS_SCALED) with *DENSITY times the "
+                             f"factor and *SPECIFIC HEAT divided by it, *MASS values, *BEAM GENERAL "
+                             f"SECTION DENSITY= and rotary inertias times it, GRAV magnitudes divided "
+                             f"by it (on a set per factor, ..._MS<k>, where a GRAV set holds several): "
+                             f"Abaqus' gravity loads and thermal response keep the true mass. ccx's "
+                             f"mass matrix is Abaqus' scaled one.", once=True)
         if targets and not why and not dt_why:
             self._sms_target = dict(targets)
             self.report.warn(f"[APPROX] explicit mass scaling to a target increment DT (TYPE=BELOW "
@@ -16367,11 +16607,12 @@ class _Materials:
         """*FIXED / *VARIABLE MASS SCALING: commented out (ccx has no such card) — carried by the
         scaled masses or a step's minimum increment where _plan_explicit_mass_scaling converts
         it, else a numerical control dropped with the reason (ccx runs the true mass, or the
-        masses the factor scales)."""
+        masses the factors scale)."""
         f, why = self._mass_scaling_cards.get(id(b), (1.0, "not read"))
         kw = b.keyword
         if why:
-            mass = f"the masses scaled by FACTOR={f:g}" if f != 1.0 else "the true mass"
+            mass = ("the masses the *FIXED MASS SCALING factors scale per element set" if f is None else
+                    f"the masses scaled by FACTOR={f:g}" if f != 1.0 else "the true mass")
             return self._commented(b, f"*{kw}: explicit mass scaling (artificial mass) not converted: "
                                       f"{why}; commented out, so ccx runs {mass}.", reduces=False)
         done = [x for x, given in (("its FACTOR in the scaled masses", b.param("FACTOR")),
@@ -28032,6 +28273,15 @@ class _Loads:
                     body.append(ln)
                     lines.append((tag + key, ln, mag))
                 continue
+            parts = self._grav_scale.get(g[0].upper()) if label in ("GRAV", "CENTRIF") and len(g) > 2 else None
+            if parts:
+                # its elements' masses go out their factor times larger, on a set per factor
+                # (_plan_partial_mass_scaling)
+                for name, f in parts:
+                    mag = g[2] if f == 1.0 else "%.12g" % (pf(g[2]) / f)
+                    body.append(", ".join([name, g[1], mag] + g[3:]))
+                    lines.append((tag + (name.upper(), label), body[-1], mag))
+                continue
             if self._mass_scale and label in ("GRAV", "CENTRIF") and len(g) > 2 and g[2]:
                 # the masses it acts on are divided by the scale (_plan_coupled_inertia)
                 g = g[:2] + ["%.12g" % (pf(g[2]) * self._mass_scale)] + g[3:]
@@ -34753,8 +35003,14 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # id(*FIXED / *VARIABLE MASS SCALING) -> (the factor converted, why the card is not:
         # "" where it is); explicit step -> the minimum increment for ccx's selective mass
         # scaling (--approximate) (_plan_explicit_mass_scaling)
-        self._mass_scaling_cards: Dict[int, Tuple[float, str]] = {}
+        self._mass_scaling_cards: Dict[int, Tuple[Optional[float], str]] = {}
         self._sms_target: Dict[int, float] = {}
+        # the deck's mass scaling as _plan_mass_scaling_factors reads it, for
+        # _plan_explicit_mass_scaling; GRAV / CENTRIF element set or element (upper case) ->
+        # [(set written, its elements' factor)] where an explicit FACTOR scales part of the model
+        self._ms_plan: Optional[dict] = None
+        self._grav_scale: Dict[str, List[Tuple[str, float]]] = {}
+        self._star_scale: Dict[str, float] = {}     # rotary-inertia star set -> its factor
         self._ref_nodes: set = set()
         self._rb_rot: Dict[int, int] = {}          # rigid-body REF NODE -> ROT NODE
         self._rb_rot_synth: Dict[int, int] = {}    # ... where the converter created the ROT NODE
@@ -35072,6 +35328,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._kin_twist_bc: Dict[int, List[Vec]] = {}         # ... axes the deck's BCs always hold
         self._rigid_cards_out = False
         self._star_masses: List[Tuple[str, float]] = []     # (element set, mass) per *MASS card
+        self._star_sources: Dict[str, Tuple[int, ...]] = {}  # star set -> the elements it carries mass of
+        self._rotaryi_members: Dict[str, List[int]] = {}    # set -> its ROTARYI the stars took out of it
         self._rotary_done: set = set()             # id(*ROTARY INERTIA) carried by a star
         self._rigid_own_sets: set = set()          # the bodies' node sets the converter made
         self._node_elem_map: Optional[Dict[int, List[int]]] = None   # node -> elements (lazy)
@@ -35538,6 +35796,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_free_ref_nodes(blocks)       # before every planner that reads a REF NODE
         self._plan_dp_materials(blocks)         # before the step model: NLGEOM in ccx
         self._read_steps(blocks)                # after the last planner that rewrites a step card
+        self._plan_mass_scaling_factors(blocks)     # before every planner reading material names
         self._plan_solver_facts(blocks)         # after the step model and _plan_rigid
         self._reset_emission()                  # (handle_step advances the step cursor)
         self._plan_node_classes(blocks)         # after the mesh planners: the final element types

@@ -6,6 +6,14 @@ physics.
 
 ## Unreleased
 
+* **Explicit mass scaling on part of the model** — `*FIXED MASS SCALING, FACTOR=f, ELSET=...`
+  on part of the model (a local factor overriding the global one) was dropped (ccx ran the true
+  mass); each section whose elements share a factor now gets a copy of its materials with the
+  density f times and the specific heat 1/f times the original, and `*MASS` values, a `*BEAM
+  GENERAL SECTION`'s `DENSITY=` and rotary inertias go out f times larger, GRAV magnitudes f
+  times smaller (a GRAV set holding several factors split into a set per factor): Abaqus'
+  scaled mass matrix. A section of two factors, a user material or a factor that changes
+  between steps stay dropped, with the reason.
 * **ccx stops the conversion now avoids** — a `*TIE` line naming one surface as slave and master
   is left out (Abaqus ties nothing there; ccx 2.23 looped without end), and a solid or node slave
   surface that shares nodes with its master becomes a node surface of its other nodes (Abaqus

@@ -185,9 +185,12 @@ TRANSLATED = {
         "larger, specific heats and GRAV magnitudes f times smaller (Abaqus' gravity and thermal "
         "response keep the true mass): Abaqus' scaled mass matrix. A target increment `DT` "
         "(`TYPE=BELOW MIN`) → with `--approximate` ccx's selective mass scaling (`DT` the step's "
-        "minimum increment). Otherwise (part of the model, a factor that changes between steps, "
-        "`TYPE=UNIFORM` / `SET EQUAL DT` with `DT`, `ROLLING`) a numerical control: ccx runs the "
-        "true mass.",
+        "minimum increment). `FACTOR` on part of the model (`ELSET`, overriding the global one) → "
+        "per section of one factor a copy of its materials with density × f and specific heat / f, "
+        "`*MASS` values and rotary inertias × f, GRAV magnitudes / f, on a set per factor where a "
+        "GRAV set holds several. Otherwise (a section of two factors, a user material, a factor "
+        "that changes between steps, `DT` on part of the model, `TYPE=UNIFORM` / `SET EQUAL DT` "
+        "with `DT`, `ROLLING`) a numerical control: ccx runs the true mass.",
     "*FREQUENCY": "Abaqus-only params dropped; `EIGENSOLVER=SUBSPACE` max-frequency field blanked "
         "(ccx reads it as the lower bound); `NORMALIZATION=DISPLACEMENT` noted (ccx mass-normalizes). "
         "The step's `*CLOAD` / `*DLOAD` / `*DSLOAD` are commented out: Abaqus ignores them.",

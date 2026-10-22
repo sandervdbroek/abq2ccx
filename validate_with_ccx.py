@@ -4817,6 +4817,36 @@ def explicit_mass_deck(card="", twin=1.0):
     return "\n".join(lines) + "\n"
 
 
+def explicit_part_deck(card="", twin=False):
+    """explicit_mass_deck's bar with its two outer elements a quarter as long (x = 2, 2.25,
+    2.5: they set the stable increment), in sections of their own of one material, *MASS
+    0.002 at the tip node 20, under gravity 9810 in -z on the whole bar (one GRAV line on
+    BAR) and the mass, and the ramped tip load 0.5 in y.  ``card``: the step's mass scaling
+    card (its element set OUTER: the outer elements and the mass); ``twin``: those 100 times
+    heavier and their gravity 100 times smaller, by hand (a material of their own)."""
+    xs = (0.0, 1.0, 2.0, 2.25, 2.5)
+    nid = lambda i, j, k: 1 + i + 5 * (j + 2 * k)                             # noqa: E731
+    lines = ["*Heading", "An explicit bar with mass scaling on part of it", "*Node"]
+    lines += [f"{nid(i, j, k)}, {xs[i]}, {j}., {k}." for k in range(2) for j in range(2) for i in range(5)]
+    for name, ids in (("BAR_IN", (0, 1)), ("BAR_OUT", (2, 3))):
+        lines.append(f"*Element, type=C3D8, elset={name}")
+        lines += [f"{i + 1}, {nid(i, 0, 0)}, {nid(i + 1, 0, 0)}, {nid(i + 1, 1, 0)}, {nid(i, 1, 0)}, "
+                  f"{nid(i, 0, 1)}, {nid(i + 1, 0, 1)}, {nid(i + 1, 1, 1)}, {nid(i, 1, 1)}" for i in ids]
+    out = "M2" if twin else "M"
+    lines += ["*Element, type=MASS, elset=PM", "100, 20", "*Elset, elset=BAR", "BAR_IN, BAR_OUT",
+              "*Elset, elset=OUTER", "BAR_OUT, PM", "*Nset, nset=ROOT", "1, 6, 11, 16", "*Nset, nset=TIP", "20",
+              "*Material, name=M", "*Elastic", "1000., 0.3", "*Density", "1e-3"]
+    lines += ["*Material, name=M2", "*Elastic", "1000., 0.3", "*Density", "0.1"] if twin else []
+    lines += ["*Solid Section, elset=BAR_IN, material=M", f"*Solid Section, elset=BAR_OUT, material={out}",
+              "*Mass, elset=PM", "0.2" if twin else "0.002", "*Boundary", "ROOT, 1, 3",
+              "*Amplitude, name=RAMP", "0., 0., 0.05, 1.", "*Step, nlgeom=YES", "*Dynamic, Explicit",
+              ", 0.05"] + ([card] if card else []) + ["*Dload"]
+    lines += ["BAR_IN, GRAV, 9810., 0., 0., -1.", "BAR_OUT, GRAV, 98.1, 0., 0., -1.", "PM, GRAV, 98.1, 0., 0., -1."] \
+        if twin else ["BAR, GRAV, 9810., 0., 0., -1.", "PM, GRAV, 9810., 0., 0., -1."]
+    lines += ["*Cload, amplitude=RAMP", "TIP, 2, 0.5", "*Node print, nset=TIP", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
 def material_card_deck(kind, twin=False):
     """Decks whose material cards ccx stopped on or misread (code review 3, task material-copies):
     * "dp_mass": shell_mass_deck's S4 plate (gravity) of a *DEFORMATION PLASTICITY material
@@ -13791,6 +13821,27 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  explicit_mass_dt (the bar, *FIXED MASS SCALING, DT=1e-3, "
               f"--approximate): ccx's selective mass scaling, increment {inc:.6g} (without "
               f"--approximate {inc_plain:.6g}), tip moved {tip:.4g}")
+    failures += 0 if ok else 1
+
+    # FACTOR=100 on part of the model (it was dropped: ccx ran the true mass): the outer
+    # elements' material copied with the density 100x, the *MASS 100x, and the bar's GRAV line
+    # split into a set per factor, the outer one's / 100 (Abaqus' gravity keeps the true mass):
+    # every printed increment as the twin scaled by hand, and ccx's increment 4x the true
+    # mass's (the inner elements, 4x as long, set it now)
+    runs = [explicit_run(explicit_part_deck(*a), tag) for a, tag in (
+        (("*Fixed Mass Scaling, factor=100., elset=OUTER",), "explicit_mass_part"),
+        (("", True), "explicit_mass_part_ref"), (("",), "explicit_mass_part_true"))]
+    ok = all(runs)
+    if ok:
+        (got, inc, _), (ref, inc_ref, _), (_, inc_true, _) = runs
+        tip = max(abs(x) for x in ref[-1])
+        err = max(abs(a - b) for u, v in zip(got, ref) for a, b in zip(u, v)) / tip
+        grow = inc / inc_true
+        ok = len(got) == len(ref) > 2 and err < 1e-9 and tip > 1e-3 and abs(grow - 4.0) < 1e-3 and inc == inc_ref
+        print(f"{'PASS' if ok else 'FAIL'}  explicit_mass_part (the bar with short outer elements, gravity "
+              f"and a ramped tip load, *FIXED MASS SCALING, FACTOR=100 on the outer elements and the point "
+              f"mass): {len(got)} printed increments as the twin scaled by hand ({err:.1e} of the tip's "
+              f"{tip:.4g} apart), increment {inc:.6g} = {grow:.6g} x the true mass's {inc_true:.6g}")
     failures += 0 if ok else 1
 
     # --- task 124: conversions ccx 2.23 stopped or looped on: exact forms ---
