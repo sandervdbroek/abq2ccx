@@ -8140,6 +8140,71 @@ def test_traction_on_plane_and_axisymmetric_edges():
     assert _close(_cloads(body)[0], {(2, 2): 6 * math.pi, (3, 2): 6 * math.pi}, 1e-9)
 
 
+# one quadratic element, r 5-8, z 0-1, its bottom edge's midside node at r = {m} (6: a third
+# of the edge; 6.5: the middle); the bottom edge is face 1 (surface BOT)
+AXI_EDGE = ("*Node\n1, 5., 0.\n2, 8., 0.\n3, 8., 1.\n4, 5., 1.\n5, {m}, 0.\n6, 8., 0.5\n7, 6.5, 1.\n"
+            "8, 5., 0.5\n*Element, type={t}, elset=E\n{conn}\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=E, material=M\n{sec}*Surface, name=BOT\nE, S1\n*Boundary\n3, 2\n4, 2\n"
+            "*Step{nl}\n*Static\n{load}*End Step\n")
+AXI_CONN = {8: "1, 1, 2, 3, 4, 5, 6, 7, 8", 6: "1, 1, 2, 4, 5, 9, 8\n*Node\n9, 6.5, 0.5"}
+
+
+def _axi_edge(t, m=6.0, load="*Dload\n1, P1, 2.\n", nl="", sec=""):
+    return AXI_EDGE.format(t=t, m=m, load=load, nl=nl, sec=sec, conn=AXI_CONN[6 if t.endswith(("6", "6M")) else 8])
+
+
+def test_two_point_edge_shift_marks_the_edges_ccx_misloads():
+    # ccx 2.23 integrates a pressure on a CAX8R / CAX6 edge at 2 points; N_i p 2 pi r n ds is of
+    # degree 3 on a straight edge with its midside node in the middle or at one radius
+    shift = lambda *xy: A.two_point_edge_shift([(x, y, 0.) for x, y in xy])  # noqa: E731
+    assert shift((5, 0), (8, 0), (6.5, 0)) < 1e-12 and shift((5, 0), (5, 3), (5, 2)) < 1e-12
+    assert shift((5, 0), (8, 1), (6.5, .5)) < 1e-12
+    assert abs(shift((5, 0), (8, 0), (6, 0)) - 2 / 63) < 1e-12               # 2-point: 0.7407 at r = 5
+    assert shift((5, 0), (8, 1), (6.5, .7)) > 1e-3                          # off the chord
+
+
+def test_pressure_on_two_point_axisymmetric_edges_becomes_nodal_forces():
+    # a pressure on a CAX8R / CAX6 edge whose midside node is off the middle: ccx 2.23 would
+    # integrate it at 2 points (0.95-1.07 of the face displacements on a 3 x 4 mesh, probed),
+    # Abaqus integrates it fully: the consistent nodal forces, in a deck without NLGEOM
+    want = {}
+    for n, f in zip((1, 2, 5), A.consistent_nodal_forces(
+            "line", [(5., 0., 0.), (8., 0., 0.), (6., 0., 0.)], lambda p, nn, t: (0., 2., 0.), True)):
+        want[(n, 2)] = f[1]
+    for t in ("CAX8R", "CGAX8R", "CAX6M"):
+        for load in ("*Dload\n1, P1, 2.\n", "*Dsload\nBOT, P, 2.\n"):
+            body, conv, rep = convert_str(_axi_edge(t, load=load))
+            got = _cloads(body)
+            assert len(got) == 1 and _close(got[0], want, 1e-9), (t, load, got)
+            assert "*DLOAD" not in body and all(r.startswith("element ") for r in conv.reduced_physics)
+            assert "pressures on CAX8R / CAX6 edges in a deck without NLGEOM" in rep.text()
+    # replaced and removed in later steps, as Abaqus does with the pressure
+    steps = ("*Dload\n1, P1, 2.\n*End Step\n*Step\n*Static\n*Dload\n1, P1, 4.\n*End Step\n"
+             "*Step\n*Static\n*Dload, op=new\n")
+    got = _cloads(convert_str(_axi_edge("CAX8R", load=steps))[0])
+    assert _close(got[1], {k: 2 * v for k, v in want.items()}, 1e-9)
+    assert _close(got[2], {k: 0.0 for k in want}, 0.0), got
+
+
+def test_pressure_stays_where_ccx_integrates_it_fully():
+    # midside node in the middle (exact at 2 points), full CAX8 (3 points), plane CPE8R (degree 3)
+    for t, m, sec in (("CAX8R", 6.5, ""), ("CAX8", 6.0, ""), ("CPE8R", 6.0, "1.\n"), ("CAX6", 6.5, "")):
+        body, conv, rep = convert_str(_axi_edge(t, m=m, sec=sec))
+        assert "*DLOAD\n1, P1, 2.\n" in body and _cloads(body) == [{}], t
+        assert "CAX8R / CAX6" not in rep.text()
+
+
+def test_pressure_on_two_point_edges_under_nlgeom_is_kept_and_warned():
+    # under NLGEOM the pressure follows the deforming faces (nodal forces would not): kept, one
+    # warning for all its lines
+    load = "*Dload\n1, P1, 2.\n*Dsload\nBOT, P, 1.\n"
+    body, conv, rep = convert_str(_axi_edge("CAX8R", load=load, nl=", nlgeom"))
+    assert "*DLOAD\n1, P1, 2.\n" in body and _cloads(body) == [{}]
+    warns = [m for lv, m in rep.entries if lv == "WARNING" and "kept as ccx face pressures" in m]
+    assert len(warns) == 1 and "('1', 'BOT')" in warns[0] and "0.032 of a node's share" in warns[0]
+    assert "under NLGEOM" in warns[0] and not conv.reduced_physics
+
+
 def test_traction_under_nlgeom_converts_only_when_exact():
     deck = (HEX + "*Surface, name=TOP\nEALL, S2\n*Step, nlgeom\n*Static\n*Dsload{}\n"
             "TOP, TRVEC, 4., {}\n*End Step\n")

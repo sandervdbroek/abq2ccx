@@ -4778,8 +4778,8 @@ def ccx_integration_points(typ: str, xyz: Sequence[Vec]) -> Optional[List[Vec]]:
     return [tuple(sum([w * p[k] for w, p in zip(N, xyz)]) for k in range(3)) for N in weights]
 
 
-def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: bool = False
-                            ) -> List[Vec]:
+def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: bool = False,
+                            rule: Optional[Sequence[Tuple[float, float]]] = None) -> List[Vec]:
     """f_i = integral of N_i t over one edge or face in its undeformed geometry, by Gauss
     quadrature (exact for the constant tractions and line loads of straight or flat
     members, and to quadrature accuracy on curved ones).  ``kind`` is "line" (2/3 nodes) or
@@ -4788,12 +4788,13 @@ def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: b
     face its unit normal; the tangent is the unit edge direction (None on a face).  An
     axisymmetric edge integrates over the full circle (2 pi r ds, r = x): ccx reads a
     concentrated load on an axisymmetric node as the total around the circumference
-    (probed on 2.23 against a pressure-loaded twin)."""
+    (probed on 2.23 against a pressure-loaded twin).  ``rule``: another Gauss rule for an edge,
+    ((point, weight), ...) on [-1, 1] (two_point_edge_shift)."""
     n = len(xyz)
-    rule = (((g, 0.0, w) for g, w in _GAUSS_LINE) if kind == "line" else
-            _GAUSS_TRI if n in (3, 6) else _GAUSS_QUAD)
+    points = (((g, 0.0, w) for g, w in rule or _GAUSS_LINE) if kind == "line" else
+              _GAUSS_TRI if n in (3, 6) else _GAUSS_QUAD)
     forces = [[0.0, 0.0, 0.0] for _ in range(n)]
-    for a, b, w in rule:
+    for a, b, w in points:
         N, da, db = _shape(kind, n, a, b)
         p = tuple(sum([N[i] * xyz[i][k] for i in range(n)]) for k in range(3))
         ga = tuple(sum([da[i] * xyz[i][k] for i in range(n)]) for k in range(3))
@@ -4814,6 +4815,30 @@ def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: b
             for k in range(3):
                 forces[i][k] += s * t[k]
     return [(f[0], f[1], f[2]) for f in forces]
+
+
+# ccx 2.23 expands a CAX8R into a C3D20R and a CAX6 into a C3D15 (gen3delem.f) and integrates a
+# face pressure on them at 2 points along the 2-D edge (e_c3d.f: mint2d 2 on a 2-D element's
+# C3D20R, 2 x 2 on a C3D15's quadrilateral face; 3 on the CAX8's C3D20, 9 points on its face);
+# Abaqus integrates distributed loads fully (2017 "Solid (continuum) elements": "The mass
+# matrix and distributed loadings use full integration")
+TWO_POINT_AXI_EDGE_TYPES = frozenset({"CAX8R", "CAX6"})
+_GAUSS2_LINE = ((-0.5773502691896258, 1.0), (0.5773502691896258, 1.0))
+
+
+def two_point_edge_shift(xyz: Sequence[Vec]) -> float:
+    """How far ccx's 2-point rule (TWO_POINT_AXI_EDGE_TYPES) moves a pressure's nodal shares on
+    the quadratic axisymmetric edge ``xyz`` (corners, then the midside node): max |f2_i - f_i| /
+    max |f_i| over its nodes, f the consistent forces (consistent_nodal_forces), f2 the 2-point
+    ones.  N_i p 2 pi r n ds is of degree 3 in the edge coordinate on a straight edge with its
+    midside node in the middle or at one radius (0 to round-off), up to 5 with the midside node
+    off the middle or off the chord.  The sum of the shares is exact either way."""
+    def unit(p, n, t):
+        return n
+    f = consistent_nodal_forces("line", xyz, unit, True)
+    f2 = consistent_nodal_forces("line", xyz, unit, True, rule=_GAUSS2_LINE)
+    big = max(vnorm(v) for v in f)
+    return max(vnorm(vsub(a, b)) for a, b in zip(f, f2)) / big if big else 0.0
 
 
 def blocks_from_lines(lines: Sequence[str]) -> List[Block]:
@@ -28390,6 +28415,11 @@ class _Loads:
             # 'EALL, GRAV, 9810., , , -1.' along -x or spins a CENTRIF line with a blank axis
             # point about an axis of length zero (NaN)
             g = g[:2] + [x or "0." for x in g[2:]]
+            if re.fullmatch(r"P[1-6]", label) and not family:
+                conv = self._two_point_pressure(b, g, [(g[0], label[1])])
+                if conv is not None:            # (CAX8R / CAX6 edges ccx would load unlike Abaqus)
+                    side += conv
+                    continue
             split = self._sheet_lines(g[0], label, g[2] if len(g) > 2 else "", 1.0) if family else None
             if split is not None:                     # both faces of the expanded element
                 for ln, key, mag in split:
@@ -28508,6 +28538,11 @@ class _Loads:
                     continue
                 faces, why = self._surface_faces(surf, carriers_only=True)
                 side += self._to_nodal_forces(b, "DSLOAD", g, faces, why)
+            conv = self._two_point_pressure(b, [g[0], label, mag or "0."],
+                                            [(t, f) for t, f in sd[1] if not self._only_carriers(t)])
+            if conv is not None:                # (CAX8R / CAX6 edges ccx would load unlike Abaqus)
+                side += conv
+                continue
             dropped = False
             for token, face in sd[1]:
                 if self._only_carriers(token):
@@ -29179,11 +29214,85 @@ class _Loads:
             return self._drop_load_line(b, g, f"'{g[0]}' gives no element faces", reduces=False)
         return self._to_nodal_forces(b, b.keyword, list(g[:5]) + [""] * (5 - len(g[:5])), faces, None)
 
+    def _two_point_pressure(self, b: Block, g: List[str], pairs: Sequence[Tuple[str, str]]
+                            ) -> Optional[List[str]]:
+        """A pressure line ``g`` (*DLOAD Pn, *DSLOAD P) on the faces ``pairs`` ((element / set,
+        face: 1-6 or S1-S6)) that loads an edge of a CAX8R / CAX6 element where ccx's 2-point rule
+        moves the nodal shares (two_point_edge_shift beyond 1e-6) -> consistent nodal forces of
+        the whole line (_to_nodal_forces): Abaqus' fully integrated load, exact in a deck
+        without NLGEOM, where the pressure stays on the undeformed faces in every step.  Probed
+        on 2.23: ccx's pressure gives the
+        2-point forces' displacements to 6e-5, 0.95-1.07 of the exact forces' on a 3 x 4 CAX8R
+        mesh with the midside nodes at a third of each edge (0.998-1.001 on 24 x 32), and a 2 x 2
+        CAX8R thick sphere 0.986-1.054 of Lame's u_r where the exact forces give 0.993-1.007.
+        None (the pressure stays) where no such edge is loaded; under NLGEOM (the pressure
+        follows the deforming faces, nodal forces would not) and on faces other than 2-D
+        continuum ones, warned once (_warn_two_point_kept)."""
+        shift = 0.0
+        faces: list = []
+        plain = True                            # only 2-D continuum faces (nodal forces exact)
+        for token, face in pairs:
+            label = (face or "").upper()
+            label = label if label.startswith("S") else f"S{label}"
+            for e in self._load_elements(token):
+                info = self.geom.elements.get(e)
+                cc = ccx_type(info[0]) if info else ""
+                got, why = self._load_faces([e], label, shell_reference=False) \
+                    if cc.startswith(PLANE_ELEM_PREFIXES) and e not in self._carriers else ([], "")
+                if why is not None:
+                    plain = False
+                    continue
+                nodes, kind, scale, axi, planar, n1, _ = got[0]
+                xyz = [self.geom.nodes[n] for n in nodes]
+                if cc in TWO_POINT_AXI_EDGE_TYPES and len(nodes) == 3:
+                    shift = max(shift, two_point_edge_shift(xyz))
+                normals: List[Vec] = []
+                consistent_nodal_forces(kind, xyz, lambda p, n, tg: normals.append(n) or
+                                        (0.0, 0.0, 0.0), axi)
+                conn = info[1]                  # pushing in: against the outward normal
+                mid = tuple(sum(self.geom.nodes[k][i] for k in conn) / len(conn) for i in range(3))
+                fmid = tuple(sum(x[i] for x in xyz) / len(xyz) for i in range(3))
+                sense = -1.0 if vdot(normals[0], vsub(fmid, mid)) > 0.0 else 1.0
+                faces.append((nodes, kind, scale, axi, planar, n1, sense))
+        if shift <= 1e-6:
+            return None
+        if self._nl_any or not plain:           # (warned once: _warn_two_point_kept)
+            old = self._two_point_kept.get(g[0], (0.0, False))
+            self._two_point_kept[g[0]] = (max(old[0], shift), old[1] or self._nl_any)
+            return None
+        return self._to_nodal_forces(b, b.keyword, g, faces, None, face_pressure=True)
+
+    def _warn_two_point_kept(self) -> None:
+        """One warning for the pressures _two_point_pressure left on CAX8R / CAX6 edges."""
+        kept = self._two_point_kept
+        if not kept:
+            return
+        names = list(kept)
+        shift = max(v[0] for v in kept.values())
+        nl = any(v[1] for v in kept.values())
+        self.report.warn(f"Pressures on CAX8R / CAX6 edges kept as ccx face pressures ("
+                         f"{', '.join(repr(x) for x in names[:5])}"
+                         + (f" and {len(names) - 5} more" if len(names) > 5 else "")
+                         + f"): ccx 2.23 integrates them at 2 points along the edge (Abaqus: "
+                           f"fully), which on an axisymmetric edge whose midside node lies off its "
+                           f"middle or off its chord moves part of the load between the edge's "
+                           f"nodes — here by up to {shift:.2g} of a node's share (each edge's total "
+                           f"is exact; probed: 0.95-1.07 of the face displacements on a 3 x 4 mesh "
+                           f"with the midside nodes at a third of each edge, 0.998-1.001 on 24 x "
+                           f"32). Their consistent nodal forces, which a deck without NLGEOM gets, "
+                           f"are not exact "
+                         + ("under NLGEOM (the pressure follows the deforming faces)" if nl else
+                            "on a load that also acts on other than 2-D continuum faces")
+                         + ". Midside nodes in the middle of straight edges, or a finer mesh, avoid "
+                           "it.")
+
     def _to_nodal_forces(self, b: Block, card: str, g: List[str], faces: list,
-                         why: Optional[str]) -> List[str]:
+                         why: Optional[str], face_pressure: bool = False) -> List[str]:
         """One traction (TRVEC / TRSHR), beam line-load (PX / PY / PZ / P1 / P2), shell body force
         (BX / BY / BZ) or surface-element pressure (P) data line ``g`` -> consistent nodal forces (consistent_nodal_forces over
         ``faces``), registered for the *CLOAD at the end of the step (_flush_nodal_loads).
+        ``face_pressure``: ``g`` is a continuum face pressure (P1..P6, a surface's P) that ccx
+        would integrate at too few points (_two_point_pressure).
         Returns the comment lines that take the load's place in the deck.  As the Abaqus
         Analysis User's Guide defines them: TRVEC is the magnitude times the normalized
         direction; TRSHR projects the direction onto the face in its undeformed geometry, at
@@ -29193,7 +29302,8 @@ class _Loads:
         full circle, shells their thickness (_shell_body_lines); a 2-D model has no third
         component."""
         label = g[1].upper()
-        base = label[:5] if label.startswith("TR") else "HP" if label.startswith("HP") else label
+        base = "P" if face_pressure else label[:5] if label.startswith("TR") else \
+            "HP" if label.startswith("HP") else label
         if why:
             return self._drop_load_line(b, g, why)
         try:
@@ -29309,6 +29419,12 @@ class _Loads:
         self._set_nodal_load(key, forces, amp)
         if base.startswith("TR"):
             what, lack = "surface tractions (TRVEC / TRSHR)", "ccx has no such load"
+        elif face_pressure:
+            what, lack = ("pressures on CAX8R / CAX6 edges in a deck without NLGEOM, where the "
+                          "midside node lies off the middle of the edge or off its chord",
+                          "ccx 2.23 integrates a pressure there at 2 points along the edge, which "
+                          "moves part of the load between the edge's nodes (Abaqus integrates it "
+                          "fully: these forces)")
         elif base == "P":
             what, lack = "pressures (P) on surface elements", "ccx has no surface element"
         elif base == "HP":
@@ -35470,6 +35586,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._u1_refused: Optional[str] = None
         self._u1_taken: set = set()                # names given to U1 sets and materials
         self._u1_pairs: Optional[set] = None       # the U1 elements' end-node pairs (lazy)
+        # pressures kept on CAX8R / CAX6 edges ccx integrates at 2 points (_two_point_pressure):
+        # element / set / surface -> the largest shift of a nodal share, whether under NLGEOM
+        self._two_point_kept: "OrderedDict[str, Tuple[float, bool]]" = OrderedDict()
 
     # the step model's deck-wide facts, read-only, by the names the planners and handlers read
     # them: ``self.steps``' (before _read_steps the early model's, whose aggregates are the
@@ -36026,6 +36145,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             out += ["** abq2ccx: kinematic-coupling reference node rotations no coupled DOF "
                     "depends on (ccx stops on them free)"] + self._kin_hold_bc + self._kin_hold_eq
         out.extend(self.emit_other(blocks))
+        self._warn_two_point_kept()
         if self._body_copy_of:                  # (_body_copy: before the first *STEP)
             at = next(i for i, ln in enumerate(out) if ln.strip().upper().startswith("*STEP"))
             out[at:at] = ["** abq2ccx: copies of element sets for body loads of one set on two "

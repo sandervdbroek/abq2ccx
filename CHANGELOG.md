@@ -25,6 +25,15 @@ physics.
   gets `1.` (ccx read 0: `*ERROR`, step time NaN); a blank one elsewhere, and a `*MODAL DYNAMIC`
   without a data line, are warned. The `*ELCOPY, REFLECT` brick order is the one Abaqus' bolted
   pipe flange decks label the copies' faces by.
+* **Pressures on `CAX8R` / `CAX6` edges** — ccx 2.23 integrates a face pressure on the bricks it
+  expands these axisymmetric elements into at 2 points along the edge, while Abaqus integrates
+  distributed loads fully: where an edge's midside node lies off its middle or off its chord, ccx
+  moved part of the load between the edge's nodes (0.95–1.07 of the face displacements on a 3 × 4
+  mesh with the midside nodes at a third of each edge; a 2 × 2 thick sphere 0.986–1.054 of Lamé's
+  inner displacement). In a deck without NLGEOM such a `*DLOAD` / `*DSLOAD` pressure line now
+  becomes its consistent nodal forces (0.993–1.007 there); under NLGEOM, where the pressure
+  follows the deforming faces, it stays, warned. `CAX8`, plane elements and straight edges with
+  the midside node in the middle load exactly in ccx and are unchanged.
 * **ccx stops the conversion now avoids** — a `*TIE` line naming one surface as slave and master
   is left out (Abaqus ties nothing there; ccx 2.23 looped without end), and a solid or node slave
   surface that shares nodes with its master becomes a node surface of its other nodes (Abaqus

@@ -4136,6 +4136,35 @@ def axi_coupling_deck(pressure=False):
             f"*STEP\n*STATIC\n{load}*NODE PRINT, NSET=ALLN\nU\n*END STEP\n")
 
 
+SPHERE_A, SPHERE_B, SPHERE_E, SPHERE_NU, SPHERE_P = 10.0, 20.0, 2.0e5, 0.3, 100.0
+
+
+def axi_two_point_sphere_deck():
+    """A thick sphere (r 10-20) as a quarter of CAX8R, 2 x 2 elements with their midside nodes on
+    the arcs, its inner surface pressed by *DLOAD P1 (Lame: u_r(a) = p a^3 ((1 - 2 nu) a +
+    (1 + nu) b^3 / (2 a^2)) / (E (b^3 - a^3))).  ccx 2.23 integrates a pressure on a CAX8R edge
+    at 2 points along it, which on these curved edges moves part of each edge's load between
+    its nodes (Abaqus integrates it fully)."""
+    a, b = SPHERE_A, SPHERE_B
+    rs = [a + (b - a) * i / 4 for i in range(5)]
+    ts = [0.5 * math.pi * j / 4 for j in range(5)]
+    nid = lambda i, j: 1 + i + 5 * j                                        # noqa: E731
+    nodes = "".join(f"{nid(i, j)}, {r * math.sin(t):.15g}, {r * math.cos(t):.15g}\n" for j, t in enumerate(ts)
+                    for i, r in enumerate(rs) if i % 2 == 0 or j % 2 == 0)
+    els = ""
+    for j in (0, 2):                     # counterclockwise in (r, z): towards the equator first
+        for i in (0, 2):
+            els += (f"{1 + i // 2 + j}, {nid(i, j)}, {nid(i, j + 2)}, {nid(i + 2, j + 2)}, {nid(i + 2, j)}, "
+                    f"{nid(i, j + 1)}, {nid(i + 1, j + 2)}, {nid(i + 2, j + 1)}, {nid(i + 1, j)}\n")
+    return (f"*NODE, NSET=ALLN\n{nodes}*NSET, NSET=INNER\n{', '.join(str(nid(0, j)) for j in range(5))}\n"
+            f"*NSET, NSET=AXIS\n{', '.join(str(nid(i, 0)) for i in range(5))}\n"
+            f"*NSET, NSET=EQUATOR\n{', '.join(str(nid(i, 4)) for i in range(5))}\n"
+            f"*ELEMENT, TYPE=CAX8R, ELSET=E\n{els}*ELSET, ELSET=IN\n1, 3\n*MATERIAL, NAME=M\n*ELASTIC\n"
+            f"{SPHERE_E}, {SPHERE_NU}\n*SOLID SECTION, ELSET=E, MATERIAL=M\n*BOUNDARY\nAXIS, 1, 1\n"
+            f"EQUATOR, 2, 2\n*STEP\n*STATIC\n*DLOAD\nIN, P1, {SPHERE_P}\n*NODE PRINT, NSET=INNER\nU\n"
+            f"*END STEP\n")
+
+
 def free_surface_coupling_deck(pressure=False):
     """A C3D8 block (x 0-2, y 0-1-2.5-4, z 0-1-3; 2 x 3 x 2 elements), its top held, its bottom
     layer's free surface (*SURFACE line without a face label: Abaqus trims the layer's side
@@ -13903,6 +13932,21 @@ def main():
                   f"of a {'CAX4 annulus' if dof == 1 else 'C3D8 layer'} against the uniform pressure): "
                   f"{err:.1e} of |u| {peak:.6g} apart")
         failures += 0 if ok else 1
+
+    # a pressure on CAX8R edges whose midside nodes lie off their chords: ccx 2.23 integrates it
+    # at 2 points along the edge (Abaqus fully), which gave 0.986-1.054 of Lame's u_r on the
+    # inner surface; its consistent nodal forces give 0.993-1.007
+    got = review_run(axi_two_point_sphere_deck(), "axi_two_point_pressure", dat_displacements)
+    ok = bool(got) and len(got) == 5
+    if ok:
+        a, b, nu = SPHERE_A, SPHERE_B, SPHERE_NU
+        lame = SPHERE_P * a ** 3 * ((1 - 2 * nu) * a + (1 + nu) * b ** 3 / (2 * a * a)) / (SPHERE_E * (b ** 3 - a ** 3))
+        ratio = [math.hypot(v[0], v[1]) / lame for v in got.values()]
+        ok = max(abs(x - 1.0) for x in ratio) <= 0.012
+        print(f"{'PASS' if ok else 'FAIL'}  axi_two_point_pressure (a 2 x 2 CAX8R thick sphere, internal "
+              f"pressure on curved edges): u_r(a) {min(ratio):.4f}-{max(ratio):.4f} of Lame's "
+              f"{lame:.6g} (ccx's own pressure: 0.986-1.054)")
+    failures += 0 if ok else 1
 
     # a steady-state step whose period is blank (Abaqus' benchmark radiationfinnedsurf): ccx
     # read it as 0 ('*ERROR ... step size is negative', step time NaN)
