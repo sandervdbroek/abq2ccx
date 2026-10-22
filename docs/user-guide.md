@@ -121,8 +121,13 @@ a different model without saying so. With it, these reframings are made, each wi
 * self-contact (one surface, or the same surface twice) → ccx's `S, S` with
   `TYPE=SURFACE TO SURFACE` (within 0.1 % of symmetric pairs on a mild closure, 10–13 % off
   on a deep one);
-* `CPE4` / `CAX4` of a plastic material (they lock in plastic flow), and flagged plastic
-  `CPE4R` / `CAX4R` → `CPE8R` / `CAX8R` with midside nodes, their linear neighbours too;
+* `CPE4` / `CAX4` of a plastic, creeping or nearly incompressible material (they lock), and
+  such flagged `CPE4R` / `CAX4R` → `CPE8R` / `CAX8R` with midside nodes, their linear
+  neighbours too; such `C3D8` → `C3D8I`;
+* `S3` / `S3R` shells (one `C3D6` wedge in ccx 2.23, which locks in bending) → `S6` with
+  midside nodes;
+* a plastic `*SHELL SECTION` (ccx integrates it at 2 Gauss points through the thickness) → a
+  composite of 4 equal layers, its linear shells `S8R` / `S6`;
 * `S4`, `S4R5`, `S4T` and `S4RT` shells collapsed to a triangle → `S3`, `S3R`, `S3T`, `S3RT`
   (a collapsed `S4R` is `S3R` without the option: exact);
 * a `*DAMPING` value the materials share but Abaqus does not apply to point masses, springs or

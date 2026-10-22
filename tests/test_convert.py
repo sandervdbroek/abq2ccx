@@ -55,9 +55,24 @@ def convert_str(text, **overrides):
 S4R_FLAG = "element S4R (ccx 2.23 bends it only through its C3D8R's hourglass stiffness)"
 
 
+S3_FLAG = "element S3 (ccx 2.23 runs it as one C3D6 wedge, which locks in bending)"
+PLASTIC_SHELL_FLAG = ("plastic *SHELL SECTION (ccx 2.23 integrates it through the thickness at its "
+                      "brick's 2 or 3 Gauss points, not at the section's points)")
+
+
 def other_reduced(conv):
-    """conv.reduced_physics without the flag every plain S4R deck carries (_plan_s4r_shells)."""
-    return [r for r in conv.reduced_physics if r != S4R_FLAG]
+    """conv.reduced_physics without the flags every plain S4R deck (_plan_s4r_shells), S3 deck
+    (_plan_s3_shells), plastic shell section (_plan_plastic_shells) and C3D8 cube of a plastic,
+    creeping or nearly incompressible material (_plan_volume_locking) carry."""
+    return [r for r in conv.reduced_physics if r not in (S4R_FLAG, S3_FLAG, PLASTIC_SHELL_FLAG)
+            and not r.startswith("element C3D8 of a ")]
+
+
+def other_warnings(rep):
+    """rep's warnings but those of the flags other_reduced leaves out (C3D8 locking, S3, plastic
+    shell sections) and the reduced-physics summary."""
+    return [m for level, m in rep.entries if level == "WARNING" and not m.startswith(
+        ("Element C3D8 (", "Element S3", "*SHELL SECTION of a plastic material", "Reduced physics — "))]
 
 
 HEX = """*NODE
@@ -3900,7 +3915,7 @@ def test_no_analysis_left_out_where_ccx_segfaults():
         live = [ln for ln in body.splitlines() if not ln.startswith("**")]
         assert live.count("*STEP") == 1 and live[-1] == "*END STEP", body
         assert "** abq2ccx: The deck ends before step 2, at which ccx would stop" in body
-        assert len(conv.reduced_physics) == 1 and not conv.unloaded_steps
+        assert len(other_reduced(conv)) == 1 and not conv.unloaded_steps
     # an elastic model keeps it (test_steps_without_a_ccx_procedure_stop_ccx), and so does a
     # hyperelastic one
     hyper = model.replace("*Elastic\n1000., 0.3\n*Plastic\n10., 0.\n20., 0.1\n",
@@ -7999,14 +8014,14 @@ def test_blank_free_values_read_as_their_blank_spelling():
           "0.3, 0.3, 384.6, 384.6,\n384.6\n*Solid Section, elset=EALL, material=M\n")
     body, conv, _ = convert_str(ec + load.format(""))
     assert "*ELASTIC, TYPE=ENGINEERING CONSTANTS\n1000., 1000., 1000., 0.3," in body
-    assert not conv.reduced_physics
+    assert not other_reduced(conv)
     body, conv, rep = convert_str(HEX_MODEL + "*Amplitude, name=A, definition=SMOOTHSTEP\n0., 0., 1., 1.\n"
                                   + load.format(", amplitude=A"))
-    assert "SMOOTHSTEP" not in rep.text() and not conv.reduced_physics
+    assert "SMOOTHSTEP" not in rep.text() and not other_reduced(conv)
     body, conv, rep = convert_str(HEX_MODEL.replace("*Elastic\n1000., 0.3\n", "*Elastic\n1000., 0.3\n*Plastic\n"
                                                     "10., 0.\n20., 0.1\n")
                                   + "*Initial Conditions, type=PLASTICSTRAIN\n1, 0.01\n" + load.format(""))
-    assert "not a ccx initial-condition type" not in rep.text() and not conv.reduced_physics
+    assert "not a ccx initial-condition type" not in rep.text() and not other_reduced(conv)
 
 
 def test_abbreviation_tables_spell_names_as_the_converter_reads_them():
@@ -9750,7 +9765,7 @@ def test_material_property_distributions_become_material_copies():
     assert "2000., 100., 100., 0., 0., 0., 50., 50." in lines[d1:] and "2.4e-5" in lines[d1:]
     assert "*SOLID SECTION, ELSET=ALL_D1, MATERIAL=M" in lines
     assert "*SOLID SECTION, ELSET=ALL_D2, MATERIAL=M_D1" in lines and "*PLASTIC" in lines[d1:]
-    assert conv.reduced_physics == [] and "EL" not in lines and "copy of the material" in rep.text()
+    assert other_reduced(conv) == [] and "EL" not in lines and "copy of the material" in rep.text()
     # no default line: Abaqus requires one, the elements it does not list get the first line
     _, _, rep = convert_str(TWO_BRICKS + mat.replace(", 7.8e-9\n2, 7.8e-9", "2, 7.8e-9"))
     assert "*DISTRIBUTION RHO has no default line" in rep.text()
@@ -12001,7 +12016,7 @@ def test_frequency_base_temperatures():
     def heads(model, cards, head="", after=""):
         body, conv, rep = convert_str(model + _deck_step("Static", cards) +
                                       _deck_step("Frequency\n3", "", head) + after)
-        return [s.split("\n")[0] for s in body.split("*STEP")[1:]], conv.reduced_physics, rep.text()
+        return [s.split("\n")[0] for s in body.split("*STEP")[1:]], other_reduced(conv), rep.text()
 
     # heated only, no expansion: no stress in the base state, PERTURBATION is exact
     got, red, rep = heads(cold, heat)
@@ -12142,10 +12157,10 @@ def test_plastic_material_where_ccx_segfaults():
     st, freq = _deck_step("Static", load), _deck_step("Frequency, storage=yes\n2")
     _, conv, rep = convert_str(pl + st + freq + st)
     assert "Step 3 (*STATIC, no NLGEOM) after a *FREQUENCY step in a model with a plastic" in rep.text()
-    assert conv.reduced_physics == ["*STATIC step after a *FREQUENCY step with a plastic or creeping "
+    assert other_reduced(conv) == ["*STATIC step after a *FREQUENCY step with a plastic or creeping "
                                     "material (ccx 2.23 segfaults)"]
     _, conv, rep = convert_str(pl + st + freq + _deck_step("Static", "*Cload\n7, 2, 1.\n"))
-    assert "ccx ramps them from 0" not in rep.text() and len(conv.reduced_physics) == 1
+    assert "ccx ramps them from 0" not in rep.text() and len(other_reduced(conv)) == 1
     # ... nor where NLGEOM is in force in ccx (Step.ccx_nlgeom): written again after the
     # frequency step, or carried on from an NLGEOM step after it (code review 3, B39)
     for runs in (_deck_step("Static", load, ", nlgeom") + freq + st,      # NLGEOM written again
@@ -12158,12 +12173,12 @@ def test_plastic_material_where_ccx_segfaults():
     visco = _deck_step("Visco, cetol=1e-3\n0.1, 1.", load)
     assert "Step 3 (*VISCO, no NLGEOM)" in convert_str(creep + visco + freq + visco)[2].text()
     _, conv, rep = convert_str(pl + st + _deck_step("Buckle\n1", "*Cload\n7, 3, -1.\n"))
-    assert "*BUCKLE step 2 in a model with a plastic" in rep.text() and conv.reduced_physics
+    assert "*BUCKLE step 2 in a model with a plastic" in rep.text() and other_reduced(conv)
     # modal dynamics: the preselected RF and element output it carries over (Abaqus) go
     body, conv, rep = convert_str(pl + st + freq + _deck_step("Modal Dynamic\n0.1, 0.5", load))
     assert body.split("*STEP")[3].endswith("*NODE FILE, FREQUENCY=10\nU, V\n*EL FILE\n*END STEP")
     assert "*EL FILE S, E dropped from step 3: ccx 2.23 segfaults" in rep.text()
-    assert "*NODE FILE RF dropped from step 3" in rep.text() and not conv.reduced_physics
+    assert "*NODE FILE RF dropped from step 3" in rep.text() and not other_reduced(conv)
     # steady-state dynamics with output of its own: ccx's carried *EL FILE and *NODE PRINT RF
     ssd = _deck_step("Steady State Dynamics\n10., 100., 2", load + "*Output, field\n*Node Output\nU\n")
     body, _, rep = convert_str(pl + st.replace("*End", "*Node print, nset=ALL\nU, RF\n*End") + freq + ssd)
@@ -12580,11 +12595,11 @@ def test_plastic_material_where_ccx_segfaults_other_procedures():
            "ANALYSIS step of a model with a *PLASTIC material (probed)."
     _, conv, rep = convert_str(pl + st + freq + _deck_step("Complex Frequency\n2"))
     assert rep.text().count("segfaults") == 1 and ends in rep.text()
-    assert conv.reduced_physics == ["*COMPLEX FREQUENCY step (no ccx counterpart)"]
+    assert other_reduced(conv) == ["*COMPLEX FREQUENCY step (no ccx counterpart)"]
     riks = _deck_step("Static, riks\n0.1, 1.", load)
     _, conv, rep = convert_str(pl + st + freq + riks)
     assert rep.text().count("segfaults") == 1 and ends in rep.text()
-    assert conv.reduced_physics == ["*STATIC, RIKS step (ccx has no arc-length solver)"]
+    assert other_reduced(conv) == ["*STATIC, RIKS step (ccx has no arc-length solver)"]
     _, conv, rep = convert_str(pl + st + freq + riks, approximate=True)
     assert "Step 3 (*STATIC, no NLGEOM) after a *FREQUENCY step" in rep.text()
     # contact: a block on the cube; Abaqus' preselected contact output and a *CONTACT PRINT of
@@ -12598,7 +12613,7 @@ def test_plastic_material_where_ccx_segfaults_other_procedures():
     body, conv, rep = convert_str(pl + blk + st + freq + _deck_step("Modal Dynamic\n0.1, 0.5", load))
     assert body.split("*STEP")[3].endswith("*EL FILE\n*CONTACT FILE\n*CONTACT PRINT\n*END STEP")
     assert "Empty *CONTACT FILE added to step 3" in rep.text()
-    assert conv.reduced_physics == ["base state of a *FREQUENCY step that modal / steady-state "
+    assert other_reduced(conv) == ["base state of a *FREQUENCY step that modal / steady-state "
                                     "dynamics read"]       # (its contact status; not the output)
     assert "Empty *CONTACT PRINT added to step 3" in rep.text()
     ssd = _deck_step("Steady State Dynamics\n10., 100., 2", load + "*Output, field\n*Node Output\nU\n"
@@ -15523,7 +15538,7 @@ def test_rigid_constraints_in_steps_ccx_runs_nonlinear():
             if eq:
                 assert _equation_terms(body) == eqs and "*RIGID BODY" not in live, (model, proc, card)
                 assert "*KINEMATIC" not in live and "ccx runs a *" in rep.text()
-                assert rep.n_warnings == 0 and not conv.reduced_physics
+                assert other_warnings(rep) == [] and not other_reduced(conv)
             else:
                 assert not _equation_terms(body) and ("*RIGID BODY" in live or "*KINEMATIC" in live)
     # such a step before an NLGEOM step keeps ccx's RIGID MPCs (exact under NLGEOM): reduced
@@ -15533,7 +15548,7 @@ def test_rigid_constraints_in_steps_ccx_runs_nonlinear():
     assert "*RIGID BODY" in body and not _equation_terms(body)
     assert "in a deck where a *STATIC step with a *PLASTIC material runs without NLGEOM before an " \
            "NLGEOM step" in rep.text()
-    assert conv.reduced_physics == ["rigid constraint turned with the finite rotation in a geometrically linear step"]
+    assert other_reduced(conv) == ["rigid constraint turned with the finite rotation in a geometrically linear step"]
 
 
 def test_shell_beam_rotations_in_steps_ccx_runs_nonlinear_warned():
@@ -15552,7 +15567,7 @@ def test_shell_beam_rotations_in_steps_ccx_runs_nonlinear_warned():
             (plastic, "*Step\n*Static\n*Cload\n6, 4, 0.1\n*End Step\n*Step, nlgeom\n*Static\n", "", None),
             (plastic + "*Boundary\n5, 5, 5, 0.01\n", "*Step\n*Static\n", "", None)):
         body, conv, rep = convert_str(strip.format(mat) + step + loads + "*End Step\n")
-        assert conv.reduced_physics == [FINITE_ROT], (mat, step, loads)
+        assert other_reduced(conv) == [FINITE_ROT], (mat, step, loads)
         assert "ccx runs that step through its nonlinear solver and turns these rotation constraints" \
                " with the finite rotation" in rep.text() and (why or "") in rep.text()
     # not: held rotations, an elastic *STATIC step, NLGEOM, a card in the NLGEOM step only,
@@ -15563,7 +15578,7 @@ def test_shell_beam_rotations_in_steps_ccx_runs_nonlinear_warned():
                              (plastic, "*Step\n*Static\n*Cload\n6, 3, 0.1\n*End Step\n*Step, nlgeom\n"
                               "*Static\n", "*Cload\n6, 4, 0.1\n")):
         body, conv, rep = convert_str(strip.format(mat) + step + loads + "*End Step\n")
-        assert not conv.reduced_physics and rep.n_warnings == 0, (mat, step, loads)
+        assert not other_reduced(conv) and other_warnings(rep) == [], (mat, step, loads)
     line = TIP3.replace("*Nset, nset=TIP\n3\n*Transform, nset=TIP\n{}\n", "").replace(
         "*Elastic\n1000., 0.3\n", "*Elastic\n1000., 0.3\n" + plastic)
     body, conv, rep = convert_str(line.format("*Cload\n3, 3, 0.1\n"))
@@ -15572,7 +15587,7 @@ def test_shell_beam_rotations_in_steps_ccx_runs_nonlinear_warned():
     frame = line.replace("3, 2., 0., 0.\n", "3, 2., 0., 0.\n4, 2., 1., 0.\n").replace(
         "2, 2, 3\n", "2, 2, 3\n3, 3, 4\n").format("*Cload\n4, 3, 0.1\n")
     body, conv, rep = convert_str(frame)
-    assert conv.reduced_physics == [FINITE_ROT] and "1 knot(s) (e.g. node 3;" in rep.text()
+    assert other_reduced(conv) == [FINITE_ROT] and "1 knot(s) (e.g. node 3;" in rep.text()
     # ... not where BCs hold its rotations at zero (its RIGID MPC only translates; before:
     # flagged; validate_with_ccx.py finite_rotation_knot_held), but where one is free or moved
     held = frame.replace("*Step", "*Boundary\n3, 4, 6\n*Step")
@@ -15599,7 +15614,7 @@ def test_kinematic_coupling_rotation_line_in_a_linear_rigid_deck():
     one, _, _ = convert_str(plastic + "*Kinematic Coupling, ref node=REF\nR, 1, 6\n" + step)
     assert _equation_terms(two) == _equation_terms(one) and len(_equation_terms(two)) == 12
     assert "*KINEMATIC" not in "\n".join(_live(two)) and [(5, 4, 1.), (101, 1, -1.)] in _equation_terms(two)
-    assert conv.reduced_physics == [FINITE_ROT] and "has a line without linear equations" not in rep.text()
+    assert other_reduced(conv) == [FINITE_ROT] and "has a line without linear equations" not in rep.text()
     solid = HEX + "*Node\n9, 0.5, 0.5, 2.\n*Nset, nset=TOPN\n5, 6, 7, 8\n*Solid Section, elset=EALL, " \
         "material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n1e6, 0.\n*Kinematic Coupling, " \
         "ref node=9\nTOPN, 1, 3\nTOPN, 4, 6\n*Step\n*Static\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n" \
@@ -16976,17 +16991,17 @@ def test_reduced_physics_record():
     plain = HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=EALL, material=M\n"
     step = "*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n7, 3, 1.\n*End Step\n"
     _, conv, _ = convert_str(plain + step)
-    assert conv.reduced_physics == []
+    assert other_reduced(conv) == []
     _, conv, rep = convert_str(plain.replace("*Solid", "*Plastic, hardening=USER\n3\n*Solid") + step)
-    assert conv.reduced_physics == ["*PLASTIC"] and "Reduced physics" in rep.text()
+    assert other_reduced(conv) == ["*PLASTIC"] and "Reduced physics" in rep.text()
     _, conv, _ = convert_str(plain.replace("*Solid", "*Concrete Damaged Plasticity\n30., 0.1\n*Solid")
                              + step)
-    assert conv.reduced_physics == ["*CONCRETE DAMAGED PLASTICITY"]
+    assert other_reduced(conv) == ["*CONCRETE DAMAGED PLASTICITY"]
     _, conv, _ = convert_str(plain.replace("C3D8", "C3D8H") + step)
-    assert conv.reduced_physics == ["element C3D8H -> C3D8"]
+    assert other_reduced(conv) == ["element C3D8H -> C3D8"]
     _, conv, _ = convert_str(plain + "*Energy Output\n*Bulk Viscosity\n0.06, 1.2\n"
                                      "*File Format, ascii\n" + step)
-    assert conv.reduced_physics == [], conv.reduced_physics
+    assert other_reduced(conv) == [], other_reduced(conv)
     tri = ("*Node\n1,0.,0.\n2,1.,0.\n3,0.,1.\n*Element, type={}, elset=E\n1,1,2,3\n"
            "*Material, name=M\n*Elastic\n1000., 0.3\n*{} Section, elset=E, material=M\n0.1\n"
            "*Boundary\n1, 1, 3\n2, 2, 3\n*Step\n*Static\n*Cload\n3, 2, 1.\n*End Step\n")
@@ -16997,17 +17012,17 @@ def test_reduced_physics_record():
             deck = deck.replace("1,1,2,3\n", "1,1,2,3,4,5,6\n").replace(
                 "3,0.,1.\n", "3,0.,1.\n4,0.5,0.\n5,0.5,0.5\n6,0.,0.5\n")
         _, conv, rep = convert_str(deck)
-        assert bool(conv.reduced_physics) == reduced, (typ, conv.reduced_physics, rep.text())
+        assert bool(other_reduced(conv)) == reduced, (typ, other_reduced(conv), rep.text())
     # a *SECTION CONTROLS whose options do not apply (SECOND ORDER ACCURACY in Abaqus/Standard,
     # hourglass factors 1 on a fully integrated element) changes nothing; ENHANCED hourglass
     # control on a C3D8R does
     sc = plain.replace("material=M\n", "material=M, controls=EC\n") + \
         "*Section Controls, name=EC, second order accuracy=YES\n1., 1., 1.\n" + step
     _, conv, rep = convert_str(sc)
-    assert conv.reduced_physics == [] and "changes nothing" in rep.text()
+    assert other_reduced(conv) == [] and "changes nothing" in rep.text()
     _, conv, _ = convert_str(sc.replace("C3D8,", "C3D8R,").replace("second order accuracy=YES",
                                                                     "hourglass=ENHANCED"))
-    assert conv.reduced_physics == ["*SECTION CONTROLS (HOURGLASS=ENHANCED on C3D8R)"]
+    assert other_reduced(conv) == ["*SECTION CONTROLS (HOURGLASS=ENHANCED on C3D8R)"]
 
 
 
@@ -17195,7 +17210,7 @@ def test_nmap_translation_scale_and_shift():
     # node 1: (1, 2, 3) + (0, 6, 8), turned 90 degrees about x; node 2: (0, 7, 8) scaled
     # about (0, 1, 1) to (0, 19, 29), shifted to (5, 25, 36) and turned
     assert "\n1, 1, -11, 8\n2, 5, -36, 25\n3, 9, 9, 9\n" in body, body
-    assert body.endswith("*NORMAL\n1, 1, 0, -1, 0") and conv.reduced_physics == []
+    assert body.endswith("*NORMAL\n1, 1, 0, -1, 0") and other_reduced(conv) == []
     # a ROTATION or TRANSLATION without an axis, a CYLINDRICAL without point b: skipped
     for typ, data in (("ROTATION", "0., 0., 0., 0., 0., 0.\n0., 0., 0.\n90.\n"),
                       ("TRANSLATION", "1., 1., 1., 1., 1., 1.\n5.\n"), ("CYLINDRICAL", "1., 1., 1.\n")):
@@ -17523,7 +17538,9 @@ def test_section_controls_that_change_the_formulation_or_nothing():
 def test_approximate_reframings_are_reduced_physics():
     body, conv, _ = convert_str(HEX + "*Material, name=M\n*Elastic\n1000., 0.5\n"
                                 "*Solid Section, elset=EALL, material=M\n", approximate=True)
-    assert conv.reduced_physics == ["--approximate: *ELASTIC Poisson ratio >= 0.5 clamped to 0.475"]
+    assert conv.reduced_physics == ["--approximate: Element C3D8 (1 elements, of a nearly incompressible "
+                                    "material) written as C3D8I",
+                                    "--approximate: *ELASTIC Poisson ratio >= 0.5 clamped to 0.475"]
 
 COUPLED_HEX = HEX.replace("TYPE=C3D8", "TYPE=C3D8T") + """*ELEMENT, TYPE=MASS, ELSET=PM
 9, 8
@@ -20343,7 +20360,7 @@ def test_flat_c3d8r_bricks_get_a_note():
 
 PLASTIC = "*Plastic\n250., 0.\n"
 LOCK_FLAG = ("element CPE4 of a plastic material (ccx 2.23 lacks Abaqus' selectively reduced volume "
-             "terms: it locks in plastic flow)")
+             "terms: it locks where the material keeps its volume)")
 
 
 def test_plastic_cpe4_cax4_flagged_as_locking():
@@ -20407,10 +20424,120 @@ def test_flagged_plastic_cpe4r_is_upgraded_not_twinned():
     body, conv, rep = convert_str(deck, approximate=True)
     assert all(t == "CPE8R" for t, _ in conv.geom.elements.values()) and "*ELEMENT, TYPE=CPE4\n" not in body
     assert "[APPROX] Element CPE4R (4 elements) written as CPE8R: ccx 2.23 expands a CPE4R" in rep.text()
-    assert "so the elements of a plastic material are written as CPE8R" in rep.text()
+    assert "so the elements of a material that keeps its volume (plastic, creeping or nearly " \
+           "incompressible) are written as CPE8R" in rep.text()
     assert "[APPROX] Element CPE4R / CAX4R written as CPE8R, with a node at the middle" not in rep.text()
     _, conv, _ = convert_str(deck)                                    # as written: unchanged
     assert {t for t, _ in conv.geom.elements.values()} == {"CPE4R"}
+
+
+def test_plastic_c3d8_flagged_c3d8i_under_approximate():
+    # ccx 2.23's C3D8 has no selectively reduced volume terms either (numbers as CPE4's):
+    # reduced physics with a plastic material; --approximate writes C3D8I on the same nodes
+    plastic = HEX + "*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n10., 0.\n" \
+        "*Solid Section, elset=EALL, material=M\n*Boundary\n1, 1, 3\n*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n"
+    _, conv, rep = convert_str(plastic)
+    assert conv.reduced_physics == ["element C3D8 of a plastic material (ccx 2.23 lacks Abaqus' selectively "
+                                    "reduced volume terms: it locks where the material keeps its volume)"]
+    assert "Element C3D8 (1 elements, of a plastic material): Abaqus integrates the volume change of its " \
+           "first-order hexahedra at one point" in rep.text()
+    assert "Rerun with --approximate to write them as C3D8I" in rep.text()
+    body, conv, rep = convert_str(plastic, approximate=True)
+    assert "*ELEMENT, TYPE=C3D8I\n1, 1, 2, 3, 4, 5, 6, 7, 8\n" in body
+    assert conv.reduced_physics == ["--approximate: Element C3D8 (1 elements, of a plastic material) written as C3D8I"]
+    # suffixes kept (hybrid, coupled temperature-displacement); elastic or cohesive: not flagged
+    for typ, new in (("C3D8H", "C3D8IH"), ("C3D8T", "C3D8IT")):
+        _, conv, _ = convert_str(plastic.replace("TYPE=C3D8", "TYPE=" + typ), approximate=True)
+        assert conv.geom.elements[1][0] == new and A.ccx_type(new) == "C3D8I", typ
+    _, conv, _ = convert_str(plastic.replace("*Plastic\n10., 0.\n", ""))
+    assert conv.reduced_physics == []
+    assert not A.brick_locks("COH3D8") and not A.brick_locks("C3D8R") and A.brick_locks("C3D8HT")
+
+
+def test_creep_and_near_incompressibility_lock_cpe4_cax4_c3d8():
+    # Mises creep and a Poisson's ratio from 0.475 keep the volume as plastic flow does: the
+    # same locking flag (a thick cylinder creeps at 0.003 of its steady rate, expands 0.93 of
+    # Lame's displacement at nu 0.475 on 4 elements through the wall); --approximate CPE8R
+    creep = _plane_strip("CPE4", 4, 1, 1., 0.1, "", "*Creep\n1e-10, 3., 0.\n").replace(
+        "*Step\n*Static\n", "*Step\n*Visco, cetol=1e-4\n0.1, 1.\n")
+    _, conv, rep = convert_str(creep)
+    assert conv.reduced_physics == [LOCK_FLAG.replace("plastic", "creeping")]
+    assert "under Norton creep it creeps at 0.0005 / 0.003 / 0.02 of the steady-state rate" in rep.text()
+    body, conv, _ = convert_str(creep, approximate=True)
+    assert {t for t, _ in conv.geom.elements.values()} == {"CPE8R"}
+    # creep that never acts (no *VISCO, coupled temperature-displacement or soils step)
+    _, conv, _ = convert_str(_plane_strip("CPE4", 4, 1, 1., 0.1, "", "*Creep\n1e-10, 3., 0.\n"))
+    assert conv.reduced_physics == []
+    near = lambda nu: _plane_strip("CAX4", 4, 1, 1., 0.1, "", x0=1.).replace("210000., 0.3", f"210000., {nu}")  # noqa: E731
+    _, conv, rep = convert_str(near(0.475))
+    assert conv.reduced_physics == [LOCK_FLAG.replace("CPE4", "CAX4").replace("plastic", "nearly incompressible")]
+    assert "Lame's displacement" in rep.text()
+    assert convert_str(near(0.47))[1].reduced_physics == []
+    # temperature tables: any row; hyperelastic rows by their small-strain Poisson's ratio (D1 = 0:
+    # incompressible); C3D8 alike
+    assert convert_str(near("0.3, 0.\n210000., 0.49, 100.").replace("210000., 0.3", ""))[1].reduced_physics
+    hyper = HYPER_BAR.format(card="*Hyperelastic, neo hooke\n{}\n")
+    for row, locks in (("0.4, 0.", True), ("0.4, 0.05", True), ("0.4, 0.5", False)):
+        _, conv, _ = convert_str(hyper.format(row))
+        assert any(r.startswith("element C3D8 of a nearly incompressible") for r in conv.reduced_physics) == locks, row
+    # a flagged CPE4R of such a material: --approximate writes CPE8R, its twin CPE4 would lock
+    deep = _plane_strip("CPE4R", 4, 1, 1., 0.1, "0.02\n").replace("210000., 0.3", "210000., 0.49")
+    _, conv, rep = convert_str(deep, approximate=True)
+    assert {t for t, _ in conv.geom.elements.values()} == {"CPE8R"}
+    assert "so the elements of a material that keeps its volume" in rep.text()
+
+
+def test_s3_shells_flagged_s6_under_approximate():
+    # ccx 2.23 runs an S3 as one C3D6 wedge, which locks in bending on flat and curved shells
+    # alike (a plate of a/t 100 on 16 elements a side: 0.11 of its deflection, the
+    # Scordelis-Lo roof 0.21): every S3 is reduced physics; --approximate writes S6, its S4
+    # neighbours S8R (no hanging midside node)
+    deck = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,2,0,0\n6,2,1,0\n*Element, type={t}, elset=T\n"
+            "1, 1, 2, 3\n2, 1, 3, 4\n*Element, type=S4, elset=Q\n3, 2, 5, 6, 3\n*Elset, elset=ALL\nT, Q\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Shell Section, elset=ALL, material=M\n0.01\n"
+            "*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Static\n*Cload\n5, 3, 1.\n*End Step\n")
+    for typ in ("S3", "S3R"):
+        _, conv, rep = convert_str(deck.format(t=typ))
+        assert conv.reduced_physics == [S3_FLAG], typ
+        assert f"Element {typ} (2 elements): ccx 2.23 expands an S3 into one C3D6 wedge" in rep.text()
+    body, conv, rep = convert_str(deck.format(t="S3R"), approximate=True)
+    assert [t for t, _ in conv.geom.elements.values()] == ["S6", "S6", "S8R"]
+    assert conv.reduced_physics == ["--approximate: Element S3R (2 elements) written as S6"]
+    assert "1 other linear shell(s) joined to them by an edge were upgraded too (S4 -> S8R)" in rep.text()
+    # STRI3 is flagged for the substitution and for the wedge; an S4 mesh is not
+    _, conv, _ = convert_str(deck.format(t="STRI3"))
+    assert S3_FLAG in conv.reduced_physics and len(conv.reduced_physics) == 2
+    assert convert_str(deck.replace("type={t}, elset=T\n1, 1, 2, 3\n2, 1, 3, 4\n",
+                                    "type=S4, elset=T\n1, 1, 2, 3, 4\n"))[1].reduced_physics == []
+
+
+def test_plastic_shell_sections_flagged_and_layered():
+    # ccx 2.23 integrates an expanded shell's section through the thickness at 2 Gauss points
+    # (S6 / S8: 3), Abaqus a plastic one at 5 Simpson points: in plastic bending ccx's carries
+    # 1.155 (0.86) times the fully plastic moment; --approximate writes a composite of 4 equal
+    # layers (8 Gauss points, the fully plastic moment exact), its S4 as S8R
+    deck = S4 + "*Plastic\n1., 0.\n*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Static\n*Cload\n5, 3, 1.\n*End Step\n"
+    deck = deck.replace("*Elastic\n1000.,0.3\n*Plastic", "*Elastic\n1000.,0.3\n*Plastic")
+    _, conv, rep = convert_str(deck)
+    assert conv.reduced_physics == [PLASTIC_SHELL_FLAG]
+    assert "*SHELL SECTION of a plastic material (1 section(s): ELSET=E; 2 elements, S4): ccx 2.23 " \
+           "integrates an expanded shell's section through the thickness at its brick's Gauss points (2 on " \
+           "S4), Abaqus at the section's 5 Simpson points" in rep.text()
+    body, conv, rep = convert_str(deck, approximate=True)
+    assert "*SHELL SECTION, ELSET=E, COMPOSITE\n0.025, , M\n0.025, , M\n0.025, , M\n0.025, , M\n" in body
+    assert {t for t, _ in conv.geom.elements.values()} == {"S8R"}
+    # (an S8R strip one element wide is flagged for itself: _warn_s8r_strips)
+    assert conv.reduced_physics[0] == "--approximate: *SHELL SECTION of a plastic material"
+    # Gauss points as many as ccx's (S4: 2): the deck's own rule; elastic: nothing to flag
+    gauss = deck.replace("*Shell Section,elset=E,material=M\n0.1\n",
+                         "*Shell Section,elset=E,material=M, section integration=GAUSS\n0.1, 2\n")
+    assert convert_str(gauss)[1].reduced_physics == []
+    assert convert_str(deck.replace("*Plastic\n1., 0.\n", ""))[1].reduced_physics == []
+    # S8 (no composite in ccx) and a nodal thickness stay as written, flagged, under --approximate
+    nodal = deck.replace("material=M\n0.1\n", "material=M, nodal thickness\n0.1\n").replace(
+        "*Boundary\n", "*Nodal Thickness\n1, 0.1\n2, 0.1\n3, 0.1\n4, 0.1\n5, 0.1\n6, 0.1\n*Boundary\n", 1)
+    _, conv, rep = convert_str(nodal, approximate=True)
+    assert PLASTIC_SHELL_FLAG in conv.reduced_physics and "Left as written (1 section(s)" in rep.text()
 
 
 HYPER_BAR = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
@@ -20426,12 +20553,12 @@ def test_hyperelastic_d1_below_ccx_threshold_flagged():
     # ccx 2.23 replaces a compressibility coefficient below 1e-10 (an absolute value) by
     # 0.1^i / mu0: a neo-Hooke steel in Pa (D1 1.1e-11) runs at a Poisson's ratio of 0.475
     _, conv, rep = convert_str(HYPER_BAR.format(card="*Hyperelastic, neo hooke\n4.04e10, 1.1428571e-11\n"))
-    assert conv.reduced_physics == [HYPER_FLAG]
+    assert other_reduced(conv) == [HYPER_FLAG]
     assert ("*HYPERELASTIC of material RUBBER: D1 = 1.14286e-11, a bulk modulus 2 / D1 = 1.75e+11 (a "
             "Poisson's ratio of 0.3); ccx's is 9.23 times that") in rep.text()
     assert "Rescale the deck's units (e.g. to MPa and mm)" in rep.text()
     _, conv, rep = convert_str(HYPER_BAR.format(card="*Hyperelastic, neo hooke\n0.4, 0.\n"))
-    assert conv.reduced_physics == [HYPER_FLAG] and "D1 = 0, an incompressible material" in rep.text()
+    assert other_reduced(conv) == [HYPER_FLAG] and "D1 = 0, an incompressible material" in rep.text()
     # D1 at the threshold, other models: D1 found by its position
     for card, flagged in (("*Hyperelastic, neo hooke\n4.04e10, 1e-10\n", False),
                           ("*Hyperelastic, mooney-rivlin\n0.3, 0.1, 1e-12\n", True),
@@ -24273,9 +24400,11 @@ def test_collapsed_quad_shells_as_triangles():
     assert "written as S3R, Abaqus' triangle that is the degenerated S4R" in rep.text()
     body, conv, rep = convert_str(deck.format(t="S4"))
     assert "2, 2, 5, 3, 3\n" in body and "rerun with --approximate to write them as triangles" in rep.text()
+    # (and --approximate writes an S3 as S6: _plan_s3_shells)
     body, conv, rep = convert_str(deck.format(t="S4"), approximate=True)
-    assert "*ELEMENT, TYPE=S3\n2, 2, 5, 3\n" in body
-    assert conv.reduced_physics == ["--approximate: Collapsed S4 shells written as S3"]
+    assert "*ELEMENT, TYPE=S6\n2, 2, 5, 3, 10, 11, 7\n" in body
+    assert conv.reduced_physics == ["--approximate: Collapsed S4 shells written as S3",
+                                    "--approximate: Element S3 (1 elements) written as S6"]
     # an edge load names its edge by the quadrilateral's number: kept, warned
     body, _, rep = convert_str(deck.format(t="S4R").replace("*Cload\n5, 3, 1e-6\n", "*Dload\n2, EDNOR2, 1.\n"))
     assert "2, 2, 5, 3, 3\n" in body and "names an edge of them" in rep.text()
@@ -25077,10 +25206,10 @@ def test_visco_increment_capped_for_norton_creep():
     # are below ccx's 1e-20 floor on A t^m (t > 1 here; A 1e-300): that alone is reduced physics
     floor = ["*CREEP A t^m below ccx's 1e-20 floor (a faster creep)"]
     body, conv, report = convert_str(deck(creep="1e-20, 5., -0.99", visco="1., 1000."))
-    assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n1., 1000.\n" in body and conv.reduced_physics == floor
+    assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n1., 1000.\n" in body and other_reduced(conv) == floor
     body, conv, report = convert_str(deck(creep="1e-300, 20.", load="*Dload\n1, P4, -1e20\n",
                                           visco="1., 1000."))
-    assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n1., 1000.\n" in body and conv.reduced_physics == floor
+    assert "*STEP, INC=40\n*VISCO, CETOL=5.E-3\n1., 1000.\n" in body and other_reduced(conv) == floor
     assert "would take more than 1e+06 increments" in report.text()
     # m = -0.9 from t = 0: (7.07e-3 * 0.1 / (2e-15 200^5))^10 = 2.71 h, as the float form gave
     body, _, _ = convert_str(deck(creep="2e-15, 5., -0.9", visco="0.002, 1000."))
@@ -25090,6 +25219,7 @@ def test_visco_increment_capped_for_norton_creep():
 def test_creep_below_ccx_floor_flagged():
     # ccx 2.23 raises a Norton law's A t^m to at least 1e-20 (incplas.f, isotropic *ELASTIC),
     # t the total time: an SI deck's A = 1e-30 creeps 1e10 times too fast, without a message
+    # (the creeping C3D8 cube's volume-locking flag aside: other_reduced)
     flag = "*CREEP A t^m below ccx's 1e-20 floor (a faster creep)"
 
     def deck(creep="1.E-30, 3.", elastic="*Elastic\n2.E11, 0.3", static="1.E-7, 1.E-6",
@@ -25099,12 +25229,13 @@ def test_creep_below_ccx_floor_flagged():
                 + static + "\n*Dload\n1, P4, -1.E6\n*End Step\n*Step\n" + visco + "\n*End Step\n")
     _, conv, report = convert_str(deck())
     assert "with A = 1.E-30 ccx creeps 1e+10 times as much as the deck's law at a constant stress " \
-           "in *VISCO step 2" in report.text() and conv.reduced_physics == [flag]
+           "in *VISCO step 2" in report.text() and other_reduced(conv) == [flag]
+    assert any(r.startswith("element C3D8 of a creeping material") for r in conv.reduced_physics)
     # m > 0 from total time 0 (the *STATIC step's 1e-6): below the floor up to t = 100 of 200,
     # 1 + m (100 / 200)^(m + 1) = 1.25 (probed: 1.246, ccx's increments end-point rule);
     # after a *STATIC step of 1000 the floor never bites
     _, conv, report = convert_str(deck(creep="1.E-22, 3., 1.", visco="*Visco, cetol=1.E-3\n1., 200."))
-    assert "m = 1 ccx creeps 1.25 times as much" in report.text() and conv.reduced_physics == [flag]
+    assert "m = 1 ccx creeps 1.25 times as much" in report.text() and other_reduced(conv) == [flag]
     # m < 0 after a total time of 1: past the floor's t = 0.01 throughout
     _, _, report = convert_str(deck(creep="1.E-21, 3., -0.5", static="1., 1.",
                                     visco="*Visco, cetol=1.E-3\n1.E-3, 0.1"))
@@ -25138,7 +25269,7 @@ def test_creep_planners_skip_steps_with_no_positive_time():
     for n, periods in ((5., ("-1000.",)), (5., ("0.",)), (3., ("-1000.", "1000.")), (5., ("-1000.", "500."))):
         body, conv, rep = convert_str(deck(n, *periods))
         assert body.count("*VISCO") == len(periods), (n, periods)
-        assert len(periods) > 1 or ("largest increment" not in rep.text() and not conv.reduced_physics)
+        assert len(periods) > 1 or ("largest increment" not in rep.text() and not other_reduced(conv))
 
 
 def test_unused_user_material_noted_as_never_called():
@@ -25668,7 +25799,7 @@ def test_offset_shell_gradients_written_for_the_mid_thickness_node():
                              "2, 3, 5, 13, 11, 4, 8, 12, 7\n", "*Element, type=S3, elset=EALL\n1, 1, 3, 11\n"
                              "2, 1, 11, 9\n").format(typ="", sec=", offset=SPOS", ic="0.") + step)
     body, conv, rep = convert_str(s3)
-    assert _card_at(_step(body, 1), "*TEMPERATURE") == ["NALL, 10., 100."] and not conv.reduced_physics
+    assert _card_at(_step(body, 1), "*TEMPERATURE") == ["NALL, 10., 100."] and not other_reduced(conv)
 
 
 def test_b31_gradients_warned():

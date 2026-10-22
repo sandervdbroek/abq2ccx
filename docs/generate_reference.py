@@ -92,7 +92,9 @@ TRANSLATED = {
         "`ENHANCED` on hyperelastic materials and modified elements — changes nothing; data-line "
         "factors of 1 are the defaults, and the out-of-plane, bulk-viscosity and drill factors act "
         "only in Abaqus/Explicit); otherwise a warning and reduced physics.",
-    "*SHELL SECTION": "thickness only (integration-point count dropped); composite plies → one "
+    "*SHELL SECTION": "thickness only (integration-point count dropped: ccx integrates through the "
+        "thickness at its brick's 2 or 3 Gauss points, so a plastic section is reduced physics; "
+        "`--approximate`: a composite of equal layers); composite plies → one "
         "synthesized `*ORIENTATION` per ply angle, composed with a base rotation about the "
         "normal, every ply naming one where any does (ccx 2.23 gives a ply without one the "
         "previous ply's); where ccx would place the material directions of an orthotropic or "
@@ -770,9 +772,13 @@ def element_status(t):
                 + ("physics" if twin in ("M3D4", "B31") else "physics where its elements are over 3 "
                    "depths wide (1.5 if plastic)") + f"; `--approximate` → `{twin}`")
     ct = A.ccx_element_type(t, A.Report())
-    if A.plane_locks(t) and t not in A.SLAB_TYPES:
-        own += (" — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced "
-                f"physics with a plastic material; `--approximate` → `{A.PLANE_QUADRATIC_UPGRADE[ct[:3]][1]}`")
+    if (A.plane_locks(t) and t not in A.SLAB_TYPES) or A.brick_locks(t):
+        up = A.PLANE_QUADRATIC_UPGRADE[ct[:3]][1] if A.plane_locks(t) else "C3D8I"
+        own += (" — locks where the material keeps its volume (ccx 2.23 has no selectively reduced "
+                "volume terms): reduced physics with a plastic, creeping or nearly incompressible "
+                f"(ν ≥ {A.LOCKING_NU:g}) material; `--approximate` → `{up}`")
+    if ct == "S3":
+        own += " — in ccx 2.23 one `C3D6` wedge, which locks in bending: reduced physics; `--approximate` → `S6`"
     return own
 
 
@@ -884,7 +890,15 @@ def gen_elements():
                          "`--approximate` writes `S4`, within 2.5 % there, and `S8R` (midside "
                          f"nodes as above) where an element is over {A.S4_MAX_WIDTH:g} thicknesses "
                          "wide, as `S4` locks there (`validate_with_ccx.py s4r_plate_*`, "
-                         "`s4r_coarse_plate_*`).\n")
+                         "`s4r_coarse_plate_*`). An `S3` is one `C3D6` wedge, which locks in bending, "
+                         "flat or curved (the Scordelis-Lo roof on 16 × 16 squares per quarter: 0.21 of "
+                         "its deflection): reduced physics; `--approximate` writes `S6`, 0.4 % off "
+                         "there (`s3_roof`). ccx integrates a shell's section through the thickness "
+                         "at its brick's 2 Gauss points (`S6`, `S8`: 3), Abaqus a plastic one at 5 "
+                         "Simpson points: in plastic bending ccx's carries 1.155 (0.86) times the "
+                         "fully plastic moment, so a plastic `*SHELL SECTION` is reduced physics; "
+                         f"`--approximate` writes it as a composite of {A.PLASTIC_SHELL_LAYERS} equal "
+                         "layers (`plastic_shell_*`).\n")
         if cat == "membrane":
             parts.append("ccx 2.23 expands every membrane element into a solid on nodes of its own "
                          "and leaves the mid-thickness node of a quadratic element's corners free "

@@ -301,6 +301,18 @@ def dat_displacement(dat_path, node):
     return dat_displacements(dat_path).get(node)
 
 
+# The element-formulation flags a check's vehicle may carry beside what the check is about:
+# ccx's C3D8 locking where the material keeps its volume, its S3 wedge, a plastic shell
+# section's 2 Gauss points through the thickness (Converter._plan_volume_locking,
+# _plan_s3_shells, _plan_plastic_shells)
+VEHICLE_FLAGS = ("element C3D8 of a ", "element S3 (", "plastic *SHELL SECTION")
+
+
+def other_reduced(conv):
+    """conv.reduced_physics without VEHICLE_FLAGS."""
+    return [r for r in conv.reduced_physics if not r.startswith(VEHICLE_FLAGS)]
+
+
 def ccx_ratio(num, den):
     """num / den for a scale taken from ccx's output (a twin's largest |u|, a reference run's
     eigenvalue or reaction).  A zero or non-finite scale, as when a deck's loads were all lost,
@@ -4947,10 +4959,10 @@ def scordelis_roof_deck(typ, n, rho):
     """The Scordelis-Lo roof (MacNeal and Harder 1985) in inches, as the corpus deck
     petrkryslucsd_barrelvault_s3r_fineirreg gives it: R 300, half length 300, t 3, E 3e6,
     nu 0, a 40 degree half angle, its self-weight as *DLOAD ROOF, BX, -0.20833 (90 psf over
-    3 in) along -x, the vertical.  The quarter on n x n ``typ`` (S4 / S8R) shells: the
-    diaphragm at z = 0 holds u1 and u2, symmetry at z = 300 and along the crown (y = 0).
-    ``rho``: the material's density (None: none).  Returns (deck, the free edge's midspan
-    node), whose published vertical deflection is 0.3024 ft = 3.6288 in."""
+    3 in) along -x, the vertical.  The quarter on n x n ``typ`` (S4 / S8R; S3: two per
+    square) shells: the diaphragm at z = 0 holds u1 and u2, symmetry at z = 300 and along the
+    crown (y = 0).  ``rho``: the material's density (None: none).  Returns (deck, the free
+    edge's midspan node), whose published vertical deflection is 0.3024 ft = 3.6288 in."""
     quad = typ == "S8R"
     m = 2 * n if quad else n
     nid = lambda i, j: 1 + i + (m + 1) * j              # i around the arc, j along z
@@ -4970,6 +4982,10 @@ def scordelis_roof_deck(typ, n, rho):
                      nid(a + 1, b), nid(a + 2, b + 1), nid(a + 1, b + 2), nid(a, b + 1)]
             else:
                 c = [nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)]
+            if typ == "S3":
+                lines.append(", ".join(map(str, [k] + c[:3])))
+                k += 1
+                c = [c[0], c[2], c[3]]
             lines.append(", ".join(map(str, [k] + c)))
     sets = {"WALL": [nid(i, 0) for i in range(m + 1)], "SYMM": [nid(i, m) for i in range(m + 1)],
             "APEX": [nid(0, j) for j in range(m + 1)]}
@@ -7760,12 +7776,13 @@ def plane_cantilever_deck(typ, nx, ny, length, depth, thickness=None):
     return "\n".join(lines) + "\n", ref
 
 
-def plastic_strip_deck(n=4):
+def plastic_strip_deck(n=4, typ="CPE4"):
     """(deck, plastic moment, end rotation): a plane-strain CPE4 strip 10 deep and 10 long of
     n x n elements, elastic-perfectly plastic Mises (E 210000, nu 0.3, sigma_y 240), held in x
     along x = 0 (and in y at mid-depth there), its end x = 10 turned rigidly (u_x = theta (y -
     5)) to 20 times its first-yield rotation; the end's reactions give the moment, M_p = (2 /
-    sqrt 3) sigma_y h^2 / 4 per unit thickness at collapse."""
+    sqrt 3) sigma_y h^2 / 4 per unit thickness at collapse.  ``typ`` "C3D8": the strip as one
+    layer of C3D8 bricks 1 thick, z held (plane strain)."""
     h, sy, nu = 10.0, 240.0, 0.3
     mp = 2 / math.sqrt(3) * sy * h * h / 4
     my = sy / math.sqrt(1 - nu + nu * nu) * h * h / 6
@@ -7773,16 +7790,116 @@ def plastic_strip_deck(n=4):
     nid = lambda i, j: 1 + i + (n + 1) * j     # noqa: E731
     nodes = {nid(i, j): (i * h / n, j * h / n) for j in range(n + 1) for i in range(n + 1)}
     elems = [[nid(i, j), nid(i + 1, j), nid(i + 1, j + 1), nid(i, j + 1)] for j in range(n) for i in range(n)]
-    end = [nid(n, j) for j in range(n + 1)]
-    lines = (["*NODE"] + [f"{k}, {x:.12g}, {y:.12g}" for k, (x, y) in nodes.items()]
-             + ["*ELEMENT, TYPE=CPE4, ELSET=S"] + [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(elems, 1)]
-             + ["*NSET, NSET=ROOT"] + _ids([nid(0, j) for j in range(n + 1)]) + ["*NSET, NSET=END"] + _ids(end)
+    layers = [0] if typ == "CPE4" else [0, (n + 1) ** 2]
+    if typ != "CPE4":
+        elems = [c + [k + layers[1] for k in c] for c in elems]
+    end = [nid(n, j) + o for j in range(n + 1) for o in layers]
+    lines = (["*NODE"] + [f"{k + o}, {x:.12g}, {y:.12g}" + (f", {o and 1.}" if o or typ != "CPE4" else "")
+                          for o in layers for k, (x, y) in nodes.items()]
+             + [f"*ELEMENT, TYPE={typ}, ELSET=S"] + [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(elems, 1)]
+             + ["*NSET, NSET=ROOT"] + _ids([nid(0, j) + o for j in range(n + 1) for o in layers])
+             + ["*NSET, NSET=END"] + _ids(end) + ["*NSET, NSET=ALL"] + _ids([k + o for o in layers for k in nodes])
              + ["*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.3", "*PLASTIC", f"{sy:g}, 0.",
-                "*SOLID SECTION, ELSET=S, MATERIAL=M", "*BOUNDARY", "ROOT, 1, 1", f"{nid(0, n // 2)}, 2, 2",
-                "*STEP", "*STATIC", "0.05, 1., 1e-5, 0.05", "*BOUNDARY"]
-             + [f"{k}, 1, 1, {theta * (nodes[k][1] - h / 2):.12g}" for k in end]
+                "*SOLID SECTION, ELSET=S, MATERIAL=M", "*BOUNDARY", "ROOT, 1, 1"]
+             + [f"{nid(0, n // 2) + o}, 2, 2" for o in layers] + (["ALL, 3, 3"] if typ != "CPE4" else [])
+             + ["*STEP", "*STATIC", "0.05, 1., 1e-5, 0.05", "*BOUNDARY"]
+             + [f"{k}, 1, 1, {theta * (nodes[k if k in nodes else k - layers[-1]][1] - h / 2):.12g}" for k in end]
              + ["*NODE PRINT, NSET=END", "U, RF", "*END STEP"])
     return "\n".join(lines) + "\n", mp, theta
+
+
+def creep_cylinder_deck(nr=4):
+    """(deck, steady-state creep rate of the inner radius): the plane-strain thick cylinder a =
+    10, b = 20 as a CAX4 strip of nr square elements, z held; E 1000, nu 0.3, Norton creep
+    (*CREEP, LAW=TIME: A 1e-3, n 3, m 0), a pressure p = 1 on the inner face in a static step,
+    held over two *VISCO steps to t = 1500 and 2000 (the inner radius printed at each step's
+    end).  The steady state of incompressible flow (Mises, plane strain): u'(a) = C / a, C =
+    (sqrt 3 A / 2) (sqrt 3 p / (n (a^(-2/n) - b^(-2/n))))^n."""
+    a, b, ac, nc, p = 10.0, 20.0, 1e-3, 3.0, 1.0
+    rate = math.sqrt(3) * ac / 2 * (math.sqrt(3) * p / (nc * (a ** (-2 / nc) - b ** (-2 / nc)))) ** nc / a
+    h = (b - a) / nr
+    nodes = {1 + i + (nr + 1) * j: (a + i * h, j * h) for j in (0, 1) for i in range(nr + 1)}
+    elems = [[1 + i, 2 + i, nr + 3 + i, nr + 2 + i] for i in range(nr)]
+    visco = lambda t: ["*STEP, INC=2000", "*VISCO, CETOL=1e-4", f"5., {t:g}, 1e-6, 50.",   # noqa: E731
+                       "*NODE PRINT, NSET=INNER, FREQUENCY=10000", "U", "*END STEP"]
+    lines = (["*NODE"] + [f"{q}, {x:.12g}, {y:.12g}" for q, (x, y) in nodes.items()]
+             + ["*ELEMENT, TYPE=CAX4, ELSET=S"] + [f"{e}, " + ", ".join(map(str, cc)) for e, cc in enumerate(elems, 1)]
+             + ["*NSET, NSET=ALL"] + _ids(list(nodes)) + ["*NSET, NSET=INNER", f"1, {nr + 2}"]
+             + ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3", "*CREEP, LAW=TIME", f"{ac:g}, {nc:g}, 0.",
+                "*SOLID SECTION, ELSET=S, MATERIAL=M", "*BOUNDARY", "ALL, 2, 2",
+                "*STEP", "*STATIC", "*DLOAD", f"1, P4, {p:g}", "*END STEP"] + visco(1500.) + visco(500.))
+    return "\n".join(lines) + "\n", rate
+
+
+def lame_quarter_deck(nr=4, nu=0.499):
+    """(deck, Lame's inner displacement): a quarter of the plane-strain thick cylinder a = 10,
+    b = 20 as one layer of nr x nr C3D8 bricks (E 1000, Poisson's ratio ``nu``), z held,
+    symmetry on x = 0 and y = 0, a pressure 1 on the inner face; u(a) = (1 + nu) p a^2 ((1 - 2
+    nu) a + b^2 / a) / (E (b^2 - a^2)), printed at the inner node on y = 0."""
+    a, b = 10.0, 20.0
+    nid = lambda i, j, l: 1 + i + (nr + 1) * j + (nr + 1) ** 2 * l     # noqa: E731
+    lines = ["*NODE"]
+    for l in (0, 1):
+        for j in range(nr + 1):
+            for i in range(nr + 1):
+                r, t = a + (b - a) * i / nr, math.pi / 2 * j / nr
+                lines.append(f"{nid(i, j, l)}, {r * math.cos(t):.15g}, {r * math.sin(t):.15g}, {l * (b - a) / nr:.15g}")
+    lines.append("*ELEMENT, TYPE=C3D8, ELSET=S")
+    e = 0
+    for j in range(nr):
+        for i in range(nr):
+            e += 1
+            c = [nid(i, j, 0), nid(i + 1, j, 0), nid(i + 1, j + 1, 0), nid(i, j + 1, 0)]
+            lines.append(", ".join(map(str, [e] + c + [k + (nr + 1) ** 2 for k in c])))
+    every = [nid(i, j, l) for l in (0, 1) for j in range(nr + 1) for i in range(nr + 1)]
+    lines += (["*NSET, NSET=ALL"] + _ids(every)
+              + ["*NSET, NSET=X0"] + _ids([nid(i, nr, l) for l in (0, 1) for i in range(nr + 1)])
+              + ["*NSET, NSET=Y0"] + _ids([nid(i, 0, l) for l in (0, 1) for i in range(nr + 1)])
+              + ["*NSET, NSET=INNER", f"{nid(0, 0, 0)}", "*ELSET, ELSET=WALL"] + _ids([1 + nr * j for j in range(nr)])
+              + ["*MATERIAL, NAME=M", "*ELASTIC", f"1000., {nu:g}", "*SOLID SECTION, ELSET=S, MATERIAL=M",
+                 "*BOUNDARY", "ALL, 3, 3", "X0, 1, 1", "Y0, 2, 2", "*STEP", "*STATIC", "*DLOAD", "WALL, P6, 1.",
+                 "*NODE PRINT, NSET=INNER", "U", "*END STEP"])
+    return "\n".join(lines) + "\n", (1 + nu) * a * a * ((1 - 2 * nu) * a + b * b / a) / (1000. * (b * b - a * a))
+
+
+def plastic_shell_strip_deck(typ):
+    """(deck, its limit load 2 P_L): a strip 3 long, 0.1 wide and 0.1 thick of 30 ``typ``
+    shells along it (S6: two per square), elastic-perfectly plastic Mises (E 1000, nu 0,
+    sigma_y 1), simply supported at its ends, its lines at L/3 and 2L/3 pushed down 6 times
+    their elastic deflection under the limit load: 4-point bending, the moment between them
+    P L / 3, so the reaction there levels off at 2 P_L, P_L = 3 M_p / L, M_p = sigma_y b t^2 / 4
+    (printed: the total reaction of the pushed nodes)."""
+    ln, b, t, n = 3.0, 0.1, 0.1, 30
+    pl = 3 * b * t * t / 4 / ln
+    quad = typ in ("S8R", "S6")
+    mx, my = (2 * n, 2) if quad else (n, 1)
+    nid = lambda i, j: 1 + i + (mx + 1) * j    # noqa: E731
+    els = []
+    for k in range(n):
+        i = 2 * k
+        if typ == "S8R":
+            els.append([nid(i, 0), nid(i + 2, 0), nid(i + 2, 2), nid(i, 2), nid(i + 1, 0), nid(i + 2, 1),
+                        nid(i + 1, 2), nid(i, 1)])
+        elif typ == "S6":
+            els += [[nid(i, 0), nid(i + 2, 0), nid(i + 2, 2), nid(i + 1, 0), nid(i + 2, 1), nid(i + 1, 1)],
+                    [nid(i, 0), nid(i + 2, 2), nid(i, 2), nid(i + 1, 1), nid(i + 1, 2), nid(i, 1)]]
+        else:
+            els.append([nid(k, 0), nid(k + 1, 0), nid(k + 1, 1), nid(k, 1)])
+    used = sorted({x for c in els for x in c})
+    pos = {k: (ln * ((k - 1) % (mx + 1)) / mx, b * ((k - 1) // (mx + 1)) / my) for k in used}
+    ends = [k for k in used if pos[k][0] < 1e-9 or pos[k][0] > ln - 1e-9]
+    pushed = [k for k in used if min(abs(pos[k][0] - ln / 3), abs(pos[k][0] - 2 * ln / 3)) < 1e-9]
+    a = ln / 3
+    w = 6 * pl * a * a * (3 * ln - 4 * a) / (6 * 1000. * b * t ** 3 / 12)
+    lines = (["*NODE"] + [f"{k}, {pos[k][0]:.12g}, {pos[k][1]:.12g}, 0." for k in used]
+             + [f"*ELEMENT, TYPE={typ}, ELSET=STRIP"] + [f"{e}, " + ", ".join(map(str, c)) for e, c in enumerate(els, 1)]
+             + ["*NSET, NSET=ENDS"] + _ids(ends) + ["*NSET, NSET=PUSHED"] + _ids(pushed)
+             + ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.", "*PLASTIC", "1., 0.",
+                "*SHELL SECTION, ELSET=STRIP, MATERIAL=M", f"{t:g}", "*BOUNDARY", "ENDS, 3, 3",
+                f"{ends[0]}, 1, 2", f"{ends[-1]}, 2, 2", "*STEP, INC=500", "*STATIC", "0.02, 1., 1e-6, 0.02",
+                "*BOUNDARY", f"PUSHED, 3, 3, {-w:.12g}", "*NODE PRINT, NSET=PUSHED, TOTALS=ONLY", "RF",
+                "*END STEP"])
+    return "\n".join(lines) + "\n", 2 * pl
 
 
 def plastic_cylinder_deck(nr=4, frac=0.9):
@@ -10807,7 +10924,7 @@ def main():
             with open(src, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(t)
             _, conv = convert(src, inp)
-            flagged.append(bool(conv.reduced_physics))
+            flagged.append(bool(other_reduced(conv)))
             d, status, _ = run_ccx(ccx, env, inp)
             u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
             shutil.rmtree(d, ignore_errors=True)
@@ -12392,7 +12509,7 @@ def main():
         d, status, out = run_ccx(ccx, env, inp)
         u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None
         shutil.rmtree(d, ignore_errors=True)
-        lost = [r for r in conv.reduced_physics if not r.startswith(allow)] if allow else conv.reduced_physics
+        lost = [r for r in other_reduced(conv) if not r.startswith(allow)] if allow else other_reduced(conv)
         if u is None or lost:
             print(f"FAIL  {tag}: " + (f"did not solve ({status})" if u is None else
                                       "reduced physics: " + "; ".join(lost)))
@@ -15005,6 +15122,103 @@ def main():
                   f"{'flagged' if flagged else 'NOT flagged'} reduced physics")
         failures += 0 if ok else 1
 
+    # ccx 2.23's C3D8 locks alike (plastic flow, creep, near incompressibility), and CPE4 /
+    # CAX4 lock in creep and near incompressibility too: flagged reduced physics; --approximate
+    # writes C3D8I (same nodes) and CPE8R / CAX8R
+    c3d8_strip, mp, theta = plastic_strip_deck(typ="C3D8")
+    creep, rate = creep_cylinder_deck()
+    lame, lame_u = lame_quarter_deck()
+
+    def creep_rate(dat):
+        """[the inner radius' rate between the ends of the two *VISCO steps, its last value]."""
+        u = {stp: rows for stp, title, _set, _t, rows in A.dat_blocks(dat) if title.startswith("displacements")}
+        return [(u[3][0][1] - u[2][0][1]) / 500., u[3][0][1]] if 2 in u and 3 in u else None
+
+    for tag, text, ref, read, twin, what in (
+            ("plastic_strip_c3d8", c3d8_strip, mp, strip_moment, "C3D8I",
+             "a plane-strain strip of 4 x 4 C3D8 bricks bent to 20 times its first-yield rotation, its "
+             "end moment / the plastic moment"),
+            ("creep_cylinder_cax4", creep, rate, creep_rate, "CAX8R",
+             "a CAX4 thick cylinder, b = 2a, 4 elements through the wall, Norton creep under a held "
+             "pressure, its inner radius' late rate / the steady-state one"),
+            ("incompressible_cylinder_c3d8", lame, lame_u, lambda dat: [dat_displacements(dat)[1][0]] * 2, "C3D8I",
+             "a quarter thick cylinder of 4 x 4 C3D8 bricks, b = 2a, Poisson's ratio 0.499, its inner "
+             "displacement under pressure / Lame's")):
+        raw = review_run(text, tag, read)
+        _, conv = convert(os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}_flag.inp"))
+        app = review_run(text, tag + "_approximate", read, approximate=True)
+        ok = bool(raw and app)
+        if ok:
+            flagged = any(r.startswith(("element C3D8 of a", "element CAX4 of a")) for r in conv.reduced_physics)
+            with open(os.path.join(tmp, f"{tag}_approximate.inp"), encoding="utf-8") as fh:
+                written = f"*ELEMENT, TYPE={twin}\n" in fh.read()
+            err = abs(app[0] / ref - 1)
+            ok = flagged and written and err < (0.015 if twin == "C3D8I" and "creep" not in tag else 0.01) \
+                and app[1] != 0
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): {app[0] / ref:.4f} written as "
+                  f"{twin if written else 'NOT ' + twin} (--approximate); as written {raw[0] / ref:.3g}, "
+                  f"{'flagged' if flagged else 'NOT flagged'} reduced physics")
+        failures += 0 if ok else 1
+
+    # ccx 2.23 runs an S3 as one C3D6 wedge through the thickness, which locks in bending: the
+    # Scordelis-Lo roof of 16 x 16 squares per quarter (two S3 each); --approximate writes S6
+    # (with its midside nodes on the roof's cylinder S6 converges from below: 0.98 on 8 x 8)
+    text, node = scordelis_roof_deck("S3", 16, 1.0)
+    roof = lambda dat: [-dat_displacements(dat).get(node, [math.nan])[0]]     # noqa: E731
+    raw = review_run(text, "s3_roof", roof)
+    _, conv = convert(os.path.join(tmp, "s3_roof_src.inp"), os.path.join(tmp, "s3_roof_flag.inp"))
+    app = review_run(text, "s3_roof_approximate", roof, approximate=True)
+    ok = bool(raw and app)
+    if ok:
+        flagged = any(r.startswith("element S3 ") for r in conv.reduced_physics)
+        with open(os.path.join(tmp, "s3_roof_approximate.inp"), encoding="utf-8") as fh:
+            written = "*ELEMENT, TYPE=S6\n" in fh.read()
+        err = abs(app[0] / 3.6288 - 1)
+        ok = flagged and written and err < 0.01
+        print(f"{'PASS' if ok else 'FAIL'}  s3_roof (Scordelis-Lo roof, 16 x 16 squares per quarter as two S3 "
+              f"each, its free-edge midspan deflection): {app[0]:.5g} written as {'S6' if written else 'NOT S6'} "
+              f"(--approximate), {err:.2%} off the published 3.6288 in; as written {raw[0] / 3.6288:.3g} "
+              f"times it, {'flagged' if flagged else 'NOT flagged'} reduced physics")
+    failures += 0 if ok else 1
+
+    # ccx 2.23 integrates an expanded shell's section through the thickness at its brick's 2
+    # (S4, S8R) or 3 (S6) Gauss points, Abaqus a plastic one at 5 Simpson points, which carry
+    # exactly the fully plastic moment: a strip in 4-point bending under displacement control
+    # levels off at 1.155 (ccx then stops: the section has no tangent left) / 0.866 times its
+    # limit load; --approximate writes a composite of 4 equal layers (S4 -> S8R): 1.000
+    def strip_rf(dat):
+        tot = dat_tables(dat, "total force")
+        return [-tot[-1][0][2]] if tot and tot[-1] else None
+
+    for typ in ("S6", "S4"):
+        tag = f"plastic_shell_{typ.lower()}"
+        text, ref = plastic_shell_strip_deck(typ)
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        _, conv = convert(src, inp)
+        d, status, _out = run_ccx(ccx, env, inp)                 # as written: ccx may stop at the hinge
+        raw = strip_rf(os.path.join(d, "job.dat"))
+        shutil.rmtree(d, ignore_errors=True)
+        app = review_run(text, tag + "_approximate", strip_rf, approximate=True)
+        ok = bool(raw and app)
+        if ok:
+            flagged = any(r.startswith("plastic *SHELL SECTION") for r in conv.reduced_physics)
+            with open(os.path.join(tmp, f"{tag}_approximate.inp"), encoding="utf-8") as fh:
+                body = fh.read()
+            written = body.count(", , M\n") == 4 and ("*ELEMENT, TYPE=S8R\n" in body) == (typ == "S4")
+            err = abs(app[0] / ref - 1)
+            ok = flagged and written and err < 0.01
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a plastic {typ} strip in 4-point bending pushed to 6 "
+                  f"times its elastic deflection at the limit load, its reaction / the limit load): "
+                  f"{app[0] / ref:.4f} as {'4 equal layers' if written else 'NOT 4 layers'}"
+                  f"{' of S8R' if typ == 'S4' else ''} (--approximate); as written {raw[0] / ref:.4f}"
+                  f"{'' if status == 'solved' else ' when ccx stopped'}, {'flagged' if flagged else 'NOT flagged'} "
+                  f"reduced physics")
+        else:
+            print(f"FAIL  {tag}: no results ({status} as written)")
+        failures += 0 if ok else 1
+
     # numbers over the 20 characters ccx 2.23 reads of a field: it stopped on the *CLOAD
     # (-5.148903517857142e-05) and read the modulus 1.0000000000000000000e-03 as 1
     u = review_run(long_numbers_deck(), "long_numbers", dat_displacements)
@@ -16202,9 +16416,9 @@ def main():
         _rep, conv = convert(src, inp)
         d, status, out = run_ccx(ccx, env, inp)
         r20_dirs.append(d)
-        if status != "solved" or conv.reduced_physics:
+        if status != "solved" or other_reduced(conv):
             print(f"FAIL  {tag}: " + (f"did not solve ({status})" if status != "solved" else
-                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+                                      "reduced physics: " + "; ".join(other_reduced(conv))))
             print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
             return None
         return os.path.join(d, "job.dat")
@@ -17101,9 +17315,9 @@ def main():
         d, status, out = run_ccx(ccx, env, inp)
         blocks = list(A.dat_blocks(os.path.join(d, "job.dat"))) if status == "solved" else None
         shutil.rmtree(d, ignore_errors=True)
-        if blocks is None or sorted(conv.reduced_physics) != sorted(reduced):
+        if blocks is None or sorted(other_reduced(conv)) != sorted(reduced):
             print(f"FAIL  {tag}: " + (f"did not solve ({status})" if blocks is None else
-                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+                                      "reduced physics: " + "; ".join(other_reduced(conv))))
             print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
             return None
         return blocks
@@ -17191,17 +17405,20 @@ def main():
               f"0, 11, 31 too; ccx stopped): left out, u_x = 1 / E ({err:.1e} off)")
     failures += 0 if ok else 1
     # a collapsed S4R / S4 (ccx stopped in gen3dnor): as S3R, exactly; S4 under --approximate
+    # (which writes the triangle and its twin as S6, their neighbour as S8R)
     S4R_REDUCED = "element S4R (ccx 2.23 bends it only through its C3D8R's hourglass stiffness)"
+    S6_APPROX = "--approximate: Element S3 (1 elements) written as S6"
     for kind, reduced, approx in (("coll_s4r", [S4R_REDUCED], False),
-                                  ("coll_s4", ["--approximate: Collapsed S4 shells written as S3"], True)):
+                                  ("coll_s4", ["--approximate: Collapsed S4 shells written as S3", S6_APPROX], True)):
         runs = [t116_run(f"t116_{kind}", kind, reduced, approx),
-                t116_run(f"t116_{kind}_ref", kind + "_ref", [S4R_REDUCED] if kind == "coll_s4r" else [])]
+                t116_run(f"t116_{kind}_ref", kind + "_ref", [S4R_REDUCED] if kind == "coll_s4r" else [S6_APPROX],
+                         approx)]
         ok = all(r is not None for r in runs)
         if ok:
             got, want = t116_last(runs[0]), t116_last(runs[1])
             scale = max(abs(x) for v in want.values() for x in v[:3])
             err = max(abs(a - b) for n in want for a, b in zip(got.get(n, [math.inf] * 3), want[n][:3]))
-            ok = len(got) == 5 and err <= 1e-12 * scale and scale > 0
+            ok = len(got) == len(want) >= 5 and err <= 1e-12 * scale and scale > 0
             print(f"{'PASS' if ok else 'FAIL'}  t116_{kind} (a plate with a collapsed "
                   f"{kind[5:].upper()} beside a plain one; ccx stopped in gen3dnor): the twin with it "
                   f"written as a triangle ({err:.1e} apart, max |u| {scale:.4g})")

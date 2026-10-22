@@ -27,8 +27,8 @@ Direct CalculiX types: **67**. Total recognised: **176**.
 | `C3D4H` | 4 | → `C3D4` (substituted: reduced physics) |
 | `C3D6` | 6 | direct |
 | `C3D6H` | 6 | → `C3D6` (substituted: reduced physics) |
-| `C3D8` | 8 | direct |
-| `C3D8H` | 8 | → `C3D8` (substituted: reduced physics) |
+| `C3D8` | 8 | direct — locks where the material keeps its volume (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic, creeping or nearly incompressible (ν ≥ 0.475) material; `--approximate` → `C3D8I` |
+| `C3D8H` | 8 | → `C3D8` (substituted: reduced physics) — locks where the material keeps its volume (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic, creeping or nearly incompressible (ν ≥ 0.475) material; `--approximate` → `C3D8I` |
 | `C3D8I` | 8 | direct |
 | `C3D8IH` | 8 | → `C3D8I` (substituted: reduced physics) |
 | `C3D8R` | 8 | direct |
@@ -50,8 +50,8 @@ Direct CalculiX types: **67**. Total recognised: **176**.
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
 | `CAX3` | 3 | direct |
-| `CAX4` | 4 | direct — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CAX8R` |
-| `CAX4H` | 4 | → `CAX4` (substituted: reduced physics) — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CAX8R` |
+| `CAX4` | 4 | direct — locks where the material keeps its volume (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic, creeping or nearly incompressible (ν ≥ 0.475) material; `--approximate` → `CAX8R` |
+| `CAX4H` | 4 | → `CAX4` (substituted: reduced physics) — locks where the material keeps its volume (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic, creeping or nearly incompressible (ν ≥ 0.475) material; `--approximate` → `CAX8R` |
 | `CAX4R` | 4 | direct — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CAX4` |
 | `CAX6` | 6 | direct |
 | `CAX6M` | 6 | → `CAX6` (substituted: reduced physics) |
@@ -137,7 +137,7 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
 | `CGAX3` | 3 | → `CAX3` (substituted: reduced physics) |
-| `CGAX4` | 4 | → `CAX4` (substituted: reduced physics) — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CAX8R` |
+| `CGAX4` | 4 | → `CAX4` (substituted: reduced physics) — locks where the material keeps its volume (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic, creeping or nearly incompressible (ν ≥ 0.475) material; `--approximate` → `CAX8R` |
 | `CGAX4R` | 4 | → `CAX4R` (substituted: reduced physics) — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CAX4` |
 | `CGAX6` | 6 | → `CAX6` (substituted: reduced physics) |
 | `CGAX8` | 8 | → `CAX8` (substituted: reduced physics) |
@@ -148,7 +148,7 @@ Beams under a section only ccx's `U1` element carries (`*BEAM GENERAL SECTION`, 
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
 | `CPEG3` | 3 | → `CPE3` (substituted: reduced physics) |
-| `CPEG4` | 4 | → `CPE4` (substituted: reduced physics) — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CPE8R` |
+| `CPEG4` | 4 | → `CPE4` (substituted: reduced physics) — locks where the material keeps its volume (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic, creeping or nearly incompressible (ν ≥ 0.475) material; `--approximate` → `CPE8R` |
 | `CPEG4R` | 4 | → `CPE4R` (substituted: reduced physics) — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CPE4` |
 | `CPEG6` | 6 | → `CPE6` (substituted: reduced physics) |
 | `CPEG6M` | 6 | → `CPE6` (substituted: reduced physics) |
@@ -209,8 +209,8 @@ ccx 2.23 expands every membrane element into a solid on nodes of its own and lea
 | Abaqus type | Nodes | CalculiX |
 | --- | --- | --- |
 | `CPE3` | 3 | direct |
-| `CPE4` | 4 | direct — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CPE8R` |
-| `CPE4H` | 4 | → `CPE4` (substituted: reduced physics) — locks in plastic flow (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic material; `--approximate` → `CPE8R` |
+| `CPE4` | 4 | direct — locks where the material keeps its volume (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic, creeping or nearly incompressible (ν ≥ 0.475) material; `--approximate` → `CPE8R` |
+| `CPE4H` | 4 | → `CPE4` (substituted: reduced physics) — locks where the material keeps its volume (ccx 2.23 has no selectively reduced volume terms): reduced physics with a plastic, creeping or nearly incompressible (ν ≥ 0.475) material; `--approximate` → `CPE8R` |
 | `CPE4I` | 4 | → `C3D8I` slab (exact for small-strain linear elasticity in static steps); otherwise → `CPE4`, reduced physics |
 | `CPE4R` | 4 | direct — in ccx 2.23 one `C3D8R` brick whose hourglass stiffness alone bends it: reduced physics where its elements are over 3 depths wide (1.5 if plastic); `--approximate` → `CPE4` |
 | `CPE6` | 6 | direct |
@@ -255,8 +255,8 @@ ccx has no rigid element, and its `*RIGID BODY` refuses shell/beam nodes, so eac
 | `DS4` | 4 | passed through (verify) |
 | `DS6` | 6 | passed through (verify) |
 | `DS8` | 8 | passed through (verify) |
-| `S3` | 3 | direct; under a composite section → `S6` with midside nodes (reduced physics) |
-| `S3R` | 3 | → `S3` (exact); under a composite section → `S6` with midside nodes (reduced physics) |
+| `S3` | 3 | direct; under a composite section → `S6` with midside nodes (reduced physics) — in ccx 2.23 one `C3D6` wedge, which locks in bending: reduced physics; `--approximate` → `S6` |
+| `S3R` | 3 | → `S3` (exact); under a composite section → `S6` with midside nodes (reduced physics) — in ccx 2.23 one `C3D6` wedge, which locks in bending: reduced physics; `--approximate` → `S6` |
 | `S4` | 4 | direct; under a composite section → `S8R` with midside nodes (reduced physics) |
 | `S4R` | 4 | direct — in ccx 2.23 bends only through its `C3D8R`'s hourglass stiffness (reduced physics; `--approximate` → `S4`, `S8R` where coarse); under a composite section → `S8R` with midside nodes (reduced physics) |
 | `S4R5` | 4 | → `S4R` (substituted: reduced physics) — in ccx 2.23 bends only through its `C3D8R`'s hourglass stiffness (reduced physics; `--approximate` → `S4`, `S8R` where coarse); under a composite section → `S8R` with midside nodes (reduced physics) |
@@ -267,11 +267,11 @@ ccx has no rigid element, and its `*RIGID BODY` refuses shell/beam nodes, so eac
 | `S9R5` | 9 | passed through (verify) |
 | `SC6R` | 6 | → `C3D6` (substituted: reduced physics); under a composite section one `C3D6` per ply |
 | `SC8R` | 8 | → `C3D8I` (substituted: reduced physics); under a composite section one `C3D8I` per ply |
-| `STRI3` | 3 | → `S3` (substituted: reduced physics); under a composite section → `S6` with midside nodes (reduced physics) |
+| `STRI3` | 3 | → `S3` (substituted: reduced physics); under a composite section → `S6` with midside nodes (reduced physics) — in ccx 2.23 one `C3D6` wedge, which locks in bending: reduced physics; `--approximate` → `S6` |
 | `STRI65` | 6 | → `S6` (substituted: reduced physics) |
 | `US3` | 3 | direct |
 
-ccx 2.23 runs a composite `*SHELL SECTION` on `S6` and `S8R` only, and has no layered solid section. Linear composite shells become `S6`/`S8R` with a node at the middle of every edge (on the curved surface the averaged nodal normals define; straight where flat or folded), shared with the linear shells and 2-node beams joined to them by an edge, which are upgraded too (a beam along a curved edge then follows its arc, where Abaqus' is straight). Composite continuum shells become one solid per ply, stacked from the bottom face (`STACK DIRECTION`), each its share of the thickness with its material and ply axes; sets, faces, face loads, BCs and node sets follow the plies. Both are validated against classical lamination theory and Pagano's 3-D solution (`validate_with_ccx.py composite_plate_*`). ccx 2.23 expands an `S4R` into one `C3D8R` brick integrated at a single point on the mid-surface, so only the hourglass stiffness ccx adds to that brick resists its bending, not the section (a simply supported plate, a/t 100: deflection 1/50, buckling load 97×); `--approximate` writes `S4`, within 2.5 % there, and `S8R` (midside nodes as above) where an element is over 6 thicknesses wide, as `S4` locks there (`validate_with_ccx.py s4r_plate_*`, `s4r_coarse_plate_*`).
+ccx 2.23 runs a composite `*SHELL SECTION` on `S6` and `S8R` only, and has no layered solid section. Linear composite shells become `S6`/`S8R` with a node at the middle of every edge (on the curved surface the averaged nodal normals define; straight where flat or folded), shared with the linear shells and 2-node beams joined to them by an edge, which are upgraded too (a beam along a curved edge then follows its arc, where Abaqus' is straight). Composite continuum shells become one solid per ply, stacked from the bottom face (`STACK DIRECTION`), each its share of the thickness with its material and ply axes; sets, faces, face loads, BCs and node sets follow the plies. Both are validated against classical lamination theory and Pagano's 3-D solution (`validate_with_ccx.py composite_plate_*`). ccx 2.23 expands an `S4R` into one `C3D8R` brick integrated at a single point on the mid-surface, so only the hourglass stiffness ccx adds to that brick resists its bending, not the section (a simply supported plate, a/t 100: deflection 1/50, buckling load 97×); `--approximate` writes `S4`, within 2.5 % there, and `S8R` (midside nodes as above) where an element is over 6 thicknesses wide, as `S4` locks there (`validate_with_ccx.py s4r_plate_*`, `s4r_coarse_plate_*`). An `S3` is one `C3D6` wedge, which locks in bending, flat or curved (the Scordelis-Lo roof on 16 × 16 squares per quarter: 0.21 of its deflection): reduced physics; `--approximate` writes `S6`, 0.4 % off there (`s3_roof`). ccx integrates a shell's section through the thickness at its brick's 2 Gauss points (`S6`, `S8`: 3), Abaqus a plastic one at 5 Simpson points: in plastic bending ccx's carries 1.155 (0.86) times the fully plastic moment, so a plastic `*SHELL SECTION` is reduced physics; `--approximate` writes it as a composite of 4 equal layers (`plastic_shell_*`).
 
 ## surface (load carrier)
 

@@ -19,6 +19,15 @@ physics.
   and s, whose A is far smaller, creeps up to 1e24 times too fast. Where that raises a creep
   step's creep strain by more than 0.1 %, the report now gives the factor and the step, and the
   deck counts as reduced physics. Units with a larger A avoid it (MPa for Pa).
+* **Element weaknesses flagged** — three ccx 2.23 element behaviours that counted as faithful are
+  now reduced physics, each with an `--approximate` cure. `C3D8`, and `CPE4` / `CAX4` with
+  creep or a Poisson's ratio from 0.475 (as with plastic flow), lock where the material keeps
+  its volume (a thick cylinder creeps at 0.003 of its steady rate on 4 elements through the
+  wall): `--approximate` writes `C3D8I` / `CPE8R` / `CAX8R`. `S3` / `S3R` run as one `C3D6`
+  wedge, which locks in bending on flat and curved shells (the Scordelis-Lo roof: 0.12 of its
+  deflection on 8 × 8 squares): `--approximate` writes `S6`. A plastic `*SHELL SECTION` is
+  integrated at 2 Gauss points through the thickness (Abaqus: 5 Simpson points), so it carries
+  1.155 times the fully plastic moment: `--approximate` writes a composite of 4 equal layers.
 * **Geostatic initial stresses and steps** — `*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC` was
   commented out. It is now written at each of ccx's integration points: the vertical stress
   linear in the elevation (z in 3-D, y in plane and axisymmetric models) through the card's two

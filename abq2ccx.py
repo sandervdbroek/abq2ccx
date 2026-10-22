@@ -446,6 +446,13 @@ COMPOSITE_SHELL_UPGRADE = {"S3": "S6", "S4": "S8R", "S4R": "S8R"}
 # --approximate writes an S4R more than this many thicknesses wide (the square root of its
 # area) as S8R, else as S4 (Converter._plan_s4r_shells)
 S4_MAX_WIDTH = 6.0
+# The Gauss points through the thickness of the brick ccx 2.23 expands a shell into (C3D6,
+# C3D8I, C3D8R, C3D15, C3D20, C3D20R), where Abaqus integrates a shell section at 5 Simpson
+# points by default; --approximate writes a plastic section as a composite of
+# PLASTIC_SHELL_LAYERS equal layers of its material, each at 2 Gauss points
+# (Converter._plan_plastic_shells)
+SHELL_SECTION_POINTS = {"S3": 2, "S4": 2, "S4R": 1, "S6": 3, "S8": 3, "S8R": 2}
+PLASTIC_SHELL_LAYERS = 4
 # Elements ccx 2.23 also expands into one C3D8R brick integrated at a single point
 # (gen3delem.f; the S4R is _plan_s4r_shells') -> the fully integrated element --approximate
 # writes them as (Converter._plan_one_point_bricks)
@@ -453,13 +460,15 @@ ONE_POINT_TWIN = {"CPS4R": "CPS4", "CPE4R": "CPE4", "CAX4R": "CAX4", "M3D4R": "M
 # the median ratio of a plane / axisymmetric one's shorter in-plane size to its brick's depth
 # above which it is flagged: elastic materials, plastic ones
 ONE_POINT_DEPTH_RATIO = (3.0, 1.5)
-# ccx 2.23 integrates CPE4 / CAX4 fully (a C3D8 brick), without the selectively reduced volume
-# terms of Abaqus' first-order quadrilaterals, so they lock in plastic flow; --approximate
-# writes them, and the linear plane elements joined to them by an edge, as the quadratic
-# element of a triangle / quadrilateral, with a node at the middle of every edge
-# (Converter._plan_plastic_plane_quads)
+# ccx 2.23 integrates CPE4 / CAX4 / C3D8 fully (C3D8 bricks), without the selectively reduced
+# volume terms of Abaqus' first-order quadrilaterals and hexahedra, so they lock where the
+# material keeps its volume (plastic flow, creep, a Poisson's ratio from LOCKING_NU);
+# --approximate writes the plane ones, and the linear plane elements joined to them by an
+# edge, as the quadratic element of a triangle / quadrilateral, with a node at the middle of
+# every edge, and the bricks as C3D8I (Converter._plan_volume_locking)
 PLANE_LOCKING = ("CPE4", "CAX4")
 PLANE_QUADRATIC_UPGRADE = {f: (f + "6", f + "8R") for f in ("CPE", "CPS", "CAX")}
+LOCKING_NU = 0.475
 
 
 def plane_locks(typ: str) -> bool:
@@ -468,6 +477,13 @@ def plane_locks(typ: str) -> bool:
     runs as CPE4 / CAX4 (PLANE_LOCKING) — not the cohesive, gasket or heat-transfer elements
     it maps there."""
     return ccx_type(typ) in PLANE_LOCKING and typ.upper().startswith(("CPE", "CAX", "CGAX"))
+
+
+def brick_locks(typ: str) -> bool:
+    """Whether deck element type ``typ`` is Abaqus' fully integrated first-order hexahedron
+    (C3D8 and its suffixes) that ccx 2.23 runs as C3D8 — not the cohesive or gasket elements
+    it maps there."""
+    return ccx_type(typ) == "C3D8" and typ.upper().startswith("C3D8")
 # Continuum shells under a composite section: one ccx solid per ply (_plan_ply_split); the
 # default limit on the solids that adds (--max-ply-elements)
 PLY_SOLID = {"SC8R": "C3D8I", "SC6R": "C3D6"}
@@ -1004,7 +1020,7 @@ MULTIWORD_PARAMS = (
     "PROPERTY EVALUATION", "PUBLIC NODES", "RAMP INITIAL STRESS",
     "REDUCED POLYNOMIAL", "REF NODE", "REF NODE MOTION", "RELATIVE TO ABSOLUTE", "ROT NODE",
     "ROUNDOFF TOLERANCE", "SCALE FACTOR",
-    "SCALE STRESS", "SECOND ORDER ACCURACY", "SECTION FORCES", "SECTION POINTS", "SHELL THICKNESS",
+    "SCALE STRESS", "SECOND ORDER ACCURACY", "SECTION FORCES", "SECTION INTEGRATION", "SECTION POINTS", "SHELL THICKNESS",
     "SHIFT NODES", "SHOCK SMOOTHING", "SMALL SLIDING", "SOLID INFINITE FORMULATION",
     "SPH FORMULATION", "SPH SMOOTHING LENGTH", "SPH TENSILE INSTABILITY CONTROL",
     "STACK DIRECTION", "STEADY STATE", "STRUCTURAL DAMPING", "SUBSPACE PROJECTION",
@@ -13511,6 +13527,71 @@ class _Mesh:
                          f"load 37 % high; S8R within 1 %)."
                          + added)
 
+    def _plan_s3_shells(self, blocks: List[Block]) -> None:
+        """The triangles ccx runs as S3 (S3, S3R, STRI3, a collapsed S4) left after the
+        composite upgrade.  ccx 2.23 expands an S3 into one C3D6 wedge through the thickness
+        (gen3delem.f), linear in plane and through the thickness, so its bending locks in
+        shear, on flat and curved shells alike, the more so the thinner the shell; its
+        membrane is right.  Probed on 2.23 (linear static; S4 is the C3D8I expansion):
+        * a simply supported square plate under pressure, its deflection over the plate
+          solution on 4 / 8 / 16 / 32 elements a side (each square two S3): at a/t 10 0.34 /
+          0.62 / 0.81 / 0.88 (S4 1.00 / 1.08 / 1.11 / 1.12, the brick's own transverse shear),
+          at a/t 100 0.009 / 0.034 / 0.11 / 0.28 (S4 0.14 / 0.74 / 0.98 / 1.00), at a/t 1000
+          below 0.006;
+        * the Scordelis-Lo roof (R/t 100) on 4 / 8 / 16 / 32 per quarter: 0.05 / 0.12 / 0.21 /
+          0.40 of the published deflection (S4 0.50 / 0.95 / 0.994 / 0.996);
+        * a few triangles stiffen an S4 mesh: 2 / 5 / 10 % of the cells of the 16 x 16 plate
+          (a/t 100) as two S3 each take 7 / 18 / 23 % off its deflection, of the roof 3 / 8 /
+          17 %;
+        * a pressurized cylinder (a membrane state) 0.98 / 1.00 of p R^2 / (E t) on 4 / 16.
+        The error does not vanish on thick meshes (0.79 of S4's deflection on elements 0.3
+        thicknesses wide), and nothing in the mesh says whether a shell bends, so every S3 is
+        reduced physics, as the S4R is; or under --approximate S6 (a C3D15 wedge) through the
+        composite upgrade (_upgrade_linear_shells: a node at the middle of every edge, the
+        linear shells joined to them by an edge upgraded too, the new nodes on the curved
+        surface): 0.71 / 0.95 / 0.998 / 1.006 on the a/t 100 plate, 0.81 / 0.98 / 0.996 /
+        0.998 on the roof."""
+        s3 = [e for e, (typ, _c) in self.geom.elements.items() if ccx_type(typ) == "S3"]
+        if not s3:
+            return
+        hits: Dict[str, int] = {}
+        for e in s3:
+            typ = self.geom.elements[e][0].upper()
+            hits[typ] = hits.get(typ, 0) + 1
+        what = f"{'/'.join(sorted(hits))} ({len(s3)} elements)"
+        why = ("ccx 2.23 expands an S3 into one C3D6 wedge through the thickness, linear in plane "
+               "and through it, so its bending locks, on flat and curved shells alike, the more so "
+               "the thinner the shell (probed: a simply supported plate of a/t 100 deflects 0.03 / "
+               "0.11 / 0.28 of the plate solution on 8 / 16 / 32 elements a side, S4 0.74 / 0.98 / "
+               "1.00; the Scordelis-Lo roof 0.12 / 0.21 / 0.40 of its deflection on 8 / 16 / 32 "
+               "elements per quarter; 5 % of a plate's cells as S3 take 18 % off an S4 mesh's "
+               "deflection); its membrane stretching is right")
+        if not self._approx:
+            self.report.warn(f"Element {what}: {why}. Rerun with --approximate to write them as S6, "
+                             f"with a node at the middle of every edge (within 5 % of that plate "
+                             f"from 8 elements a side, 2 % of the roof from 8 per quarter), or mesh "
+                             f"with S4 or S8R.")
+            self._reduces("element S3 (ccx 2.23 runs it as one C3D6 wedge, which locks in bending)")
+            return
+        corners = self._linear_shell_corners()
+        seeds = [e for e in s3 if e in corners]
+        if not seeds:
+            return
+        up, kinds, span, beams = self._upgrade_linear_shells(blocks, corners, seeds)
+        others = sorted(k for k in kinds if k.split(" ->")[0] not in hits)
+        self.report.warn(
+            f"[APPROX] Element {what} written as S6: {why}. ccx's S6 (a C3D15 wedge) deflects 0.95 / "
+            f"0.998 / 1.006 of that plate's deflection on 8 / 16 / 32 elements a side, 0.98 / "
+            f"0.996 / 0.998 of the roof's; each has a node at the middle of every edge ({span}) on "
+            f"the curved surface the shells' averaged nodal normals define (straight where it is "
+            f"flat or folds)"
+            + (f"; {sum(kinds[k] for k in others)} other linear shell(s) joined to them by an edge "
+               f"were upgraded too ({', '.join(others)}), so no midside node hangs" if others else "")
+            + (f"; {beams} 2-node beam(s) along an upgraded edge became 3-node beams through its "
+               f"midside node" if beams else "")
+            + ". BCs, temperatures and initial conditions on both ends of an edge reach its midside "
+              "node, and so do the node sets of BCs, couplings, ties and output.")
+
     def _section_thickness(self, blocks: List[Block], keywords: Tuple[str, ...]
                            ) -> Dict[int, Tuple[Optional[float], str]]:
         """Element -> (its section's thickness: the first field of the first data line of its
@@ -13580,8 +13661,9 @@ class _Mesh:
             return
         sec = self._section_thickness(blocks, ("SOLID SECTION",))
         plastic = self._plastic_materials(blocks)
+        keep = self._volume_keeping_materials(blocks)
         for ct, els in groups.items():
-            ratio, plast = None, []
+            ratio, plast, vol = None, [], []
             if ct in ("CPS4R", "CPE4R", "CAX4R"):
                 rs = []
                 for e in els:
@@ -13592,6 +13674,8 @@ class _Mesh:
                     t, mat = sec.get(e, (None, ""))
                     if mat in plastic:
                         plast.append(e)
+                    if mat in keep:
+                        vol.append(e)
                     # ccx turns an axisymmetric element 1 degree to either side; a plane one
                     # without a thickness is Abaqus' 1 thick
                     d = 0.5 * abs(sum(p[0] for p in pts)) * math.sin(math.radians(1.0)) \
@@ -13602,14 +13686,15 @@ class _Mesh:
                 ratio = sorted(rs)[len(rs) // 2]
                 if ratio <= ONE_POINT_DEPTH_RATIO[1 if plast else 0]:
                     continue
-            self._one_point_flag(ct, els, ratio, plast)
+            self._one_point_flag(ct, els, ratio, plast, vol)
 
     def _one_point_flag(self, ct: str, els: List[int], ratio: Optional[float],
-                        plast: Sequence[int] = ()) -> None:
+                        plast: Sequence[int] = (), vol: Sequence[int] = ()) -> None:
         """Warn about the elements ``els`` of ccx type ``ct`` (_plan_one_point_bricks; ``plast``:
-        those of a plastic material) and flag them reduced physics, or under --approximate
-        write them as their fully integrated twin — a plastic CPE4R / CAX4R as the quadratic
-        element instead, as the twin locks in plastic flow (_plan_plastic_plane_quads)."""
+        those of a plastic material, ``vol``: of a material that keeps its volume) and flag
+        them reduced physics, or under --approximate write them as their fully integrated twin
+        — a CPE4R / CAX4R of ``vol`` as the quadratic element instead, as the twin locks there
+        (_plan_volume_locking)."""
         twin = ONE_POINT_TWIN[ct]
         kinds = sorted({self.geom.elements[e][0].upper() for e in els})
         what = f"{'/'.join(kinds)} ({len(els)} elements)"
@@ -13651,8 +13736,8 @@ class _Mesh:
                       "it locks in plastic flow too: a limit load 27 % high on 8 elements through "
                       "the depth, 2.5x on 2") + ")")
         if self._approx:
-            quad = list(plast) if ct in ("CPE4R", "CAX4R") else []
-            self._plastic_one_point += quad
+            quad = list(vol) if ct in ("CPE4R", "CAX4R") else []
+            self._locking_one_point += quad
             for e in set(els) - set(quad):
                 typ, conn = self.geom.elements[e]
                 base, sfx = split_suffixes(typ)
@@ -13663,10 +13748,11 @@ class _Mesh:
                 self._elem_types.add(new)
             up = PLANE_QUADRATIC_UPGRADE.get(ct[:3], ("", ""))[1]
             written = twin if not quad else \
-                (f"{up} ({len(quad)}, of a plastic material) and {twin} ({len(els) - len(quad)})"
+                (f"{up} ({len(quad)}, of a material that keeps its volume) and {twin} ({len(els) - len(quad)})"
                  if len(quad) < len(els) else up)
-            also = (f"; so the elements of a plastic material are written as {up} instead, with a "
-                    f"node at the middle of every edge (see the warning on plastic flow)" if quad else "")
+            also = (f"; so the elements of a material that keeps its volume (plastic, creeping or "
+                    f"nearly incompressible) are written as {up} instead, with a node at the middle "
+                    f"of every edge (see the warning on locking)" if quad else "")
             self.report.warn(f"[APPROX] Element {what} written as {written}: {why}. ccx's {fix}{also}.")
         else:
             self.report.warn(f"Element {what}: {why}. Rerun with --approximate to write them as "
@@ -13698,57 +13784,90 @@ class _Mesh:
                          f"/ ((1 + nu) (1 - 2 nu)) for a plastic or anisotropic material (1.35 E at "
                          f"nu = 0.3).", once=True)
 
-    def _plan_plastic_plane_quads(self, blocks: List[Block]) -> None:
-        """CPE4 / CAX4 (plane_locks: any suffix) of a plastic material.  Abaqus integrates the
-        volume change of its first-order quadrilaterals at one point (selectively reduced
-        integration, 2017 "Solid (continuum) elements": they "do not lock"); ccx 2.23 expands
-        them into C3D8 bricks integrated at 2 x 2 x 2 points with no such terms (gen3delem.f:
-        'C3D8  E' / 'C3D8  A'), so in plastic flow, which keeps the volume, they lock and reach
-        no limit load.  Probed on 2.23 (elastic-perfectly plastic Mises): a plane-strain thick
-        cylinder (b = 2a) carries 1.4 times its limit pressure (2/sqrt 3) sigma_y ln(b/a) — all
-        that was applied — on 2 to 16 elements through the wall, its inner radius 23 to 1500
-        times the first-yield displacement out; a plane-strain strip bent to 20 times its
-        first-yield rotation carries 3.5 / 1.6 / 1.16 / 1.04 times its plastic moment on 2 / 4 /
-        8 / 16 elements through the depth.  CPE8R / CAX8R (C3D20R bricks) stop at the limit
-        pressure (0.987 of it on 2 elements, 0.999 on 4) and carry 1.000 of the plastic moment
-        from 2.  So flagged reduced physics, or under --approximate written as CPE8R / CAX8R
-        through the shell upgrade's _upgrade_linear_shells (plane): a node at the middle of every
-        edge, the linear plane elements joined to them by an edge upgraded too (no midside node
-        hangs), together with the flagged CPE4R / CAX4R of a plastic material
-        (_plastic_one_point), whose twin would lock alike.  (Abaqus' triangles and fully
-        integrated quadratic elements lock in Abaqus too: written as they are.)"""
+    # what ccx 2.23's CPE4 / CAX4 / C3D8 do where the material keeps its volume, probed on a
+    # plane-strain thick cylinder (b = 2a) under internal pressure (_plan_volume_locking)
+    _LOCK_EVIDENCE = {
+        "plastic": "elastic-perfectly plastic, it carries 1.4 times its limit pressure, all that "
+                   "was applied, on 2 to 16 elements through the wall, and a strip bent to 20 "
+                   "times its first-yield rotation 3.5 / 1.6 / 1.16 / 1.04 times its plastic "
+                   "moment on 2 / 4 / 8 / 16 elements through its depth",
+        "creeping": "under Norton creep it creeps at 0.0005 / 0.003 / 0.02 of the steady-state "
+                    "rate on 2 / 4 / 8 elements through the wall",
+        "nearly incompressible": "elastic or neo-Hooke, it expands 0.77 / 0.93 / 0.98 of Lame's "
+                                 "displacement on 2 / 4 / 8 elements through the wall at a Poisson's "
+                                 "ratio of 0.475, 0.39 on 4 at 0.499 (0.92 / 0.98 / 0.99 at 0.3)",
+    }
+
+    def _plan_volume_locking(self, blocks: List[Block]) -> None:
+        """CPE4 / CAX4 (plane_locks: any suffix) and C3D8 (brick_locks) of a material that
+        keeps its volume (_volume_keeping_materials: plastic, creeping, or nearly
+        incompressible: a Poisson's ratio from LOCKING_NU, Abaqus' own bound for nearly
+        incompressible materials and the one ccx gives a hyperelastic D1 = 0).  Abaqus
+        integrates the volume change of its first-order quadrilaterals and hexahedra at one
+        point (selectively reduced integration, 2017 "Solid (continuum) elements": they "do not
+        lock"); ccx 2.23 expands CPE4 / CAX4 into C3D8 bricks (gen3delem.f: 'C3D8  E' / 'C3D8
+        A') and integrates every C3D8 at 2 x 2 x 2 points with no such terms, so where the
+        deformation keeps the volume they lock (_LOCK_EVIDENCE: a thick cylinder, CPE4, CAX4
+        and C3D8 alike, carries 1.4 times its limit pressure, creeps at 0.003 of its
+        steady-state rate and expands 0.93 of Lame's displacement at nu 0.475, on 4 elements
+        through the wall).  CPE8R / CAX8R (C3D20R bricks) stop at the limit pressure (0.987
+        of it on 2 elements, 0.999 on 4), carry 1.000 of a strip's plastic moment from 2,
+        creep at 1.004 / 1.000 of the steady rate and expand 1.005 / 1.000 of Lame's
+        displacement on 2 / 4 elements at any Poisson's ratio; C3D8I (incompatible modes, the
+        same nodes) 1.022 / 1.006, 1.000, 0.91 / 0.98 and 0.96 / 0.99.  So flagged reduced
+        physics, or under --approximate CPE4 / CAX4 written as CPE8R / CAX8R through the shell
+        upgrade's _upgrade_linear_shells (plane): a node at the middle of every edge, the
+        linear plane elements joined to them by an edge upgraded too (no midside node hangs),
+        together with the flagged CPE4R / CAX4R of such a material (_locking_one_point), whose
+        twin would lock alike; and C3D8 as C3D8I.  (Abaqus' triangles, tetrahedra, wedges and
+        fully integrated quadratic elements lock in Abaqus too: written as they are.)"""
         sec = self._section_thickness(blocks, ("SOLID SECTION",))
-        plastic = self._plastic_materials(blocks)
-        lock = [e for e, (typ, _c) in self.geom.elements.items()
-                if plane_locks(typ) and sec.get(e, (None, ""))[1] in plastic]
-        if not lock and not self._plastic_one_point:
-            return
+        keep = self._volume_keeping_materials(blocks)
+        plane: Dict[int, str] = {}
+        brick: Dict[int, str] = {}
+        for e, (typ, _c) in self.geom.elements.items():
+            kind = keep.get(sec.get(e, (None, ""))[1])
+            if kind and plane_locks(typ):
+                plane[e] = kind
+            elif kind and brick_locks(typ):
+                brick[e] = kind
+        if plane or self._locking_one_point:
+            self._lock_plane_quads(blocks, plane)
+        if brick:
+            self._lock_bricks(brick)
+
+    def _lock_why(self, cts: List[str], kinds: List[str], what: str) -> str:
+        """Why ccx's ``cts`` lock on materials of ``kinds`` (_plan_volume_locking)."""
+        return (f"Abaqus integrates the volume change of its first-order {what} at one point "
+                f"(selectively reduced integration), ccx 2.23 that of its {' / '.join(cts)} at all "
+                f"eight points of a C3D8 brick, so where the material keeps its volume they lock "
+                f"(probed on a thick cylinder under internal pressure: "
+                + "; ".join(self._LOCK_EVIDENCE[k] for k in kinds) + ")")
+
+    def _lock_plane_quads(self, blocks: List[Block], lock: Dict[int, str]) -> None:
+        """_plan_volume_locking's CPE4 / CAX4 (``lock``: element -> its material's kind)."""
         hits: Dict[str, int] = {}
         for e in lock:
             typ = self.geom.elements[e][0].upper()
             hits[typ] = hits.get(typ, 0) + 1
         cts = sorted({ccx_type(t) for t in hits})
+        kinds = [k for k in self._LOCK_EVIDENCE if k in lock.values()]
         ups = [PLANE_QUADRATIC_UPGRADE[ct[:3]][1] for ct in cts]
-        what = f"{'/'.join(sorted(hits))} ({len(lock)} elements, of a plastic material)"
-        why = (f"Abaqus integrates the volume change of its first-order quadrilaterals at one point "
-               f"(selectively reduced integration), ccx 2.23 that of its {' / '.join(cts)} at all "
-               f"four (a C3D8 brick, 2 x 2 x 2 points), so in plastic flow, which keeps the volume, "
-               f"they lock and reach no limit load (probed: a thick cylinder under internal "
-               f"pressure carries 1.4 times its limit pressure, all that was applied, on 2 to 16 "
-               f"elements through the wall; a strip bent to 20 times its first-yield rotation "
-               f"carries 3.5 / 1.6 / 1.16 / 1.04 times its plastic moment on 2 / 4 / 8 / 16 "
-               f"elements through its depth)")
+        what = f"{'/'.join(sorted(hits))} ({len(lock)} elements, of a {' / '.join(kinds)} material)"
+        why = self._lock_why(cts, kinds, "quadrilaterals")
         good = (f"{' / '.join(ups)} (C3D20R bricks) within 1.3 % of the cylinder's limit pressure "
-                f"and of the strip's plastic moment on 2 elements through the wall or depth")
+                f"and of a strip's plastic moment, 0.4 % of its creep rate and 0.5 % of Lame's "
+                f"displacement on 2 elements through the wall or depth")
         if not self._approx:
             self.report.warn(f"Element {what}: {why}. Rerun with --approximate to write them as "
                              f"{' / '.join(ups)}, with a node at the middle of every edge: ccx's "
                              f"{good}.")
-            self._reduces(f"element {' / '.join(cts)} of a plastic material (ccx 2.23 lacks Abaqus' "
-                          f"selectively reduced volume terms: it locks in plastic flow)")
+            self._reduces(f"element {' / '.join(cts)} of a {' / '.join(kinds)} material (ccx 2.23 "
+                          f"lacks Abaqus' selectively reduced volume terms: it locks where the "
+                          f"material keeps its volume)")
             return
         corners = self._linear_shell_corners(plane=True)
-        seeds = [e for e in lock + self._plastic_one_point if e in corners]
+        seeds = [e for e in list(lock) + self._locking_one_point if e in corners]
         if not seeds:
             return
         before = {e: self.geom.elements[e][0].upper() for e in corners}
@@ -13759,19 +13878,20 @@ class _Mesh:
         for e in sorted(up - set(seeds)):
             k = f"{before[e]} -> {self.geom.elements[e][0]}"
             extra[k] = extra.get(k, 0) + 1
-        flagged = [e for e in self._plastic_one_point if e in up]
+        flagged = [e for e in self._locking_one_point if e in up]
         if not lock:
             why = (f"ccx's fully integrated {' / '.join(cts) or 'CPE4 / CAX4'}, which --approximate "
-                   f"writes a CPE4R / CAX4R flagged for its depth as, lock in plastic flow (no "
-                   f"selectively reduced volume terms): no limit load (probed: a thick cylinder "
-                   f"carries 1.4 times its limit pressure, a bent strip 1.6 times its plastic "
-                   f"moment on 4 elements through its depth)")
+                   f"writes a CPE4R / CAX4R flagged for its depth as, lock where the material "
+                   f"keeps its volume (no selectively reduced volume terms; probed: a thick "
+                   f"cylinder carries 1.4 times its limit pressure, a bent strip 1.6 times its "
+                   f"plastic moment on 4 elements through its depth)")
             good = (f"{' / '.join(written)} (C3D20R bricks) within 1.3 % of the cylinder's limit "
                     f"pressure and of the strip's plastic moment on 2 elements through the wall or depth")
+        of = f"of a {' / '.join(kinds)} material" if lock else "of a material that keeps its volume"
         self.report.warn(
-            f"[APPROX] Element {'/'.join(sources)} ({len(seeds)} elements, of a plastic material) "
-            f"written as {' / '.join(written)}: {why}. ccx's {good}; each has a node at the middle "
-            f"of every edge ({span})"
+            f"[APPROX] Element {'/'.join(sources)} ({len(seeds)} elements, {of}) written as "
+            f"{' / '.join(written)}: {why}. ccx's {good}; each has a node at the middle of every "
+            f"edge ({span})"
             + (f", the {len(flagged)} CPE4R / CAX4R among them flagged for their depth" if flagged and lock else "")
             + (f"; {sum(extra.values())} other plane element(s) joined to them by an edge were "
                f"upgraded too ({', '.join(extra)}), so no midside node hangs" if extra else "")
@@ -13779,6 +13899,36 @@ class _Mesh:
                f"midside node" if beams else "")
             + ". BCs, temperatures and initial conditions on both ends of an edge reach its midside "
               "node, and so do the node sets of BCs, couplings, ties and output.")
+
+    def _lock_bricks(self, lock: Dict[int, str]) -> None:
+        """_plan_volume_locking's C3D8 (``lock``: element -> its material's kind): reduced
+        physics, or under --approximate C3D8I (the deck's suffixes kept: C3D8H -> C3D8IH)."""
+        hits: Dict[str, int] = {}
+        for e in lock:
+            typ = self.geom.elements[e][0].upper()
+            hits[typ] = hits.get(typ, 0) + 1
+        kinds = [k for k in self._LOCK_EVIDENCE if k in lock.values()]
+        what = f"{'/'.join(sorted(hits))} ({len(lock)} elements, of a {' / '.join(kinds)} material)"
+        why = self._lock_why(["C3D8"], kinds, "hexahedra")
+        good = ("C3D8I (incompatible modes, the same nodes) within 2.2 % of the cylinder's limit "
+                "pressure and of a strip's plastic moment, 9 % of its creep rate and 4.5 % of "
+                "Lame's displacement on 2 elements through the wall (0.6 %, 2.3 % and 1.2 % on 4)")
+        if not self._approx:
+            self.report.warn(f"Element {what}: {why}. Rerun with --approximate to write them as "
+                             f"C3D8I: ccx's {good}.")
+            self._reduces(f"element C3D8 of a {' / '.join(kinds)} material (ccx 2.23 lacks Abaqus' "
+                          f"selectively reduced volume terms: it locks where the material keeps "
+                          f"its volume)")
+            return
+        for e in lock:
+            typ, conn = self.geom.elements[e]
+            base, sfx = split_suffixes(typ)
+            new = base.upper().replace("C3D8", "C3D8I", 1) + sfx
+            if ccx_type(new) != "C3D8I":
+                new = "C3D8I"
+            self.geom.elements[e] = (new, conn)
+            self._elem_types.add(new)
+        self.report.warn(f"[APPROX] Element {what} written as C3D8I: {why}. ccx's {good}.")
 
     def _note_curved_membranes(self) -> None:
         """A note where linear membranes (M3D3, M3D4, M3D4R) on a curved surface run in a
@@ -13820,6 +13970,122 @@ class _Mesh:
                          f"+-1 to +-93 times that expansion as its node coordinates are written to "
                          f"15 or 12 digits. With NLGEOM the membrane's tension stiffens those modes.",
                          once=True)
+
+    def _plan_plastic_shells(self, blocks: List[Block]) -> None:
+        """Homogeneous *SHELL SECTIONs of a plastic material on the shells ccx expands.  ccx
+        2.23 integrates an expanded shell's section through the thickness at its brick's Gauss
+        points (SHELL_SECTION_POINTS: 2 on S3 / S4 / S8R, 3 on S6 / S8, 1 on S4R, on the
+        mid-surface), Abaqus at the section's own points, 5 Simpson points by default (2017
+        "Using a shell section integrated during the analysis").  Elastic, or stretched, the
+        rules agree; in plastic bending they part: 2 Gauss points stay elastic up to 1.73
+        times the first-yield moment and carry 1.155 times the fully plastic one, 3 carry 0.86
+        times it, while 5 Simpson points yield from the first-yield moment and carry exactly
+        the fully plastic one.  Probed on 2.23 (a strip, b = t, in 4-point bending, elastic-
+        perfectly plastic Mises): S4 and S8R reach 1.155 times the limit load, elastic to the
+        end, S6 0.869.  So reduced physics — unless the deck asks for Gauss points as many as
+        every element's brick has (SECTION INTEGRATION=GAUSS) —, or under --approximate the
+        section written as a composite of PLASTIC_SHELL_LAYERS equal layers of its material
+        (ccx: 2 Gauss points per layer, 8 through the thickness): the strip then reaches 1.0004
+        of its limit load on S8R and 1.003 on S6, first yield at 1.12 times the first-yield
+        moment.  ccx runs composite shells on S8R / S6 only, so the section's linear shells
+        become S8R / S6 with a node at the middle of every edge (_upgrade_linear_shells, the
+        linear shells joined to them by an edge too); a section with S8 or without a constant
+        thickness is left as it is (and flagged)."""
+        plastic = self._plastic_materials(blocks)
+        found: List[Tuple[Block, List[int], Dict[str, int], int, bool]] = []
+        for b in blocks:
+            mat = b.uparam("MATERIAL")
+            elset = (b.param("ELSET") or "").strip()
+            if b.keyword != "SHELL SECTION" or b.has("COMPOSITE") or mat not in plastic or \
+                    self._continuum_shell_elset(elset):
+                continue
+            els = [e for e in self.geom.elset(elset)
+                   if e in self.geom.elements and ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS]
+            if not els:
+                continue
+            rec = next((r for r in merged_data_records(b) if any(x.strip() for x in r)), [])
+            gauss = b.uparam("SECTION INTEGRATION") == "GAUSS"
+            try:
+                npts = pint(rec[1]) if len(rec) > 1 and rec[1].strip() else (3 if gauss else 5)
+            except ValueError:
+                npts = 3 if gauss else 5
+            kinds: Dict[str, int] = {}
+            for e in els:
+                ct = ccx_type(self.geom.elements[e][0])
+                kinds[ct] = kinds.get(ct, 0) + 1
+            if gauss and all(SHELL_SECTION_POINTS[k] == npts for k in kinds):
+                continue
+            found.append((b, els, kinds, npts, gauss))
+        if not found:
+            return
+        kinds = {}
+        for _b, _els, ks, _n, _g in found:
+            for k, v in ks.items():
+                kinds[k] = kinds.get(k, 0) + v
+        by_pts: Dict[int, List[str]] = {}
+        for k in sorted(kinds):
+            by_pts.setdefault(SHELL_SECTION_POINTS[k], []).append(k)
+        pts = "; ".join(f"{n} on {' / '.join(ks)}" + (", on the mid-surface, where bending never yields"
+                                                       if n == 1 else "")
+                        for n, ks in sorted(by_pts.items(), reverse=True))
+        rules = sorted({f"{n} {'Gauss' if g else 'Simpson'}" for _b, _e, _k, n, g in found})
+        names = [(b.param("ELSET") or "").strip() for b, *_ in found]
+        what = (f"*SHELL SECTION of a plastic material ({len(found)} section(s): ELSET="
+                f"{', '.join(names[:3])}{', ...' if len(names) > 3 else ''}; "
+                f"{sum(len(e) for _b, e, *_ in found)} elements, {'/'.join(sorted(kinds))})")
+        why = (f"ccx 2.23 integrates an expanded shell's section through the thickness at its "
+               f"brick's Gauss points ({pts}), Abaqus at the section's {' / '.join(rules)} points, so "
+               f"in plastic bending they part: 2 Gauss points stay elastic up to 1.73 times the "
+               f"first-yield moment and carry 1.155 times the fully plastic one, 3 carry 0.86 times "
+               f"it, 5 Simpson points yield from the first-yield moment and carry exactly the fully "
+               f"plastic one (probed: a strip in 4-point bending reaches 1.155 times its limit load "
+               f"on S4 and S8R, elastic to the end, 0.869 on S6); stretched, they agree")
+        layered = ("a composite of {n} equal layers of its material, which ccx integrates at 2 "
+                   "Gauss points each (the strip reaches 1.0004 of its limit load on S8R, 1.003 on "
+                   "S6, first yield at 1.12 times the first-yield moment)").format(n=PLASTIC_SHELL_LAYERS)
+        cure: List[Tuple[Block, List[int]]] = []
+        if self._approx:
+            for b, els, ks, _n, _g in found:
+                rec = next((r for r in merged_data_records(b) if any(x.strip() for x in r)), [])
+                try:
+                    t = pf(rec[0]) if rec and rec[0].strip() else 0.0
+                except ValueError:
+                    t = 0.0
+                if "S8" in ks or not (math.isfinite(t) and t > 0) or b.has("NODAL THICKNESS") or \
+                        b.has("SHELL THICKNESS"):
+                    continue
+                mat = (b.param("MATERIAL") or "").strip()
+                del b.params["MATERIAL"]
+                b.params["COMPOSITE"] = None
+                b.data = [f"{t / PLASTIC_SHELL_LAYERS:.12g}, 3, {mat}"] * PLASTIC_SHELL_LAYERS
+                cure.append((b, els))
+        left = [f for f in found if not any(f[0] is b for b, _e in cure)]
+        if left:
+            self.report.warn(f"{what}: {why}. Rerun with --approximate to write the section as "
+                             f"{layered}." if not self._approx else
+                             f"{what}: {why}. Left as written ({len(left)} section(s) with S8 "
+                             f"shells, which ccx's composite shells exclude, or without one constant "
+                             f"thickness).")
+            self._reduces("plastic *SHELL SECTION (ccx 2.23 integrates it through the thickness at its "
+                          "brick's 2 or 3 Gauss points, not at the section's points)")
+        if not cure:
+            return
+        corners = self._linear_shell_corners()
+        seeds = [e for _b, els in cure for e in els if e in corners]
+        up: set = set()
+        if seeds:
+            up, ukinds, span, beams = self._upgrade_linear_shells(blocks, corners, seeds)
+        added = ("" if not up else
+                 f" ccx runs composite shells on S8R and S6 only: {len(up)} linear shell(s) were "
+                 f"written as such ({', '.join(f'{k}: {v}' for k, v in ukinds.items())}), each with a "
+                 f"node at the middle of every edge ({span}) on the curved surface the shells' "
+                 f"averaged nodal normals define (straight where it is flat or folds), the linear "
+                 f"shells joined to them by an edge among them, so no midside node hangs"
+                 + (f"; {beams} 2-node beam(s) along an upgraded edge became 3-node beams through "
+                    f"its midside node" if beams else "")
+                 + ". BCs, temperatures and initial conditions on both ends of an edge reach its "
+                   "midside node, and so do the node sets of BCs, couplings, ties and output.")
+        self.report.warn(f"[APPROX] {what} written as {layered}: {why}.{added}")
 
     def _plan_quadratic_shells(self, blocks: List[Block]) -> None:
         """Composite shells ccx cannot run -> the quadratic shells it can.  ccx 2.23 reads
@@ -13894,8 +14160,8 @@ class _Mesh:
         translations tied to the shell's, 2.0 % off and not uniform; one tied to nothing, as
         Abaqus' beam joins at its ends only, 3.0 %).  ``plane``: linear plane
         and axisymmetric elements (``corners`` from _linear_shell_corners(plane=True)) ->
-        PLANE_QUADRATIC_UPGRADE (plastic CPE4 / CAX4 under --approximate,
-        _plan_plastic_plane_quads), the deck's suffixes kept where Abaqus has the quadratic
+        PLANE_QUADRATIC_UPGRADE (locking CPE4 / CAX4 under --approximate,
+        _plan_volume_locking), the deck's suffixes kept where Abaqus has the quadratic
         element with them (CPE4H -> CPE8RH, CAX4T -> CAX8RT); their new nodes lie on the
         straight edges."""
         els = self.geom.elements
@@ -21763,6 +22029,44 @@ class _Materials:
         the volume."""
         return {m for m, opts in self._material_options(blocks).items()
                 if any(c.keyword == "PLASTIC" for c in opts[1:])}
+
+    def _volume_keeping_materials(self, blocks: List[Block]) -> Dict[str, str]:
+        """The materials (upper case) whose deformation keeps the volume, on which ccx 2.23's
+        fully integrated CPE4 / CAX4 / C3D8 lock (_plan_volume_locking) -> "plastic" (a
+        *PLASTIC option), "creeping" (*CREEP, not of a Drucker-Prager or cap material, in a
+        deck with a step that creeps: *VISCO, or *COUPLED TEMPERATURE-DISPLACEMENT / *SOILS
+        without CREEP=NONE) or "nearly incompressible" (an isotropic *ELASTIC row with a
+        Poisson's ratio from LOCKING_NU, or a *HYPERELASTIC row whose small-strain one reaches
+        it: the deck's own, D1 = 0 incompressible; where ccx replaces a tiny D1, _check_hyper_d1
+        flags that)."""
+        creeps = any(b.keyword == "VISCO" or (b.keyword in ("COUPLED TEMPERATURE-DISPLACEMENT", "SOILS")
+                                              and b.uparam("CREEP") != "NONE") for b in blocks)
+        out: Dict[str, str] = {}
+        for m, opts in self._material_options(blocks).items():
+            kws = {c.keyword for c in opts[1:]}
+            if "PLASTIC" in kws:
+                out[m] = "plastic"
+            elif creeps and "CREEP" in kws and not kws & {"DRUCKER PRAGER", "CAP PLASTICITY"}:
+                out[m] = "creeping"
+            elif any(nu >= LOCKING_NU for c in opts[1:] for nu in self._poisson_ratios(c)):
+                out[m] = "nearly incompressible"
+        return out
+
+    @staticmethod
+    def _poisson_ratios(c: Block) -> List[float]:
+        """The Poisson's ratios of an isotropic *ELASTIC card's rows, or the small-strain ones
+        of a *HYPERELASTIC card's (bulk modulus 2 / D1: 0.5 at D1 = 0); [] for any other card
+        or rows that do not read."""
+        if c.keyword == "ELASTIC" and (c.param("TYPE") or "ISOTROPIC").strip().upper() in ("ISOTROPIC", "ISO"):
+            try:
+                return [pf(r[1]) if r[1] else 0.0 for r in material_rows(c, 2) or ()]
+            except ValueError:
+                return []
+        out = []
+        for d, mu in (hyper_d1(c) if c.keyword == "HYPERELASTIC" else None) or ():
+            if mu > 0 and d >= 0:
+                out.append(0.5 if d == 0 else (6.0 / d - 2.0 * mu) / (2.0 * (6.0 / d + mu)))
+        return out
 
     # ccx 2.23's Norton creep (incplas, isotropic *ELASTIC) stops on 'matrix found to be
     # singular' once one increment's creep strain passes about 45 / (n - 3)^1.5 elastic strains
@@ -43797,13 +44101,13 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # other nodes the converter puts between two nodes: (a, c, node, s), the node at
         # a + s (c - a) — the midside nodes of upgraded composite shells and plane elements,
         # and the ply interface nodes of split continuum shells (_plan_quadratic_shells,
-        # _plan_plastic_plane_quads, _plan_ply_split)
+        # _plan_volume_locking, _plan_ply_split)
         self._edge_nodes: List[Tuple[int, int, int, float]] = []
         self._quad_edges: Dict[int, List[Tuple[int, int, int]]] = {}  # shell -> (a, c, midside)
         self._quad_from: Dict[int, str] = {}       # such a shell -> its type in the deck
-        # flagged CPE4R / CAX4R of a plastic material that --approximate writes as quadratic
-        # elements, not as their locking twin (_one_point_flag, _plan_plastic_plane_quads)
-        self._plastic_one_point: List[int] = []
+        # flagged CPE4R / CAX4R of a material that keeps its volume, which --approximate writes
+        # as quadratic elements, not as their locking twin (_one_point_flag, _plan_volume_locking)
+        self._locking_one_point: List[int] = []
         # composite sections on continuum shells written ply by ply: id(section) -> plan, the
         # *EQUATION lines that hold ply interface nodes on a neighbour's edge, and why the
         # split was left out (_plan_ply_split)
@@ -44695,10 +44999,12 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_u1_beams(blocks)
         self._plan_truss_copies(blocks)         # after U1 and the pre-tension cuts
         self._plan_pretension_knots(blocks)     # after U1 (its beams need none); not planar
+        self._plan_plastic_shells(blocks)       # plastic sections (--approximate: layered)
         self._plan_quadratic_shells(blocks)     # composite S3 / S4 / S4R -> S6 / S8R
         self._plan_s4r_shells(blocks)           # the S4R left (--approximate: S4 / S8R)
+        self._plan_s3_shells(blocks)            # S3 (--approximate: S6), after its S6 neighbours
         self._plan_one_point_bricks(blocks)     # CPS4R, CPE4R, CAX4R, M3D4R, B31R; flat C3D8R
-        self._plan_plastic_plane_quads(blocks)  # after it: its flagged plastic CPE4R / CAX4R
+        self._plan_volume_locking(blocks)       # after it: its flagged CPE4R / CAX4R
         self._plan_ply_split(blocks)            # composite SC6R / SC8R -> one solid per ply
         self._plan_quadratic_membranes(blocks)  # M3D6 / M3D8 / M3D8R -> the converter's own solids
         self._note_curved_membranes()           # after it and _plan_one_point_bricks: the final types
