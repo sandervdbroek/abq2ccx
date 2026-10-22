@@ -3560,6 +3560,37 @@ def general_contact_deck(form):
             "UTOP, 3, 3, -0.01\n*Node Print, nset=UTOP, totals=only\nRF\n*End Step\n")
 
 
+def explicit_coupled_deck(form):
+    """A bar of four elements along x (4 x 1 x 1; E 1000, nu 0, density 1e-3, conductivity 1,
+    specific heat 0.625, no expansion) at 20, its x = 0 end held at 120 for 0.01: ``form`` "td"
+    is Abaqus/Explicit's *DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT on C3D8T, the bar free in
+    x and moving at 1 along it, held in y and z on its symmetry planes, the z = 0 BC given the
+    value 0.5 without amplitude (Abaqus/Explicit ignores it and holds the nodes); "heat" is
+    the same heating as an Abaqus/Standard *HEAT TRANSFER on DC3D8, in fixed increments of
+    1/100 of the period (those --approximate's coupled step takes there)."""
+    ids = {(i, j, k): 1 + i + 5 * j + 10 * k for k in range(2) for j in range(2) for i in range(5)}
+    nodes = "\n".join(f"{n}, {i}., {j}., {k}." for (i, j, k), n in sorted(ids.items(), key=lambda t: t[1]))
+    elems = "\n".join(f"{i + 1}, " + ", ".join(str(ids[c]) for c in (
+        (i, 0, 0), (i + 1, 0, 0), (i + 1, 1, 0), (i, 1, 0), (i, 0, 1), (i + 1, 0, 1), (i + 1, 1, 1),
+        (i, 1, 1))) for i in range(4))
+
+    def nset(name, keep):
+        return f"*Nset, nset={name}\n" + ", ".join(str(n) for c, n in sorted(ids.items()) if keep(*c)) + "\n"
+    head = (f"*Node\n{nodes}\n*Element, type={'C3D8T' if form == 'td' else 'DC3D8'}, elset=E\n{elems}\n"
+            "*Solid Section, elset=E, material=M\n*Material, name=M\n*Conductivity\n1.\n*Density\n1e-3\n"
+            "*Elastic\n1000., 0.\n*Specific Heat\n0.625\n" +
+            nset("ALL", lambda i, j, k: True) + nset("X0", lambda i, j, k: i == 0) +
+            nset("Y0", lambda i, j, k: j == 0) + nset("Z0", lambda i, j, k: k == 0) +
+            "*Initial Conditions, type=TEMPERATURE\nALL, 20.\n")
+    if form == "td":
+        return (head + "*Initial Conditions, type=VELOCITY\nALL, 1, 1.\n*Boundary\nY0, 2, 2\n*Step\n"
+                "*Dynamic Temperature-displacement, Explicit, direct user control\n1e-6, 0.01\n"
+                "*Boundary\nX0, 11, 11, 120.\nZ0, 3, 3, 0.5\n*Output, history, number interval=1\n"
+                "*Node Output, nset=ALL\nU, NT\n*End Step\n")
+    return (head + "*Step\n*Heat Transfer\n1e-4, 0.01\n*Boundary\nX0, 11, 11, 120.\n"
+            "*Node Print, nset=ALL\nNT\n*End Step\n")
+
+
 def follower_turning_deck(form, steps=6, step_deg=15.0):
     """A unit cube (C3D8, ``form`` "3d": *DSLOAD TRVEC on its face x = 1) or square (CPE4,
     "2d": element-based *DLOAD TRVEC2 on its edge x = 1) whose face x = 0 is turned about z in
@@ -15307,6 +15338,45 @@ def main():
               f"under 3 x 3 elements, the upper one pushed down 0.01; *CONTACT, ALL EXTERIOR under "
               f"--approximate): reaction {got:.7g} vs {want:.7g} with a hand-written node-to-surface "
               f"pair ({err:.1e} apart); {plain:.2g} with it commented out (no --approximate)")
+    failures += 0 if ok else 1
+
+    # --- Abaqus/Explicit's coupled step under --approximate: ccx's *COUPLED TEMPERATURE-
+    # DISPLACEMENT with the model's mass (the bar keeps moving at 1: u = 0.01 at t = 0.01; with
+    # the masses scaled away, as for Abaqus/Standard's coupled step, it would not move), its
+    # temperatures those of *HEAT TRANSFER in the same increments, the z = 0 nodes held at 0
+    # (the BC's 0.5 ignored, as Abaqus/Explicit does); without --approximate *NO ANALYSIS
+    def temps(dat):
+        return {int(r[0]): r[1] for r in (dat_tables(dat, "temperatures") or [[]])[-1] if len(r) == 2}
+
+    def td_run(dat):
+        u, t = dat_node_blocks(dat, "displacements"), temps(dat)
+        return (u[-1], t) if u and t else None
+    td = review_run(explicit_coupled_deck("td"), "explicit_coupled_td", td_run, approximate=True)
+    heat = review_run(explicit_coupled_deck("heat"), "explicit_coupled_heat", temps)
+    src, inp = os.path.join(tmp, "explicit_coupled_plain_src.inp"), os.path.join(tmp, "explicit_coupled_plain.inp")
+    with open(src, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(explicit_coupled_deck("td"))
+    rep, _conv = convert(src, inp)
+    with open(inp, encoding="utf-8") as fh:
+        plain = [ln.strip().upper() for ln in fh if not ln.startswith("**")]
+    stops = "*NO ANALYSIS" in plain and not any(ln.startswith("*COUPLED") for ln in plain) and \
+        any("--approximate" in m for k, m in rep.entries if k == "WARNING")
+    ok = bool(td and heat) and stops
+    if ok:
+        (u, t), ht = td, heat
+        far = [n for n in u if n % 5 == 0]                  # the x = 4 end
+        moved = max(abs(u[n][0] - 0.01) for n in u)
+        held = max(abs(u[n][2]) for n in u if n <= 10)      # the z = 0 nodes
+        dt = max(abs(t[n] - ht[n]) for n in ht)
+        ok = moved < 1e-9 and held < 1e-12 and dt < 1e-6 and min(ht[n] for n in far) > 50.0
+        print(f"{'PASS' if ok else 'FAIL'}  explicit_coupled_approx (a C3D8T bar moving at 1, heated "
+              f"to 120 at one end, *DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT under --approximate): "
+              f"u_x {u[far[0]][0]:.9g} = 1 x 0.01 ({moved:.1e}), the z = 0 nodes' BC of 0.5 held at "
+              f"{held:.1e}, the far end at {t[far[0]]:.6g} = *HEAT TRANSFER's ({dt:.1e} apart); "
+              f"without --approximate *NO ANALYSIS")
+    elif not stops:
+        print("FAIL  explicit_coupled_approx: without --approximate the step is not *NO ANALYSIS "
+              "with a warning naming --approximate")
     failures += 0 if ok else 1
 
     # --- cards ccx 2.23 stopped or crashed on as they were written (code review 2, R20) ---

@@ -17508,6 +17508,115 @@ def test_explicit_mass_scaling_target_increment():
     assert not conv._sms_target and "has a fixed increment (DIRECT USER CONTROL)" in rep.text()
 
 
+# --- Abaqus/Explicit's coupled temperature-displacement step ------------------------------
+
+TD_CUBE = HEX.replace("C3D8", "C3D8T") + """*SOLID SECTION, ELSET=EALL, MATERIAL=M
+*MATERIAL, NAME=M
+*CONDUCTIVITY
+34.
+*DENSITY
+7.8e-9
+*ELASTIC
+200000., 0.3
+*INELASTIC HEAT FRACTION
+0.9
+*PLASTIC
+400., 0.
+*SPECIFIC HEAT
+4.6e8
+*NSET, NSET=X0
+1, 4, 5, 8
+*NSET, NSET=Z0
+1, 2, 3, 4
+*INITIAL CONDITIONS, TYPE=TEMPERATURE
+EALL, 20.
+*INITIAL CONDITIONS, TYPE=VELOCITY
+EALL, 1, 1000.
+"""
+
+
+def _td_step(head="", data=", 0.002, , 1e-5"):
+    return (f"*STEP\n*DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT{head}\n{data}\n*BOUNDARY\n"
+            "Z0, 3, 3, 0.5\nX0, 11, 11, 100.\n*OUTPUT, FIELD\n*NODE OUTPUT\nU, NT\n*END STEP\n")
+
+
+def test_explicit_coupled_step_approximate():
+    # ccx 2.23 has no explicit coupled step: without --approximate it stops there (*NO
+    # ANALYSIS), the warning naming --approximate; with it ccx's transient *COUPLED
+    # TEMPERATURE-DISPLACEMENT, which ccx solves with the mass (not scaled away as for
+    # Abaqus/Standard's), increments from T/100 or the deck's maximum one, Abaqus/Explicit's
+    # rules kept: NLGEOM, no increment limit, the z = 0 BC's 0.5 ignored (held at 0), 20 output
+    # intervals; explicit time integration and the heat of plastic work flagged as lost
+    body, conv, rep = convert_str(TD_CUBE + _td_step(", ELEMENT BY ELEMENT"))
+    assert "*NO ANALYSIS" in body and "\n*COUPLED" not in body
+    assert "Rerun with --approximate to write it as ccx's implicit *COUPLED TEMPERATURE-" in rep.text()
+    assert "*DYNAMIC TEMPERATURE-DISPLACEMENT step (no ccx counterpart)" in conv.reduced_physics
+    assert not conv.source_unloaded         # (Abaqus' reading: the initial velocity loads the step)
+    body, conv, rep = convert_str(TD_CUBE + _td_step(", ELEMENT BY ELEMENT"), approximate=True)
+    st = _step(body, 1)
+    assert st.startswith(", INC=10000000, NLGEOM\n") or st.startswith(", NLGEOM, INC=10000000\n"), st[:40]
+    assert "*COUPLED TEMPERATURE-DISPLACEMENT\n1e-05, 0.002, , 1e-05\n" in st
+    assert "** *DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT, ELEMENT BY ELEMENT\n** , 0.002, , 1e-5\n" in st
+    assert "*BOUNDARY\nZ0, 3, 3\nX0, 11, 11, 100.\n" in st and "*NO ANALYSIS" not in body
+    assert _card(body, "*DENSITY") == ["7.8e-9"] and _card(body, "*SPECIFIC HEAT") == ["4.6e8"]
+    assert "*TIME POINTS, NAME=ABQ2CCX_TP1, GENERATE\n0.0001, 0.002, 0.0001\n" in body
+    s = conv.steps.steps[0]
+    assert (s.proc, s.explicit, s.abaqus_explicit, s.nlgeom) == ("COUPLED TEMPERATURE-DISPLACEMENT", False, True, True)
+    assert s.defaults["DISPLACEMENT"] == "FIXED" and conv._explicit_deck and not conv.steps.explicit
+    assert conv.steps.inertia == {"DYNAMIC TEMPERATURE-DISPLACEMENT"} and conv._mass_scale is None
+    warn = next(m for k, m in rep.entries if m.startswith("[APPROX] *DYNAMIC TEMPERATURE-DISPLACEMENT"))
+    assert "Lost: explicit time integration" in warn and "ELEMENT BY ELEMENT dropped" in warn
+    assert "heat of plastic work" in warn
+    assert "--approximate: *DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT -> ccx's *COUPLED " \
+           "TEMPERATURE-DISPLACEMENT" in conv.reduced_physics
+    assert "*INELASTIC HEAT FRACTION" in conv.reduced_physics
+    # the initial velocity loads the step in both readings: no hollow-solve flag; the 0.5 of
+    # the held BC is no load (without the velocity and the heating the deck loads nothing)
+    assert not conv.unloaded_steps and not conv.source_unloaded
+    _, conv, _ = convert_str(TD_CUBE.replace("*INITIAL CONDITIONS, TYPE=VELOCITY\nEALL, 1, 1000.\n", "") +
+                             _td_step().replace("X0, 11, 11, 100.\n", ""), approximate=True)
+    assert conv.source_unloaded and not conv.unloaded_steps
+    # the deck's maximum increment only where below T/100; DIRECT USER CONTROL's increment (an
+    # explicit stability limit) not
+    body, _, _ = convert_str(TD_CUBE + _td_step(data=", 0.002, , 1e-3"), approximate=True)
+    assert "*COUPLED TEMPERATURE-DISPLACEMENT\n2e-05, 0.002, , 2e-05\n" in body
+    body, _, rep = convert_str(TD_CUBE + _td_step(", DIRECT USER CONTROL", "1e-8, 0.002"), approximate=True)
+    assert "*COUPLED TEMPERATURE-DISPLACEMENT\n2e-05, 0.002, , 2e-05\n" in body
+    assert "DIRECT USER CONTROL dropped" in rep.text()
+    # a period that does not read: left as without --approximate
+    body, conv, rep = convert_str(TD_CUBE + _td_step(data=", T"), approximate=True)
+    assert "*NO ANALYSIS" in body and not conv._td_steps
+    assert "not written as ccx's *COUPLED TEMPERATURE-DISPLACEMENT (--approximate): its time period 'T'" in rep.text()
+
+
+def test_explicit_coupled_step_two_d_mass_and_damping():
+    # ccx's coupled step builds its mass as implicit *DYNAMIC does (nonlingeo.c, intscheme 1;
+    # probed: a CPE4 strip's history equal to *DYNAMIC's), so the 2-D half-mass flag applies,
+    # and ccx damps it with *DAMPING as any dynamic step (nmethod 4)
+    deck = ("*NODE\n1, 0., 0.\n2, 1., 0.\n3, 1., 1.\n4, 0., 1.\n*ELEMENT, TYPE=CPE4T, ELSET=EALL\n1, 1, 2, 3, 4\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=M\n1.\n*MATERIAL, NAME=M\n*CONDUCTIVITY\n1.\n*DAMPING, ALPHA=5.\n"
+            "*DENSITY\n1e-3\n*ELASTIC\n1000., 0.\n*SPECIFIC HEAT\n1.\n*NSET, NSET=X0\n1, 4\n"
+            "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nEALL, 0.\n*BOUNDARY\nX0, 1, 2\n*AMPLITUDE, NAME=R\n0., 0., 1., 1.\n"
+            "*STEP\n*DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT\n, 0.01\n*CLOAD, AMPLITUDE=R\n2, 1, 1.\n*END STEP\n")
+    body, conv, rep = convert_str(deck, approximate=True)
+    assert "Implicit *COUPLED TEMPERATURE-DISPLACEMENT (step 1) on CPE4T elements" in rep.text()
+    assert any("in implicit *COUPLED TEMPERATURE-DISPLACEMENT (ccx 2.23 runs it with half" in r
+               for r in conv.reduced_physics)
+    assert conv._damping == (5.0, 0.0) and "*DAMPING, ALPHA=5." in body
+
+
+def test_time_points_of_one_interval():
+    # one output interval (NUMBER INTERVAL=1, or a TIME INTERVAL of the period): the step's end
+    # alone, as a plain *TIME POINTS list (ccx 2.23 stopped on the GENERATE line '1., 1., 1.',
+    # whose start is not below its end: allocation.f)
+    deck = HEX_MODEL + ("*STEP\n*STATIC\n0.1, 1.\n*CLOAD\n7, 3, 1.\n*OUTPUT, FIELD, NUMBER INTERVAL=1\n"
+                        "*NODE OUTPUT\nU\n*END STEP\n")
+    body, _, _ = convert_str(deck)
+    assert "*TIME POINTS, NAME=ABQ2CCX_TP1\n1.\n*STEP" in body and "GENERATE" not in body
+    body, _, _ = convert_str(deck.replace("NUMBER INTERVAL=1", "NUMBER INTERVAL=4"))
+    assert "*TIME POINTS, NAME=ABQ2CCX_TP1, GENERATE\n0.25, 1., 0.25\n" in body
+
+
 # --- rigid elements and analytical rigid surfaces ---------------------------------------
 
 RIGID_PLATE = """*NODE

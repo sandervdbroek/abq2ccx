@@ -180,6 +180,11 @@ TRANSLATED = {
     "*STATIC": "`RIKS` commented out by default, with `*NO ANALYSIS` in its place: ccx stops at "
         "that step (it would silently run it as plain static; reduced physics; `--approximate` "
         "reframes it); `DIRECT=NO STOP` → `DIRECT`; `STABILIZE` dropped (warned).",
+    "*DYNAMIC TEMPERATURE-DISPLACEMENT": "commented out, with `*NO ANALYSIS` in its place: ccx 2.23 "
+        "has no explicit coupled step (reduced physics). `--approximate` → ccx's transient `*COUPLED "
+        "TEMPERATURE-DISPLACEMENT`, which keeps the mass: the deck's period, increments from 1/100 of it "
+        "(or its maximum increment) down, Abaqus/Explicit's NLGEOM, BC and output rules; explicit time "
+        "integration and the heat of plastic work lost.",
     "*COMPLEX FREQUENCY": "commented out, with `*NO ANALYSIS` in its place: ccx stops at that step "
         "(ccx's card computes Coriolis or flutter modes only, without damping; reduced physics).",
     "*GEOSTATIC": "→ `*STATIC` in a linear step of a model without pore pressure elements (the "

@@ -124,6 +124,10 @@ a different model without saying so. With it, these reframings are made, each wi
   contact → the materials' value, which ccx's one model-wide pair applies to them too;
 * explicit mass scaling to a target increment (`TYPE=BELOW MIN`) → ccx's selective mass
   scaling, `DT` the step's minimum increment;
+* `*DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT` (ccx has no explicit coupled step) → ccx's
+  transient `*COUPLED TEMPERATURE-DISPLACEMENT`, which it solves implicitly with the model's
+  mass: the deck's period, increments from 1/100 of it down, Abaqus/Explicit's NLGEOM, BC and
+  output rules; explicit time integration and the heat of plastic work are lost;
 * a distributing coupling that turns, in a deck with NLGEOM → linear `*EQUATION`s (exact for
   small rotations); a kinematic coupling of some rotations about its `ORIENTATION`'s axes
   under NLGEOM → tied about the initial axes; one of only some translations in a deck with a

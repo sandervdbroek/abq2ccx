@@ -5143,8 +5143,9 @@ def _load_entries(b: Block, user_loads: bool, explicit: bool = False
     return out
 
 
-def step_load_audit(blocks: Sequence[Block], user_loads: bool,
-                    abaqus: bool = False) -> List[Optional[List[str]]]:
+def step_load_audit(blocks: Sequence[Block], user_loads: bool, abaqus: bool = False,
+                    explicit_td: Optional[Dict[int, Block]] = None,
+                    coupled_inertia: bool = False) -> List[Optional[List[str]]]:
     """Per *STEP, in order: None for an eigenvalue extraction (it needs no load), else the
     loads active in the step — an empty list means the step solves with no load at all,
     i.e. to a zero response.  Loads and prescribed BCs carry over to later steps until an
@@ -5156,7 +5157,12 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool,
     labels) counts.  It does in an Abaqus deck; in a ccx deck the stock ccx subroutine
     would run in place of the deck's own, so it does not.  ``abaqus``: the deck is read as
     Abaqus reads it, where every linear perturbation step (perturbation_step), an eigenvalue
-    extraction too, counts its own loads only; ccx carries a *FREQUENCY step's on."""
+    extraction too, counts its own loads only; ccx carries a *FREQUENCY step's on.
+    An Abaqus/Explicit coupled step (*DYNAMIC TEMPERATURE-DISPLACEMENT, read so with ``abaqus``)
+    is explicit dynamics there: initial velocities load it.  ``explicit_td`` (Converter.
+    _td_steps): the *COUPLED TEMPERATURE-DISPLACEMENT cards --approximate wrote for it, read
+    alike; ``coupled_inertia``: the ccx deck of such a conversion, whose transient coupled steps
+    ccx solves with the mass, so that initial velocities load them."""
     state: Dict[str, Dict[tuple, str]] = {}
     initial: Dict[str, List[str]] = {"VELOCITY": [], "STRESS": []}
     acts = op_new_cards(blocks, tuple(LOAD_CARD_FIELD))
@@ -5204,7 +5210,10 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool,
         perturb = perturbation_step(step) if abaqus else proc in PERTURBATION_PROCEDURES or \
             (step[0].has("PERTURBATION") and proc not in LOAD_FREE_PROCEDURES)
         active = {} if perturb else state
-        explicit = any(x.keyword == "DYNAMIC" and x.has("EXPLICIT") for x in step)
+        # (Abaqus/Explicit's coupled step, as the deck has it or as --approximate wrote it)
+        td = any((explicit_td is not None and id(x) in explicit_td) or
+                 (abaqus and x.keyword == "DYNAMIC TEMPERATURE-DISPLACEMENT") for x in step)
+        explicit = td or any(x.keyword == "DYNAMIC" and x.has("EXPLICIT") for x in step)
         for x in step[1:]:
             if x.keyword in LOAD_CARD_FIELD:
                 apply(x, active, explicit)
@@ -5212,7 +5221,9 @@ def step_load_audit(blocks: Sequence[Block], user_loads: bool,
             out.append(None)
         else:
             loads = [d for card in active.values() for d in card.values()] + initial["STRESS"]
-            if proc in ("DYNAMIC", "MODAL DYNAMIC"):
+            if proc in ("DYNAMIC", "MODAL DYNAMIC") or td or (
+                    coupled_inertia and proc == "COUPLED TEMPERATURE-DISPLACEMENT" and
+                    not any(x.has("STEADY STATE") for x in step if x.keyword == proc)):
                 loads += initial["VELOCITY"]
             out.append(dedup(loads))
         step = None
@@ -5865,7 +5876,11 @@ class Step:
     proc_card: Optional[Block]    # the procedure card, where ccx has the procedure (PROC_KW)
     motion_proc: str              # the procedure, where it is in PROC_KW or Converter._MOTION_PROCS
                                   # (motion fields; *SOILS, *GEOSTATIC too)
-    explicit: bool                # proc_card is a *DYNAMIC, EXPLICIT (handle_step's; the motion fields')
+    explicit: bool                # proc_card is a *DYNAMIC, EXPLICIT: ccx's explicit solver runs it
+    abaqus_explicit: bool         # an Abaqus/Explicit step: explicit, or one --approximate writes as
+                                  # ccx's *COUPLED TEMPERATURE-DISPLACEMENT (Converter.
+                                  # _explicit_coupled_steps), which keeps Abaqus/Explicit's rules:
+                                  # NLGEOM, default amplitudes, held displacement BCs, output
     pert_param: bool              # *STEP, PERTURBATION as written
     perturbation: bool            # an Abaqus linear perturbation step (perturbation_step): _pert_idx,
                                   # the motion fields, the output carry-over, step_load_audit's Abaqus reading
@@ -5968,11 +5983,11 @@ class StepModel:
         return given
 
     @staticmethod
-    def _motion(head: Block, card: Optional[Block]) -> Tuple[Dict[str, str], str]:
+    def _motion(head: Block, card: Optional[Block], explicit: bool) -> Tuple[Dict[str, str], str]:
         """(defaults, ccx_amp) of a step (Step) whose *STEP card is ``head`` and whose
-        motion_proc card is ``card``."""
+        motion_proc card is ``card``; ``explicit``: an Abaqus/Explicit step (Step.abaqus_explicit,
+        whose *STEP card handle_step writes without AMPLITUDE)."""
         proc = card.keyword if card is not None else ""
-        explicit = proc == "DYNAMIC" and card.has("EXPLICIT")
         # the default amplitude of loads and BCs (Abaqus manual, "Defining an analysis",
         # Table 1): STEP in Abaqus/Explicit and in transient procedures, RAMP in static and
         # steady-state ones; *STEP AMPLITUDE overrides it in Abaqus/Standard
@@ -6016,9 +6031,13 @@ class StepModel:
                                                  card.has("STEADY STATE")) else "STEP"
         return defaults, ccx
 
-    def __init__(self, blocks: Sequence[Block], dp: bool = False) -> None:
+    def __init__(self, blocks: Sequence[Block], dp: bool = False,
+                 explicit_td: Optional[Dict[int, Block]] = None) -> None:
         """``dp``: the deck has a deformation plasticity material ccx reads (Converter._dp_nlgeom),
-        which bears on the *STEP cards handle_step writes (Step.nlgeom_written)."""
+        which bears on the *STEP cards handle_step writes (Step.nlgeom_written).
+        ``explicit_td``: the *COUPLED TEMPERATURE-DISPLACEMENT cards --approximate wrote for
+        Abaqus/Explicit's coupled step, by id (Converter._td_steps; Step.abaqus_explicit)."""
+        explicit_td = explicit_td or {}
         steps: List[Step] = []
         loose: List[Block] = []                 # the cards since the last step
         nlgeom = False                          # NLGEOM in force in Abaqus (Step.nlgeom)
@@ -6043,15 +6062,16 @@ class StepModel:
             motion_card = procedure if kw in PROC_KW or kw in Converter._MOTION_PROCS else None
             motion_proc = motion_card.keyword if motion_card is not None else ""
             explicit = proc == "DYNAMIC" and proc_card.has("EXPLICIT")
+            abq_explicit = explicit or id(procedure) in explicit_td
             pert_param = head.has("PERTURBATION")
             pert = perturbation_step(cards)
             given = _nlgeom_given(head)
             # (the steps _plan_base_restore gives the base state again: a general step after
             # perturbation steps, and a static perturbation step after another)
             again = written and since and (not pert or proc == "STATIC")
-            nl_written = self._writes_nlgeom(given, explicit, pert, nlgeom, dp, again)
+            nl_written = self._writes_nlgeom(given, abq_explicit, pert, nlgeom, dp, again)
             if not pert:
-                nlgeom = nlgeom or (explicit if given is None else given)
+                nlgeom = nlgeom or (abq_explicit if given is None else given)
                 written = written or bool(nl_written)
             since = pert
             flag = flag if nl_written is None else nl_written
@@ -6079,12 +6099,12 @@ class StepModel:
                 lc2, repeats = frozenset(), False
             period = abaqus_period(procedure, pert)
             advance = 0.0 if pert else period
-            defaults, ccx_amp = self._motion(head, motion_card)
+            defaults, ccx_amp = self._motion(head, motion_card, abq_explicit)
             steps.append(Step(
                 no=len(steps) + 1, cards=tuple(cards), between=tuple(loose), procedure=procedure,
                 proc=proc, proc_card=proc_card, motion_proc=motion_proc, explicit=explicit,
-                pert_param=pert_param, perturbation=pert, nlgeom_card=given, nlgeom=nlgeom,
-                nlgeom_written=nl_written, ccx_nlgeom=ccx_nl,
+                abaqus_explicit=abq_explicit, pert_param=pert_param, perturbation=pert,
+                nlgeom_card=given, nlgeom=nlgeom, nlgeom_written=nl_written, ccx_nlgeom=ccx_nl,
                 temp_dof=kw if kw in TEMPERATURE_DOF_PROCS else None,
                 star_proc="PERTURBATION" if pert_param else
                 proc + (", RIKS" if proc_card.has("RIKS") else "") if proc else "",
@@ -6122,14 +6142,19 @@ class StepModel:
         # (_plan_coupled_inertia: whether the masses can go; _plan_u1_beams: U1's mass matrix),
         # and its weight too, under a mass-proportional *DLOAD (mass_acts: whether a section's
         # DENSITY= must stay, _plan_shell_density, _plan_quadratic_membranes; surface elements)
-        self.inertia = frozenset(s.procedure.keyword for s in steps if s.procedure is not None
-                                 and s.procedure.keyword in INERTIA_PROCS)
+        # (Abaqus' procedure: --approximate's *COUPLED TEMPERATURE-DISPLACEMENT for Abaqus/
+        # Explicit's coupled step keeps its inertia, as ccx solves it with the mass)
+        self.inertia = frozenset(
+            "DYNAMIC TEMPERATURE-DISPLACEMENT" if id(s.procedure) in explicit_td else s.procedure.keyword
+            for s in steps if s.procedure is not None and
+            (s.procedure.keyword in INERTIA_PROCS or id(s.procedure) in explicit_td))
         self.mass_loads = frozenset(r[1].strip().upper() for s in steps for b in s.cards
                                     if b.keyword == "DLOAD" for r in merged_data_records(b)
                                     if len(r) > 1 and r[1].strip().upper() in MASS_LOADS)
         self.mass_acts = bool(self.inertia or self.mass_loads)
         self.dynamic = "DYNAMIC" in self.procs
         self.explicit = any(s.explicit for s in steps)
+        self.abaqus_explicit = any(s.abaqus_explicit for s in steps)    # (Converter._explicit_deck)
         # not heat transfer alone: _mechanical (a deck without procedures counts: its model
         # data serve a mechanical analysis, as a model-only deck included in one)
         self.mechanical = not procs or any(k != "HEAT TRANSFER" for k in procs)
@@ -11949,7 +11974,7 @@ class _Mesh:
                 self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL on a face-to-"
                               "face pair (ccx's exponential law differs)")
                 return self.passthrough(b)
-            explicit = kmax > 0.0 and self.steps.explicit
+            explicit = kmax > 0.0 and self.steps.abaqus_explicit
             pts = exponential_overclosure(c0, p0, kmax if explicit else None)
             u = 1.0 + pts[-1][1] / c0
             slope = kmax if explicit else p0 / (math.e - 1.0) * (math.expm1(u) + u * math.exp(u)) / c0
@@ -12363,8 +12388,9 @@ class _Mesh:
         law its name; a BC of the card's own step varies on its card's AMPLITUDE, law its name
         ("" for none).  In a linear perturbation step a BC from before it is a zero change of
         the base state.  law None: the value is unknown (FIXED, USER, SUBMODEL, a velocity or
-        acceleration, an amplitude the converter does not evaluate, an explicit step's line
-        without AMPLITUDE, whose value Abaqus ignores)."""
+        acceleration, an amplitude the converter does not evaluate, an Abaqus/Explicit step's
+        line without AMPLITUDE, whose value Abaqus ignores: it holds the DOF where the step
+        finds it, at 0 from the deck's first step on)."""
         self._bc_held = {}
         partners: Dict[int, set] = {}
         for a, c, _m, _s in self._between():
@@ -12393,10 +12419,13 @@ class _Mesh:
             if e is None:
                 return None, None
             mag, amp, delay, src = e
+            held = src is not None and src.abaqus_explicit and not amp
+            if held:                                # (where the DOF was as its step started)
+                return (0.0, "") if src.no == 1 else (None, None)
             if src is step:                         # (both model data, or the card's step)
-                return (None, None) if src is not None and src.explicit and not amp else (mag, amp)
+                return mag, amp
             if not amp:
-                return (None, None) if src is not None and src.explicit else (mag, "")
+                return mag, ""
             curve = curves.get(amp)
             if curve is not None and curve.total:
                 return mag, amp
@@ -15393,7 +15422,7 @@ class _Mesh:
         small strains."""
         trusses = sorted({ccx_type(t) for t, _ in self.geom.elements.values()} &
                          {"T2D2", "T3D2", "T3D3"})
-        if self._explicit_deck and trusses:
+        if self._steps_now.explicit and trusses:
             self.report.warn(f"Truss elements ({', '.join(trusses)}) in a deck with an explicit "
                              f"dynamic step: ccx's explicit solver stops on them ('linear and "
                              f"nonlinear MPC's depend on each other': the MPCs of its truss "
@@ -16475,7 +16504,7 @@ class _Rigid:
                     (moduli if b.keyword == "ELASTIC" else dens).append(v)
         e_ref, rho_ref = max(moduli or [1.0]), max(dens or [1.0])
         thermal = any(b.keyword in CCX_THERMAL_PROCS for b in blocks)
-        if self._explicit_deck:
+        if self._steps_now.explicit:                # (ccx's explicit solver needs their mass)
             rho = 1e-9 * rho_ref
             self._skin_material = (rho * (1e-3 * math.sqrt(e_ref / rho_ref)) ** 2, rho, thermal)
         else:
@@ -18166,7 +18195,9 @@ class _Materials:
                 if mass_of(None, section.param("DENSITY")):
                     alpha_src.append((label, a))
                 beta_src.append((label, bt))
-        dyn = [s for s in self.steps if s.proc == "DYNAMIC"]
+        # (ccx applies it in --approximate's coupled step for Abaqus/Explicit's too: nonlingeo.c,
+        # any dynamic step, nmethod 4, damps; that one's Abaqus step damps)
+        dyn = [s for s in self.steps if s.proc == "DYNAMIC" or s.abaqus_explicit]
         implicit, explicit = any(not s.explicit for s in dyn), any(s.explicit for s in dyn)
         extra_a: List[Tuple[str, Optional[float]]] = []
         for b in point:
@@ -18710,7 +18741,8 @@ class _Materials:
                 mech[cur.upper()] = cur
                 umat[cur.upper()] = b
         self._umat_explicit = any((b.keyword == "DYNAMIC" and b.has("EXPLICIT")) or
-                                  b.keyword == "DYNAMIC TEMPERATURE-DISPLACEMENT" for b in blocks)
+                                  b.keyword == "DYNAMIC TEMPERATURE-DISPLACEMENT" or
+                                  id(b) in self._td_steps for b in blocks)
         if not mech:
             return blocks
         abaqus = self._abaqus_umat and not self._umat_explicit
@@ -19643,7 +19675,8 @@ class _Materials:
         kept.  (An initial contact overclosure is no such start: ccx closes it at the first
         increment exactly, with either alpha.)"""
         coupled = [(s.no, s.cards) for s in self.steps          # (step number, its cards)
-                   if s.proc == "COUPLED TEMPERATURE-DISPLACEMENT" and not s.proc_card.has("STEADY STATE")]
+                   if s.proc == "COUPLED TEMPERATURE-DISPLACEMENT" and not s.proc_card.has("STEADY STATE")
+                   and not s.abaqus_explicit]       # (Abaqus/Explicit's keeps its inertia)
         if not coupled:
             return
         heavy, unread = False, []
@@ -19827,7 +19860,7 @@ class _Materials:
             s = in_step.get(id(b))
             if s is None:
                 why = why or f"a *{b.keyword} outside a step (Abaqus reads it in a step only)"
-            elif not s.explicit:
+            elif not s.abaqus_explicit:
                 why = why or (f"a *{b.keyword} in step {s.no}, which is no *DYNAMIC, EXPLICIT step "
                               f"(the card is Abaqus/Explicit's)")
         massive: Optional[List[int]] = None
@@ -19935,10 +19968,14 @@ class _Materials:
                 dt_var = target(var[-1], s)
             if dt_var is not None:                  # (and the masses it scales carry on)
                 dt_mass = max(dt_mass or 0.0, dt_var)
-            if s.explicit:
+            if s.abaqus_explicit:
                 fields[s.no] = field
-                if dt_mass is not None:
+                if dt_mass is not None and s.explicit:
                     targets[s.no] = dt_mass
+                elif dt_mass is not None:
+                    dt_why = dt_why or (f"step {s.no} is written as ccx's implicit *COUPLED "
+                                        f"TEMPERATURE-DISPLACEMENT (--approximate), and ccx's "
+                                        f"selective mass scaling acts in explicit dynamics only")
         steps = sorted(fields)
         f = 1.0                                     # the factor of every element with mass
         part: Dict[int, float] = {}                 # else: element -> its factor other than 1
@@ -26912,7 +26949,7 @@ class _Constraints:
         does not read), both are warned; the half mass is reduced physics (no card gives ccx
         another mass matrix), the integration rule an accuracy that refinement restores (the
         3-D C3D20R's 2 x 2 x 2 frequency mass is alike)."""
-        dyn = [s.no for s in self.steps if s.proc == "DYNAMIC" and not s.explicit]
+        dyn = [s.no for s in self.steps if (s.proc == "DYNAMIC" or s.abaqus_explicit) and not s.explicit]
         freq = [s.no for s in self.steps if s.proc == "FREQUENCY"]
         if not dyn and not freq:
             return
@@ -26931,8 +26968,11 @@ class _Constraints:
             if heavy:
                 found.setdefault(ccx_type(typ), set()).add(typ.upper())
         half = sorted(t for c in HALF_MASS_2D_TYPES if c in found for t in found[c]) if dyn else []
+        # (--approximate's coupled step for Abaqus/Explicit's is dynamic in ccx too)
+        what = "*DYNAMIC" if any(self.steps.steps[n - 1].proc == "DYNAMIC" for n in dyn) else \
+            "*COUPLED TEMPERATURE-DISPLACEMENT"
         if half:
-            self.report.warn(f"Implicit *DYNAMIC (step {', '.join(map(str, dyn))}) on "
+            self.report.warn(f"Implicit {what} (step {', '.join(map(str, dyn))}) on "
                              f"{'/'.join(half)} elements: ccx 2.23 runs it with half their mass (it "
                              f"integrates the brick it expands such an element into over one half "
                              f"and builds the dynamic step's mass without mirroring it onto the "
@@ -26940,7 +26980,7 @@ class _Constraints:
                              f"times faster than in Abaqus (probed: a 3 x 4 mesh under a ramped "
                              f"load follows the half-mass response to 3e-7). CPE8 / CPS8 / CAX8 "
                              f"and the triangles are integrated whole.", once=True)
-            self._reduces(f"element {'/'.join(half)} in implicit *DYNAMIC (ccx 2.23 runs it with "
+            self._reduces(f"element {'/'.join(half)} in implicit {what} (ccx 2.23 runs it with "
                           f"half their mass)")
         quad = sorted(t for c in TWO_BY_TWO_2D_TYPES if c in found for t in found[c]) if freq else []
         tri = sorted(t for c in ("CPE6", "CPS6", "CAX6") if c in found for t in found[c]) if freq else []
@@ -31624,7 +31664,7 @@ class _Loads:
         cur = self.emit.next_step(self.steps)
         proc_block = cur.proc_card
         proc = self.emit.proc
-        explicit = cur.explicit
+        explicit = cur.abaqus_explicit              # (its *STEP card's rules: Abaqus/Explicit's)
         # a procedure card after the step's own (Step.procedure): Abaqus rejects the deck,
         # ccx would run the later one; commented out (in the card loop)
         extra = [b for b in inner if b.keyword in STEP_PROCS and b is not cur.procedure]
@@ -31862,6 +31902,11 @@ class _Loads:
                                               "would carry them into the next general step and "
                                               "take them off over it (probed).", reduces=False))
                 continue
+            if id(b) in self._td_steps:               # (_explicit_coupled_steps)
+                was = self._td_steps[id(b)]
+                out.extend(["** abq2ccx: --approximate: Abaqus/Explicit's coupled step, written as "
+                            "ccx's *COUPLED TEMPERATURE-DISPLACEMENT (see the [APPROX] warning):"] +
+                           ["** " + x for x in [emit_keyword(was.keyword, was.params)] + list(was.data)])
             out.extend(self.translate_one(b))
         out.extend(self._modal_damping_add.get(self.emit.no, []))
         out.extend(self._boundary_pieces(self._vel_tail.get(self.emit.no, [])))
@@ -32621,7 +32666,7 @@ class _Loads:
                     # *BOUNDARY: "In an Abaqus/Standard dynamic ... procedure, amplitude curves
                     # specified for ... TYPE=VELOCITY will be smoothed automatically"
                     off = t0 if c.total else 0.0
-                    frac = c.smooth if c.smooth is not None else 0.0 if step.explicit else 0.25
+                    frac = c.smooth if c.smooth is not None else 0.0 if step.abaqus_explicit else 0.25
                     if frac > 0.0 and any(off < x < off + T for x in c.corners):
                         self.report.warn(f"*BOUNDARY, TYPE=VELOCITY with a TABULAR amplitude in a "
                                          f"dynamic step: Abaqus replaces the curve around each of "
@@ -32784,7 +32829,7 @@ class _Loads:
                         # it, which ends where a STEP does
                         mode = "UNKNOWN" if mag is None or b.has("USER") or b.has("SUBMODEL") else \
                             "FIXED" if b.has("FIXED") else ("AMP" if curve else "UNKNOWN") if amp \
-                            else "FIXED" if step.explicit else "STEP"
+                            else "FIXED" if step.abaqus_explicit else "STEP"
                         bc = dict(q="DISPLACEMENT", mode=mode, mag=mag or 0.0, curve=curve)
                     else:
                         bad = mag is None or b.has("USER") or not dofs or \
@@ -32968,7 +33013,7 @@ class _Loads:
         query: set = set()
         for step in self.steps:
             s = step.no
-            if step.explicit:
+            if step.abaqus_explicit:
                 kind = "hold"
             elif step.motion_label in self._RAMP_PROCS and step.ccx_amp == "STEP" and \
                     step.period is not None:
@@ -33110,7 +33155,7 @@ class _Loads:
             amp = (b.param("AMPLITUDE") or "").strip().upper()
             factor: Optional[float] = 1.0
             if b.has("FIXED") or b.has("USER") or b.has("SUBMODEL") or \
-                    self._bc_type(b) != "DISPLACEMENT" or (step is not None and step.explicit and not amp):
+                    self._bc_type(b) != "DISPLACEMENT" or (step is not None and step.abaqus_explicit and not amp):
                 factor = None
             elif amp:
                 factor = None if amp in totals else \
@@ -33316,7 +33361,7 @@ class _Loads:
                 if kind == "disp" and src not in mine:
                     if amp and mag != 0.0:
                         at_zero.discard(k)
-                elif kind == "disp" and step.explicit and not amp:
+                elif kind == "disp" and step.abaqus_explicit and not amp:
                     continue
                 elif kind == "disp" and mag == 0.0:
                     at_zero.add(k)
@@ -36545,8 +36590,12 @@ class _Loads:
             self.report.warn(msg, once=True)
             self._reduces(f"step {self.emit.no} without a procedure (ccx stops there)")
             return ["** abq2ccx: " + msg, "*NO ANALYSIS"]
+        how = (" Rerun with --approximate to write it as ccx's implicit *COUPLED TEMPERATURE-"
+               "DISPLACEMENT, which keeps the inertia but loses explicit time integration and the "
+               "heat of plastic work." if b.keyword == "DYNAMIC TEMPERATURE-DISPLACEMENT" and
+               not self._approx else "")
         return self._no_analysis(b, f"*{b.keyword}: Abaqus' {ABAQUS_ONLY_PROCS[b.keyword]} has no "
-                                    f"ccx counterpart; commented out. {why}",
+                                    f"ccx counterpart; commented out. {why}{how}",
                                  f"*{b.keyword} step (no ccx counterpart)")
 
     def handle_dynamic(self, b: Block) -> List[str]:
@@ -40244,7 +40293,8 @@ class _Output:
         for the output spacing), fixed increment and (explicit) maximum increment."""
         proc = step.proc_card
         t = {"kind": "auto", "proc": proc.keyword if proc else None, "period": 1.0,
-             "dt": None, "dtmax": None, "matrix": id(proc) in self._matrix_steps}
+             "dt": None, "dtmax": None, "matrix": id(proc) in self._matrix_steps,
+             "abaqus_explicit": step.abaqus_explicit}   # (Abaqus' default output: _requested_control)
         if proc is None:
             return t
         if proc.keyword in UNTIMED_PROCS:
@@ -40275,8 +40325,8 @@ class _Output:
         ``ctx``) asks for — ('F', n) every n increments, ('D', dt) every dt of step time,
         ('N', n) n equal intervals of the step, ('P', name) a *TIME POINTS sequence, ('OFF',
         parameter) — and whether it is the Abaqus default: every increment, every 10 in
-        *DYNAMIC and *MODAL DYNAMIC, and in explicit dynamics 20 intervals for field and
-        200 for history output."""
+        *DYNAMIC and *MODAL DYNAMIC, and in an Abaqus/Explicit step (Step.abaqus_explicit) 20
+        intervals for field and 200 for history output."""
         for src in (b,) if ctx is None else (b, ctx):
             p = src.params
             for key in ("FREQUENCY", "FREQ", "NUMBER INTERVAL"):
@@ -40298,7 +40348,7 @@ class _Output:
             if (p.get("TIME POINTS") or "").strip():
                 return ("P", p["TIME POINTS"].strip().upper()), False
         if ctx is not None:
-            if timing["kind"] == "explicit":
+            if timing["kind"] == "explicit" or timing.get("abaqus_explicit"):
                 return ("N", 200 if ctx.has("HISTORY") else 20), True
             if timing["proc"] in ("DYNAMIC", "MODAL DYNAMIC"):
                 return ("F", 10), True
@@ -40478,9 +40528,13 @@ class _Output:
             name = f"ABQ2CCX_TP{n}"
         self._out_amp_names.add(name)
         self._out_tp_names[key] = name
-        if times[0] == "U":
+        if times[0] == "U" and times[1] < period * (1.0 - 1e-12):
             self.emit.out_tp_cards += [f"*TIME POINTS, NAME={name}, GENERATE",
                                    f"{fmt_num(times[1])}, {fmt_num(period)}, {fmt_num(times[1])}"]
+        elif times[0] == "U":
+            # one interval: the step's end alone (ccx 2.23 stops on a GENERATE line whose start is
+            # not below its end: allocation.f, 'ERROR reading *TIME POINTS')
+            self.emit.out_tp_cards += [f"*TIME POINTS, NAME={name}", fmt_num(period)]
         else:
             # 12 digits (short_real): a user *TIME POINTS, GENERATE time can run to 21
             # characters in repr, and ccx reads 20
@@ -41023,8 +41077,8 @@ class _PostPasses:
         zero response.  Fills ``unloaded_steps`` (1-based) and ``source_unloaded`` (the deck
         itself applies no load in any step and has no eigenvalue step).  ccx runs no step from
         the first one it stops at (_no_analysis) on."""
-        src = step_load_audit(blocks, user_loads=True, abaqus=True)
-        dst = step_load_audit(deck.blocks(), user_loads=False)
+        src = step_load_audit(blocks, user_loads=True, abaqus=True, explicit_td=self._td_steps)
+        dst = step_load_audit(deck.blocks(), user_loads=False, coupled_inertia=bool(self._td_steps))
         self.source_unloaded = bool(src) and all(s == [] for s in src)
         run = min(self.emit.stopped, default=len(src) + 1)
         self.unloaded_steps = [i for i, (s, d) in enumerate(zip(src, dst), 1)
@@ -41989,6 +42043,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._lc_marks: Dict[int, str] = {}        # *LOAD CASE of a step split per case -> its case
         self._matrix_steps: Dict[int, Block] = {}  # MATRIXSTORAGE *FREQUENCY -> its *MATRIX GENERATE
         self._geostatic: Dict[int, Block] = {}     # *STATIC -> the *GEOSTATIC it stands for
+        # --approximate: *COUPLED TEMPERATURE-DISPLACEMENT -> its Abaqus/Explicit *DYNAMIC
+        # TEMPERATURE-DISPLACEMENT (_explicit_coupled_steps)
+        self._td_steps: Dict[int, Block] = {}
         self._ic_ori: Dict[int, Tuple[str, str]] = {}  # element -> its section, orientation (_plan_ic_axes)
         self._ic_shell: Dict[int, tuple] = {}      # continuum shell / ply solid -> how its axes form (ditto)
         # (id(split composite section), ply group's set) -> ply solid -> its axes (_ply_group_axes)
@@ -42374,8 +42431,10 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
 
     @property
     def _explicit_deck(self) -> bool:
-        """A *DYNAMIC, EXPLICIT step."""
-        return self._steps_now.explicit
+        """An Abaqus/Explicit deck: a *DYNAMIC, EXPLICIT step, or one --approximate writes as
+        ccx's *COUPLED TEMPERATURE-DISPLACEMENT (Step.abaqus_explicit).  (Whether ccx's explicit
+        solver runs a step: StepModel.explicit.)"""
+        return self._steps_now.abaqus_explicit
 
     @property
     def _mechanical(self) -> bool:
@@ -42759,6 +42818,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         blocks = self._split_load_cases(blocks)       # after it: its moved cards are the step's
         blocks = self._matrix_generate_steps(blocks)  # before anything reads the procedures
         blocks = self._geostatic_steps(blocks)        # likewise
+        blocks = self._explicit_coupled_steps(blocks)     # likewise (--approximate)
         blocks = self._sp_amplitudes(blocks)          # before anything reads load amplitudes
         blocks = self._blank_periods(blocks)          # before the step model reads the periods
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
@@ -43072,7 +43132,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         (_sp_amplitudes, before, keeps the same curves for itself).  The early model's step
         cards are not (the planners up to _plan_free_ref_nodes rewrite some), but its deck
         aggregates are, and the planners before _read_steps read only those (StepModel)."""
-        self.steps = StepModel(blocks)
+        self.steps = StepModel(blocks, explicit_td=self._td_steps)
         # NAME -> its *DISTRIBUTION card ("" for one without a name), as the planners look them
         # up (_plan_distributions leaves the "" one out of _dists)
         self._dist_cards = {b.uparam("NAME"): b for b in blocks if b.keyword == "DISTRIBUTION"}
@@ -43115,7 +43175,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         deck aggregates (StepModel); a unit test checks that they are this model's.  The
         *STEP cards handle_step writes depend on a deformation plasticity material ccx reads
         (_plan_dp_materials)."""
-        self.steps = StepModel(blocks, dp=self._dp_nlgeom)
+        self.steps = StepModel(blocks, dp=self._dp_nlgeom, explicit_td=self._td_steps)
 
     def _ccx_iterated_steps(self, blocks: List[Block], contact: bool = True) -> List[str]:
         """Per step, why ccx 2.23 runs it through its nonlinear solver (nonlingeo: it iterates,
@@ -43398,6 +43458,87 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                 continue
             self.report.warn(f"Step {step.no}: *GEOSTATIC not converted to *STATIC: {why}.", once=True)
         return [swap.get(id(b), b) for b in blocks] if swap else blocks
+
+    # the share of the step time --approximate's coupled step for Abaqus/Explicit's starts its
+    # increments at and keeps them below (_explicit_coupled_steps)
+    TD_INCREMENT_SHARE = 0.01
+
+    def _explicit_coupled_steps(self, blocks: List[Block]) -> List[Block]:
+        """Abaqus/Explicit's *DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT integrates the heat
+        equation (forward differences) and the motion (central differences, with inertia)
+        explicitly; ccx 2.23 has no explicit coupled step and no *INELASTIC HEAT FRACTION.
+        Without --approximate the step stops ccx (_no_procedure).  Under --approximate it ->
+        ccx's transient *COUPLED TEMPERATURE-DISPLACEMENT, which ccx solves implicitly (HHT,
+        ALPHA -0.05) with the model's mass (couptempdisps.f: nmethod 4; _plan_coupled_inertia
+        keeps the mass here), so the inertia, the heat conduction and the thermal loads and
+        BCs stay; lost are explicit time integration and the heat of plastic work ([APPROX]).
+        The period is the deck's; ccx's automatic increments start at, and stay below,
+        TD_INCREMENT_SHARE of it, or the deck's maximum increment where that is smaller.  The
+        explicit increment controls (ELEMENT BY ELEMENT, FIXED TIME INCREMENTATION, DIRECT USER
+        CONTROL's increment, SCALE FACTOR, IMPROVED DT METHOD) are stability limits of the
+        explicit integrator: dropped.  The step keeps Abaqus/Explicit's rules
+        (Step.abaqus_explicit; the cards by id: ``_td_steps``).
+
+        Not the isothermal *DYNAMIC, EXPLICIT, for which a step without thermal loads or BCs
+        would qualify: there ccx's coupled step holds the temperatures too, and it solved 19 of
+        the corpus' 28 such decks without user materials (single elements in under a second,
+        as the explicit form did where that stayed steady; bar necking in 125 s), while ccx's
+        explicit form ran 280 to 1800 s per element (ccx's plane and axisymmetric elements are
+        bricks 1 or 0.035 r deep: increments down to 7e-10 s) and rang without Abaqus' bulk
+        viscosity; at the Taylor bars' strain rates ccx's Johnson-Cook routine stops in both
+        (probed on 2.23)."""
+        if not any(b.keyword == "DYNAMIC TEMPERATURE-DISPLACEMENT" for b in blocks) or not self._approx:
+            return blocks                       # (without --approximate: _no_procedure)
+        swap: Dict[int, Block] = {}
+        done: List[str] = []                    # the steps written so
+        dropped: set = set()                    # the explicit increment controls left out
+        n = 0
+        for step, cards in deck_parts(blocks):
+            n += step
+            b = step_procedure(cards) if step else None
+            if b is None or b.keyword != "DYNAMIC TEMPERATURE-DISPLACEMENT":
+                continue
+            f = [x.strip() for x in (merged_data_records(b) or [[]])[0]] + ["", "", "", ""]
+            try:
+                period = pf(f[1])
+            except ValueError:
+                period = math.nan
+            if not (math.isfinite(period) and period > 0.0):
+                self.report.warn(f"Step {n}: *DYNAMIC TEMPERATURE-DISPLACEMENT not written as ccx's "
+                                 f"*COUPLED TEMPERATURE-DISPLACEMENT (--approximate): its time period "
+                                 f"'{f[1]}' is no positive number.", once=True)
+                continue
+            dt = period * self.TD_INCREMENT_SHARE
+            try:
+                cap = pf(f[3]) if f[3] and not b.has("DIRECT USER CONTROL") else math.inf
+            except ValueError:
+                cap = math.inf
+            dt = float(f"{min(dt, cap) if cap > 0.0 else dt:.12g}")
+            dropped |= {k for k in b.params if k != "EXPLICIT"}
+            new = Block("COUPLED TEMPERATURE-DISPLACEMENT", OrderedDict(),
+                        [f"{fmt_num(dt)}, {f[1]}, , {fmt_num(dt)}"]).placed(b)
+            self._td_steps[id(new)] = b
+            swap[id(b)] = new
+            done.append(str(n))
+        if not swap:
+            return blocks
+        self.report.warn(f"[APPROX] *DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT -> ccx's *COUPLED "
+                         f"TEMPERATURE-DISPLACEMENT (step {', '.join(done)}): ccx has no explicit "
+                         f"coupled step; it solves this one implicitly (HHT) with the model's mass, so "
+                         f"the inertia, heat conduction and thermal loads and BCs stay. Lost: "
+                         f"explicit time integration (ccx takes its own increments, from "
+                         f"{self.TD_INCREMENT_SHARE:g} of the step time or the deck's maximum "
+                         f"increment down"
+                         + (f"; {', '.join(sorted(dropped))} dropped" if dropped else "")
+                         + ") and the heat of plastic work (ccx has no *INELASTIC HEAT FRACTION: the "
+                         "temperatures do not rise with plastic flow). Kept from Abaqus/Explicit: "
+                         "NLGEOM by default, no increment limit, a displacement BC without "
+                         "amplitude held where it is, the default output intervals. Where the "
+                         "thermal response does not matter, *DYNAMIC, EXPLICIT in its place keeps "
+                         "explicit integration at the initial temperatures (ccx's plane and "
+                         "axisymmetric elements need far smaller increments there than Abaqus' do). "
+                         "Verify.", once=True)
+        return [swap.get(id(b), b) for b in blocks]
 
     def _sp_amplitudes(self, blocks: List[Block]) -> List[Block]:
         """A static perturbation or *BUCKLE step's loads, BCs and temperatures on an amplitude:

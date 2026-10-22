@@ -68,6 +68,25 @@ physics.
   memory per node and element: about 14 % less CPU time over the corpus's 1052 decks (17 % on
   its 661 assembly decks) and 12–34 % less peak memory on the largest assembly decks. The
   converted decks are the same, byte for byte.
+* **Explicit coupled temperature-displacement steps under `--approximate`** — ccx 2.23 has no
+  explicit coupled step, so `*DYNAMIC TEMPERATURE-DISPLACEMENT, EXPLICIT` stops ccx (`*NO
+  ANALYSIS`; the warning now names `--approximate`). With `--approximate` it becomes ccx's
+  transient `*COUPLED TEMPERATURE-DISPLACEMENT`, which ccx solves implicitly with the model's
+  mass (not scaled away as for Abaqus/Standard's coupled step): the deck's period, increments
+  from 1/100 of it (or its maximum increment) down, and Abaqus/Explicit's rules — NLGEOM by
+  default, no increment limit, a displacement BC without amplitude held, 20 output intervals.
+  Flagged `[APPROX]`: explicit time integration and the heat of plastic work are lost. 19 of
+  the corpus' 28 such decks without user materials solve this way, the single-element ones in
+  under a second (ccx's explicit form took 5–30 minutes per element). Where ccx's implicit
+  dynamics runs 2-D elements with half their mass, this step is flagged too.
+* **One output interval** — `*OUTPUT, NUMBER INTERVAL=1` (or a `TIME INTERVAL` of the step's
+  period) was written as `*TIME POINTS, GENERATE` from the period to the period, on which ccx
+  2.23 stops; it is now the step's end alone.
+* **Held BCs at converter-added nodes in Abaqus/Explicit's first step** — a displacement BC
+  without amplitude, whose value Abaqus/Explicit ignores, holds the DOF at 0 in the deck's first
+  step; a midside node between such a node and a moved one now gets the interpolation, where it
+  was left free (warned).
+
 * **Batch triage, crash reports, ccx install hint** — `--json` prints one object per deck per
   line (JSON Lines), now with the deck's `status` (`converted`, `reduced`, `commented` or
   `failed`) and `reduced_physics`, and a line with `error` for a deck that failed (none was
