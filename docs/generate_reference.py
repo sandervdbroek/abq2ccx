@@ -201,6 +201,11 @@ TRANSLATED = {
         "The step's `*CLOAD` / `*DLOAD` / `*DSLOAD` are commented out: Abaqus ignores them. On "
         "`CPE8R` / `CPS8R` / `CAX8R` / `CPE6` / `CPS6` / `CAX6` warned: ccx 2.23 integrates their "
         "mass at 2 x 2 / 3 points, Abaqus fully (frequencies up to a few % high on coarse meshes).",
+    "*MATRIX GENERATE / *MATRIX OUTPUT": "→ `*FREQUENCY, SOLVER=MATRIXSTORAGE` as the last step, "
+        "for the whole model: ccx writes the stiffness and mass to `<job>.sti` / `<job>.mas` and "
+        "each row's node.direction to `<job>.dof` (its own format, the free DOFs only), then "
+        "stops; `*MATRIX OUTPUT` commented out. No damping or load matrix (reduced physics); "
+        "otherwise commented out with `*NO ANALYSIS`.",
     "*BUCKLE": "`EIGENSOLVER` dropped; Abaqus range/size fields blanked where ccx reads "
         "accuracy/vectors/iterations. A `*BUCKLE` step, or the step after a `*STEP, PERTURBATION` "
         "one, that would hold no body load once an earlier step held one gets a zero `GRAV` line "

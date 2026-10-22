@@ -103,7 +103,9 @@ and beam theory) and midside nodes between ends heated on two cards (the one-car
 explicit bar with *FIXED MASS SCALING, FACTOR=100 against the bar with its masses scaled by hand
 (its increment 10 times the true mass's), and a target increment DT as ccx's selective mass
 scaling (--approximate); *BOUNDARY, FIXED on *TRANSFORM translations and in a static perturbation
-step against the twins with the values written.
+step against the twins with the values written; the stiffness and mass files of a *MATRIX
+GENERATE step (ccx's MATRIXSTORAGE) of a C3D8 cube, free and with BCs, an equation and a point
+mass, against the exact brick matrices.
 
 Every check reads something ccx must solve for (a free node's motion, a reaction, a stress,
 an eigenvalue), and a run counts as solved only if ccx's output shows each step setting up
@@ -1388,6 +1390,104 @@ def umat_shear_deck(gamma=0.4, n=10):
               for c in range(3) for k, (_, y, _) in enumerate(corners) for d in (1, 2, 3)]
     lines += ["*EL PRINT, ELSET=EALL", "S", "*END STEP"]
     return "\n".join(lines) + "\n"
+
+
+def brick_matrices(e, nu, rho):
+    """The stiffness and consistent mass of a C3D8 unit cube [0, 1]^3 (Abaqus' node order), 24 x
+    24 by node and direction, integrated exactly by 2 x 2 x 2 Gauss points (the integrands are
+    quadratic in each coordinate): what a ccx *FREQUENCY, SOLVER=MATRIXSTORAGE step must write."""
+    corners = [(-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),
+               (-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)]
+    lam, mu = e * nu / ((1 + nu) * (1 - 2 * nu)), e / (2 * (1 + nu))
+    dmat = [[lam + 2 * mu if i == j else lam for j in range(3)] + [0.0] * 3 for i in range(3)] + \
+        [[0.0] * 3 + [mu if i == j else 0.0 for j in range(3)] for i in range(3)]
+    k = [[0.0] * 24 for _ in range(24)]
+    m = [[0.0] * 24 for _ in range(24)]
+    g = 1.0 / math.sqrt(3.0)
+    for p in itertools.product((-g, g), repeat=3):
+        n = [math.prod((1 + c[i] * p[i]) / 2 for i in range(3)) for c in corners]
+        # dN/dx = 2 dN/dxi (x = (xi + 1) / 2); each point weighs det J = 1/8
+        dn = [[c[i] * math.prod((1 + c[j] * p[j]) / 2 for j in range(3) if j != i) for i in range(3)]
+              for c in corners]
+        b = [[0.0] * 24 for _ in range(6)]
+        for a, (x, y, z) in enumerate(dn):
+            for row, col, v in ((0, 0, x), (1, 1, y), (2, 2, z), (3, 0, y), (3, 1, x),
+                                (4, 0, z), (4, 2, x), (5, 1, z), (5, 2, y)):
+                b[row][3 * a + col] = v
+        db = [[sum(dmat[r][s] * b[s][c] for s in range(6)) for c in range(24)] for r in range(6)]
+        for i in range(24):
+            for j in range(24):
+                k[i][j] += sum(b[r][i] * db[r][j] for r in range(6)) / 8
+                if i % 3 == j % 3:
+                    m[i][j] += rho * n[i // 3] * n[j // 3] / 8
+    return k, m
+
+
+def matrix_generate_checks(ccx, env, tmp):
+    """*MATRIX GENERATE, STIFFNESS, MASS (-> *FREQUENCY, SOLVER=MATRIXSTORAGE): ccx's .sti and .mas
+    of a C3D8 unit cube against brick_matrices, free (as the corpus decks: every DOF) and with
+    BCs in the step, an equation u8x = u7x and a point mass at node 7 (the held DOFs left out,
+    the equation's dependent DOF eliminated: T^T K T, T^T M T over the free DOFs); and STIFFNESS
+    alone of a material without *DENSITY (ccx stops without one: *DENSITY 0, a zero .mas).
+    Each run must end in the "matrices" verdict (classify_ccx_run).  Returns the number of
+    failures."""
+    cube = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+            "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n"
+            "1, 1, 2, 3, 4, 5, 6, 7, 8\n*MATERIAL, NAME=STEEL\n*DENSITY\n2.\n*ELASTIC\n1000., 0.3\n"
+            "*SOLID SECTION, ELSET=EALL, MATERIAL=STEEL\n")
+    gen = "*MATRIX GENERATE, STIFFNESS, MASS\n"
+    k0, m0 = brick_matrices(1000.0, 0.3, 2.0)
+    failures = 0
+    for tag, model, step in (
+            ("free", cube, gen),
+            ("held", cube + "*EQUATION\n2\n8, 1, 1., 7, 1, -1.\n*ELEMENT, TYPE=MASS, ELSET=PM\n2, 7\n"
+                     "*MASS, ELSET=PM\n0.5\n", gen + "*BOUNDARY\n1, 1, 3\n2, 2, 3\n"),
+            ("massless", cube.replace("*DENSITY\n2.\n", ""), "*MATRIX GENERATE, STIFFNESS\n")):
+        free = [(nd, dr) for nd in range(1, 9) for dr in (1, 2, 3)
+                if not (tag == "held" and (nd == 1 or (nd, dr) in ((2, 2), (2, 3), (8, 1))))]
+        t = {(nd, dr): [(nd, dr)] + ([(8, 1)] if tag == "held" and (nd, dr) == (7, 1) else [])
+             for nd, dr in free}                # the DOFs each free one moves (T's columns)
+        m1 = [[0.0] * 24 for _ in m0] if tag == "massless" else [row[:] for row in m0]
+        if tag == "held":
+            for i in range(18, 21):
+                m1[i][i] += 0.5
+        want = {}
+        for name, mat in (("sti", k0), ("mas", m1)):
+            want[name] = {(a, c): sum(mat[3 * (p[0] - 1) + p[1] - 1][3 * (q[0] - 1) + q[1] - 1]
+                                      for p in t[a] for q in t[c]) for a in free for c in free}
+        src, inp = os.path.join(tmp, f"matrix_{tag}_src.inp"), os.path.join(tmp, f"matrix_{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(model + "*STEP\n" + step + "*MATRIX OUTPUT, STIFFNESS, MASS, FORMAT=COORDINATE\n"
+                     "*END STEP\n")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        errs, rows = {}, []
+        if status == "matrices":
+            job = os.path.join(d, "job")
+            rows = [tuple(int(x) for x in ln.strip().split(".")) for ln in open(job + ".dof")]
+            for name in ("sti", "mas"):
+                got = {}
+                for ln in open(f"{job}.{name}"):
+                    i, j, v = ln.split()
+                    got[(rows[int(i) - 1], rows[int(j) - 1])] = float(v)
+                    got[(rows[int(j) - 1], rows[int(i) - 1])] = float(v)
+                scale = max(max(abs(v) for v in want[name].values()), 1e-300)
+                errs[name] = max(abs(got.get(key, 0.0) - v) for key, v in want[name].items()) / scale \
+                    if set(got) <= set(want[name]) else math.inf
+        shutil.rmtree(d, ignore_errors=True)
+        ok = status == "matrices" and sorted(rows) == sorted(free) and \
+            max(errs.values(), default=math.inf) < 1e-9
+        what = {"free": "STIFFNESS, MASS", "held": "STIFFNESS, MASS; BCs in the step, an equation, a "
+                "point mass", "massless": "STIFFNESS, no *DENSITY: a zero mass"}[tag]
+        print(f"{'PASS' if ok else 'FAIL'}  matrix_generate_{tag} (a C3D8 unit cube, *MATRIX GENERATE, "
+              f"{what}): "
+              f"ccx {status}, {len(rows)} rows ({len(free)}), stiffness and mass "
+              f"{errs.get('sti', math.inf):.1e} / {errs.get('mas', math.inf):.1e} off the exact brick "
+              f"matrices")
+        if status != "matrices":
+            print("\n".join(ln for ln in out.splitlines() if "ERROR" in ln)[:400])
+        failures += 0 if ok else 1
+    return failures
 
 
 def umat_build_checks(tmp):
@@ -10314,6 +10414,8 @@ def main():
               f"UMAT, S33 = {f'{s[2]:.4f}' if s else status} (reference {ref:.4f})")
         failures += 0 if ok else 1
     failures += umat_build_checks(tmp)
+    # --- *MATRIX GENERATE: ccx's MATRIXSTORAGE files against the exact brick matrices ---------
+    failures += matrix_generate_checks(ccx, env, tmp)
 
     # --- the --run results digest (abq2ccx.ccx_results_digest) against the references above:
     # the planar beam's frequencies and buckling load (beam theory, Euler), the circular-section
@@ -12170,9 +12272,10 @@ def main():
              "2\n*END STEP\n", "Frequency", "*COMPLEX FREQUENCY", "ccx stopped at input"),
             ("soils_stops", static + "*STEP\n*SOILS, CONSOLIDATION\n0.1, 1.\n*CLOAD\n19, 2, 2.\n"
              "*END STEP\n", "Static", "*SOILS", "ccx ran the *SOILS step as a load-controlled *STATIC"),
+            # (element matrices, which ccx's MATRIXSTORAGE does not write: matrix_generate_checks)
             ("matrix_generate_stops", "*STEP\n*FREQUENCY\n4\n*END STEP\n*STEP\n*MATRIX GENERATE, "
-             "STIFFNESS\n*END STEP\n", "Frequency", "*MATRIX GENERATE",
-             "ccx ran a second *FREQUENCY step")):
+             "STIFFNESS, ELEMENT BY ELEMENT\n*END STEP\n", "Frequency",
+             "*MATRIX GENERATE, ELEMENT BY ELEMENT", "ccx ran a second *FREQUENCY step")):
         src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(after_pert_model() + steps)

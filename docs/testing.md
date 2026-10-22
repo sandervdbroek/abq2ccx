@@ -178,6 +178,7 @@ and held in memory only in part (ccx 2.23 can print without end), and is stopped
 | `instance_blank_orientation`, `_distribution`, `_beam_n1` (generated) | an orthotropic cube, then a `B31` cantilever, in a moved and turned instance, blank fields in its lines, the material axes, a `*TRANSFORM` and n1 | uniaxial stress in material axis 2; F L³ / 3 E I; the decks written with zeros | 0, 2.5e-3; identical (before: axes unturned, off by 2.1 × max |u|; 4× the deflection) |
 | `perturbation_restore_*` (generated) | cubes given a `*CLOAD`, a pressure, a prescribed displacement and a temperature, a `*FREQUENCY` (or `*STEP, PERTURBATION` + `*BUCKLE`) step changing them all (or, after a `*FREQUENCY` step, a `*MODAL DYNAMIC` one changing the loads), then a static step giving nothing | the first step's state; each cube's corner must move | exact (before: 0.49 off) |
 | `modal_own_loads` (generated) | a cube loaded statically (a `*CLOAD`, a pressure, gravity, a traction), then `*FREQUENCY` and a `*MODAL DYNAMIC` step with loads of its own | the same deck without the static loads | exact (before: 0.013 off) |
+| `matrix_generate_free` / `_held` / `_massless` (generated) | a `C3D8` unit cube's `*MATRIX GENERATE`: free; with BCs in the step, an `*EQUATION` and a point mass; `STIFFNESS` alone without `*DENSITY` | the exact brick stiffness and consistent mass (over the free DOFs, the equation's dependent DOF eliminated) | 2e-14 |
 | `buckle_gravity_preload` (generated) | a `C3D8` column under gravity in a static step, then a `*BUCKLE` step loaded at its top (`*STEP, PERTURBATION` and a plain `*STEP`) | the same gravity as nodal forces (exact on bricks) | exact (ccx aborted after the buckle step; the plain step ignored the preload) |
 | `frequency_preload` (generated) | the `buckle_gravity_preload` column under gravity in a static step, then a `*FREQUENCY` step: with `NLGEOM` and a plain `*STEP`; without `NLGEOM` and `*STEP, PERTURBATION` | the same written with `PERTURBATION`; the unloaded column | exact (before: 25.02 Hz for 20.74, 20.74 for 25.02) |
 | `buckle_self_weight_then_static` (generated) | the column buckling under its weight and a top load, then a static step pulling its top sideways | the buckle step alone; the static step alone | exact (ccx aborted after the static step) |
@@ -234,7 +235,10 @@ The tests:
   and writes only finite results to the `.dat` print blocks and the `.frd`; **unsolved**
   when a step shows none (ccx 2.23 runs a step that sets up no equations to "Job finished"
   and exit 0); **nonfinite** when it finishes with NaN/Inf (likewise for a diverged
-  solution); **accepted** for a mesh-only deck that reads cleanly; **failed** otherwise.
+  solution); **matrices** when a matrix generation step (`*FREQUENCY, SOLVER=MATRIXSTORAGE`)
+  wrote fresh, finite `.sti` / `.mas` / `.dof` files (ccx stops there, exit 0 without "Job
+  finished"; such a deck must give it); **accepted** for a mesh-only deck that reads cleanly;
+  **failed** otherwise.
 * `test_classify_ccx_run` — the judge itself, including the "Job finished, then abort" case
   of issue #3, a `*DYNAMIC` step that sets up no equations (kinematic couplings), and
   NaN/Inf results as ccx 2.23 writes them, also as `-NAN(IND)` (a Windows

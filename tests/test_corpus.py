@@ -17,8 +17,9 @@ Two layers of checking:
   3. SOLVE     — optional: if CalculiX (ccx) is found, decks marked ``expect_solve``
                  must solve (ccx exits 0, prints "Job finished" with no *ERROR and no
                  crash, runs an analysis STEP, and writes no NaN/Inf to the .dat or
-                 .frd), and mesh-only decks marked ``parse_only`` must be accepted by
-                 ccx; the rest are recorded only.
+                 .frd) — a deck with a matrix generation step must write its matrices
+                 instead (``expected_solve``) —, and mesh-only decks marked ``parse_only``
+                 must be accepted by ccx; the rest are recorded only.
      ANSWERS   — optional, with ccx: an ``expect_solve`` deck with a ``reference`` (the
                  Abaqus benchmark decks) must give its published answer (see
                  ``reference_check``).
@@ -109,6 +110,15 @@ def dangling(text):
 # CLI's --run all apply the same rules (exit code, crash messages, a STEP must run, the
 # results must be finite).
 classify_ccx_run = A.classify_ccx_run
+
+
+def expected_solve(text):
+    """The verdict an expect_solve deck's conversion ``text`` must get from ccx: "matrices"
+    where it has a matrix generation step (*FREQUENCY, SOLVER=MATRIXSTORAGE: ccx writes the
+    matrices and stops, abq2ccx.ccx_matrices), else "solved"."""
+    cards = (ln.upper().replace(" ", "") for ln in text.splitlines() if ln.startswith("*"))
+    return "matrices" if any(c.startswith("*FREQUENCY,") and "SOLVER=MATRIXSTORAGE" in c
+                             for c in cards) else "solved"
 
 
 def run_ccx(ccx, env, text, read=None):
@@ -410,6 +420,39 @@ def test_classify_ccx_run():
         # a step that solved nothing: its results are no solution, finite or not
         assert classify_ccx_run(0, static + idle + end, "", job) == "unsolved"
 
+    # *FREQUENCY, SOLVER=MATRIXSTORAGE (a matrix generation step) writes the matrices and stops:
+    # exit 0, and through a pipe no "Job finished" (ccx 2.23's C output is lost), so the judge
+    # reads the files: fresh, the .dof's rows node.direction, upper-triangle finite entries
+    freq = " STEP            1\n\n Frequency analysis was selected\n\n"
+    with tempfile.TemporaryDirectory() as d:
+        job = os.path.join(d, "job")
+
+        def write(ext, text):
+            open(job + ext, "w", encoding="utf-8", newline="\n").write(text)
+
+        write(".inp", "*STEP\n")
+        write(".sti", "1 1  2.0e+02\n1 2 -1.0e+02\n2 2  1.0e+02\n")
+        write(".mas", "1 1  3.0e+00\n1 2  0.0e+00\n2 2  3.0e+00\n")
+        write(".dof", "2.1\n2.2\n")
+        assert A.ccx_matrices(job) == "job.sti, job.mas, job.dof (2 rows)"
+        assert classify_ccx_run(0, freq, "", job) == "matrices"
+        assert classify_ccx_run(0, freq + " Job finished\n", "", job) == "matrices"
+        assert classify_ccx_run(0, freq, "") == "failed"                 # no files to read
+        assert classify_ccx_run(201, freq, "", job) == "failed"
+        assert classify_ccx_run(0, freq + " *ERROR in arpack\n", "", job) == "failed"
+        assert classify_ccx_run(0, "", "", job) == "failed"              # no STEP ran
+        write(".mas", "1 1  3.0e+00\n2 2  nan\n")
+        assert A.ccx_matrices(job) is None and classify_ccx_run(0, freq, "", job) == "failed"
+        write(".mas", "1 1  3.0e+00\n2 5  1.0e+00\n")                 # column 5 of 2 (x2: cyclic)
+        assert classify_ccx_run(0, freq, "", job) == "failed"
+        os.unlink(job + ".mas")
+        assert A.ccx_matrices(job) == "job.sti, job.dof (2 rows)"
+        write(".dof", "2.1\nx\n")
+        assert A.ccx_matrices(job) is None
+        write(".dof", "2.1\n2.2\n")
+        os.utime(job + ".sti", (1.0, 1.0))                              # an earlier run's
+        assert A.ccx_matrices(job) is None and classify_ccx_run(0, freq, "", job) == "failed"
+
 
 def test_corpus_solves():
     """expect_solve decks must solve and parse_only decks must be accepted by ccx
@@ -421,8 +464,9 @@ def test_corpus_solves():
         return
     for e in sorted(decks, key=lambda x: x["name"]):
         if e["expect_solve"]:
-            status = run_ccx(ccx, env, convert(e["name"])[0])
-            assert status == "solved", f"{e['name']}: expected to solve in ccx, got {status!r}"
+            text = convert(e["name"])[0]
+            status, want = run_ccx(ccx, env, text), expected_solve(text)
+            assert status == want, f"{e['name']}: expected {want!r} from ccx, got {status!r}"
         elif e.get("parse_only"):
             status = run_ccx(ccx, env, convert(e["name"])[0])
             assert status in ("accepted", "solved"), \
@@ -528,8 +572,9 @@ def main():
             else:
                 status = run_ccx(ccx, env, text)
             if e["expect_solve"]:
-                ccxcol = "SOLVED" if status == "solved" else status.upper()
-                if status != "solved":
+                want = expected_solve(text)
+                ccxcol = want.upper() if status == want else status.upper()
+                if status != want:
                     result = {"accepted": "UNEXPECTED: no analysis step ran",
                               "nonfinite": "UNEXPECTED: NaN/Inf results"}.get(
                                   status, "UNEXPECTED no-solve")
@@ -540,7 +585,7 @@ def main():
                     result = "UNEXPECTED: ccx rejected it"
                     failures += 1
             else:
-                ccxcol = {"solved": "solved+", "accepted": "accepted+",
+                ccxcol = {"solved": "solved+", "accepted": "accepted+", "matrices": "matrices+",
                           "nonfinite": "nonfinite(ok)"}.get(status, "no-solve(ok)")
         print(f"{name:27s} {'ok':>5s} {rep.n_warnings:>3d} {d:>6d} {ccxcol:>13s}  {result}")
     n_solve = sum(1 for e in decks if e["expect_solve"])

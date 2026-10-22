@@ -52,6 +52,17 @@ physics.
   membranes, beams, trusses and point masses. The nodal forces stay on the undeformed geometry,
   so under NLGEOM they need `--approximate`. Checked against the rotating-disc solution, the hoop
   displacement of a disc under rotary acceleration and beam theory.
+* **`*MATRIX GENERATE` writes the matrices** — the step was commented out and ccx stopped there.
+  A step asking for the stiffness or mass matrix now becomes `*FREQUENCY, SOLVER=MATRIXSTORAGE`:
+  ccx writes the same stiffness and mass to `<job>.sti` and `<job>.mas`, with the DOF of each
+  row in `<job>.dof`, in its own format (the report says how it differs from Abaqus' `.mtx`
+  files), and stops. It is converted only as the last step, for the whole model, with
+  multipoint constraints applied; else it stays commented out, with the reason. A material
+  without `*DENSITY` gets `*DENSITY 0` (ccx stops without one: a zero mass). A damping or
+  load matrix is not written, and beam, shell and plane elements give the matrices of ccx's
+  expanded 3-D model: both flagged as reduced physics. The six corpus decks with such a step
+  now write their matrices; the solve judge has a "matrices" verdict for this run, which exits
+  without "Job finished".
 * **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the

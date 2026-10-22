@@ -3667,6 +3667,57 @@ def test_steps_without_a_ccx_procedure_stop_ccx():
     assert conv.reduced_physics == ["step 2 without a procedure (ccx stops there)"]
 
 
+def test_matrix_generate_as_matrixstorage_frequency():
+    # *MATRIX GENERATE -> *FREQUENCY, SOLVER=MATRIXSTORAGE (no data line): ccx 2.23 writes the
+    # stiffness and mass to <job>.sti / <job>.mas, the rows' node.direction to <job>.dof, and
+    # stops; the step's loads make only Abaqus' load matrix, and Abaqus writes no field output
+    model = HEX + HEX_SEC.replace("*Elastic", "*Density\n2.\n*Elastic")
+    gen = "Matrix Generate, stiffness, mass"
+    out = "*Matrix Output, stiffness, mass, format=coordinate\n*Matrix Check\n"
+    body, conv, rep = convert_str(model + _deck_step(gen, out + "*Boundary\n1, 1, 3\n*Cload\n7, 1, 1.\n"))
+    step = body.split("*STEP")[1]
+    assert step.startswith("\n** abq2ccx: Abaqus' *MATRIX GENERATE, STIFFNESS, MASS\n"
+                           "*FREQUENCY, SOLVER=MATRIXSTORAGE\n** abq2ccx: *MATRIX OUTPUT"), step
+    assert "\n*BOUNDARY\n1, 1, 3\n" in step and "\n** *CLOAD\n** 7, 1, 1.\n" in step
+    assert "** *MATRIX CHECK" in step and "FILE" not in step and "*NO ANALYSIS" not in body
+    assert conv.reduced_physics == [] and not conv.source_unloaded and not conv.unloaded_steps
+    assert "<job>.sti and <job>.mas" in rep.text() and "line k of <job>.dof" in rep.text()
+    # STIFFNESS alone of a material without *DENSITY: ccx 2.23 stops without one, and *DENSITY 0
+    # is Abaqus' massless element
+    body, conv, rep = convert_str(HEX + HEX_SEC + _deck_step("Matrix Generate, stiffness"))
+    assert "*MATERIAL, NAME=MHEX\n*ELASTIC\n1000., 0.3\n*DENSITY\n0.\n" in body and \
+        conv.reduced_physics == []
+    assert "ccx 2.23 stops at the matrix generation step without one" in rep.text()
+    # a damping or load matrix is not written; beam / shell matrices are the expanded model's
+    _, conv, rep = convert_str(model + _deck_step(gen + ", viscous damping, load"))
+    assert conv.reduced_physics == ["*MATRIX GENERATE VISCOUS DAMPING, LOAD matrix not written"]
+    shell = ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*ELEMENT, TYPE=S4, "
+             "ELSET=E\n1, 1, 2, 3, 4\n*Material, name=M\n*Density\n2.\n*Elastic\n1000., 0.3\n"
+             "*Shell Section, elset=E, material=M\n0.1\n")
+    body, conv, rep = convert_str(shell + _deck_step(gen))
+    assert "*FREQUENCY, SOLVER=MATRIXSTORAGE" in body and "expanded 3-D model" in rep.text()
+    assert conv.reduced_physics == ["*MATRIX GENERATE of beam / shell / plane elements (ccx's "
+                                    "expanded 3-D model's matrices)"]
+    # the base state as in a *FREQUENCY step: an NLGEOM preload's stress stiffness
+    pre = _deck_step("Static", "*Boundary\n1, 1, 3\n2, 2, 3\n4, 3, 3\n*Cload\n7, 3, -1.\n",
+                     head=", nlgeom")
+    body, conv, _ = convert_str(model + pre + _deck_step(gen))
+    assert "*STEP, PERTURBATION\n** abq2ccx: Abaqus' *MATRIX GENERATE" in body, body
+    # left as it was where ccx would write other matrices: ccx stops at the step
+    for params, pre, post, why in (
+            (", element by element", "", "", "ELEMENT BY ELEMENT asks for element matrices"),
+            (", elset=EALL", "", "", "ELSET=EALL asks for a part of the model"),
+            (", mpc=no", "*Equation\n2\n8, 1, 1., 7, 1, -1.\n", "", "MPC=NO keeps the constraints'"),
+            ("", "", _deck_step("Static", "*Cload\n7, 1, 1.\n"), "ccx stops after writing the matrices")):
+        body, conv, rep = convert_str(model + pre + _deck_step(gen + params) + post)
+        assert "MATRIXSTORAGE\n" not in body and "\n*NO ANALYSIS\n" in body, params
+        assert f"*MATRIX GENERATE not converted to ccx's *FREQUENCY, SOLVER=MATRIXSTORAGE: {why}" \
+            in rep.text(), params
+        assert conv.reduced_physics == ["*MATRIX GENERATE step (no ccx counterpart)"], params
+    body, conv, _ = convert_str(model + _deck_step(gen + ", mpc=no, public nodes=N"))
+    assert "*FREQUENCY, SOLVER=MATRIXSTORAGE" in body and conv.reduced_physics == []
+
+
 def test_no_analysis_left_out_where_ccx_segfaults():
     # ccx 2.23 segfaults at a *NO ANALYSIS step of a model with a plastic, creeping, Mohr-
     # Coulomb, deformation-plasticity or user material (probed): as the first step the step is

@@ -931,21 +931,24 @@ KEYWORD_ALIASES = {"AMP": "AMPLITUDE"}
 MULTIWORD_PARAMS = (
     "ANALYTICAL SURFACE", "CHANGE NUMBER", "CONSTANT RESULTANT", "CONSTRAINT NAME",
     "CONTACT ELEMENTS", "CONVERSION CRITERION", "CYCLIC SYMMETRY", "DAMPING PROJECTION",
-    "DIRECT USER CONTROL", "DISTORTION CONTROL", "DRILL STIFFNESS", "ELEMENT CONVERSION",
-    "ELEMENT DELETION",
-    "ELEMENT SHIFT", "EXPONENTIAL DECAY", "FILLET RADIUS", "FIXED INTERVAL",
+    "DIRECT USER CONTROL", "DISTORTION CONTROL", "DRILL STIFFNESS", "ELEMENT BY ELEMENT",
+    "ELEMENT CONVERSION", "ELEMENT DELETION",
+    "ELEMENT SHIFT", "EXPONENTIAL DECAY", "FILLET RADIUS", "FIXED INTERVAL", "FRICTION DAMPING",
     "HYBRID FORMULATION", "IMPROVED DT METHOD", "INFLUENCE RADIUS", "INITIAL GAP OPENING",
     "KINEMATIC SPLIT", "LAST ITERATIONS", "LAST MODE", "LENGTH RATIO", "LOAD CASE", "MAX DEGRADATION",
     "MEMBRANE THICKNESS", "MODE LIST", "NEO HOOKE", "NEW SET", "NO ROTATION", "NO SEPARATION",
     "NO THICKNESS", "NODAL THICKNESS", "NUMBER INTERVAL", "OLD SET", "OUTPUT ALL",
-    "PARTICLE THICKNESS", "PIN NSET", "POSITION TOLERANCE", "RAMP INITIAL STRESS",
+    "PARTICLE THICKNESS", "PIN NSET", "POSITION TOLERANCE", "PROPERTY EVALUATION", "PUBLIC NODES",
+    "RAMP INITIAL STRESS",
     "REDUCED POLYNOMIAL", "REF NODE", "RELATIVE TO ABSOLUTE", "ROT NODE", "SCALE FACTOR",
     "SCALE STRESS", "SECOND ORDER ACCURACY", "SECTION FORCES", "SECTION POINTS", "SHELL THICKNESS",
-    "SHIFT NODES", "SHOCK SMOOTHING", "SMALL SLIDING", "SPH FORMULATION", "SPH SMOOTHING LENGTH",
-    "SPH TENSILE INSTABILITY CONTROL", "STACK DIRECTION", "STEADY STATE", "SUBSPACE PROJECTION",
+    "SHIFT NODES", "SHOCK SMOOTHING", "SMALL SLIDING", "SOLID INFINITE FORMULATION",
+    "SPH FORMULATION", "SPH SMOOTHING LENGTH", "SPH TENSILE INSTABILITY CONTROL",
+    "STACK DIRECTION", "STEADY STATE", "STRUCTURAL DAMPING", "SUBSPACE PROJECTION",
     "TEST DATA INPUT",
     "THERMAL NETWORK", "TIE NSET", "TIED NSET", "TIME DELAY", "TIME INTERVAL", "TIME POINTS",
     "TIME RESET", "TOTAL FORCE", "TOTAL TIME AT START", "TWO STEP", "VAN DER WAALS",
+    "VISCOUS DAMPING",
     "WEIGHT FACTOR", "WEIGHTING METHOD")
 _PARAM_BY_COMPACT = {k.replace(" ", ""): k for k in MULTIWORD_PARAMS + tuple(PARAM_ALIASES)
                      if " " in k}
@@ -3638,7 +3641,8 @@ ABAQUS_ONLY_PROCS = {
     "GEOSTATIC": "geostatic stress field (the initial stresses and pore pressures equilibrated "
                  "with the loads)",
     "SOILS": "coupled pore fluid diffusion and stress analysis",
-    "MATRIX GENERATE": "matrix generation (the model's global matrices written out)",
+    "MATRIX GENERATE": "matrix generation in this form (the warning above says why: "
+                       "Converter._matrix_generate_steps)",
     "RANDOM RESPONSE": "random response analysis",
     "RESPONSE SPECTRUM": "response spectrum analysis",
     "DIRECT CYCLIC": "direct cyclic analysis",
@@ -3959,7 +3963,7 @@ OUTPUT_ONLY_KEYWORDS = {
     "INCREMENTATION OUTPUT", "FILE FORMAT",
     "FILE OUTPUT", "MONITOR", "PRINT", "DIAGNOSTICS", "CONTOUR INTEGRAL", "RADIATION OUTPUT",
     "RADIATION PRINT", "RADIATION FILE", "USER OUTPUT VARIABLES", "ELEMENT MATRIX OUTPUT",
-    "MODAL OUTPUT", "MODAL PRINT", "MODAL FILE", "SECTION FILE", "INTEGRATED OUTPUT",
+    "MATRIX CHECK", "MODAL OUTPUT", "MODAL PRINT", "MODAL FILE", "SECTION FILE", "INTEGRATED OUTPUT",
     "INTEGRATED OUTPUT SECTION", "ELEMENT RESPONSE", "NODE RESPONSE", "SURFACE PRINT"}
 # Abaqus numerical controls with no ccx card (ccx uses its own): they steer the solver, not
 # the model, so ccx still solves the deck's physics.
@@ -18559,11 +18563,13 @@ class _Materials:
         without a density no mass (it is optional for stress/displacement elements), as ccx
         does without temperatures, so every section material without one gets *DENSITY 0
         (``_zero_density``: the *BEAM GENERAL SECTION material too, _general_as_beam_section);
-        before the planners that copy materials."""
+        before the planners that copy materials.  So does a deck with a matrix generation step
+        (_matrix_generate_steps), which ccx 2.23 stops at without a density ('no density was
+        assigned'; probed: with *DENSITY 0 it writes the stiffness and a zero mass)."""
         heated = bool(self.steps.procs & CCX_THERMAL_PROCS) or any(
             b.keyword == "TEMPERATURE" or (b.keyword == "INITIAL CONDITIONS" and
                                            b.uparam("TYPE") == "TEMPERATURE") for b in blocks)
-        self._zero_density = heated and self.steps.mass_acts
+        self._zero_density = (heated and self.steps.mass_acts) or bool(self._matrix_steps)
         if not self._zero_density:
             return
         used = {m.upper() for b in blocks if b.keyword.endswith("SECTION")
@@ -18575,7 +18581,11 @@ class _Materials:
             at = max(i for i, x in enumerate(blocks) if any(x is c for c in group)) + 1
             blocks[at:at] = [Block("DENSITY", OrderedDict(), ["0."])]
             names.append(name)
-        if names:
+        if names and not (heated and self.steps.mass_acts):
+            self.report.note(f"Material{'s' if len(names) > 1 else ''} {', '.join(names)} without "
+                             f"*DENSITY: *DENSITY 0 added. ccx 2.23 stops at the matrix generation "
+                             f"step without one; Abaqus gives its elements no mass. Exact.", once=True)
+        elif names:
             self.report.note(f"Material{'s' if len(names) > 1 else ''} {', '.join(names)} without "
                              f"*DENSITY: *DENSITY 0 added. Where temperatures are defined, ccx 2.23 "
                              f"gives such a material the density of the element it assembled just "
@@ -28042,6 +28052,13 @@ class _Loads:
                 continue
             if b.keyword != "BOUNDARY" and self._op_new_drop.get(id(b)):     # (handle_boundary's own)
                 out.append(self._op_new_drop[id(b)])
+            if id(cur.procedure) in self._matrix_steps and \
+                    b.keyword in ("CLOAD", "DLOAD", "DSLOAD", "LOAD CASE"):
+                out.extend(self._commented(b, "Loads of a *MATRIX GENERATE step commented out: they "
+                                              "make Abaqus' load matrix, which ccx does not write; "
+                                              "the stiffness and mass do not depend on them.",
+                                           reduces=False))
+                continue
             if proc == "FREQUENCY" and b.keyword in ("CLOAD", "DLOAD", "DSLOAD"):
                 out.extend(self._commented(b, "Loads of a *FREQUENCY step commented out: Abaqus "
                                               "ignores them (natural frequency extraction), ccx "
@@ -32173,6 +32190,8 @@ class _Loads:
         EIGENSOLVER, NORMALIZATION, SIM, ACOUSTIC COUPLING, ... are dropped.  With
         EIGENSOLVER=SUBSPACE the second data field is Abaqus' maximum frequency of
         interest, which ccx would read as the LOWER bound of the search — blanked."""
+        if id(b) in self._matrix_steps:
+            return self._matrix_storage(b)
         keep: "OrderedDict[str, Optional[str]]" = OrderedDict()
         solver = (b.param("EIGENSOLVER") or "LANCZOS").strip().upper()
         for k, v in b.params.items():
@@ -32212,6 +32231,60 @@ class _Loads:
                 self.report.note(f"*FREQUENCY: no number of modes given (Abaqus: all modes in the "
                                  f"frequency range) -> {f[0]} requested (ccx needs a count).", once=True)
         return [emit_keyword("FREQUENCY", keep)] + data
+
+    # what of a *MATRIX GENERATE card's other parameters the MATRIXSTORAGE step drops, and why
+    _MATRIX_DROPPED = {
+        "PROPERTY EVALUATION": "ccx evaluates no frequency-dependent properties",
+        "PUBLIC NODES": "it only hides the other nodes from a matrix usage model; the .dof lists every node",
+        "FRICTION DAMPING": "it adds damping, which ccx's files do not hold",
+        "SOLID INFINITE FORMULATION": "ccx has no infinite elements",
+    }
+
+    def _matrix_storage(self, b: Block) -> List[str]:
+        """The *FREQUENCY, SOLVER=MATRIXSTORAGE card ``b`` of a *MATRIX GENERATE step
+        (_matrix_generate_steps), after the deck's card as a comment, and where the matrices go.
+        A damping or load matrix asked for is not written (reduced physics), nor are the
+        matrices of beam, shell, membrane, plane or truss elements Abaqus' own: ccx's are those
+        of its expanded 3-D model, three translations at each expanded node, labelled by the
+        original node in the .dof (probed: an S4 square, 33 rows; reduced physics)."""
+        orig = self._matrix_steps[id(b)]
+        asked = [k for k in ("STIFFNESS", "MASS", "VISCOUS DAMPING", "STRUCTURAL DAMPING", "LOAD")
+                 if orig.has(k)]
+        self.report.note(f"*MATRIX GENERATE, {', '.join(asked)} -> *FREQUENCY, SOLVER=MATRIXSTORAGE: "
+                         f"ccx writes the stiffness and mass matrices to <job>.sti and <job>.mas, "
+                         f"beside its .frd, and stops. Not Abaqus' <job>_STIF<n>.mtx / _MASS<n>.mtx: "
+                         f"lines 'row column value' of the upper triangle, column by column, in "
+                         f"global directions, the rows counting only the free DOFs (ccx leaves out "
+                         f"those *BOUNDARY holds and, as Abaqus' MPC=YES, the dependent DOFs of "
+                         f"equations and MPCs); line k of <job>.dof gives row k as node.direction.",
+                         once=True)
+        lost = [k for k in asked if k not in ("STIFFNESS", "MASS")]
+        if lost:
+            self.report.warn(f"*MATRIX GENERATE, {', '.join(lost)}: ccx writes no such matrix "
+                             f"(MATRIXSTORAGE writes the stiffness and mass only).", once=True)
+            self._reduces(f"*MATRIX GENERATE {', '.join(lost)} matrix not written")
+        for k in orig.params:
+            if k in self._MATRIX_DROPPED:
+                self.report.note(f"*MATRIX GENERATE {k} dropped: {self._MATRIX_DROPPED[k]}.", once=True)
+        flat = sorted({t for e, (t, _c) in self.geom.elements.items() if e not in self._u1 and
+                       e not in self._qmem and ccx_type(t).startswith(CCX_EXPANDED_PREFIXES)})
+        if flat:
+            self.report.warn(f"*MATRIX GENERATE on a model with {', '.join(flat[:4])}"
+                             f"{', ...' if len(flat) > 4 else ''} elements: ccx's matrices are those "
+                             f"of its expanded 3-D model (three translations at each expanded node, "
+                             f"labelled by the original node in the .dof, no rotations), not "
+                             f"Abaqus' element matrices.", once=True)
+            self._reduces("*MATRIX GENERATE of beam / shell / plane elements (ccx's expanded "
+                          "3-D model's matrices)")
+        return ["** abq2ccx: Abaqus' " + emit_keyword(orig.keyword, orig.params),
+                emit_keyword("FREQUENCY", b.params)]
+
+    def handle_matrix_output(self, b: Block) -> List[str]:
+        """``*MATRIX OUTPUT``: the text files Abaqus writes of a matrix generation step's
+        matrices; ccx's MATRIXSTORAGE writes its own (_matrix_storage)."""
+        return self._commented(b, "*MATRIX OUTPUT commented out: ccx writes the matrices of a "
+                                  "*MATRIX GENERATE step in its own format (<job>.sti, <job>.mas, "
+                                  "<job>.dof), whatever the FORMAT.", reduces=False)
 
     def _note_eigensolver(self, b: Block, v: Optional[str]) -> None:
         """EIGENSOLVER= of a *FREQUENCY / *BUCKLE card, which ccx has no choice of."""
@@ -35782,7 +35855,10 @@ class _Output:
         the *STEP of a step without output database requests (``why``): 'default', the
         output Abaqus writes then, or 'carried', an earlier step's preselected request, whose
         variables change with the procedure.  Its contact output (PRESELECT_CONTACT) only
-        where ccx writes it for the model (_contact_output_issues)."""
+        where ccx writes it for the model (_contact_output_issues).  None in a matrix generation
+        step (``timing['matrix']``), which writes the matrices only."""
+        if timing.get("matrix"):
+            return []
         node, elem = self._preselect_labels(timing["proc"], var)
         key = "EXPLICIT" if timing["kind"] == "explicit" else timing["proc"]
         abq_contact, contact = self._preselect_contact(timing)
@@ -35963,7 +36039,7 @@ class _Output:
         for the output spacing), fixed increment and (explicit) maximum increment."""
         proc = step.proc_card
         t = {"kind": "auto", "proc": proc.keyword if proc else None, "period": 1.0,
-             "dt": None, "dtmax": None}
+             "dt": None, "dtmax": None, "matrix": id(proc) in self._matrix_steps}
         if proc is None:
             return t
         if proc.keyword in UNTIMED_PROCS:
@@ -37690,6 +37766,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._dp_nlgeom = False                    # one stays: ccx runs NLGEOM (_plan_dp_materials)
         self._dp_unused: Dict[int, str] = {}       # cards of an unused one -> why commented out
         self._lc_marks: Dict[int, str] = {}        # *LOAD CASE of a step split per case -> its case
+        self._matrix_steps: Dict[int, Block] = {}  # MATRIXSTORAGE *FREQUENCY -> its *MATRIX GENERATE
         self._ic_ori: Dict[int, Tuple[str, str]] = {}  # element -> its section, orientation (_plan_ic_axes)
         self._ic_shell: Dict[int, tuple] = {}      # continuum shell / ply solid -> how its axes form (ditto)
         # (id(split composite section), ply group's set) -> ply solid -> its axes (_ply_group_axes)
@@ -38164,6 +38241,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "COMPLEX FREQUENCY": "handle_complex_frequency",
         "DYNAMIC": "handle_dynamic",
         "FREQUENCY": "handle_frequency",
+        "MATRIX OUTPUT": "handle_matrix_output",
         "BUCKLE": "handle_buckle",
         "HEAT TRANSFER": "handle_heat_transfer",
         "VISCO": "handle_visco",
@@ -38389,6 +38467,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             blocks = flatten_assembly(blocks, self.report, self.opt)
         blocks = self._move_between_cards(blocks)     # before anything splits the deck into steps
         blocks = self._split_load_cases(blocks)       # after it: its moved cards are the step's
+        blocks = self._matrix_generate_steps(blocks)  # before anything reads the procedures
         blocks = self._sp_amplitudes(blocks)          # before anything reads load amplitudes
         blocks = self._blank_periods(blocks)          # before the step model reads the periods
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
@@ -38874,6 +38953,59 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                                      once=True)
             out.append(b)
         return out
+
+    # the constraint cards whose dependent DOFs *MATRIX GENERATE, MPC=NO keeps (Abaqus' MPC=YES
+    # default leaves them out, as ccx does)
+    _MPC_CARDS = {"EQUATION", "MPC", "TIE", "COUPLING", "KINEMATIC COUPLING", "RIGID BODY",
+                  "DISTRIBUTING COUPLING", "SHELL TO SOLID COUPLING"}
+
+    def _matrix_generate_steps(self, blocks: List[Block]) -> List[Block]:
+        """A *MATRIX GENERATE step -> *FREQUENCY, SOLVER=MATRIXSTORAGE, with no data line (ccx
+        reads none there): ccx 2.23 then writes the model's stiffness and mass matrices
+        (<job>.sti, <job>.mas) and the node.direction of each row (<job>.dof), and stops: no
+        later step runs (arpack.c, matrixstorage.c; 2.23 manual, *FREQUENCY).  Both are linear
+        perturbation steps that assemble the matrices about the base state with the BCs in
+        force: ccx leaves the held DOFs out and eliminates the dependent DOFs of equations and
+        MPCs (Abaqus' MPC=YES default), and the step gets the *FREQUENCY step's PERTURBATION
+        (_frequency_perturbation: a preload's stress stiffness under NLGEOM only; probed, it
+        changes the .sti).  The step stays as it was (commented out, ccx stops there:
+        _no_procedure), warned, where ccx would write other matrices: neither STIFFNESS nor
+        MASS asked for, ELEMENT BY ELEMENT, ELSET=, SOURCE=MATRIX INPUT, FIELD=ACOUSTIC, MPC=NO
+        on a model with constraints, or a step after it.  The converted procedure card ->
+        the original (``_matrix_steps``: handle_frequency reports the files)."""
+        parts = list(deck_parts(blocks))
+        last = max((i for i, (step, _) in enumerate(parts) if step), default=-1)
+        mpcs = any(b.keyword in self._MPC_CARDS for b in blocks)
+        swap: Dict[int, Block] = {}
+        n = 0
+        for i, (step, cards) in enumerate(parts):
+            n += step
+            b = step_procedure(cards) if step else None
+            if b is None or b.keyword != "MATRIX GENERATE":
+                continue
+            why = None
+            if not (b.has("STIFFNESS") or b.has("MASS")):
+                why = "it asks for neither the stiffness nor the mass matrix, the two ccx writes"
+            elif b.has("ELEMENT BY ELEMENT"):
+                why = "ELEMENT BY ELEMENT asks for element matrices, ccx writes assembled ones"
+            elif b.param("ELSET"):
+                why = f"ELSET={b.param('ELSET').strip()} asks for a part of the model, ccx writes the whole model's"
+            elif b.uparam("SOURCE") == "MATRIX INPUT":
+                why = "SOURCE=MATRIX INPUT asks for the *MATRIX INPUT terms alone, which ccx lacks"
+            elif b.uparam("FIELD") == "ACOUSTIC":
+                why = "FIELD=ACOUSTIC asks for the acoustic matrices, ccx has no acoustic elements"
+            elif b.uparam("MPC") == "NO" and mpcs:
+                why = "MPC=NO keeps the constraints' dependent DOFs, which ccx eliminates"
+            elif i != last:
+                why = "ccx stops after writing the matrices, so the later steps would not run"
+            if why:
+                self.report.warn(f"Step {n}: *MATRIX GENERATE not converted to ccx's *FREQUENCY, "
+                                 f"SOLVER=MATRIXSTORAGE: {why}.", once=True)
+                continue
+            new = Block("FREQUENCY", OrderedDict(SOLVER="MATRIXSTORAGE"), [])
+            self._matrix_steps[id(new)] = b
+            swap[id(b)] = new
+        return [swap.get(id(b), b) for b in blocks] if swap else blocks
 
     def _sp_amplitudes(self, blocks: List[Block]) -> List[Block]:
         """A static perturbation or *BUCKLE step's loads, BCs and temperatures on an amplitude:
@@ -40546,6 +40678,48 @@ def ccx_unsolved_steps(stdout: str) -> List[int]:
     return [int(n) for n, text in zip(parts[1::2], parts[2::2]) if not _CCX_SOLVE_RE.search(text)]
 
 
+def ccx_matrices(job: str) -> Optional[str]:
+    """The matrix files a ccx step with SOLVER=MATRIXSTORAGE wrote for ``job`` (its path
+    without the extension) in this run, as "job.sti, job.mas, job.dof (24 rows)", or None.
+    ccx 2.23 writes them and stops, exit 0 without "Job finished" (its C output is lost when
+    stdout is a pipe; probed).  The first matrix (.sti, or .con for heat transfer) and the
+    .dof must be no older than <job>.inp, each .dof line node.direction, and each line of a
+    fresh matrix file (the first, .mas, .str, .sph) 'row column value' of the upper triangle
+    with a finite value (columns up to twice the .dof's rows: a cyclic symmetric model's
+    matrices are stored double, matrixstorage.c)."""
+    def fresh(ext: str) -> bool:
+        try:
+            t = os.path.getmtime(job + ext)
+        except OSError:
+            return False
+        try:
+            return t >= os.path.getmtime(job + ".inp")
+        except OSError:
+            return True
+    files = [e for e in (".sti", ".con") if fresh(e)][:1]
+    if not files or not fresh(".dof"):
+        return None
+    files += [e for e in (".mas", ".str", ".sph") if fresh(e)]
+    rows = 0
+    try:
+        with open(job + ".dof", encoding="ascii", errors="replace") as fh:
+            for ln in fh:
+                node, _, d = ln.strip().partition(".")
+                if not (node.isdigit() and d.isdigit()):
+                    return None
+                rows += 1
+        for ext in files:
+            with open(job + ext, encoding="ascii", errors="replace") as fh:
+                for ln in fh:
+                    i, j, v = ln.split()
+                    if not 1 <= int(i) <= int(j) <= 2 * rows or not math.isfinite(float(v)):
+                        return None
+    except (OSError, ValueError):
+        return None
+    name = os.path.basename(job)
+    return ", ".join(name + e for e in files + [".dof"]) + f" ({rows} rows)" if rows else None
+
+
 def classify_ccx_run(returncode, stdout: str, stderr: str, job: Optional[str] = None) -> str:
     """Classify a finished ccx run:
 
@@ -40557,16 +40731,23 @@ def classify_ccx_run(returncode, stdout: str, stderr: str, job: Optional[str] = 
                         up no equations like any other (see ccx_unsolved_steps);
     * ``"nonfinite"`` - the same, but the results hold NaN or Inf: ccx finishes a
                         diverged solution like any other (see ccx_nonfinite_result);
+    * ``"matrices"``  - exit 0, no ``*ERROR``, no crash/abort message, a STEP ran, and (given
+                        ``job``) it wrote its matrices (SOLVER=MATRIXSTORAGE: ccx_matrices),
+                        "Job finished" or not: the result of a matrix generation step;
     * ``"accepted"``  - no STEP ran (a mesh-only deck ccx only parsed), otherwise clean;
     * ``"failed"``    - anything else, including a crash after "Job finished".
 
     The per-iteration "no convergence" message is normal in nonlinear solves and is not
     a failure; a run that really gives up prints ``*ERROR``."""
-    if returncode != 0 or "Job finished" not in stdout:
+    if returncode != 0:
         return "failed"
     if "*ERROR" in stdout or "*ERROR" in stderr:
         return "failed"
     if any(s in stdout or s in stderr for s in CCX_ABORT_SIGNS):
+        return "failed"
+    if job and _CCX_STEP_RE.search(stdout) and ccx_matrices(job):
+        return "matrices"
+    if "Job finished" not in stdout:
         return "failed"
     if not _CCX_STEP_RE.search(stdout):
         return "accepted"
@@ -41534,7 +41715,8 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
             holds: Optional[Dict[int, tuple]] = None) -> dict:
     """Run CalculiX on a converted deck.  Returns ``{"code", "ccx", "ccx_version", "status",
     "log", "results"}``: ``code`` 0 if the analysis solves with finite results (or ccx accepts
-    a mesh-only deck that has nothing to solve), else 1; ``status`` as CcxRun.status (None
+    a mesh-only deck that has nothing to solve, or writes a matrix generation step's
+    matrices), else 1; ``status`` as CcxRun.status (None
     if no ccx ran); ``log`` the file ccx's output streams to, <job>.ccx.log (run_ccx_job:
     shown as it comes unless ``quiet``; stopped after ``timeout`` seconds); ``results`` a
     solved run's ccx_results_digest (``instances``, ``model``), which is also printed unless
@@ -41600,6 +41782,10 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
     elif status == "accepted":
         sys.stderr.write("abq2ccx: ccx accepted the deck, but it has no analysis step — "
                          "nothing was solved.\n")
+        run["code"] = 0
+    elif status == "matrices":
+        sys.stderr.write(f"abq2ccx: ccx wrote the matrices of the matrix generation step, "
+                         f"{ccx_matrices(job)}, and stopped there (their format: see the report).\n")
         run["code"] = 0
     elif status == "unsolved":
         idle = ccx_unsolved_steps(r.stdout)
