@@ -39,6 +39,17 @@ physics.
   and not where ccx's buckling factors may not be the lowest; it says why otherwise, and the
   deck runs on its perfect geometry. Without `--run` the card stays commented out and names the
   deck to supply.
+* **OFFSET TO NODES orientations, value distributions, integrated output** — three cards that
+  were commented out now convert exactly. `*ORIENTATION, DEFINITION=OFFSET TO NODES` (a
+  rectangular or cylindrical system) becomes a `*DISTRIBUTION` orientation with each element's
+  own axes from its local nodes; ccx stopped on the sections that named it. A `*DISTRIBUTION` of
+  a shell's thickness or offset, a composite layer's thickness or angle, a membrane's thickness,
+  or a solid's `*ELASTIC`, `*DENSITY` or `*EXPANSION` gives one section per distinct value on
+  its own element set, with a material copy per distinct property values; ccx used the
+  data-line thickness, or stopped on the distribution name. `*INTEGRATED OUTPUT` (with its
+  `*INTEGRATED OUTPUT SECTION`) becomes `*SECTION PRINT` on the surface: the total force, the
+  moment about the origin and the area in global axes. A reference node's moment, an
+  orientation's axes and `SOCF` are noted: ccx prints none of them.
 * **Batch triage, crash reports, ccx install hint** — `--json` prints one object per deck per
   line (JSON Lines), now with the deck's `status` (`converted`, `reduced`, `commented` or
   `failed`) and `reduced_physics`, and a line with `error` for a deck that failed (none was

@@ -9371,7 +9371,144 @@ def test_distribution_not_named_by_an_orientation_commented():
     body, _, rep = convert_str(HEX3 + "*Distribution, name=Thick, location=ELEMENT, table=TT\n"
                                ", 0.1\n1, 0.2\n*Solid Section, elset=ALL, material=M\n,\n")
     assert not any(l.startswith("*DISTRIBUTION") for l in _live(body))
-    assert "not named by any *ORIENTATION" in rep.text()
+    assert "is named by no orientation, shell or membrane thickness" in rep.text()
+
+
+# two C3D8 stacked along y (validate_with_ccx.py offset_bricks): element 2's local nodes 1-2
+# run along x, element 1's along y
+TWO_BRICKS = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+              "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n9, 1., 2., 0.\n10, 0., 2., 0.\n11, 1., 2., 1.\n"
+              "12, 0., 2., 1.\n*Element, type=C3D8, elset=ALL\n1, 1, 4, 8, 5, 2, 3, 7, 6\n"
+              "2, 4, 3, 9, 10, 8, 7, 11, 12\n*Elset, elset=SECOND\n2\n")
+ORTHO_M = ("*Material, name=M\n*Elastic, type=ENGINEERING CONSTANTS\n1000., 100., 100., 0., 0., 0., "
+           "50., 50.\n50.\n")
+
+
+def test_offset_to_nodes_orientation_as_a_distribution():
+    # the axes from each element's local nodes (a - c, b - c; c local node 1 by default) are a
+    # per-element *DISTRIBUTION orientation, which ccx takes (validate_with_ccx.py offset_bricks)
+    sec = "*Solid Section, elset=ALL, material=M, orientation=OFF\n"
+    body, conv, rep = convert_str(TWO_BRICKS + "*Orientation, name=OFF, definition=OFFSET TO NODES\n2, 4\n"
+                                  + ORTHO_M + sec)
+    assert _card(body, "*DISTRIBUTION, NAME=OFF_NODES") == ["1, 0., 1., 0., 0., 0., 1.",
+                                                           "2, 1., 0., 0., 0., 1., 0."]
+    assert _card(body, "*ORIENTATION, NAME=OFF") == ["OFF_NODES"] and conv.reduced_physics == []
+    assert "OFFSET TO NODES -> a *DISTRIBUTION orientation" in rep.text()
+    # an origin node, a rotation line; cylindrical: points a and b themselves
+    body, _, _ = convert_str(TWO_BRICKS + "*Orientation, name=OFF, definition=OFFSET TO NODES\n3, 4, 2\n3, 30.\n"
+                             + ORTHO_M + sec)
+    # (element 1: a = (0, 0, 1), b = (0, -1, 1) from node 4; the rotation turned into its axes)
+    assert _card(body, "*DISTRIBUTION, NAME=OFF_NODES")[0] == "1, 0, -0.5, 0.866025404, 0, -0.866025404, -0.5"
+    body, _, _ = convert_str(TWO_BRICKS + "*Orientation, name=OFF, definition=OFFSET TO NODES, "
+                             "system=CYLINDRICAL\n1, 5\n" + ORTHO_M + sec)
+    assert _card(body, "*DISTRIBUTION, NAME=OFF_NODES") == ["1, 0., 0., 0., 1., 0., 0.",
+                                                           "2, 0., 1., 0., 0., 1., 1."]
+    # local nodes that give one element no axes (a and c the same node there): warned, reduced
+    body, conv, rep = convert_str(TWO_BRICKS.replace("2, 4, 3, 9,", "2, 4, 3, 4,") +
+                                  "*Orientation, name=OFF, definition=OFFSET TO NODES\n2, 3\n" + ORTHO_M + sec)
+    assert "give no axes on 1 element(s)" in rep.text() and len(conv.reduced_physics) == 1
+    # on shells: Abaqus' directions per element group (_plan_split / _shell_axes_rows)
+    strip = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+             "6, 2., 1., 0.\n*Element, type=S4, elset=ALL\n1, 1, 4, 5, 2\n2, 2, 3, 6, 5\n")
+    body, conv, _ = convert_str(strip + "*Orientation, name=OFF, definition=OFFSET TO NODES\n2, 4\n3, 0.\n"
+                                "*Material, name=M\n*Elastic, type=LAMINA\n1000., 100., 0., 50., 50., 50.\n"
+                                "*Shell Section, elset=ALL, material=M, orientation=OFF\n0.1\n")
+    oris = [ln for ln in _live(body) if ln.startswith("*SHELL SECTION")]
+    assert len(oris) == 2 and all("ORIENTATION=" in ln for ln in oris)
+
+
+def test_shell_thickness_and_layer_distributions_split_the_section():
+    strip = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+             "6, 2., 1., 0.\n*Element, type=S4, elset=ALL\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n"
+             "*Material, name=M\n*Elastic\n1000., 0.\n*Distribution table, name=T\nLENGTH\n")
+    dist = "*Distribution, name=TH, location=ELEMENT, table=T\n, 0.1\n2, 0.2\n"
+    body, conv, rep = convert_str(strip + dist + "*Shell Section, elset=ALL, material=M, shell thickness=TH\n0.5, 5\n")
+    assert _card(body, "*SHELL SECTION, ELSET=ALL_D1, MATERIAL=M") == ["0.1"]
+    assert _card(body, "*SHELL SECTION, ELSET=ALL_D2, MATERIAL=M") == ["0.2"]
+    assert _card(body, "*ELSET, ELSET=ALL_D2") == ["2"] and conv.reduced_physics == []
+    assert not any(ln.startswith("*DISTRIBUTION") for ln in _live(body))
+    # a composite's layers scaled to it (SYMMETRIC: the full stack), a layer's thickness and angle
+    # by their own distributions, the offset by one
+    body, _, _ = convert_str(strip + dist + "*Distribution, name=ANG, location=ELEMENT\n, 0.\n2, 45.\n"
+                             "*Shell Section, elset=ALL, composite, shell thickness=TH, symmetric, offset=TH\n"
+                             "1., 3, M, 0.\n1., 3, M, ANG\n")
+    assert _card(body, "*SHELL SECTION, ELSET=ALL_D1, COMPOSITE, OFFSET=0.1") == ["0.025, , M"] * 4
+    assert _card(body, "*SHELL SECTION, ELSET=ALL_D2, COMPOSITE, OFFSET=0.2") == [
+        "0.05, , M, ABQ2CCX_OR0", "0.05, , M, ABQ2CCX_OR1", "0.05, , M, ABQ2CCX_OR1", "0.05, , M, ABQ2CCX_OR0"]
+    body, _, _ = convert_str(strip + dist + "*Shell Section, elset=ALL, composite\nTH, 3, M, 0.\n0.3, 3, M, 90.\n")
+    sections = [ln for ln in _live(body) if ln.startswith("*SHELL SECTION")]
+    assert len(sections) == 2 and _card(body, sections[1]) == ["0.2, , M, ABQ2CCX_OR0", "0.3, , M, ABQ2CCX_OR1"]
+    # a membrane's thickness
+    body, _, _ = convert_str(strip.replace("S4", "M3D4") + dist +
+                             "*Membrane Section, elset=ALL, material=M, membrane thickness=TH\n0.5\n")
+    assert _card(body, "*MEMBRANE SECTION, ELSET=ALL_D2, MATERIAL=M") == ["0.2"]
+
+
+def test_material_property_distributions_become_material_copies():
+    # *ELASTIC (a 9-value record over two lines), *DENSITY and *EXPANSION by distributions: one
+    # copy per distinct set of values, the default ones in the material itself
+    mat = ("*Distribution, name=EL, location=ELEMENT, table=TE\n, 1000., 100., 100., 0., 0., 0., 50.\n50., 50.\n"
+           "SECOND, 2000., 100., 100., 0., 0., 0., 50.\n50., 50.\n*Distribution table, name=TE\n"
+           "MODULUS, MODULUS, MODULUS, RATIO, RATIO, RATIO, MODULUS, MODULUS, MODULUS\n"
+           "*Distribution, name=RHO, location=ELEMENT\n, 7.8e-9\n2, 7.8e-9\n"
+           "*Distribution, name=ALPHA, location=ELEMENT\n, 1.2e-5\n2, 2.4e-5\n"
+           "*Material, name=M\n*Elastic, type=ENGINEERING CONSTANTS\nEL\n*Density\nRHO\n*Expansion\nALPHA\n"
+           "*Plastic\n250., 0.\n*Solid Section, elset=ALL, material=M\n")
+    body, conv, rep = convert_str(TWO_BRICKS + mat)
+    lines = _live(body)
+    m = lines.index("*MATERIAL, NAME=M")
+    d1 = lines.index("*MATERIAL, NAME=M_D1")
+    assert "1000., 100., 100., 0., 0., 0., 50., 50." in lines[m:d1] and "1.2e-5" in lines[m:d1]
+    assert "2000., 100., 100., 0., 0., 0., 50., 50." in lines[d1:] and "2.4e-5" in lines[d1:]
+    assert "*SOLID SECTION, ELSET=ALL_D1, MATERIAL=M" in lines
+    assert "*SOLID SECTION, ELSET=ALL_D2, MATERIAL=M_D1" in lines and "*PLASTIC" in lines[d1:]
+    assert conv.reduced_physics == [] and "EL" not in lines and "copy of the material" in rep.text()
+    # no default line: Abaqus requires one, the elements it does not list get the first line
+    _, _, rep = convert_str(TWO_BRICKS + mat.replace(", 7.8e-9\n2, 7.8e-9", "2, 7.8e-9"))
+    assert "*DISTRIBUTION RHO has no default line" in rep.text()
+    # Abaqus documents them for solid continuum elements: on a shell written alike, warned
+    strip = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, "
+             "elset=ALL\n1, 1, 2, 3, 4\n*Distribution, name=E, location=ELEMENT\n, 1000., 0.3\n1, 900., 0.3\n"
+             "*Material, name=M\n*Elastic\nE\n*Shell Section, elset=ALL, material=M\n0.1\n")
+    body, _, rep = convert_str(strip)
+    assert "*SHELL SECTION, ELSET=ALL, MATERIAL=M_D1" in body and "documents for solid continuum" in rep.text()
+
+
+IO_BAR = (TWO_BRICKS.replace("1, 1, 4, 8, 5, 2, 3, 7, 6", "1, 1, 2, 3, 4, 5, 6, 7, 8") +
+          "*Node\n100, 0.5, 1., 0.5\n*Nset, nset=BOT\n1, 2, 5, 6\n*Nset, nset=TOP\n9, 10, 11, 12\n"
+          "*Surface, name=CUT, type=ELEMENT\n1, S5\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+          "*Solid Section, elset=ALL, material=M\n")
+IO_STEP = ("*Step\n*Static\n*Boundary\nBOT, 2, 2\n1, 1, 3\n2, 3, 3\n5, 1, 1\n*Cload\nTOP, 2, 2.5\n"
+           "*Output, history, frequency=2\n*Integrated Output, {}\n{}\n*End Step\n")
+
+
+def test_integrated_output_as_section_print():
+    # an *INTEGRATED OUTPUT over a surface -> ccx's *SECTION PRINT (total force, moment about the
+    # origin, area); its *OUTPUT's frequency is the step's (validate_with_ccx.py integrated_output)
+    body, conv, rep = convert_str(IO_BAR + IO_STEP.format("surface=CUT", "SOF, SOM"))
+    assert "*OUTPUT, FREQUENCY=2\n*SECTION PRINT, SURFACE=CUT, NAME=CUT\nSOF, SOM\n" in body
+    assert conv.reduced_physics == [] and "moment about the global origin" in rep.text()
+    # through an *INTEGRATED OUTPUT SECTION: its reference node's SOM, its axes and SOCF noted
+    ios = "*Integrated Output Section, name=IOS1, surface=CUT, ref node=100, orientation=OR\n"
+    body, _, rep = convert_str(IO_BAR + "*Orientation, name=OR\n0., 1., 0., -1., 0., 0.\n" + ios
+                               + IO_STEP.format("section=IOS1", "SOF, SOM, SOAREA, SOCF"))
+    assert "*SECTION PRINT, SURFACE=CUT, NAME=IOS1\nSOF, SOM, SOAREA\n" in body
+    assert "about reference node 100 at (0.5, 1., 0.5)" in rep.text()
+    assert "no ccx counterpart for SOCF" in rep.text() and "in the section's local axes" in rep.text()
+    assert "** *INTEGRATED OUTPUT SECTION" in body
+    _, _, rep = convert_str(IO_BAR + ios.replace("ref node=100", "ref node=100, position=CENTER")
+                            + IO_STEP.format("section=IOS1", "SOM"))
+    assert "ccx's moment about the centre of gravity" in rep.text()
+    # dropped: a node surface, an undefined section, only variables ccx lacks, a heat step
+    for deck, why in ((IO_BAR + "*Surface, name=NS, type=NODE\nTOP\n" + IO_STEP.format("surface=NS", "SOF"),
+                       "not an element-based surface"),
+                      (IO_BAR + IO_STEP.format("section=NONE", "SOF"), "SECTION NONE is not defined"),
+                      (IO_BAR + IO_STEP.format("surface=CUT", "SOCF"), "have no ccx counterpart"),
+                      (IO_BAR + IO_STEP.format("surface=CUT", "SOF").replace("*Static", "*Frequency\n2"),
+                       "no section output in a *FREQUENCY step")):
+        body, conv, rep = convert_str(deck)
+        assert "*SECTION PRINT" not in "\n".join(_live(body)) and why in rep.text(), why
+        assert conv.reduced_physics == []
 
 
 def test_distribution_plate_examples():
@@ -14188,6 +14325,8 @@ def test_attribute_owners():
                           "(_Constraints), tied contact pairs (_Mesh)",
         "_dist_tables": "the *DISTRIBUTION TABLEs of rewritten distributions: the axes' "
                         "(_plan_distributions) and the ply split's",
+        "_dist_cards": "the *DISTRIBUTION cards by name: the deck's (_plan_deck_facts) and the "
+                       "per-element ones of OFFSET TO NODES orientations (_plan_offset_orientations)",
         "_mem_thinning": "a membrane material's thinning ratio, which its copies take: the section "
                          "mass's (_Mesh) and the explicit mass scaling's (_mass_scaled_material)",
     }
@@ -18876,6 +19015,8 @@ def test_ccx_version_is_read_and_checked():
 
 COMPOSITE_MAT = ("*Material, name=CFRP\n*Elastic, type=ENGINEERING CONSTANTS\n"
                  "140000., 10000., 10000., 0.3, 0.3, 0.4, 5000., 5000.,\n3500.\n")
+# an orientation from each element's nodes the converter cannot write: ccx has no spherical system
+SPHERICAL_OFFSET = "*Orientation, name={}, definition=OFFSET TO NODES, system=SPHERICAL\n{}\n"
 S4R_STRIP = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
              "6, 2., 1., 0.\n*Element, type=S4R, elset=PLATE\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n"
              "*Nset, nset=CLAMP\n1, 4\n*Nset, nset=TIP\n3, 6\n" + COMPOSITE_MAT)
@@ -19984,15 +20125,15 @@ def test_distribution_composite_with_axis_3_off_the_normal_gets_exact_plies():
 
 
 def test_orientation_without_axes_is_not_given_made_up_directions():
-    # an orientation from each element's nodes, or one whose points are missing, has no axes
-    # the converter knows: its sections keep naming it (commented out, so ccx stops)
+    # a spherical orientation from each element's nodes, or one whose points are missing, has
+    # no axes the converter knows: its sections keep naming it (commented out, so ccx stops)
     xz = S4R_STRIP.replace(", 1., 0.\n", ", 0., 1.\n")
     sec = "*Shell Section, elset=PLATE, material=CFRP, orientation=O\n0.1\n"
-    for ori in ("*Orientation, name=O, definition=OFFSET TO NODES\n1, 2, 4\n", "*Orientation, name=O\n1., 0., 0.\n"):
+    for ori in (SPHERICAL_OFFSET.format("O", "1, 2, 4"), "*Orientation, name=O\n1., 0., 0.\n"):
         body, conv, _ = convert_str(xz + ori + sec)
         assert "ABQ2CCX_AXES" not in body and "MATERIAL=CFRP, ORIENTATION=O" in body
     # a composite ply split on such an orientation warns, as for an undefined one
-    body, conv, rep = convert_str(SC8R_STRIP + "*Orientation, name=O, definition=OFFSET TO NODES\n1, 2, 4\n"
+    body, conv, rep = convert_str(SC8R_STRIP + SPHERICAL_OFFSET.format("O", "1, 2, 4") +
                                   "*Shell Section, elset=PLATE, composite, orientation=O\n" + LAYUP)
     assert "has no axes the converter can form" in rep.text()
     assert any("ply orientation O without axes" in r for r in conv.reduced_physics)
@@ -20634,7 +20775,7 @@ def test_initial_stress_and_plastic_strain_turned_into_global_axes():
     # the values as given, reduced physics
     on_axis = "*Orientation, name=OR, system=CYLINDRICAL\n0.5, 0.5, 0., 0.5, 0.5, 1.\n"
     for deck, why in ((HEX.replace("C3D8", "C3D8R") + ISO_STEEL + on_axis + sec, "undefined at an integration point"),
-                      (HEX + ISO_STEEL + "*Orientation, name=OR, definition=OFFSET TO NODES\n1, 2, 4\n" + sec,
+                      (HEX + ISO_STEEL + SPHERICAL_OFFSET.format("OR", "1, 2, 4") + sec,
                        "are not known")):
         body, conv, rep = convert_str(deck + "*Initial Conditions, type=STRESS\nEALL, 100., 0., 0., 0., 0., 0.\n")
         assert flag[0] in conv.reduced_physics and why in rep.text()
@@ -20705,7 +20846,7 @@ def test_initial_stress_on_continuum_shells_in_their_shell_axes():
            "EALL, 0.004, -0.001, 0.002\n", ((1., 0., 0.), (0., -1., 0.), (0., 0., -1.)),
            "*INITIAL CONDITIONS, TYPE=PLASTIC STRAIN", [0.004, -0.001, 0., 0.001, 0., 0.])
     # axes the converter cannot form: the values as given, reduced physics
-    body, conv, rep = convert_str(down + ISO_STEEL + "*Orientation, name=OR, definition=OFFSET TO NODES\n1, 2, 4\n"
+    body, conv, rep = convert_str(down + ISO_STEEL + SPHERICAL_OFFSET.format("OR", "1, 2, 4")
                                   + oriented + ic)
     assert flag in conv.reduced_physics and "cannot form their shell axes" in rep.text()
     assert _card(body, "*INITIAL CONDITIONS, TYPE=STRESS")[0] == "1, 1, 100., -40., 0., 30., 0., 0."
@@ -21703,8 +21844,7 @@ def test_orientation_without_axes_ccx_could_take():
     iso = "*Material, name=M\n*Elastic\n1000., 0.3\n"
     eng = ("*Material, name=M\n*Elastic, type=ENGINEERING CONSTANTS\n100., 10., 10., 0.3, 0.3, 0.3, "
            "5., 5.,\n5.\n")
-    for ori in ("*Orientation, name=OR1\n1., 0., 0.\n",
-                "*Orientation, name=OR1, definition=OFFSET TO NODES\n1, 2\n"):
+    for ori in ("*Orientation, name=OR1\n1., 0., 0.\n", SPHERICAL_OFFSET.format("OR1", "1, 2")):
         body, conv, _ = convert_str(HEX + iso + ori + sec)
         assert "*ORIENTATION, NAME=OR1\n1., 0., 0., 0., 1., 0.\n" in body and conv.reduced_physics == []
         body, conv, _ = convert_str(HEX + eng + ori + sec)

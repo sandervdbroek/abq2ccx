@@ -999,10 +999,10 @@ MULTIWORD_PARAMS = (
     "KINEMATIC SPLIT", "LAST ITERATIONS", "LAST MODE", "LENGTH RATIO", "LOAD CASE", "MAX DEGRADATION",
     "MEMBRANE THICKNESS", "MODE LIST", "NEO HOOKE", "NEW SET", "NO ROTATION", "NO SEPARATION",
     "NO THICKNESS", "NODAL THICKNESS", "NUMBER INTERVAL", "OLD SET", "OUTPUT ALL",
-    "PARTIAL EMBED", "PARTICLE THICKNESS", "PIN NSET", "POSITION TOLERANCE", "PROPERTY EVALUATION",
-    "PUBLIC NODES", "RAMP INITIAL STRESS",
-    "REDUCED POLYNOMIAL", "REF NODE", "RELATIVE TO ABSOLUTE", "ROT NODE", "ROUNDOFF TOLERANCE",
-    "SCALE FACTOR",
+    "PARTIAL EMBED", "PARTICLE THICKNESS", "PIN NSET", "POSITION TOLERANCE", "PROJECT ORIENTATION",
+    "PROPERTY EVALUATION", "PUBLIC NODES", "RAMP INITIAL STRESS",
+    "REDUCED POLYNOMIAL", "REF NODE", "REF NODE MOTION", "RELATIVE TO ABSOLUTE", "ROT NODE",
+    "ROUNDOFF TOLERANCE", "SCALE FACTOR",
     "SCALE STRESS", "SECOND ORDER ACCURACY", "SECTION FORCES", "SECTION POINTS", "SHELL THICKNESS",
     "SHIFT NODES", "SHOCK SMOOTHING", "SMALL SLIDING", "SOLID INFINITE FORMULATION",
     "SPH FORMULATION", "SPH SMOOTHING LENGTH", "SPH TENSILE INSTABILITY CONTROL",
@@ -4396,8 +4396,8 @@ OUTPUT_ONLY_KEYWORDS = {
     "INCREMENTATION OUTPUT", "FILE FORMAT",
     "FILE OUTPUT", "MONITOR", "PRINT", "DIAGNOSTICS", "CONTOUR INTEGRAL", "RADIATION OUTPUT",
     "RADIATION PRINT", "RADIATION FILE", "USER OUTPUT VARIABLES", "ELEMENT MATRIX OUTPUT",
-    "MATRIX CHECK", "MODAL OUTPUT", "MODAL PRINT", "MODAL FILE", "SECTION FILE", "INTEGRATED OUTPUT",
-    "INTEGRATED OUTPUT SECTION", "ELEMENT RESPONSE", "NODE RESPONSE", "SURFACE PRINT"}
+    "MATRIX CHECK", "MODAL OUTPUT", "MODAL PRINT", "MODAL FILE", "SECTION FILE",
+    "ELEMENT RESPONSE", "NODE RESPONSE", "SURFACE PRINT"}
 # Abaqus numerical controls with no ccx card (ccx uses its own): they steer the solver, not
 # the model, so ccx still solves the deck's physics.
 NUMERICAL_KEYWORDS = {
@@ -21067,6 +21067,98 @@ class _Axes:
                 rot = None
         self._orient_rotation[name] = rot
 
+    # the sections whose elements an OFFSET TO NODES orientation takes its axes from
+    _OFFSET_READERS = ("SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "MEMBRANE SECTION",
+                       "COHESIVE SECTION", "GASKET SECTION")
+
+    def _plan_offset_orientations(self, blocks: List[Block]) -> None:
+        """*ORIENTATION, DEFINITION=OFFSET TO NODES as the per-element *DISTRIBUTION orientation it
+        is (Abaqus 2017 "Orientations": points a, b and c, by default local node 1, are local
+        nodes of each element that uses it, in its connectivity order): one line per element of
+        the sections that name it, a - c and b - c for a rectangular system (a distribution
+        line's origin is the global one), a and b for a cylindrical one (points on its axis),
+        in the original configuration; the card names the distribution instead.  ccx 2.23 takes
+        per-element axes only through a distribution, which _plan_distributions then plans
+        like a deck's own.  Left as it is (_orientation_out) for a spherical or Z RECTANGULAR
+        system, where no section names it, or where another card does (Abaqus allows none of
+        connectors, springs, couplings and contact pairs)."""
+        offs = [b for b in blocks if b.keyword == "ORIENTATION" and
+                b.uparam("DEFINITION").startswith("OFFSET")]
+        if not offs:
+            return
+        elems: Dict[str, List[int]] = {}
+        other: set = set()
+        for b in blocks:
+            names = {b.uparam("ORIENTATION")}
+            if b.keyword in self._OFFSET_READERS and b.has("COMPOSITE"):
+                names |= {f for _t, _m, f in self._section_layers(b)}
+            if b.keyword == "CONNECTOR SECTION":
+                other |= {x.strip().upper() for r in merged_data_records(b) for x in r}
+            for name in names - {""}:
+                if b.keyword in self._OFFSET_READERS:
+                    elems.setdefault(name, []).extend(self._existing(b.param("ELSET") or ""))
+                elif b.keyword not in ("ORIENTATION", "INTEGRATED OUTPUT SECTION"):
+                    other.add(name)
+        taken = {k for k in self._dist_cards} | {b.uparam("NAME") for b in blocks if b.param("NAME")} | \
+            {n.upper() for n in list(self.geom.elsets) + list(self.geom.nsets)}
+        P = self.geom.nodes
+        for b in offs:
+            name = b.uparam("NAME")
+            members = dedup(elems.get(name, []))
+            system = b.uparam("SYSTEM")
+            why = ("ccx has no spherical or Z RECTANGULAR system" if system not in (
+                       "", "R", "RE", "REC", "RECT", "RECTANGULAR", "C", "CY", "CYL", "CYLINDRICAL") else
+                   "a card other than a section names it (Abaqus allows it on none of connectors, springs, "
+                   "couplings and contact pairs)" if name in other else
+                   "no section names it" if not members else None)
+            recs = merged_data_records(b)
+            rec = (recs[0] if recs else []) + ["", "", ""]
+            try:
+                a, bb = pint(rec[0]), pint(rec[1])
+                c = pint(rec[2]) if rec[2] else 1
+            except ValueError:
+                why = why or "its local node numbers do not read"
+            if why:
+                self._offset_why[name] = why
+                continue
+            rect = not system.startswith("C")
+            lines, bad = [], []
+            for e in members:
+                conn = self.geom.elements[e][1]
+                if not (0 < a <= len(conn) and 0 < bb <= len(conn) and 0 < c <= len(conn)) or \
+                        any(conn[i - 1] not in P for i in (a, bb, c)):
+                    bad.append(e)
+                    continue
+                pa, pb, pc = P[conn[a - 1]], P[conn[bb - 1]], P[conn[c - 1]]
+                va, vb = (vsub(pa, pc), vsub(pb, pc)) if rect else (pa, pb)
+                if not (vnorm(vcross(va, vb)) if rect else vnorm(vsub(va, vb))):
+                    bad.append(e)
+                    continue
+                lines.append(f"{e}, " + ", ".join(short_real(x, 12) for x in (*va, *vb)))
+            if not lines:
+                self._offset_why[name] = (f"local nodes {a}, {bb}, {c} give no axes on any element of "
+                                          f"its sections (too few nodes, or the points coincide or lie "
+                                          f"on a line), which Abaqus stops on")
+                continue
+            if bad:
+                self.report.warn(f"*ORIENTATION {name}, DEFINITION=OFFSET TO NODES: local nodes "
+                                 f"{a}, {bb}, {c} give no axes on {len(bad)} element(s) of its sections "
+                                 f"(element {bad[0]}: too few nodes, or the points coincide or lie "
+                                 f"on a line); Abaqus stops on this. Those elements get the first "
+                                 f"element's axes — verify.", once=True)
+                self._reduces(f"*ORIENTATION {name}, DEFINITION=OFFSET TO NODES on elements it gives no axes")
+                lines.insert(0, ", " + lines[0].split(",", 1)[1].strip())    # (their default line)
+            dist = self._fresh_name(f"{name}_NODES", taken)
+            self._dist_cards[dist] = Block("DISTRIBUTION", OrderedDict(
+                [("NAME", dist), ("LOCATION", "ELEMENT")]), lines)
+            b.params.pop("DEFINITION", None)
+            b.data = [dist] + [", ".join(r) for r in recs[1:]]
+            self._register_orientation(b)
+            self.report.note("*ORIENTATION, DEFINITION=OFFSET TO NODES -> a *DISTRIBUTION "
+                             "orientation with each element's own axes from its local nodes (the "
+                             "same per-element systems; ccx takes per-element axes only through a "
+                             "distribution).", once=True)
+
     def _sheet_axes(self, b: Block, ori: str, angle: float,
                     plain: Tuple[Vec, Vec, Vec]) -> Optional[Tuple[Vec, Vec, Vec]]:
         """Abaqus' material axes (directions 1, 2 and the normal) of a layer of the shell,
@@ -21219,9 +21311,11 @@ class _Axes:
     def handle_orientation(self, b: Block) -> List[str]:
         definition = (b.param("DEFINITION") or "COORDINATES").strip().upper()
         if definition.startswith("OFFSET"):
-            return self._orientation_out(b, "*ORIENTATION, DEFINITION=OFFSET TO NODES (axes from "
-                                            "each element's own local nodes) has no ccx equivalent; "
-                                            "define the system by coordinates or a *DISTRIBUTION.")
+            why = self._offset_why.get(b.uparam("NAME"), "it is not written")
+            return self._orientation_out(b, f"*ORIENTATION {b.param('NAME') or ''}, DEFINITION=OFFSET "
+                                            f"TO NODES: ccx takes axes from each element's local nodes "
+                                            f"only as a *DISTRIBUTION, which the converter writes for the "
+                                            f"sections that name it; here {why}.")
         if self._orientation_distribution(b) is not None:
             return self._distribution_orientation(b)
         name = b.uparam("NAME")
@@ -21353,6 +21447,11 @@ class _Axes:
         names it (see _plan_distributions), so the card itself emits nothing.  ccx has no
         other kind of distribution."""
         name = b.uparam("NAME")
+        if name in self._value_dists:
+            self.report.note("*DISTRIBUTION of shell thicknesses, offsets, layer values or material "
+                             "properties: taken into one section (and material copy) per distinct "
+                             "value (_plan_value_distributions; no card of its own in ccx).", once=True)
+            return []
         if name in self._ply_angle_dists:
             self.report.note(f"*DISTRIBUTION {name} of composite layer angles: taken into the axes "
                              f"of the ply solids (no card of its own in ccx).", once=True)
@@ -21378,22 +21477,283 @@ class _Axes:
         if plans:
             return self._commented(b, f"*DISTRIBUTION {name} has no data lines, so the "
                                       f"*ORIENTATION that names it cannot be formed.", reduces=False)
-        return self._commented(b, f"*DISTRIBUTION {name} is not named by any *ORIENTATION: ccx "
-                                  f"supports distributions only as per-element orientations "
-                                  f"(Abaqus also distributes shell thicknesses and material "
-                                  f"properties) — model the variation with element sets and one "
-                                  f"section or material each.", reduces=name in self._param_values)
+        return self._commented(b, f"*DISTRIBUTION {name} is named by no orientation, shell or "
+                                  f"membrane thickness, shell offset, composite layer or solid's "
+                                  f"*ELASTIC / *DENSITY / *EXPANSION the converter takes it into: ccx "
+                                  f"has no distribution of other values — model the variation with "
+                                  f"element sets and one section or material each.",
+                               reduces=name in self._param_values)
 
     def handle_distribution_table(self, b: Block) -> List[str]:
         if b.uparam("NAME") in self._dist_tables:
             self.report.note("*DISTRIBUTION TABLE of an orientation distribution dropped (ccx "
                              "needs no table: its distribution lines are always a, b).", once=True)
             return []
+        if b.uparam("NAME") in self._value_dist_tables:
+            self.report.note("*DISTRIBUTION TABLE of a thickness, offset, layer or material "
+                             "distribution dropped (its values are in the split sections and "
+                             "material copies).", once=True)
+            return []
         if b.uparam("NAME") in self._qmem_dist_tables:
             self.report.note("*DISTRIBUTION TABLE of a membrane thickness distribution dropped (the "
                              "thicknesses are in the geometry of the solids).", once=True)
             return []
         return self.passthrough(b)
+
+    # values per record of a material card's distribution (Abaqus 2017 Keywords *DISTRIBUTION):
+    # *ELASTIC by TYPE, *EXPANSION by TYPE, *DENSITY one
+    _ELASTIC_DIST_VALUES = {"ISOTROPIC": 2, "ISO": 2, "ENGINEERING CONSTANTS": 9, "LAMINA": 6,
+                            "ORTHOTROPIC": 9, "ANISOTROPIC": 21}
+    _EXPANSION_DIST_VALUES = {"ISO": 1, "ISOTROPIC": 1, "ORTHO": 3, "ORTHOTROPIC": 3, "ANISO": 6,
+                              "ANISOTROPIC": 6}
+
+    def _value_records(self, name: str, n: int):
+        """``(default, {element: tokens})`` of element distribution ``name`` read as records of
+        ``n`` values (a record continues on the next lines, which carry no label, until it has
+        them: Abaqus' 8 fields a line), an element-set label covering its members, a later
+        record winning; None where it has no data or a record does not read as ``n`` numbers."""
+        dist = self._dist_cards.get(name)
+        if dist is None or not (dist.param("LOCATION") or "ELEMENT").strip().upper().startswith("ELEM"):
+            return None
+        default, vec, label, vals = None, {}, None, []
+        recs = [r for r in merged_data_records(dist) if any(r)]
+        for i, r in enumerate(recs):
+            if label is None:
+                label, vals = r[0], [x or "0." for x in r[1:]]
+            else:
+                vals += [x or "0." for x in r]
+            if len(vals) < n and i + 1 < len(recs):
+                continue
+            if len(vals) != n:
+                return None
+            try:
+                [pf(x) for x in vals]
+            except ValueError:
+                return None
+            toks = tuple(x if len(x) <= 20 and any(c in x for c in ".eE") else short_real(pf(x), 12)
+                         for x in vals)
+            if label == "":
+                default = toks
+            elif re.fullmatch(r"[-+]?\d+", label):
+                vec[int(label)] = toks
+            else:
+                for e in self._existing(label):
+                    vec[e] = toks
+            label, vals = None, []
+        if default is None and not vec:
+            return None
+        return default, vec
+
+    def _plan_value_distributions(self, blocks: List[Block]) -> List[Block]:
+        """*DISTRIBUTION of the values Abaqus 2017 distributes over elements ("Distribution
+        definition"): a *SHELL SECTION's SHELL THICKNESS (a composite's layers scaled to it,
+        Keywords *SHELL SECTION) and OFFSET, a composite shell layer's thickness and angle, a
+        *MEMBRANE SECTION's MEMBRANE THICKNESS, and the *ELASTIC, *DENSITY and *EXPANSION of a
+        solid section's material (a distribution name as their data line).  ccx distributes
+        none of these, but every element of a section has one value of each, so the section
+        is split by element set into one section per distinct set of values (the same
+        elements, the same values: exact), each naming a copy of the material with the values
+        as numbers; the default values stay in the material itself.  Continuum shells ignore a
+        shell section's distributions here (Abaqus: SHELL THICKNESS, _plan_ply_split's layer
+        angles), as do the layer angles of a composite solid (_solid_ply_axes).  An element a
+        distribution does not list and that has no default line (Abaqus requires one) gets
+        the first line's values, warned."""
+        dists = {k for k in self._dist_cards if k}
+        if not dists:
+            return blocks
+        tables = {b.uparam("NAME"): b for b in blocks if b.keyword == "DISTRIBUTION TABLE"}
+        cache: Dict[Tuple[str, int], object] = {}
+
+        def table_values(name: str) -> Optional[int]:
+            t = tables.get(self._dist_cards[name].uparam("TABLE"))
+            if t is None:
+                return None
+            labs = [x.strip().upper() for r in merged_data_records(t) for x in r if x.strip()]
+            return sum(3 if x == "COORD3D" else 6 if x in ("ORIENTS", "ORITENS") else 1 for x in labs)
+
+        def values(name: str, n: int):
+            if (name, n) not in cache:
+                want = table_values(name)
+                cache[(name, n)] = None if want not in (None, n) else self._value_records(name, n)
+            return cache[(name, n)]
+
+        def named(tok: str) -> Optional[str]:
+            """The distribution a data field names, or None."""
+            t = (tok or "").strip().upper()
+            if t not in dists:
+                return None
+            try:
+                pf(t)
+                return None
+            except ValueError:
+                return t
+        # materials whose *ELASTIC / *DENSITY / *EXPANSION name a distribution
+        opts = self._material_options(blocks)
+        mat_dist: Dict[str, List[Tuple[Block, str, int]]] = {}
+        for mat, group in opts.items():
+            for c in group[1:]:
+                recs = merged_data_records(c) if c.keyword in ("ELASTIC", "DENSITY", "EXPANSION") else []
+                d = named(recs[0][0]) if recs and recs[0] else None
+                if d is None:
+                    continue
+                typ = (c.param("TYPE") or "").strip().upper()
+                n = (self._ELASTIC_DIST_VALUES.get(typ or "ISOTROPIC") if c.keyword == "ELASTIC" else
+                     self._EXPANSION_DIST_VALUES.get(typ or "ISO") if c.keyword == "EXPANSION" else 1)
+                if n is not None and values(d, n) is not None:
+                    mat_dist.setdefault(mat, []).append((c, d, n))
+        taken = set(opts) | {n.upper() for n in list(self.geom.elsets) + list(self.geom.nsets)} | \
+            {b.uparam("NAME") for b in blocks if b.param("NAME")}
+        copies: Dict[Tuple[str, tuple], str] = {}
+        uncovered: Dict[str, int] = {}
+
+        def value_of(d: str, n: int, e: int) -> tuple:
+            default, vec = values(d, n)
+            if e in vec:
+                return vec[e]
+            if default is None:
+                uncovered[d] = uncovered.get(d, 0) + 1
+                return next(iter(vec.values()))
+            return default
+
+        def mat_key(mat: str, e: int) -> tuple:
+            return tuple(value_of(d, n, e) for _c, d, n in mat_dist[mat])
+
+        def material_named(mat: str, key: tuple) -> str:
+            """``mat`` itself for its default values, else its copy with ``key``'s."""
+            if key == tuple(values(d, n)[0] for _c, d, n in mat_dist[mat]):
+                return opts[mat][0].param("NAME") or mat
+            if (mat, key) not in copies:
+                name = self._fresh_name(f"{mat}_D{sum(1 for m, _k in copies if m == mat) + 1}", taken)
+                group = opts[mat]
+                cards = {id(c): v for (c, _d, _n), v in zip(mat_dist[mat], key)}
+                clone = [Block(c.keyword, OrderedDict(c.params), list(c.data)) if id(c) not in cards
+                         else self._valued_card(c, cards[id(c)]) for c in group]
+                clone[0].params["NAME"] = name
+                after.setdefault(id(group[-1]), []).extend(clone)
+                copies[(mat, key)] = name
+            return copies[(mat, key)]
+
+        after: Dict[int, List[Block]] = {}            # id(a material's last card) -> its copies
+        replace: Dict[int, List[Block]] = {}          # id(section) -> its sections per value
+        for b in blocks:
+            kw = b.keyword
+            elset = (b.param("ELSET") or "").strip()
+            items: List[tuple] = []          # (kind, where, distribution, values per record)
+            if kw in ("SHELL SECTION", "MEMBRANE SECTION", "SOLID SECTION") and elset:
+                shell = kw == "SHELL SECTION" and not self._continuum_shell_elset(elset)
+                for key in (("SHELL THICKNESS", "OFFSET") if shell else
+                            ("MEMBRANE THICKNESS",) if kw == "MEMBRANE SECTION" else ()):
+                    d = named(b.param(key) or "")
+                    if d and values(d, 1) is not None:
+                        items.append(("param", key, d, 1))
+                recs = merged_data_records(b) if b.has("COMPOSITE") else []
+                for i, r in enumerate(recs):
+                    g = trimmed_fields(r) + ["", "", "", ""]
+                    for f in ((0, 2, 3) if shell else (2,) if kw == "SOLID SECTION" else ()):
+                        d = named(g[f])
+                        if f == 2:
+                            if g[f].strip().upper() in mat_dist:
+                                items.append(("mat", (i, f), g[f].strip().upper(), 0))
+                        elif d and g[f].strip().upper() not in self.orientations and values(d, 1) is not None:
+                            items.append(("field", (i, f), d, 1))
+                if b.uparam("MATERIAL") in mat_dist:
+                    items.append(("mat", "MATERIAL", b.uparam("MATERIAL"), 0))
+                if kw != "SOLID SECTION" and any(x[0] == "mat" for x in items):
+                    self.report.warn(f"*{kw}, ELSET={elset}: a material of it gives *ELASTIC / *DENSITY "
+                                     f"/ *EXPANSION by a *DISTRIBUTION, which Abaqus documents for solid "
+                                     f"continuum elements only; written element set by element set as "
+                                     f"for a solid — verify.", once=True)
+            elif b.uparam("MATERIAL") in mat_dist:
+                self.report.warn(f"*{kw}, ELSET={elset}: its material {b.uparam('MATERIAL')} gives "
+                                 f"*ELASTIC / *DENSITY / *EXPANSION by a *DISTRIBUTION, which Abaqus "
+                                 f"takes on solid continuum elements only; ccx gets the distribution's "
+                                 f"default values here — verify.", once=True)
+            if not items:
+                continue
+            groups: "OrderedDict[tuple, List[int]]" = OrderedDict()
+            for e in dedup(self._existing(elset)):
+                key = tuple(mat_key(d, e) if kind == "mat" else value_of(d, n, e) for kind, _w, d, n in items)
+                groups.setdefault(key, []).append(e)
+            for kind, _w, d, _n in items:
+                if kind != "mat":
+                    self._value_dists.add(d)
+            replace[id(b)] = []
+            for k, (key, members) in enumerate(groups.items(), 1):
+                gname = elset if len(groups) == 1 else self._fresh_name(f"{elset}_D{k}", taken)
+                if gname != elset:
+                    self.geom.elsets[gname] = members
+                replace[id(b)].append(self._valued_section(b, gname, items, key, material_named))
+        out: List[Block] = []
+        for b in blocks:
+            out += replace.get(id(b), [b]) + after.get(id(b), [])
+        for mat, cards in mat_dist.items():           # the default values stay in the material
+            for c, d, n in cards:
+                default, vec = values(d, n)
+                if default is None:
+                    uncovered.setdefault(d, 0)
+                self._value_dists.add(d)
+                v = self._valued_card(c, default or next(iter(vec.values())))
+                c.params, c.data = v.params, v.data
+        for d in self._value_dists:
+            if self._dist_cards[d].param("TABLE"):
+                self._value_dist_tables.add(self._dist_cards[d].uparam("TABLE"))
+        for d, k in uncovered.items():
+            self.report.warn(f"*DISTRIBUTION {d} has no default line (Abaqus requires one)"
+                             + (f": {k} element(s) it does not list get its first line's values"
+                                if k else "") + " — verify.", once=True)
+        if replace or mat_dist:
+            self.report.note("*DISTRIBUTION of shell thicknesses / offsets, composite layer values or "
+                             "material properties -> one section per distinct set of values, on its "
+                             "own element set, with a copy of the material per distinct property "
+                             "values (ccx has no such distribution; the same values element by "
+                             "element).", once=True)
+        return out
+
+    @classmethod
+    def _valued_card(cls, c: Block, toks: Sequence[str]) -> Block:
+        """Material card ``c`` (*ELASTIC, *DENSITY, *EXPANSION) with the values ``toks`` in place
+        of the distribution its data line names, 8 to a line as Abaqus writes them; without
+        DEPENDENCIES (Abaqus: not relevant with a distribution)."""
+        params = OrderedDict((k, v) for k, v in c.params.items() if k != "DEPENDENCIES")
+        return Block(c.keyword, params, [", ".join(toks[i:i + 8]) for i in range(0, len(toks), 8)])
+
+    def _valued_section(self, b: Block, elset: str, items: List[tuple], key: tuple,
+                        material_named: Callable[[str, tuple], str]) -> Block:
+        """Section ``b`` on ``elset`` with the distributed values ``key`` of its ``items``
+        (_plan_value_distributions) as numbers and material copies; a composite's layers
+        scaled to a distributed SHELL THICKNESS."""
+        params = OrderedDict(b.params)
+        params["ELSET"] = elset
+        recs = [trimmed_fields(r) for r in merged_data_records(b)]
+        total = None
+        for (kind, where, d, _n), v in zip(items, key):
+            if kind == "param" and where == "OFFSET":
+                params["OFFSET"] = v[0]
+            elif kind == "param":
+                params.pop(where)
+                total = v[0]
+            elif kind == "field":
+                i, f = where
+                recs[i] += [""] * (f + 1 - len(recs[i]))
+                recs[i][f] = v[0]
+            elif where == "MATERIAL":
+                params["MATERIAL"] = material_named(d, v)
+            else:
+                i, f = where
+                recs[i][f] = material_named(d, v)
+        if total is not None and b.has("COMPOSITE"):
+            plies = [i for i, g in enumerate(recs) if len(g) >= 3 and g[0] and g[2]]
+            try:
+                full = sum(pf(recs[i][0]) for i in plies) * (2.0 if b.has("SYMMETRIC") else 1.0)
+            except ValueError:
+                full = 0.0
+            if full > 0.0:
+                for i in plies:
+                    recs[i][0] = short_real(pf(recs[i][0]) * pf(total) / full, 12)
+        elif total is not None:
+            recs = recs or [[]]
+            recs[0] = [total] + recs[0][1:]
+        return Block(b.keyword, params, [", ".join(g) for g in recs])
 
     def _orientation_distribution(self, b: Block) -> Optional[str]:
         """The distribution an *ORIENTATION names on its data line in place of the point
@@ -38154,6 +38514,112 @@ class _Output:
         return self._anchored_output(b) or self._commented(
             b, f"*{b.keyword}: commented out — the solution is the same.", reduces=False)
 
+    def handle_integrated_output(self, b: Block) -> List[str]:
+        """*INTEGRATED OUTPUT -> the *SECTION PRINT _integrated_request planned at it, or the card
+        commented out where there is none (its notes say why)."""
+        return self._anchored_output(b) or self._commented(
+            b, "*INTEGRATED OUTPUT: commented out — the solution is the same.", reduces=False)
+
+    def handle_integrated_output_section(self, b: Block) -> List[str]:
+        name = b.uparam("NAME")
+        return self._commented(b, f"*INTEGRATED OUTPUT SECTION {name}: ccx has no such card; " + (
+            "its surface goes to the *SECTION PRINT of each *INTEGRATED OUTPUT that names it."
+            if name in self._ios_used else "no *INTEGRATED OUTPUT names it."), reduces=False)
+
+    # the Abaqus/Standard section variables ccx's *SECTION PRINT gives (one request prints all)
+    _SECTION_PRINT_LABELS = ("SOF", "SOM", "SOAREA")
+
+    def _integrated_request(self, b: Block, ctx: Optional[Block], timing: dict) -> dict:
+        """*INTEGRATED OUTPUT (Abaqus history output over a surface, SURFACE= or an *INTEGRATED
+        OUTPUT SECTION's) -> ccx's *SECTION PRINT on the surface (.dat), which prints the total
+        force and its moment about the global origin in global axes, the faces' centroid and
+        the moment about it, the area, and the normal and shear force (2.23 manual, *SECTION
+        PRINT; under NLGEOM in the current configuration, printoutface.f): Abaqus' SOF, SOM
+        (about the fixed global origin without a reference node, "Output to the output
+        database") and SOAREA.  What differs is noted: a reference node's SOM, an orientation's
+        axes, SOCF and the other variables, and ccx's integration of the extrapolated nodal
+        stresses (Abaqus takes the internal forces of the elements under the surface)."""
+        sec = b.uparam("SECTION")
+        ios = self._ios.get(sec) if sec else None
+        if sec:
+            self._ios_used.add(sec)
+        surf = ((ios.param("SURFACE") if ios is not None else b.param("SURFACE")) or "").strip()
+        wanted = dedup(x.strip().upper() for r in merged_data_records(b) for x in r if x.strip())
+        if b.uparam("VARIABLE") in ("ALL", "PRESELECT"):
+            wanted = dedup(list(self._SECTION_PRINT_LABELS) + wanted)
+        labels = [x for x in self._SECTION_PRINT_LABELS if x in wanted]
+        rest = [x for x in wanted if x not in self._SECTION_PRINT_LABELS]
+        ctl, default = self._requested_control(b, ctx, timing)
+        r = self._request(b, "SECTION PRINT", OrderedDict([("SURFACE", surf), ("NAME", sec or surf.upper())]),
+                          labels, set=None, ctl=ctl, default=default, live=False, hist=True)
+        what = f"*INTEGRATED OUTPUT, {'SECTION=' + sec if sec else 'SURFACE=' + surf}"
+        sd = self.surfaces.get(surf.upper())
+        proc = timing["proc"]
+        # (probed: solid faces and plane, shell and membrane edges give the force through the
+        # section; Abaqus integrates over no axisymmetric or rigid facet)
+        types = {ccx_type(self.geom.elements[e][0]) for e in self._surface_elements(surf)} if sd else set()
+        other = sorted(t for t in types if not t.startswith(("C3D", "CPS", "CPE", "S3", "S4", "S6", "S8",
+                                                              "M3D")))
+        why = (f"*INTEGRATED OUTPUT SECTION {sec} is not defined" if sec and ios is None else
+               "an element set's integrated output (Abaqus/Explicit) has no ccx counterpart" if not surf else
+               f"surface {surf} is not an element-based surface (ccx's *SECTION PRINT integrates over "
+               f"element faces, as Abaqus does)" if sd is None or sd[0].startswith("NODE") else
+               f"surface {surf} has faces of {', '.join(other[:3])} elements (the converter writes "
+               f"*SECTION PRINT on solid faces and plane, shell and membrane edges; Abaqus "
+               f"integrates over no axisymmetric or rigid facet)" if other else
+               f"Abaqus' {', '.join(rest)} have no ccx counterpart (*SECTION PRINT gives SOF, SOM and "
+               f"SOAREA)" if not labels else
+               f"Abaqus writes none of it ({ctl[1]}=0)" if ctl[0] == "OFF" else
+               f"Abaqus writes no section output in a *{proc} step (eigenvalue and linear dynamics "
+               f"procedures)" if timing["kind"] == "untimed" or proc == "MODAL DYNAMIC" else
+               f"a {'*' + proc if proc else 'procedure-less'} step has no section forces to print"
+               if proc in (None, "HEAT TRANSFER") else None)
+        if why:
+            r["notes"].append(f"{what}: {why}; dropped.")
+            return r
+        r["live"] = True
+        notes = [f"{what} -> *SECTION PRINT, SURFACE={surf} (.dat): ccx prints the total force and its "
+                 f"moment about the global origin in global axes (Abaqus' SOF, and SOM without a "
+                 f"reference node), the area (SOAREA), the faces' centroid with the moment about it and "
+                 f"the normal and shear force, whichever of SOF, SOM and SOAREA is asked. ccx integrates "
+                 f"the stresses extrapolated to the face nodes and averaged there (those of 2 x 2 x 2-"
+                 f"point elements 0.004 % low), Abaqus sums the internal forces of the elements under "
+                 f"the surface: the same on a uniform stress, apart where the stress varies sharply or "
+                 f"jumps at the cut."]
+        if rest:
+            notes.append(f"{what}: no ccx counterpart for {', '.join(rest)}; not written.")
+        if ios is not None:
+            ref = (ios.param("REF NODE") or "").strip()
+            nodes = self._resolve_nodes(ref) if ref else []
+            if ref and ios.uparam("POSITION").startswith("CENT"):
+                notes.append(f"{what}: Abaqus takes SOM about the reference node {ref} it puts at the "
+                             f"surface's centre: ccx's moment about the centre of gravity (the faces' "
+                             f"centroid; under NLGEOM ccx's moves with the surface).")
+            elif ref and len(nodes) == 1 and nodes[0] in self.geom.nodes:
+                p = self.geom.nodes[nodes[0]]
+                if any(p):
+                    notes.append(f"{what}: Abaqus takes SOM about reference node {nodes[0]} at "
+                                 f"({', '.join(fmt_num(x) for x in p)}): ccx's moment about the origin "
+                                 f"minus that point x the force.")
+            elif ref:
+                notes.append(f"{what}: its reference node {ref} is not one defined node; Abaqus takes "
+                             f"SOM about it, ccx prints the moment about the origin and the centroid.")
+            if ref and (ios.uparam("REF NODE MOTION").startswith("AVERAGE") or self.steps.nl_any):
+                notes.append(f"{what}: Abaqus takes SOM about the reference node's current position "
+                             f"(it can follow the surface's mean motion), ccx about fixed points.")
+            ori = ios.uparam("ORIENTATION")
+            projected = ios.uparam("PROJECT ORIENTATION").startswith("Y")
+            if ori or projected:
+                notes.append(f"{what}: Abaqus gives SOF and SOM in the section's local axes ("
+                             + (f"orientation {ori}" if ori else "the global ones")
+                             + (", projected onto the surface" if projected else "")
+                             + "), ccx in global ones.")
+        if timing["pert"]:
+            notes.append(f"{what} in a linear perturbation step: Abaqus prints the perturbation's "
+                         f"section forces.")
+        r["notes"] += notes
+        return r
+
     def _anchored_output(self, b: Block, p: Optional[dict] = None) -> List[str]:
         """The ccx output cards (and their notes) _plan_output placed at block ``b``."""
         p = p or self._out_plan.get(id(b))
@@ -38449,7 +38915,12 @@ class _Output:
                     self.emit.out_ctl_step = self.emit.no
                     ctl = self._out_ctl.get(self.emit.no)
                     if ctl and ctl != self.emit.out_ctl_now:
-                        params[ctl[0]] = ctl[1]
+                        if kw == "SECTION PRINT" and ctl[0] == "FREQUENCY":
+                            # (ccx's *SECTION PRINT reads FREQUENCYF, the fluid output's, only;
+                            # its own *OUTPUT sets the frequency the print cards share)
+                            out.append(emit_keyword("OUTPUT", OrderedDict([ctl])))
+                        else:
+                            params[ctl[0]] = ctl[1]
                         self.emit.out_ctl_now = ctl
             out.append(emit_keyword(kw, params))
             # ccx stops on a data line of more than 16 entries ('*ERROR in splitline'), and
@@ -38479,6 +38950,7 @@ class _Output:
         OUTPUT=2D keeps exact; and each step gets one output control, taken from its .frd
         requests first (_step_output_control)."""
         quiet = Report()
+        self._ios = {b.uparam("NAME"): b for b in blocks if b.keyword == "INTEGRATED OUTPUT SECTION"}
         self._out_user_tp = {b.uparam("NAME"): b
                              for b in blocks if b.keyword == "TIME POINTS"}
         self._out_amp_names = {b.uparam("NAME")
@@ -38594,6 +39066,8 @@ class _Output:
                 elif x.keyword in ENERGY_CARDS:
                     reqs += self._energy_requests(x, ctx if x.keyword == "ENERGY OUTPUT" else None,
                                                   timing)
+                elif x.keyword == "INTEGRATED OUTPUT":
+                    reqs += self._at_anchor(self._integrated_request(x, ctx, timing), x)
                 elif x.keyword in OUTPUT_CARDS:
                     sub = x.keyword in ("NODE OUTPUT", "ELEMENT OUTPUT", "CONTACT OUTPUT")
                     if sub and ctx is not None and ctx.has("FIELD") and \
@@ -41318,6 +41792,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._dist_split: Dict[int, List[Tuple[str, dict]]] = {}  # id(section) -> groups
         self._dist_tables: set = set()             # *DISTRIBUTION TABLE names they use
         self._dist_plain: Dict[tuple, str] = {}    # (axes, angle, system) -> orientation name
+        self._offset_why: Dict[str, str] = {}       # OFFSET TO NODES orientation -> why not written
+        self._value_dists: set = set()             # distributions of section / material values,
+        self._value_dist_tables: set = set()       # ... and their tables (_plan_value_distributions)
         self._used_names: set = set()              # names the converter may not reuse
         # Abaqus *MPC lines (see _plan_mpcs): (id(card), line) -> (mode, node pairs or reason),
         # and the rigid bodies of the BEAM lines by the card they are emitted with
@@ -41345,6 +41822,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._circ_explicit_issue = ""
         # output requests (see _plan_output)
         self._out_plan: Dict[int, dict] = {}       # id(output card) -> its ccx cards
+        self._ios: Dict[str, Block] = {}           # *INTEGRATED OUTPUT SECTION by NAME
+        self._ios_used: set = set()                # ... the ones an *INTEGRATED OUTPUT names
         self._out_notes: Dict[int, List[str]] = {}  # id(*OUTPUT card) -> notes it triggers
         self._out_ctl: Dict[int, Tuple[str, str]] = {}  # step -> output control (FREQUENCY= ...)
         self._out_contact = {"abaqus": False, "pairs": 0, "nts": False, "flat": False, "axi": False}
@@ -41806,6 +42285,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "IMPERFECTION": "handle_imperfection",
         **dict.fromkeys(OUTPUT_CARDS, "handle_output"),
         **dict.fromkeys(ENERGY_CARDS, "handle_energy_output"),
+        "INTEGRATED OUTPUT": "handle_integrated_output",
+        "INTEGRATED OUTPUT SECTION": "handle_integrated_output_section",
         "KINEMATIC COUPLING": "handle_coupling",
         "FIXED MASS SCALING": "handle_mass_scaling",
         "VARIABLE MASS SCALING": "handle_mass_scaling",
@@ -42025,6 +42506,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self.build_geometry(blocks, imperfect=True)
         blocks = self._split_coupling_refs(blocks)
         self._plan_embedded(blocks)             # before anything reads node coordinates
+        self._plan_offset_orientations(blocks)  # adds *DISTRIBUTION cards: before their readers
+        blocks = self._plan_value_distributions(blocks)     # before any reader of sections, materials
         self._warn_undefined_element_nodes()
         self._warn_degenerate_elements()
         self._check_sections(blocks)            # the deck's own mesh: before any planner retypes it

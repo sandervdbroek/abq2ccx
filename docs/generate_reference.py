@@ -57,7 +57,8 @@ TRANSLATED = {
         "`validate_with_ccx.py` (`assembly_rotated_instances`: the same results as the model "
         "written flat).",
     "*ORIENTATION": "origin `c` of a 9-value line subtracted from `a`, `b` (ccx has no origin "
-        "field); `DEFINITION=NODES` resolved to coordinates, `OFFSET TO NODES` commented; "
+        "field); `DEFINITION=NODES` resolved to coordinates, `OFFSET TO NODES` → a per-element "
+        "`*DISTRIBUTION` of each element's own axes (rectangular or cylindrical; else commented); "
         "`SPHERICAL`→`RECTANGULAR` and a cylindrical system's rotation line dropped (ccx has "
         "neither; warned, a note where every section that reads the orientation gets Abaqus' "
         "directions per element or has an isotropic material, a spherical one then written as the "
@@ -72,10 +73,12 @@ TRANSLATED = {
         "subtracted, the additional rotation applied to the axes (ccx turns only the first line), "
         "a name ccx would read as a number replaced; its shell and membrane sections are split "
         "into one plain `*ORIENTATION` + section per direction (ccx gives a shell section the "
-        "first line). A distribution no `*ORIENTATION` names (shell thickness, material "
-        "property) is commented.",
-    "*DISTRIBUTION TABLE": "dropped for an orientation distribution (ccx needs no table; its lines "
-        "are always `a, b`); otherwise commented.",
+        "first line). Element distributions of a shell's thickness or offset, a composite "
+        "layer's thickness or angle, a membrane's thickness and a solid's `*ELASTIC` / `*DENSITY` "
+        "/ `*EXPANSION` → one section per distinct value on its own element set, with a material "
+        "copy per distinct property values (exact); any other distribution is commented.",
+    "*DISTRIBUTION TABLE": "dropped for a distribution written out (ccx needs no table); "
+        "otherwise commented.",
     "*SOLID SECTION": "keeps `ELSET`/`MATERIAL`/`ORIENTATION`; other params dropped; an undefined "
         "`MATERIAL` is warned (ccx 2.23 segfaults on it where the section is the deck's last card). On `CPS4I`/`CPE4I` elements written as "
         "`C3D8I` slabs: no thickness line (it is the slab's depth), and plane stress through a "
@@ -674,6 +677,11 @@ TRANSLATED = {
         "filtered against ccx's label list for that card (an unknown `*EL PRINT` label stops ccx); "
         "a print card without a set gets a whole-model set (Abaqus prints everything, ccx "
         "nothing).",
+    "*INTEGRATED OUTPUT / *INTEGRATED OUTPUT SECTION": "→ `*SECTION PRINT` on the surface "
+        "(.dat): ccx prints the total force and its moment about the origin in global axes (SOF, "
+        "SOM), the area (SOAREA), the centroid and the moment about it, for any of the three. A "
+        "reference node's SOM, an orientation's axes and SOCF are noted (ccx has none); the "
+        "section card is commented.",
     "*ENERGY OUTPUT / *ENERGY PRINT / *ENERGY FILE": "whole-model (or `ELSET`) energies → "
         "`*EL PRINT, TOTALS=ONLY` over the model or the set: `ELSE` for ALLIE / ALLSE (ccx's stress "
         "work: ALLSE + ALLPD + ALLCD, without ALLAE), in a `*DYNAMIC` step `ELKE` for ALLKE; none "

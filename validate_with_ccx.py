@@ -3354,6 +3354,113 @@ def dat_totals(dat_path):
     return out
 
 
+TWO_BRICKS = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n"
+              "6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n9, 1., 2., 0.\n10, 0., 2., 0.\n11, 1., 2., 1.\n"
+              "12, 0., 2., 1.\n*Element, type=C3D8, elset=ALL\n{}\n2, 4, 3, 9, 10, 8, 7, 11, 12\n"
+              "*Elset, elset=SECOND\n2\n*Nset, nset=BOT\n1, 2, 5, 6\n*Nset, nset=TOP\n9, 10, 11, 12\n")
+BRICKS_STEP = ("*Step\n*Static\n*Boundary\nBOT, 2, 2\n1, 1, 3\n2, 3, 3\n5, 1, 1\n{}*End Step\n")
+TWO_SHELLS = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+              "6, 2., 1., 0.\n*Element, type=S4, elset=ALL\n{}\n2, 2, 3, 6, 5\n*Nset, nset=LEFT\n1, 4\n"
+              "*Nset, nset=RIGHT\n3, 6\n*Nset, nset=NALL, generate\n1, 6, 1\n")
+SHELLS_STEP = ("*Step\n*Static\n*Boundary\nLEFT, 1, 1\n1, 2, 2\nNALL, 3, 6\n*Cload\nRIGHT, 1, 0.05\n"
+               "*Node print, nset=RIGHT\nU\n*End Step\n")
+
+
+def offset_nodes_deck(kind):
+    """An orientation from each element's local nodes (*ORIENTATION, DEFINITION=OFFSET TO NODES,
+    points a = local node 2, b = 4, c = 1) on two orthotropic elements in series, E1 = 1000
+    along local 1, E2 = E3 = 100, no Poisson effect, axially loaded (sigma 10 for the bricks, 1
+    for the shells): its local 1 runs along the load in one element and across it in the
+    other, so the end moves sigma L (1 / E1 + 1 / E2) = 0.11 (bricks, along y) and 0.011
+    (shells, along x; Abaqus projects a shell's axis 2 onto it without a rotation line, so
+    "3, 0." keeps axis 1 direction 1); global axes would give 0.02 / 0.002, the wrong local
+    ones 0.2 / 0.02."""
+    ori = "*Orientation, name=OFF, definition=OFFSET TO NODES\n2, 4\n"
+    if kind == "bricks":
+        return (TWO_BRICKS.format("1, 1, 4, 8, 5, 2, 3, 7, 6") + ori + "*Material, name=M\n*Elastic, "
+                "type=ENGINEERING CONSTANTS\n1000., 100., 100., 0., 0., 0., 50., 50.\n50.\n*Solid Section, "
+                "elset=ALL, material=M, orientation=OFF\n" +
+                BRICKS_STEP.format("*Cload\nTOP, 2, 2.5\n*Node print, nset=TOP\nU\n"))
+    return (TWO_SHELLS.format("1, 1, 4, 5, 2") + ori + "3, 0.\n*Material, name=M\n*Elastic, "
+            "type=ENGINEERING CONSTANTS\n1000., 100., 100., 0., 0., 0., 50., 50.\n50.\n*Shell Section, "
+            "elset=ALL, material=M, orientation=OFF\n0.1\n" + SHELLS_STEP)
+
+
+def value_distributions_deck(kind):
+    """Two elements in series whose values a *DISTRIBUTION sets element by element (Abaqus 2017
+    "Distribution definition"): shell thickness 0.1 / 0.2 on S4 under an end force 0.1 (u =
+    0.1 / 1000 (1 / 0.1 + 1 / 0.2) = 0.0015); on C3D8, E 1000 / 500 under sigma 10 (u = 0.03),
+    then an orthotropic expansion (0, 1e-3 / 2e-3, 0) heated by 10 (u = 0.03) and a density 1 / 3
+    under gravity 10 (no Poisson effect: a bar, which C3D8 solve exactly at the nodes; u = 30 /
+    500 / 2 + 35 / 1000 = 0.065; ccx's RF at the support would leave out the weight on its nodes)."""
+    if kind == "thickness":
+        return (TWO_SHELLS.format("1, 1, 2, 5, 4") + "*Distribution table, name=T\nLENGTH\n"
+                "*Distribution, name=TH, location=ELEMENT, table=T\n, 0.1\n2, 0.2\n*Material, name=M\n"
+                "*Elastic\n1000., 0.\n*Shell Section, elset=ALL, material=M, shell thickness=TH\n0.5, 5\n"
+                + SHELLS_STEP)
+    return (TWO_BRICKS.format("1, 1, 2, 3, 4, 5, 6, 7, 8") + "*Nset, nset=NALL, generate\n1, 12, 1\n"
+            "*Distribution table, name=TE\nMODULUS, RATIO\n*Distribution, name=DE, location=ELEMENT, "
+            "table=TE\n, 1000., 0.\nSECOND, 500., 0.\n*Distribution, name=DA, location=ELEMENT\n, 0., 1e-3, "
+            "0.\n2, 0., 2e-3, 0.\n*Distribution, name=DR, location=ELEMENT\n, 1.\n2, 3.\n*Material, name=M\n"
+            "*Elastic\nDE\n*Expansion, type=ORTHO\nDA\n*Density\nDR\n*Solid Section, elset=ALL, material=M\n"
+            "*Initial Conditions, type=TEMPERATURE\nNALL, 0.\n"
+            + BRICKS_STEP.format("*Cload\nTOP, 2, 2.5\n*Node print, nset=TOP\nU\n")
+            + "*Step\n*Static\n*Cload, op=NEW\n*Temperature\nNALL, 10.\n*Node print, nset=TOP\nU\n*End Step\n"
+            "*Step\n*Static\n*Temperature\nNALL, 0.\n*Dload\nALL, GRAV, 10., 0., -1., 0.\n"
+            "*Node print, nset=TOP\nU\n*End Step\n")
+
+
+def integrated_output_deck(kind):
+    """A bar of two C3D8 along y at x 5 .. 6 under 10 (sigma 10), clamped at y = 0, with the
+    integrated output of the cut between them (element 1's face y = 1, normal +y): SOF (0, 10,
+    0), SOM about the origin (centroid (5.5, 1, 0.5)) x F = (-5, 0, 55), SOAREA 1; through an
+    *INTEGRATED OUTPUT SECTION with a reference node there.  kind "shell": an S8R strip's cut
+    edge under 1 along x (SOF (1, 0, 0), SOM (0, 0, -0.5))."""
+    if kind == "shell":
+        nodes = {}
+        lines = ["*Node"]
+        for j, y in enumerate((0., 0.5, 1.)):
+            for i, x in enumerate((0., 0.5, 1., 1.5, 2.)):
+                nodes[i, j] = len(nodes) + 1
+                if i % 2 == 0 or j % 2 == 0:
+                    lines.append(f"{nodes[i, j]}, {x}, {y}, 0.")
+        lines.append("*Element, type=S8R, elset=ALL")
+        for k in range(2):
+            i = 2 * k
+            c = [(i, 0), (i + 2, 0), (i + 2, 2), (i, 2), (i + 1, 0), (i + 2, 1), (i + 1, 2), (i, 1)]
+            lines.append(f"{k + 1}, " + ", ".join(str(nodes[p]) for p in c))
+        used = sorted(nodes[p] for p in nodes if p[0] % 2 == 0 or p[1] % 2 == 0)
+        return ("\n".join(lines) + f"\n*Nset, nset=LEFT\n1, 6, 11\n*Nset, nset=NALL\n{', '.join(map(str, used))}\n"
+                "*Surface, name=CUT, type=ELEMENT\n1, E2\n*Material, name=M\n*Elastic\n1000., 0.\n"
+                "*Shell Section, elset=ALL, material=M\n0.1\n*Step\n*Static\n*Boundary\nLEFT, 1, 1\n1, 2, 2\n"
+                "NALL, 3, 6\n*Cload\n5, 1, 0.1666666666667\n10, 1, 0.6666666666667\n15, 1, 0.1666666666667\n"
+                "*Output, history\n*Integrated Output, surface=CUT\nSOF, SOM\n*End Step\n")
+    text = TWO_BRICKS.format("1, 1, 2, 3, 4, 5, 6, 7, 8")
+    for k in range(1, 13):
+        x = text.split(f"\n{k}, ", 1)[1].split(",", 1)[0]
+        text = text.replace(f"\n{k}, {x},", f"\n{k}, {float(x) + 5.:g}.,", 1)
+    return (text + "*Node\n100, 5.5, 1., 0.5\n*Surface, name=CUT, type=ELEMENT\n1, S5\n"
+            "*Integrated Output Section, name=IOS1, surface=CUT, ref node=100\n*Material, name=M\n"
+            "*Elastic\n1000., 0.3\n*Solid Section, elset=ALL, material=M\n" +
+            BRICKS_STEP.format("*Cload\nTOP, 2, 2.5\n*Output, history\n*Integrated Output, section=IOS1\n"
+                               "SOF, SOM, SOAREA\n"))
+
+
+def dat_section_prints(dat_path):
+    """[(force, moment about the origin, centroid, area)] of every *SECTION PRINT block of a
+    ccx .dat file (SOF / SOM / SOAREA), in order."""
+    lines = open(dat_path, encoding="utf-8", errors="replace").read().splitlines() \
+        if os.path.exists(dat_path) else []
+    out = []
+    for i, ln in enumerate(lines):
+        if ln.strip().startswith("statistics for surface set"):
+            rows = [[float(x) for x in r.split()] for r in lines[i + 1:i + 20] if r.strip() and
+                    not re.search(r"[a-df-z]", r)]
+            if len(rows) >= 4:
+                out.append((rows[0][:3], rows[0][3:6], rows[1][:3], rows[3][0]))
+    return out
+
+
 def folding_strip_deck(mode, d=0.25):
     """A C-shaped strip (two arms of 20 C3D8I joined at x = 0, gap 0.2, held in its plane)
     whose top-arm tip is pushed down ``d``, folding it onto the bottom arm, with Abaqus'
@@ -11905,6 +12012,73 @@ def main():
               f"{len(u)} node displacements in plate axes vs the x-y strip with b in the plate, max "
               f"difference {err:.1e} of max |u|")
         failures += 0 if ok else 1
+
+    # --- task 150: OFFSET TO NODES orientations, value distributions, integrated output ------
+    def t150_run(text, tag):
+        """The .dat path of ``text`` converted and solved without reduced physics, or None (FAIL
+        printed); the directory goes at the end of the block."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        _rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        t150_dirs.append(d)
+        if status != "solved" or conv.reduced_physics:
+            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if status != "solved" else
+                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return os.path.join(d, "job.dat")
+
+    t150_dirs = []
+    for kind, node, k, want in (("bricks", 9, 1, 0.11), ("shells", 3, 0, 0.011)):
+        tag = f"offset_nodes_{kind}"
+        dat = t150_run(offset_nodes_deck(kind), tag)
+        u = dat_displacements(dat).get(node, [math.nan] * 3)[k] if dat else math.nan
+        ok = abs(u / want - 1) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (*ORIENTATION, DEFINITION=OFFSET TO NODES on two "
+              f"orthotropic {kind[:-1]}s in series, local 1 along the load in one, across it in the "
+              f"other; commented out before, ccx stopped): end displacement {u:.7g} vs "
+              f"sigma L (1/E1 + 1/E2) = {want:g} (global axes: {want * 2 / 11:g})")
+        failures += 0 if ok else 1
+    dat = t150_run(value_distributions_deck("thickness"), "distribution_shell_thickness")
+    u = dat_displacements(dat).get(3, [math.nan] * 3)[0] if dat else math.nan
+    ok = abs(u / 0.0015 - 1) < 1e-6
+    print(f"{'PASS' if ok else 'FAIL'}  distribution_shell_thickness (S4 strip, SHELL THICKNESS=a "
+          f"*DISTRIBUTION 0.1 / 0.2: one section per thickness; the data-line 0.5 before): end "
+          f"displacement {u:.7g} vs 0.0015")
+    failures += 0 if ok else 1
+    dat = t150_run(value_distributions_deck("material"), "distribution_material_values")
+    if dat:
+        uy = [rows[0][2] for rows in dat_tables(dat, "displacements")] + [math.nan] * 3
+        got = (uy[0], uy[1], -uy[2])
+        ok = all(abs(g / w - 1) < 1e-6 for g, w in zip(got, (0.03, 0.03, 0.065)))
+        print(f"{'PASS' if ok else 'FAIL'}  distribution_material_values (two C3D8 whose *ELASTIC, "
+              f"*EXPANSION, TYPE=ORTHO and *DENSITY name *DISTRIBUTIONs: material copies; ccx stopped "
+              f"on the names before): u = {got[0]:.7g} vs 0.03 under sigma 10, {got[1]:.7g} vs 0.03 "
+              f"heated by 10, {got[2]:.7g} vs 0.065 under gravity")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
+    for kind, want in (("bar", ((0., 10., 0.), (-5., 0., 55.), 1.)), ("shell", ((1., 0., 0.), (0., 0., -0.5), 0.1))):
+        tag = f"integrated_output_{kind}"
+        dat = t150_run(integrated_output_deck(kind), tag)
+        sp = dat_section_prints(dat) if dat else []
+        if sp:
+            f, m, _cg, area = sp[-1]
+            err = max(abs(a - b) for a, b in zip(f + m, want[0] + want[1])) / max(abs(x) for x in want[0] + want[1])
+            ok = err < 1e-4 and abs(area / want[2] - 1) < 1e-9
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (*INTEGRATED OUTPUT of the cut through "
+                  f"{'two C3D8 under sigma 10' if kind == 'bar' else 'an S8R strip pulled by 1'}, "
+                  f"commented out before -> *SECTION PRINT): force {', '.join(f'{x:.6g}' for x in f)}, "
+                  f"moment about the origin {', '.join(f'{x:.6g}' for x in m)}, area {area:.6g} vs "
+                  f"{want} ({err:.1e} of it off: ccx's nodal stresses of 8-point elements are 4e-5 low)")
+        else:
+            ok = False
+            print(f"FAIL  {tag}: no section print in the .dat")
+        failures += 0 if ok else 1
+    for d in t150_dirs:
+        shutil.rmtree(d, ignore_errors=True)
 
     # --- decks the converter got wrong before the 19 Oct 2026 code review ------------------
     def review_run(text, tag, read, approximate=False):
