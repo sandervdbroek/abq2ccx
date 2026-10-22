@@ -43,6 +43,15 @@ physics.
   `*FREQUENCY` integrates the mass of `CPE8R` / `CPS8R` / `CAX8R` / `CPE6` / `CPS6` / `CAX6` at
   fewer points than Abaqus (up to 2.7 % higher frequencies on a coarse mesh); no card gives ccx
   another mass matrix, so both are now flagged reduced physics.
+* **`*DLOAD CENT` and `ROTA`** — ccx 2.23 has neither, and both were dropped. `CENT` (a
+  centrifugal load given as ρω²) now becomes ccx's `CENTRIF` of ω² = magnitude / density on a
+  set of the elements of each density (`ABQ2CCX_CENT_…`; a `RECT` beam's ρab, as a beam's `CENT`
+  is per unit length), and consistent nodal forces where there is no single constant density.
+  `ROTA` (a rotary acceleration α) becomes consistent nodal forces of the d'Alembert force
+  −ρα n × r over each element's mass: solids, plane elements, shells (at their mid-thickness),
+  membranes, beams, trusses and point masses. The nodal forces stay on the undeformed geometry,
+  so under NLGEOM they need `--approximate`. Checked against the rotating-disc solution, the hoop
+  displacement of a disc under rotary acceleration and beam theory.
 * **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the

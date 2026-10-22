@@ -2787,19 +2787,19 @@ def test_amplitude_modulated_sampled_and_forms_ccx_lacks():
 
 
 def test_dload_unsupported_body_load_dropped():
-    # ccx supports only GRAV and CENTRIF body loads; ROTA/CORIO/CENT/ROTDYNF are rejected
-    # outright by ccx, so they must be dropped (warned) rather than emitted — keeping the
-    # supported lines so the rest of the *DLOAD survives (forum: "ROTA not supported").
+    # ccx supports only GRAV and CENTRIF body loads; CORIO / ROTDYNF are rejected outright by
+    # ccx, so they must be dropped (warned) rather than emitted — keeping the supported lines
+    # so the rest of the *DLOAD survives.  (CENT and ROTA: test_rota_becomes_consistent_...)
     deck = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n"
             "5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n8,0.,1.,1.\n"
             "*Element,type=C3D8,elset=E\n1,1,2,3,4,5,6,7,8\n"
             "*Material,name=m\n*Elastic\n1.,.3\n*Density\n1e-9\n*Solid Section,elset=E,material=m\n"
-            "*Step\n*Static\n*Dload\nE, GRAV, 9810., 0.,0.,-1.\nE, ROTA, 500., 0.,0.,0., 0.,0.,1.\n*End Step\n")
+            "*Step\n*Static\n*Dload\nE, GRAV, 9810., 0.,0.,-1.\nE, CORIO, 500., 0.,0.,0., 0.,0.,1.\n*End Step\n")
     body, _, rep = convert_str(deck)
     live = [l for l in body.splitlines() if not l.lstrip().startswith("**")]
     assert any("GRAV" in l.upper() for l in live)           # GRAV kept
-    assert not any("ROTA" in l.upper() for l in live)        # ROTA dropped from live output
-    assert "rota" in rep.text().lower()                       # and warned
+    assert not any("CORIO" in l.upper() for l in live)       # CORIO dropped from live output
+    assert "corio" in rep.text().lower()                      # and warned
 
 
 def test_assembly_node_not_overwritten_by_instance():
@@ -9617,13 +9617,13 @@ def test_dload_op_new_keeps_its_card_when_every_line_is_dropped():
     # OP=NEW removes the earlier distributed loads even when none of its own lines converts:
     # the bare card stays; without OP=NEW such a card is commented out
     two = ("*Step\n*Static\n*Dload\nEALL, P2, 1.\n*End Step\n*Step\n*Static\n*Dload{}\n"
-           "EALL, ROTA, 10., 0., 0., 0., 0., 0., 1.\n*End Step\n")
+           "EALL, CORIO, 10., 0., 0., 0., 0., 0., 1.\n*End Step\n")
     body, conv, rep = convert_str(HEX_MODEL + two.format(", op=NEW"))
     assert _step(body, 2).startswith("\n*STATIC\n*DLOAD, OP=NEW\n*NODE FILE")
     assert "every load line was unsupported and dropped, but the bare OP=NEW card is kept" in rep.text()
-    assert "*DLOAD ROTA dropped" in conv.reduced_physics
+    assert "*DLOAD CORIO dropped" in conv.reduced_physics
     body, conv, rep = convert_str(HEX_MODEL + two.format(""))
-    assert "** *DLOAD\n** EALL, ROTA" in _step(body, 2) and "*DLOAD has no CalculiX-compatible load lines" in rep.text()
+    assert "** *DLOAD\n** EALL, CORIO" in _step(body, 2) and "*DLOAD has no CalculiX-compatible load lines" in rep.text()
 
 
 def test_body_forces_of_perturbation_steps_removed():
@@ -21437,6 +21437,191 @@ def test_shell_body_forces_become_grav_or_nodal_forces():
     body, _, _ = convert_str(model.replace("type=S4", "type=M3D4").replace("Shell Section", "Membrane Section")
                              + step.format("E, BX, 2."))
     assert "*DLOAD\nE, BX, 2.\n" in body and "GRAV" not in body
+
+
+# two unit cubes side by side (x 0..1: material M, density 2; x 1..2: material {m2}), held at x = 0
+ROTARY_CUBES = """*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 2., 0., 0.
+4, 0., 1., 0.
+5, 1., 1., 0.
+6, 2., 1., 0.
+7, 0., 0., 1.
+8, 1., 0., 1.
+9, 2., 0., 1.
+10, 0., 1., 1.
+11, 1., 1., 1.
+12, 2., 1., 1.
+*Element, type=C3D8, elset=E1
+1, 1, 2, 5, 4, 7, 8, 11, 10
+*Element, type=C3D8, elset=E2
+2, 2, 3, 6, 5, 8, 9, 12, 11
+*Elset, elset=E
+E1, E2
+*Solid Section, elset=E1, material=M
+*Solid Section, elset=E2, material={m2}
+*Material, name=M
+*Elastic
+1000., 0.3
+*Density
+2.
+*Material, name=N
+*Elastic
+1000., 0.3
+{dens}*Nset, nset=FIX
+1, 4, 7, 10
+*Boundary
+FIX, 1, 3
+*Step{nl}
+*Static
+*Dload
+{line}
+*End Step
+"""
+ROTARY_NODES = {k + 1: (float(k % 3), float(k // 3 % 2), float(k // 6)) for k in range(12)}
+
+
+def _resultant(forces, nodes):
+    """(force, moment about the origin) of {(node, DOF): value} at the ``nodes`` coordinates."""
+    f, m = [0.0] * 3, [0.0] * 3
+    for (n, d), v in forces.items():
+        f[d - 1] += v
+        e = [0.0] * 3
+        e[d - 1] = v
+        for k, x in enumerate(A.vcross(nodes[n], tuple(e))):
+            m[k] += x
+    return f, m
+
+
+def test_cent_becomes_centrif_per_density_or_nodal_forces():
+    # Abaqus' CENT gives rho w^2 (Abaqus 2017, Distributed loads), ccx has CENTRIF of w^2 only:
+    # on a set of the elements of each density, w^2 = magnitude / density
+    line = "E, CENT, 6., 0., 0., 0., 0., 0., 1."
+    body, conv, rep = convert_str(ROTARY_CUBES.format(m2="M", dens="", nl="", line=line))
+    assert "*ELSET, ELSET=ABQ2CCX_CENT_E\n1, 2\n" in body
+    assert "*DLOAD\nABQ2CCX_CENT_E, CENTRIF, 3., 0., 0., 0., 0., 0., 1.\n" in body
+    assert "ccx CENTRIF of w^2 = magnitude / rho" in rep.text() and not conv.reduced_physics
+    body, _, _ = convert_str(ROTARY_CUBES.format(m2="N", dens="*Density\n4.\n", nl="", line=line))
+    assert "ABQ2CCX_CENT_E_1, CENTRIF, 3., 0., 0., 0., 0., 0., 1.\n" \
+           "ABQ2CCX_CENT_E_2, CENTRIF, 1.5, 0., 0., 0., 0., 0., 1.\n" in body
+    # the element without a density: consistent nodal forces of 6 r (r off the z axis)
+    deck = ROTARY_CUBES.format(m2="N", dens="", nl="", line=line)
+    body, conv, rep = convert_str(deck)
+    assert "ABQ2CCX_CENT_E, CENTRIF, 3., " in body and "*ELSET, ELSET=ABQ2CCX_CENT_E\n1\n" in body
+    assert "-> nodal forces on 8 node(s), resultant (9, 3, 0)" in body
+    f, m = _resultant(_cloads(body)[0], ROTARY_NODES)
+    assert _close(f, [9.0, 3.0, 0.0], 1e-9) and abs(m[2]) < 1e-9 and not conv.reduced_physics
+    # (a constant density only: one that varies with temperature takes the nodal forces too)
+    body, _, _ = convert_str(ROTARY_CUBES.format(m2="N", dens="*Density\n4., 0.\n5., 100.\n", nl="", line=line))
+    assert "-> nodal forces on 8 node(s), resultant (9, 3, 0)" in body
+    # under NLGEOM CENTRIF follows the deformation as Abaqus' CENT does; nodal forces would not
+    body, conv, rep = convert_str(deck.replace("*Step", "*Step, nlgeom"))
+    assert "ABQ2CCX_CENT_E, CENTRIF, 3., " in body and "'does not account for large volume changes'" in rep.text()
+    assert "** E, CENT, 6." in body and conv.reduced_physics == ["*DLOAD CENT load dropped"]
+    body, conv, rep = convert_str(deck.replace("*Step", "*Step, nlgeom"), approximate=True)
+    assert "resultant (9, 3, 0)" in body and "[APPROX] *DLOAD CENT" in rep.text()
+    # point masses take no CENT (Abaqus has none for them); a whole-model line gets a set of its own
+    masses = ROTARY_CUBES.replace("*Elset, elset=E\n", "*Element, type=MASS, elset=PM\n3, 3\n*Mass, elset=PM\n"
+                                                         "1.\n*Elset, elset=E\n")
+    body, _, _ = convert_str(masses.format(m2="M", dens="", nl="", line=line.replace("E,", "PM,")))
+    assert "** abq2ccx: PM, CENT, 6., 0., 0., 0., 0., 0., 1. -> no load" in body
+    body, _, _ = convert_str(masses.format(m2="M", dens="", nl="", line=", CENT, 6., , , , , , 1."))
+    assert "ABQ2CCX_CENT, CENTRIF, 3., 0., 0., 0., 0., 0., 1." in body and "*CLOAD" not in body
+
+
+def test_rota_becomes_consistent_nodal_forces():
+    # the d'Alembert force -rho alpha n x (x - x0) (Abaqus 2017 Theory, centrifugal, Coriolis and
+    # rotary acceleration forces) as consistent nodal forces: their resultant is the elements'
+    # total, their moment about the axis -alpha I (I = 4 / 3 + 32 / 3 about z here), exactly
+    cubes = ROTARY_CUBES.format(m2="N", dens="*Density\n4.\n", nl="", line="E, ROTA, 10., 0., 0., 0., 0., 0., 2.")
+    body, conv, rep = convert_str(cubes)
+    f, m = _resultant(_cloads(body)[0], ROTARY_NODES)
+    assert _close(f, [30.0, -70.0, 0.0], 1e-9) and abs(m[2] + 120.0) < 1e-9
+    assert "rotary accelerations (ROTA" in rep.text() and not conv.reduced_physics
+    assert "ROTA" not in "".join(l for l in body.splitlines() if not l.startswith("**"))
+    # massless elements take none (here a spring), elements without a density neither
+    body, _, _ = convert_str(cubes.replace("*Elset, elset=E\nE1, E2\n", "*Element, type=SPRINGA, elset=SP\n"
+                                           "9, 3, 12\n*Spring, elset=SP\n\n1.\n*Elset, elset=E\nE1, E2, SP\n"))
+    assert _close(_resultant(_cloads(body)[0], ROTARY_NODES)[0], [30.0, -70.0, 0.0], 1e-9)
+    body, _, _ = convert_str(cubes.replace("*Density\n4.\n", ""))
+    assert _close(_resultant(_cloads(body)[0], ROTARY_NODES)[0], [10.0, -10.0, 0.0], 1e-9)
+    # a density that varies, NLGEOM (without --approximate), a zero axis: not converted
+    for edit, why, reduced in ((("*Density\n4.\n", "*Density\n4., 0.\n5., 100.\n"), "depends on temperature", True),
+                               (("*Step", "*Step, nlgeom"), "the load follows the deformed position", True),
+                               ((", 0., 0., 2.", ""), "its axis direction is zero", False)):
+        body, conv, rep = convert_str(cubes.replace(*edit))
+        assert "*CLOAD" not in body and why in rep.text()
+        assert ("*DLOAD ROTA load dropped" in conv.reduced_physics) == reduced
+    body, _, rep = convert_str(cubes.replace("*Step", "*Step, nlgeom"), approximate=True)
+    assert "*CLOAD" in body and "[APPROX] *DLOAD ROTA" in rep.text()
+    # one point mass at (1, 0, 0): -m alpha y
+    body, _, _ = convert_str(cubes.replace("*Elset, elset=E\nE1, E2\n", "*Element, type=MASS, elset=PM\n3, 2\n"
+                                           "*Mass, elset=PM\n0.5\n*Elset, elset=E\nPM\n"))
+    assert _cloads(body)[0] == {(2, 2): -5.0}
+
+
+def test_rota_on_plane_shell_beam_and_axisymmetric_elements():
+    square = "*Node\n1, 0., 0.\n2, 1., 0.\n3, 1., 1.\n4, 0., 1.\n*Element, type={typ}, elset=E\n1, 1, 2, 3, 4\n"
+    mat = "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n2.\n*Boundary\n1, 1, 2\n4, 1, 2\n"
+    step = "*Step\n*Static\n*Dload\nE, ROTA, 10., 0., 0., 0., {axis}\n*End Step\n"
+    nodes = {1: (0., 0., 0.), 2: (1., 0., 0.), 3: (1., 1., 0.), 4: (0., 1., 0.)}
+    # plane stress: the thickness times rho alpha; Abaqus takes the global z axis only there
+    plane = square.format(typ="CPS4") + "*Solid Section, elset=E, material=M\n0.5\n" + mat
+    body, conv, _ = convert_str(plane + step.format(axis="0., 0., 1."))
+    f, m = _resultant(_cloads(body)[0], nodes)
+    assert _close(f, [5.0, -5.0, 0.0], 1e-9) and _close(m, [0.0, 0.0, -20.0 / 3.0], 1e-9)
+    body, conv, rep = convert_str(plane + step.format(axis="1., 0., 0."))
+    assert "about the global z axis only" in rep.text() and "*DLOAD ROTA load dropped" not in conv.reduced_physics
+    # Abaqus has no rotary acceleration on axisymmetric elements
+    body, conv, rep = convert_str(plane.replace("CPS4", "CAX4") + step.format(axis="0., 1., 0."))
+    assert "Abaqus applies no rotary acceleration to axisymmetric elements" in rep.text()
+    # a shell's mass sits at its mid-thickness, 0.05 below the reference surface with OFFSET=SPOS:
+    # about the x axis, -rho t alpha x x (y, z - 0.05)
+    shell = square.replace("1, 0., 0.", "1, 0., 0., 0.").format(typ="S4") + \
+        "*Shell Section, elset=E, material=M, offset=SPOS\n0.1\n" + mat.replace("1, 1, 2\n4, 1, 2\n", "1, 1, 6\n4, 1, 6\n")
+    body, conv, _ = convert_str(shell + step.format(axis="1., 0., 0."))
+    assert _close(_resultant(_cloads(body)[0], nodes)[0], [0.0, -0.1, -1.0], 1e-9) and not conv.reduced_physics
+    # a beam: rho A per unit length (RECT 0.2 x 0.5); a CIRC beam pi r^2 (a B32R in ccx, its new
+    # midside node 3)
+    beam = ("*Node\n1, 0., 0., 0.\n2, 2., 0., 0.\n*Element, type=B31, elset=E\n1, 1, 2\n"
+            "*Beam Section, elset=E, material=M, section={sec}\n{dims}\n0., 0., -1.\n" + mat.replace("4, 1, 2\n", ""))
+    body, _, _ = convert_str(beam.format(sec="RECT", dims="0.2, 0.5") + step.format(axis="0., 0., 1."))
+    assert _close(_cloads(body)[0], {(1, 2): -4.0 / 3.0, (2, 2): -8.0 / 3.0}, 1e-9)
+    body, _, _ = convert_str(beam.format(sec="CIRC", dims="0.5") + step.format(axis="0., 0., 1."))
+    assert _close(_cloads(body)[0], {(2, 2): -math.pi * 10 / 3, (3, 2): -math.pi * 20 / 3}, 1e-9)
+    # (a CENT on a beam is per unit length: the RECT beam's CENTRIF divides by rho a b, others
+    # take nodal forces)
+    body, _, _ = convert_str(beam.format(sec="RECT", dims="0.2, 0.5") +
+                             "*Step\n*Static\n*Dload\nE, CENT, 6., 0., 0., 0., 0., 0., 1.\n*End Step\n")
+    assert "ABQ2CCX_CENT_E, CENTRIF, 30., " in body
+    body, _, _ = convert_str(beam.format(sec="CIRC", dims="0.5") +
+                             "*Step\n*Static\n*Dload\nE, CENT, 6., 0., 0., 0., 0., 0., 1.\n*End Step\n")
+    assert _close(_cloads(body)[0], {(2, 1): 4.0, (3, 1): 8.0}, 1e-9)
+
+
+def test_consistent_body_forces_integrate_solids():
+    # volume and first moment of each solid, straight-edged and curved
+    def moments(xyz):
+        f = A.consistent_body_forces(xyz, lambda p: (1.0, p[0], p[1] * p[2]))
+        return [sum(v[k] for v in f) for k in range(3)]
+    mid = [(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)]
+    tet = [(0., 0., 0.), (1., 0., 0.), (0., 2., 0.), (0., 0., 3.)]
+    tet10 = tet + [tuple((a + b) / 2 for a, b in zip(tet[i], tet[j])) for i, j in mid]
+    for xyz in (tet, tet10):                       # V 1, x 1/4, the integral of y z: 3/10
+        assert _close(moments(xyz), [1.0, 0.25, 0.3], 1e-12)
+    wedge = [(0., 0., 0.), (1., 0., 0.), (0., 1., 0.), (0., 0., 2.), (1., 0., 2.), (0., 1., 2.)]
+    assert _close(moments(wedge), [1.0, 1 / 3, 1 / 3], 1e-12)
+    # a C3D20 quarter ring r 1..2, z 0..1 with its midside nodes on the arcs: its face's area and
+    # first moment (consistent_nodal_forces) times its height
+    face = [(r * math.cos(t), r * math.sin(t), 0.) for r, t in ((1, 0), (2, 0), (2, math.pi / 2), (1, math.pi / 2),
+                                                                 (1.5, 0), (2, math.pi / 4), (1.5, math.pi / 2),
+                                                                 (1, math.pi / 4))]
+    ring = [p[:2] + (z,) for z in (0., 1.) for p in face[:4]] + [p[:2] + (z,) for z in (0., 1.) for p in face[4:]]
+    ring += [p[:2] + (.5,) for p in face[:4]]
+    area = [sum(v[k] for v in A.consistent_nodal_forces("area", face, lambda p, n, t: (1.0, p[0], 0.0)))
+            for k in range(2)]
+    assert _close(moments(ring)[:2], area, 1e-12) and abs(area[0] / (3 * math.pi / 4) - 1) < 0.02
 
 
 def test_shell_body_force_density_is_the_ccx_materials():

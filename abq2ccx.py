@@ -4444,10 +4444,9 @@ def ccx_label_ok(label: str, allowed: set) -> bool:
     return lab[:4] in allowed
 
 # Abaqus *DLOAD body-force labels CalculiX has no equivalent for (verified: ccx accepts
-# only GRAV and CENTRIF body loads, and rejects the whole *DLOAD on any of these).  CENT
-# is Abaqus' density-scaled centrifugal load; ROTA/CORIO/ROTDYNF are rotary-acceleration /
-# Coriolis / rotor-dynamic loads.
-DLOAD_UNSUPPORTED = {"CENT", "ROTA", "CORIO", "ROTDYNF"}
+# only GRAV and CENTRIF body loads, and rejects the whole *DLOAD on any of these): Coriolis
+# and rotordynamic loads, which take the velocity.  (CENT and ROTA: _plan_rotary_loads.)
+DLOAD_UNSUPPORTED = {"CORIO", "ROTDYNF"}
 # The *DLOAD types ccx 2.23 reads (probed: any other stops it, '*ERROR reading *DLOAD', a bare P
 # crashes it); the converter turns TRVEC / TRSHR, beam line loads and surface-element loads into
 # nodal forces before this check (Converter.handle_dload), and ...NU user loads are commented out.
@@ -4906,7 +4905,13 @@ def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: b
     over the full circle (2 pi r ds, r = x): ccx reads a concentrated load on an axisymmetric
     node as the total around the circumference (probed on 2.23 against a pressure-loaded
     twin).  ``rule``: another Gauss rule, ((point, weight), ...) on [-1, 1] for an edge
-    (two_point_edge_shift), ((a, b, weight), ...) for a face (two_by_two_body_shift)."""
+    (two_point_edge_shift), ((a, b, weight), ...) for a face (two_by_two_body_shift).
+    ``kind`` "volume" integrates over a solid (consistent_body_forces), "point" takes the
+    load at a point mass' node (no normal or tangent either way)."""
+    if kind == "volume":
+        return consistent_body_forces(xyz, lambda p: load(p, None, None))
+    if kind == "point":
+        return [load(xyz[0], None, None)]
     n = len(xyz)
     points = (((g, 0.0, w) for g, w in rule or _GAUSS_LINE) if kind == "line" else
               rule or (_GAUSS_TRI if n in (3, 6) else _GAUSS_QUAD))
@@ -4932,6 +4937,61 @@ def consistent_nodal_forces(kind: str, xyz: Sequence[Vec], load, axisymmetric: b
             for k in range(3):
                 forces[i][k] += s * t[k]
     return [(f[0], f[1], f[2]) for f in forces]
+
+
+# Gauss rules on the solids' natural domains (_solid_shape), (x, y, z, weight): 3 x 3 x 3 on
+# the hexahedron [-1, 1]^3 (degree 5 in each coordinate), the 7-point triangle rule times 3
+# points along a wedge, and a 3 x 3 x 3 product collapsed onto the tetrahedron 0 <= x, y, z,
+# x + y + z <= 1 (x = u, y = (1 - u) v, z = (1 - u)(1 - v) w; exact to total degree 3)
+_GAUSS3_01 = tuple(((g + 1.0) / 2.0, w / 2.0) for g, w in _GAUSS3)
+_SOLID_RULES = {
+    "hex": tuple((a, b, c, wa * wb * wc) for a, wa in _GAUSS3 for b, wb in _GAUSS3 for c, wc in _GAUSS3),
+    "wedge": tuple((r, s, c, w * wc) for r, s, w in _GAUSS_TRI for c, wc in _GAUSS3),
+    "tet": tuple((u, (1 - u) * v, (1 - u) * (1 - v) * t, wu * wv * wt * (1 - u) ** 2 * (1 - v))
+                 for u, wu in _GAUSS3_01 for v, wv in _GAUSS3_01 for t, wt in _GAUSS3_01),
+}
+
+
+def _solid_jacobian(xyz: Sequence[Vec], x: float, y: float, z: float) -> float:
+    """|det| of d(position) / d(x, y, z) at natural point (x, y, z) of the solid on nodes
+    ``xyz``: its shape functions are polynomials, which a complex step differentiates to
+    round-off."""
+    h, cols = 1e-30, []
+    for d in range(3):
+        p = [complex(x), complex(y), complex(z)]
+        p[d] += 1j * h
+        N = _solid_shape(len(xyz), *p)
+        cols.append(tuple(sum([Ni.imag * q[k] for Ni, q in zip(N, xyz)]) / h for k in range(3)))
+    return abs(vdot(cols[0], vcross(cols[1], cols[2])))
+
+
+def consistent_body_forces(xyz: Sequence[Vec], load) -> List[Vec]:
+    """f_i = integral of N_i b over a solid's undeformed volume (``xyz``: its 4 / 10, 6 / 15 or
+    8 / 20 nodes in Abaqus' order; ``load(point)``: the body force per unit volume there), by
+    Gauss quadrature (_SOLID_RULES): exact for a body force linear in the position on
+    straight-edged elements, to quadrature accuracy on curved ones."""
+    n = len(xyz)
+    forces = [[0.0, 0.0, 0.0] for _ in range(n)]
+    for x, y, z, w in _SOLID_RULES["tet" if n in (4, 10) else "wedge" if n in (6, 15) else "hex"]:
+        N = _solid_shape(n, x, y, z)
+        t = load(tuple(sum([N[i] * xyz[i][k] for i in range(n)]) for k in range(3)))
+        jw = _solid_jacobian(xyz, x, y, z) * w
+        for i in range(n):
+            for k in range(3):
+                forces[i][k] += N[i] * jw * t[k]
+    return [(f[0], f[1], f[2]) for f in forces]
+
+
+def rotary_body_force(label: str, mag: float, x0: Vec, axis: Vec, p: Vec) -> Vec:
+    """Abaqus/Standard's rotary body load ``label`` at point ``p`` (Abaqus 2017 Theory,
+    "Centrifugal, Coriolis, and rotary acceleration forces": the d'Alembert forces of a frame
+    turning about the unit ``axis`` through ``x0``): CENT, of magnitude rho w^2, mag times
+    the distance vector from the axis, per unit volume; ROTA, of rotary acceleration alpha =
+    ``mag``, -alpha axis x (p - x0), per unit mass."""
+    r = vsub(p, x0)
+    if label == "CENT":
+        return vscale(vsub(r, vscale(axis, vdot(r, axis))), mag)
+    return vscale(vcross(axis, r), -mag)
 
 
 # ccx 2.23 expands a CAX8R into a C3D20R and a CAX6 into a C3D15 (gen3delem.f) and integrates a
@@ -29770,8 +29830,8 @@ class _Loads:
             label = g[1].upper() if len(g) >= 2 else ""
             if label in DLOAD_UNSUPPORTED:
                 self.report.warn(f"*DLOAD type {label} has no CalculiX equivalent (ccx body loads are "
-                                 f"GRAV and CENTRIF only — not rotary-acceleration/Coriolis/density-"
-                                 f"scaled centrifugal); this load line was dropped. Verify.", once=True)
+                                 f"GRAV and CENTRIF only — not Coriolis or rotordynamic); this load "
+                                 f"line was dropped. Verify.", once=True)
                 self._reduces(f"*DLOAD {label} dropped")
                 continue
             if _is_user_load(b, g):
@@ -29787,6 +29847,13 @@ class _Loads:
                     body.append(ln)
                     lines.append((key, ln, mag))
                 side += rigid[1]
+                continue
+            if label in ("CENT", "ROTA"):
+                got, notes = self._rotary_lines(b, g)
+                for key, ln, mag in got:
+                    body.append(ln)
+                    lines.append((key, ln, mag))
+                side += notes
                 continue
             tag: tuple = ()                     # a traction as a pressure: keyed apart from a P
             m = re.fullmatch(r"(TRVEC|TRSHR)([1-6]?)", label)
@@ -30119,9 +30186,9 @@ class _Loads:
     def _rigid_dload(self, b: Block, g: List[str], label: str):
         """An element-based *DLOAD line on rigid elements: (ccx lines, commented lines), or None
         when it names none.  A pressure P acts on the facet's skin face; a mass-proportional
-        load (GRAV, CENTRIF) finds no mass on the skins, as Abaqus/Standard's rigid elements
-        have none; a body force per volume (BX, BY, BZ, BR, ...) is not converted (Abaqus
-        integrates it over the element's thickness, the skins have another)."""
+        load (GRAV, CENTRIF, CENT, ROTA) finds no mass on the skins, as Abaqus/Standard's rigid
+        elements have none; a body force per volume (BX, BY, BZ, BR, ...) is not converted
+        (Abaqus integrates it over the element's thickness, the skins have another)."""
         eids = self._load_elements(g[0])
         rid = [e for e in eids if (e, "P") in self._skins or (e, "N") in self._skins]
         if not rid:
@@ -30129,9 +30196,9 @@ class _Loads:
         if label == "P" and len(rid) == len(eids):
             lines, why = self._rigid_pressure(g[0], None, g[2] if len(g) > 2 else "", True)
             return lines, self._drop_load_line(b, g, why) if why else []
-        if label in ("GRAV", "CENTRIF", "CENT") and len(rid) < len(eids):
+        if label in ("GRAV", "CENTRIF", "CENT", "ROTA") and len(rid) < len(eids):
             return None                         # the rest of the set carries it; skins: no mass
-        if label in ("GRAV", "CENTRIF", "CENT"):
+        if label in ("GRAV", "CENTRIF", "CENT", "ROTA"):
             return [], [f"** abq2ccx: {', '.join(x for x in g if x)} -> no load: it acts only on rigid "
                         f"elements, which carry no mass (Abaqus/Standard)"]
         return [], self._drop_load_line(b, g, f"a {label} load on rigid elements (here their "
@@ -30571,6 +30638,245 @@ class _Loads:
                            f"The converter writes them as consistent nodal forces elsewhere, which "
                            f"would not be exact here: {'; '.join(whys)}. A finer mesh reduces it.")
 
+    # element types without mass, on which a rotary body load acts on nothing
+    _MASSLESS = ("SPRING", "DASHPOT", "CONN", "GAP", "DCOUP", "JOINT")
+
+    def _plan_rotary_loads(self, blocks: List[Block]) -> None:
+        """Abaqus/Standard's rotary body loads, which ccx 2.23 lacks (Abaqus 2017 "Distributed
+        loads"; Theory, "Centrifugal, Coriolis, and rotary acceleration forces"): per element set
+        or element a *DLOAD CENT / ROTA line names (no set: the whole model), a plan for
+        handle_dload (_rotary_lines):
+        - CENT, a centrifugal load given as rho w^2 (rho per unit volume, a beam's per unit
+          length): on the elements whose ccx material has one constant density rho (a RECT
+          beam: rho a b), ccx's CENTRIF of w^2 = magnitude / rho on a set per density
+          (ABQ2CCX_CENT_...), the same body force, which follows the deformation under NLGEOM as
+          Abaqus' does; on the others consistent nodal forces;
+        - ROTA, a rotary acceleration alpha: consistent nodal forces of the d'Alembert force
+          -alpha n x (x - x0) on each element's mass (rho times its volume, its area times the
+          thickness, its length times the section area; a point mass).
+        Elements without mass (springs, dashpots, connectors, gaps; no density) take no ROTA,
+        and Abaqus has no CENT on point masses; rigid elements carry no mass (_rigid_dload).
+        An element no form covers gives the reason the line is not converted."""
+        tokens: "OrderedDict[Tuple[str, str], str]" = OrderedDict()
+        for b in blocks:
+            for rec in merged_data_records(b) if b.keyword == "DLOAD" else []:
+                g = [x.strip() for x in rec]
+                if len(g) > 1 and g[1].upper() in ("CENT", "ROTA"):
+                    token = g[0] or (ALL_ELEMENTS_SET if ALL_ELEMENTS_SET in self.geom.elsets else "")
+                    if token:
+                        tokens.setdefault((token.upper(), g[1].upper()), token)
+        if not tokens:
+            return
+        section: Dict[int, Block] = {}
+        masses: Dict[int, Optional[float]] = {}
+        for b in blocks:
+            if b.keyword in ("SOLID SECTION", "SHELL SECTION", "SHELL GENERAL SECTION", "MEMBRANE SECTION",
+                             "BEAM SECTION", "BEAM GENERAL SECTION"):
+                for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                    section.setdefault(e, b)
+            elif b.keyword == "MASS":
+                recs = [trimmed_fields(r) for r in merged_data_records(b) if any(x.strip() for x in r)]
+                try:
+                    m = pf(recs[0][0]) if recs and recs[0][0] and not b.param("TYPE") else None
+                except ValueError:
+                    m = None
+                for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                    masses.setdefault(e, m)
+        opts = self._material_options(blocks)
+        shell_t = self._shell_thicknesses(blocks)
+
+        def form(e: int, label: str):
+            """None (no mass), why not, or (load item with the measure as its scale, density,
+            the measure a CENT magnitude multiplies, the density a CENTRIF needs or None).  A
+            CENT needs no density: one that does not read is none (nodal forces)."""
+            typ, conn = self.geom.elements[e]
+            up, cc = typ.upper(), ccx_type(typ)
+            if up.startswith(self._MASSLESS) or (e, "P") in self._skins or (e, "N") in self._skins:
+                return None
+            if up == "MASS":
+                if masses.get(e) is None:
+                    return f"the *MASS of point mass {e} is not one number"
+                return ([conn[0]], "point", 1.0, False, False, None, None), masses[e], None, None
+            if up == "ROTARYI":
+                return None if label == "CENT" else \
+                    f"rotary inertia element {e} takes a moment, -I alpha n, which is not converted"
+            if e in self._u1:
+                return f"beam {e} runs as ccx's U1 element"
+            b = section.get(e)
+            if b is None:
+                return f"element {e} ({typ}) has no section"
+            if b.keyword == "SHELL GENERAL SECTION" and not b.param("MATERIAL"):
+                return f"shell {e} has a general section without a material, on which Abaqus reads " \
+                       f"the load per unit area"
+            rho, why = self._section_rho(b, opts)
+            if why and label == "ROTA":
+                return f"element {e}: {why}"
+            if cc.startswith("C3D") and len(conn) in (4, 6, 8, 10, 15, 20):
+                return (list(conn), "volume", 1.0, False, False, None, None), rho, 1.0, rho
+            sheet = len(conn) in (3, 4, 6, 8)
+            if cc.startswith(("CPS", "CPE")) and sheet:
+                t = self._section_thick.get(e, 1.0)
+                return (list(conn), "area", t, False, True, None, None), rho, t, rho
+            if cc.startswith("CAX"):
+                return None, rho, None, rho
+            if (cc in SHEET_SHELLS or cc.startswith("M3D")) and sheet:
+                if b.has("NODAL THICKNESS") or b.has("SHELL THICKNESS") or b.has("MEMBRANE THICKNESS"):
+                    return f"the thickness of element {e} varies over it"
+                if cc in SHEET_SHELLS and e not in shell_t:
+                    return f"shell {e} has no section thickness"
+                t, off = shell_t[e] if cc in SHEET_SHELLS else (self._section_thick_of(b), 0.0)
+                return (list(conn), "area", t, False, False, None, -off * t), rho, t, rho
+            if self._is_beam(e):
+                area, why = self._beam_area(b)
+                got, why = (None, why) if why else self._beam_lines([e], "PX")
+                if why:
+                    return f"beam {e}: {why}"
+                nodes, kind, _, axi, planar, n1, _ = got[0]
+                rect = b.keyword == "BEAM SECTION" and b.uparam("SECTION") == "RECT"
+                return (nodes, kind, area, axi, planar, n1, None), rho, 1.0, rho * area if rect else None
+            if up.startswith(("T2D", "T3D")):
+                a = self._section_thick.get(e, 1.0)
+                nodes = [conn[0], conn[-1]] + ([conn[1]] if len(conn) == 3 else [])
+                return (nodes, "line", a, False, up.startswith("T2D"), None, None), rho, a, rho
+            return f"element {e} ({typ}) is not one this conversion loads"
+
+        self._reserve_names()
+        for (key, label), token in tokens.items():
+            plan: dict = {"groups": [], "items": [], "why": "", "reduces": True}
+            groups: "OrderedDict[float, List[int]]" = OrderedDict()
+            for e in dedup(self._load_elements(token)):
+                f = form(e, label) if e in self.geom.elements else None
+                if isinstance(f, str):
+                    plan["why"] = f
+                    break
+                if f is None or (label == "CENT" and f[0] is not None and f[0][1] == "point"):
+                    continue
+                item, rho, cent, centrif = f
+                if label == "ROTA" and item is None:
+                    plan["why"], plan["reduces"] = ("Abaqus applies no rotary acceleration to axisymmetric "
+                                                    "elements (Abaqus 2017, Distributed loads)", False)
+                    break
+                if label == "ROTA":
+                    if rho:
+                        plan["items"].append(item[:2] + (item[2] * rho,) + item[3:])
+                elif centrif:
+                    groups.setdefault(centrif, []).append(e)
+                elif item is None:
+                    plan["why"] = f"axisymmetric element {e} has no density to write it as CENTRIF"
+                    break
+                else:
+                    plan["items"].append(item[:2] + (cent,) + item[3:])
+            if not plan["why"]:
+                for k, (rho, members) in enumerate(groups.items(), 1):
+                    name = self._fresh_name("ABQ2CCX_CENT" + ("" if key == ALL_ELEMENTS_SET else f"_{key}")
+                                            + (f"_{k}" if len(groups) > 1 else ""))
+                    self.geom.elsets[name] = members
+                    plan["groups"].append((name, rho))
+            self._rotary[(key, label)] = plan
+
+    def _section_rho(self, b: Block, opts: Dict[str, List[Block]]) -> Tuple[float, str]:
+        """The one constant density of section ``b``'s material, or of all its plies (a *BEAM
+        GENERAL SECTION's DENSITY=), 0. without one; and why there is none ("" where there is)."""
+        if b.keyword == "BEAM GENERAL SECTION":
+            try:
+                return pf(b.param("DENSITY") or "0"), ""
+            except ValueError:
+                return 0.0, "its section's DENSITY= is not a number"
+        found: Optional[float] = None
+        for _t, m, _o in self._section_layers(b, strict=True) or [("", "", "")]:
+            group = opts.get(m.strip().upper())
+            if group is None:
+                return 0.0, f"its section's material '{m}' is not defined" if m else "its section names no material"
+            try:
+                rows = self._density_rows(group)
+            except ValueError:
+                return 0.0, f"the density of material '{m}' does not read"
+            if len(rows) > 1:
+                return 0.0, f"the density of material '{m}' depends on temperature or field variables"
+            rho = rows[0][0] if rows else 0.0
+            if found is not None and abs(rho - found) > 1e-12 * max(abs(rho), abs(found)):
+                return 0.0, "the plies of its section have different densities"
+            found = rho
+        return found or 0.0, ""
+
+    @staticmethod
+    def _section_thick_of(b: Block) -> float:
+        """A membrane section's thickness: its first data field, 1 where it is blank."""
+        recs = [trimmed_fields(r) for r in merged_data_records(b) if any(x.strip() for x in r)]
+        try:
+            return pf(recs[0][0]) if recs and recs[0][0] else 1.0
+        except ValueError:
+            return 1.0
+
+    @staticmethod
+    def _beam_area(b: Block) -> Tuple[float, str]:
+        """The cross-section area of beam section ``b`` as Abaqus takes it (2017 "Beam cross-section
+        library"): RECT a b, CIRC pi r^2, PIPE and THICK PIPE pi (r^2 - (r - t)^2) (the thin pipe's
+        midline times t is the same), a *BEAM GENERAL SECTION's A or profile
+        (beam_section_properties); and why there is none ("" where there is)."""
+        sec = b.uparam("SECTION") or ("GENERAL" if b.keyword == "BEAM GENERAL SECTION" else "")
+        recs = [trimmed_fields(r) for r in merged_data_records(b) if any(x.strip() for x in r)]
+        try:
+            v = [pf(x) if x else 0.0 for x in (recs[0] if recs else [])] + [0.0] * 2
+        except ValueError:
+            return 0.0, "its section dimensions are not numbers"
+        if sec == "RECT":
+            return v[0] * v[1], ""
+        if sec == "CIRC":
+            return math.pi * v[0] ** 2, ""
+        if sec in ("PIPE", "THICK PIPE"):
+            return math.pi * (v[0] ** 2 - (v[0] - v[1]) ** 2), ""
+        if b.keyword == "BEAM GENERAL SECTION":
+            p = beam_section_properties(sec, recs)
+            return (p.area, "") if isinstance(p, BeamSection) else (0.0, p)
+        return 0.0, f"the area of its SECTION={sec} profile is not computed here"
+
+    def _rotary_lines(self, b: Block, g: List[str]) -> Tuple[List[Tuple[tuple, str, str]], List[str]]:
+        """*DLOAD line ``g`` with a CENT or ROTA load as _plan_rotary_loads planned it: ([(key,
+        CENTRIF line, magnitude)] — keyed by its set's entry, _dl_faces —, comment lines; the
+        nodal forces go to the *CLOAD at the end of the step)."""
+        label = g[1].upper()
+        token = g[0] or (ALL_ELEMENTS_SET if ALL_ELEMENTS_SET in self.geom.elsets else "")
+        plan = self._rotary.get((token.upper(), label))
+        try:
+            mag = pf(g[2]) if len(g) > 2 and g[2] else 0.0
+            axis = tuple(pf(x) if x else 0.0 for x in (g[6:9] + ["", "", ""])[:3])
+            tuple(pf(x) if x else 0.0 for x in g[3:6])
+        except ValueError:
+            return [], self._drop_load_line(b, g, "its magnitude or axis is not a number", reduces=False)
+        if plan is None:
+            return [], self._drop_load_line(b, g, f"element set '{g[0]}' is empty or undefined", reduces=False)
+        if plan["why"]:
+            return [], self._drop_load_line(b, g, plan["why"], reduces=plan["reduces"])
+        if vnorm(axis) == 0.0:
+            return [], self._drop_load_line(b, g, "its axis direction is zero", reduces=False)
+        if label == "ROTA" and any(f[4] for f in plan["items"]) and \
+                math.hypot(axis[0], axis[1]) > 1e-9 * abs(axis[2]):
+            return [], self._drop_load_line(b, g, "Abaqus takes a rotary acceleration on two-dimensional "
+                                                  "elements about the global z axis only", reduces=False)
+        g = [token] + g[1:]
+        out: List[Tuple[tuple, str, str]] = []
+        for name, rho in plan["groups"]:
+            w2 = fmt_num(float("%.12g" % (mag / rho * (self._mass_scale or 1.0))))
+            out.append(((name.upper(), "CENTRIF"), ", ".join([name, "CENTRIF", w2] + [
+                x or "0." for x in (g[3:9] + [""] * 6)[:6]]), w2))
+        if out:
+            self.report.note("*DLOAD CENT (Abaqus: a centrifugal load given as rho w^2, a beam's rho its "
+                             "mass per unit length) -> ccx CENTRIF of w^2 = magnitude / rho on a set of "
+                             "the elements of each density (ABQ2CCX_CENT_...): the same body force.",
+                             once=True)
+            if self._loads_nlgeom():
+                self.report.note("*DLOAD CENT under NLGEOM -> ccx CENTRIF, which keeps each element's "
+                                 "mass; Abaqus' CENT 'does not account for large volume changes' "
+                                 "(Abaqus 2017, Distributed loads): the two agree while volume changes "
+                                 "stay small.", once=True)
+        side = self._to_nodal_forces(b, "DLOAD", g, plan["items"], None) if plan["items"] else []
+        if not out and not plan["items"]:
+            side = [f"** abq2ccx: {', '.join(x for x in g if x)} -> no load: its elements carry no "
+                    f"mass" + (" (or are point masses, which Abaqus' CENT leaves alone)" if label == "CENT"
+                               else "")]
+        return out, side
+
     @staticmethod
     def _signed(mag: str, sign: float) -> str:
         """``mag`` times ``sign`` (a blank magnitude stays blank)."""
@@ -30708,6 +31014,8 @@ class _Loads:
             return ("under NLGEOM a hydrostatic pressure stays normal to the deforming surface and "
                     "acts per unit current area (Abaqus documents no more: whether its depth "
                     "follows the surface either)")
+        if base in ("ROTA", "CENT"):
+            return "under NLGEOM the load follows the deformed position of the mass it acts on"
         if (b.param("FOLLOWER") or "YES").strip().upper() != "NO":
             return ("under NLGEOM the traction rotates with the surface (FOLLOWER=YES, the Abaqus "
                     "default)")
@@ -31003,6 +31311,8 @@ class _Loads:
             def load(p, normal, tangent):
                 q = vsub(p, d)
                 return vscale(vsub(q, vscale(spin, vdot(q, spin))), mag)
+        elif base in ("ROTA", "CENT"):          # (d: a point on the axis; _rotary_lines)
+            axis = vunit(tuple(pf(x) if x else 0.0 for x in (g[6:9] + ["", "", ""])[:3]))
         forces: Dict[Tuple[int, int], float] = {}
         flat: set = set()                                   # nodes of a 2-D model (DOFs 1-2)
         for nodes, kind, scale, axi, planar, n1, sense in faces:
@@ -31022,6 +31332,9 @@ class _Loads:
             elif base == "HP":                  # (d: the zero-pressure level, the magnitude's)
                 def load(p, normal, tangent, s=sense, k=1 if planar else 2):
                     return vscale(normal, mag * s * max(0.0, (d[0] - p[k]) / (d[0] - d[1])))
+            elif base in ("ROTA", "CENT"):      # (sense: a shell's mid-thickness off its reference)
+                def load(p, normal, tangent, s=sense):
+                    return rotary_body_force(base, mag, d, axis, vadd(p, vscale(normal, s)) if s else p)
             fv = consistent_nodal_forces(kind, [self.geom.nodes[n] for n in nodes], load, axi)
             for nd, v in zip(nodes, fv):
                 for k in range(2 if planar else 3):
@@ -31096,6 +31409,13 @@ class _Loads:
                           "above it)")
         elif base == "GRAV":
             what, lack = "gravity (GRAV) on U1 beams", "ccx stops on GRAV on U1 elements"
+        elif base == "ROTA":
+            what, lack = ("rotary accelerations (ROTA: -rho alpha n x (x - x0) per unit volume)",
+                          "ccx has no such load")
+        elif base == "CENT":
+            what, lack = ("centrifugal loads (CENT: rho w^2 times the distance from the axis per unit "
+                          "volume, a beam's per unit length) on beams and on elements without one "
+                          "constant density", "ccx's CENTRIF takes the material's density")
         elif base in ("BX", "BY", "BZ") and any(f[6] is not None for f in faces):
             what, lack = "body forces (BX / BY / BZ, per unit area) on surface elements", \
                 "ccx has no surface element"
@@ -31106,10 +31426,13 @@ class _Loads:
         else:
             what, lack = ("beam line loads (PX / PY / PZ / P1 / P2)", "ccx has no such load (it "
                           "reads P1 / P2 on a beam as a pressure on the expanded section face)")
+        where = ("elements (volumes; areas times the thickness, a shell's at its mid-thickness; lengths "
+                 "times the section area; point masses)" if base in ("ROTA", "CENT") else
+                 "faces / edges (times the section thickness on plane elements, over the full circle on "
+                 "axisymmetric ones)")
         self.report.note(f"*{b.keyword} {what} -> consistent nodal forces in a *CLOAD at the end of "
                          f"the step: {lack}. The shape functions are integrated over the undeformed "
-                         f"faces / edges (times the section thickness on plane elements, over the "
-                         f"full circle on axisymmetric ones).", once=True)
+                         f"{where}.", once=True)
         if any(f[1] == "line" and len(f[0]) == 2 and self._u1_edge(f[0]) for f in faces):
             self.report.note("On U1 beams, a cubic (Euler-Bernoulli) element, the converted line "
                              "loads and gravity also get their consistent end moments (L^2/12 per "
@@ -37531,6 +37854,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # *DLOAD BX / BY / BZ on shells (_plan_shell_body_forces): load token -> its plan, and
         # the names of the shell sets that carry such a load as GRAV
         self._shell_body: Dict[str, dict] = {}
+        # *DLOAD CENT / ROTA (_plan_rotary_loads): (load token, label) -> its plan
+        self._rotary: Dict[Tuple[str, str], dict] = {}
         self._body_sets: set = set()
         # copies of element sets for body loads on two amplitudes in a step (_body_copy): (set as
         # written, n) -> the copy's name; the copy's name -> the set it copies
@@ -38165,6 +38490,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_sheet_pressure(blocks)       # after _plan_distributions resets the used names
         self._plan_shell_body_forces(blocks)    # after the density planners' material copies
         self._plan_two_by_two_body_loads(blocks)    # likewise; after _plan_section_thick
+        self._plan_rotary_loads(blocks)         # likewise
         self._check_undefined_materials(blocks)
         self._plan_planar_constraint(blocks)
         self._note_quadratic_beams(blocks)      # after the planar constraint

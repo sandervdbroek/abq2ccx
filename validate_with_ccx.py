@@ -91,7 +91,8 @@ step), a coupling's INFLUENCE
 RADIUS against the coupling on the nodes within it, rotations coupled in an ORIENTATION's
 axes against the model turned into them, and *DLOAD BX / BY / BZ on shells (a strip against
 its C3D8 twin and the GRAV and pressure forms, also over steps; the Scordelis-Lo roof against
-its published deflection), loads ccx keys otherwise than Abaqus (nodal forces on a step-time
+its published deflection), *DLOAD CENT and ROTA (an annulus and radial beams against the
+rotating-disc solutions and beam theory), loads ccx keys otherwise than Abaqus (nodal forces on a step-time
 amplitude over steps, gravity per set and direction) against the plain loads Abaqus applies,
 and rigid-body reference nodes: a shell REF NODE with a *TRANSFORM in a dynamic step against
 the deck without it, the reaction at a REF NODE on an element outside the body against a free
@@ -4075,6 +4076,96 @@ def scordelis_roof_deck(typ, n, rho):
         ["*BOUNDARY", "APEX, YSYMM", "SYMM, ZSYMM", "WALL, 1, 2", "*STEP", "*STATIC", "*DLOAD",
          "ROOF, BX, -0.20833", "*NODE PRINT, NSET=SYMM", "U", "*END STEP"]
     return "\n".join(lines) + "\n", nid(m, m)
+
+
+def rotary_disc_deck(typ, rho=7.85e-9, steps=None, nr=4, nt=24, a=50.0, b=100.0, t=2.0):
+    """A full annulus r = a..b (50..100), t 2 thick (E 210000, nu 0.3, density ``rho``; None:
+    none), of ``typ`` C3D20 (one layer), CPS8 (plane stress) or S8R: nr x nt quadratic elements
+    with their midside nodes on the arcs.  Its hub r = a is held (a C3D20 layer in x and y, in z
+    at mid-thickness only, so that it thins as plane stress does).  ``steps``: the step cards
+    (default: CENT rho w^2 = 7.85e-3 about z, then OP=NEW ROTA 1e6 about z), each printing U on
+    the outer ring OUT: node 8001 + k at the angle k pi / 24."""
+    def nid(lay, ir, it):
+        return lay * 100000 + ir * 1000 + it % (2 * nt) + 1
+    layers = (0.0, t / 2, t) if typ == "C3D20" else (0.0,)
+    lines = ["*HEADING", f"rotary body loads on a held annulus of {typ}", "*NODE"]
+    for lay, z in enumerate(layers):
+        for ir in range(2 * nr + 1):
+            for it in range(2 * nt):
+                if (ir % 2 and it % 2) or (lay == 1 and (ir % 2 or it % 2)):
+                    continue
+                r, th = a + (b - a) * ir / (2 * nr), math.pi * it / nt
+                lines.append(f"{nid(lay, ir, it)}, {r * math.cos(th)!r}, {r * math.sin(th)!r}, {z!r}")
+    lines.append(f"*ELEMENT, TYPE={typ}, ELSET=DISC")
+    for i in range(nr):
+        for j in range(nt):
+            c = [(2 * i, 2 * j), (2 * i + 2, 2 * j), (2 * i + 2, 2 * j + 2), (2 * i, 2 * j + 2)]
+            m = [(2 * i + 1, 2 * j), (2 * i + 2, 2 * j + 1), (2 * i + 1, 2 * j + 2), (2 * i, 2 * j + 1)]
+            conn = [nid(0, *p) for p in c + m] if typ != "C3D20" else \
+                [nid(lay, *p) for lay, ps in ((0, c), (2, c), (0, m), (2, m), (1, c)) for p in ps]
+            lines.append(f"{i * nt + j + 1}, " + ", ".join(map(str, conn)))
+    hub = [nid(lay, 0, it) for lay in range(len(layers)) for it in range(0, 2 * nt, 2 if lay == 1 else 1)]
+    lines += ["*NSET, NSET=HUB"] + [", ".join(map(str, hub[k:k + 8])) for k in range(0, len(hub), 8)]
+    lines += ["*NSET, NSET=OUT, GENERATE", f"{nid(0, 2 * nr, 0)}, {nid(0, 2 * nr, 2 * nt - 1)}, 1"]
+    lines += {"C3D20": ["*SOLID SECTION, ELSET=DISC, MATERIAL=STEEL"],
+              "CPS8": ["*SOLID SECTION, ELSET=DISC, MATERIAL=STEEL", f"{t!r}"],
+              "S8R": ["*SHELL SECTION, ELSET=DISC, MATERIAL=STEEL", f"{t!r}"]}[typ]
+    lines += ["*MATERIAL, NAME=STEEL", "*ELASTIC", "210000., 0.3"] + \
+        ([] if rho is None else ["*DENSITY", repr(rho)])
+    if typ == "C3D20":
+        lines += ["*NSET, NSET=MID"] + [", ".join(str(nid(1, 0, it)) for it in range(0, 2 * nt, 2))]
+    lines += ["*BOUNDARY"] + (["HUB, 1, 2", "MID, 3, 3"] if typ == "C3D20" else
+                              [f"HUB, 1, {6 if typ == 'S8R' else 2}"])
+    if steps is None:
+        steps = ["*DLOAD\nDISC, CENT, 7.85E-3, 0., 0., 0., 0., 0., 1.",
+                 "*DLOAD, OP=NEW\nDISC, ROTA, 1.E6, 0., 0., 0., 0., 0., 1."]
+    for cards in steps:
+        lines += ["*STEP", "*STATIC", cards, "*NODE PRINT, NSET=OUT", "U", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
+def rotary_disc_refs(r, a=50.0, b=100.0, e=210000.0, nu=0.3, rw2=7.85e-3, ra=7.85e-3):
+    """(u_r under CENT rho w^2 = rw2, u_theta under ROTA rho alpha = ra) at radius r of the
+    annulus a..b in plane stress, held at r = a, free at b: u_r = -k r^3 + c1 r + c2 / r,
+    k = (1 - nu^2) rho w^2 / 8E (Timoshenko's rotating disc); u_theta = rho alpha r / 8G (r^2 - a^2
+    + b^4 (1 / r^2 - 1 / a^2)) (the shear tau = rho alpha (r^4 - b^4) / 4 r^2, which the
+    d'Alembert force -rho alpha r along the hoop direction leaves)."""
+    k = (1 - nu * nu) * rw2 / (8 * e)
+    c1 = k * ((3 + nu) * b ** 4 + (1 - nu) * a ** 4) / ((1 + nu) * b * b + (1 - nu) * a * a)
+    ur = -k * r ** 3 + c1 * r + (k * a ** 4 - c1 * a * a) / r
+    ut = ra * r * (1 + nu) / (4 * e) * (r * r - a * a + b ** 4 * (1 / (r * r) - 1 / (a * a)))
+    return ur, ut
+
+
+def rotary_members_deck(n=10, length=100.0):
+    """Three radial members along x from the z axis (x = 0, clamped there) to x = 100, E 210000,
+    nu 0 (beam theory's): a B32 *BEAM SECTION RECT 2 x 2 (density 7.85e-9) with a point mass 1e-6
+    at its tip (z = 0), a B32 *BEAM GENERAL SECTION RECT 2 x 2 with DENSITY=7.85e-9 (z = 10) and a
+    T3D2 truss of area 4 (z = 20, held in y and z).  Step 1: CENT rho A w^2 = 3.14e-2 on the
+    beams (per unit length), rho w^2 = 7.85e-3 on the truss (per unit volume): w^2 = 1e6; step
+    2, OP=NEW: ROTA 1000 about z on all.  Tips: nodes 1020, 2020, 3010."""
+    lines = ["*HEADING", "rotary body loads on radial beams, a truss and a point mass", "*NODE"]
+    for k, z in ((1, 0.0), (2, 10.0)):
+        lines += [f"{k * 1000 + i}, {length * i / (2 * n)!r}, 0., {z!r}" for i in range(2 * n + 1)]
+    lines += [f"{3000 + i}, {length * i / n!r}, 0., 20." for i in range(n + 1)]
+    for k in (1, 2):
+        lines += [f"*ELEMENT, TYPE=B32, ELSET=B{k}"] + [
+            f"{k * 100 + i}, {k * 1000 + 2 * i}, {k * 1000 + 2 * i + 1}, {k * 1000 + 2 * i + 2}" for i in range(n)]
+    lines += ["*ELEMENT, TYPE=T3D2, ELSET=T"] + [f"{300 + i}, {3000 + i}, {3001 + i}" for i in range(n)]
+    lines += ["*ELEMENT, TYPE=MASS, ELSET=TIPMASS", f"400, {1000 + 2 * n}", "*MASS, ELSET=TIPMASS", "1e-6",
+              "*ELSET, ELSET=BEAMS", "B1, B2", "*ELSET, ELSET=ALL", "BEAMS, T, TIPMASS",
+              "*BEAM SECTION, ELSET=B1, MATERIAL=STEEL, SECTION=RECT", "2., 2.", "0., 0., -1.",
+              "*BEAM GENERAL SECTION, ELSET=B2, SECTION=RECT, DENSITY=7.85e-9", "2., 2.", "0., 0., -1.",
+              "210000., 105000.", "*SOLID SECTION, ELSET=T, MATERIAL=STEEL", "4.",
+              "*MATERIAL, NAME=STEEL", "*ELASTIC", "210000., 0.", "*DENSITY", "7.85e-9",
+              "*NSET, NSET=ROOT", "1000, 2000, 3000", "*NSET, NSET=TRUSS, GENERATE", f"3001, {3000 + n}, 1",
+              "*NSET, NSET=TIPS", f"{1000 + 2 * n}, {2000 + 2 * n}, {3000 + n}",
+              "*BOUNDARY", "ROOT, 1, 6", "TRUSS, 2, 3",
+              "*STEP", "*STATIC", "*DLOAD", "BEAMS, CENT, 3.14e-2, 0., 0., 0., 0., 0., 1.",
+              "T, CENT, 7.85e-3, 0., 0., 0., 0., 0., 1.", "*NODE PRINT, NSET=TIPS", "U", "*END STEP",
+              "*STEP", "*STATIC", "*DLOAD, OP=NEW", "ALL, ROTA, 1000., 0., 0., 0., 0., 0., 1.",
+              "*NODE PRINT, NSET=TIPS", "U", "*END STEP"]
+    return "\n".join(lines) + "\n"
 
 
 def equation_steps_deck(case):
@@ -14450,6 +14541,64 @@ def main():
                   f"tip ux per step {', '.join(f'{x:.6g}' for x in ux)} vs {', '.join(f'{x:g}' for x in want)}"
                   + (f"; uz {p_uz:.6g} vs the pressure's 0.02404" if name == "amplitude" and p_uz else ""))
             failures += 0 if ok else 1
+
+    # --- *DLOAD CENT and ROTA, which ccx 2.23 lacks: CENT (rho w^2) -> CENTRIF of w^2 = CENT /
+    # rho on a set per density, or consistent nodal forces where there is no density; ROTA (alpha)
+    # -> consistent nodal forces of the d'Alembert force -rho alpha n x r.  An annulus held at its
+    # hub under CENT, then (OP=NEW) ROTA: the outer ring's radial and hoop displacements against
+    # the plane-stress solutions (before: both loads dropped, the ring at rest).  S8R without a
+    # density takes 0.5 %: ccx shares a quadratic shell node's force between its expanded nodes
+    # unlike consistent loads (corner and midside nodes 0.996 / 1.002 of u_r; any nodal force)
+    ur_b, ut_b = rotary_disc_refs(100.0)
+    for typ in ("C3D20", "CPS8", "S8R"):
+        for rho in (7.85e-9, None):
+            tag = f"rotary_disc_{typ.lower()}" + ("" if rho else "_no_density")
+            got = review_run(rotary_disc_deck(typ, rho, None if rho else [
+                "*DLOAD\nDISC, CENT, 7.85E-3, 0., 0., 0., 0., 0., 1."]), tag, dat_node_blocks)
+            centrif = bool(re.search(r"(?m)^ABQ2CCX_CENT_DISC, CENTRIF, ", open(os.path.join(
+                tmp, f"{tag}.inp"), encoding="utf-8").read()))
+            ok = bool(got) and len(got) == (2 if rho else 1) and centrif == bool(rho)
+            if not ok:
+                if got:
+                    print(f"FAIL  {tag}: {len(got)} printed steps, CENTRIF written: {centrif}")
+                failures += 1
+                continue
+            errs = []
+            for blk, want in zip(got, ((ur_b, 0.0), (0.0, ut_b))):
+                pol = [(u[0] * math.cos(th) + u[1] * math.sin(th), u[1] * math.cos(th) - u[0] * math.sin(th))
+                       for n, u in blk.items() for th in [math.pi * (n - 8001) / 24]]
+                errs.append(max(abs(p[0] - want[0]) / ur_b + abs(p[1] - want[1]) / abs(ut_b) for p in pol))
+            tol = 5e-3 if typ == "S8R" and not rho else 1e-3
+            ok = len(got[0]) == 48 and max(errs) < tol
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (annulus 50..100 held at its hub, {typ}, CENT "
+                  f"rho w^2 7.85e-3 as {'CENTRIF of w^2 1e6' if rho else 'nodal forces (no density)'}"
+                  + (", then ROTA 1e6 as nodal forces" if rho else "") + f"): outer ring u_r vs the "
+                  f"rotating disc's {ur_b:.6g}" + (f", then u_theta vs {ut_b:.6g}" if rho else "") +
+                  f", {', '.join(f'{x:.1e}' for x in errs)} off (tolerance {tol:g})")
+            failures += 0 if ok else 1
+
+    # radial members clamped on the axis: under CENT the beams' (per unit length) and the truss'
+    # (per unit volume) tips move q L^3 / 3EA (the RECT beam and the truss as CENTRIF, the general
+    # section's beam as nodal forces); under ROTA the beams bend 11 q L^4 / 120 EI, q = rho A
+    # alpha L, the RECT beam's tip mass adding m alpha L L^3 / 3EI
+    got = review_run(rotary_members_deck(), "rotary_members", dat_node_blocks)
+    if got:
+        e_mod, area, inertia, rho_a = 210000.0, 4.0, 4.0 / 3.0, 7.85e-9 * 4.0
+        u_ax = rho_a * 1e6 * 100.0 ** 3 / (3 * e_mod * area)
+        v_beam = -11 * rho_a * 1000.0 * 100.0 * 100.0 ** 4 / (120 * e_mod * inertia)
+        v_mass = -1e-6 * 1000.0 * 100.0 * 100.0 ** 3 / (3 * e_mod * inertia)
+        want = [{1020: (u_ax, 0.0), 2020: (u_ax, 0.0), 3010: (u_ax, 0.0)},
+                {1020: (0.0, v_beam + v_mass), 2020: (0.0, v_beam), 3010: (0.0, 0.0)}]
+        err = [max(math.hypot(blk[n][0] - w[0], blk[n][1] - w[1]) / abs(max(w, key=abs) or 1.0)
+                   for n, w in ws.items()) for blk, ws in zip(got, want)] if len(got) == 2 else [math.inf]
+        ok = max(err) < 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  rotary_members (radial B32 RECT beam with a tip mass, B32 "
+              f"general-section beam, T3D2 truss; CENT then ROTA): tips u_x {', '.join(f'{got[0][n][0]:.6g}' for n in (1020, 2020, 3010))} "
+              f"vs q L^3 / 3EA = {u_ax:.6g}; u_y {got[-1][1020][1]:.6g}, {got[-1][2020][1]:.6g} vs beam "
+              f"theory {v_beam + v_mass:.6g}, {v_beam:.6g} ({', '.join(f'{x:.1e}' for x in err)} off)")
+        failures += 0 if ok else 1
+    else:
+        failures += 1
 
     # --- rigid-body reference nodes (task 115) -------------------------------------------
     # a shell REF NODE with a *TRANSFORM in its PIN NSET, *DYNAMIC: the free reference node
