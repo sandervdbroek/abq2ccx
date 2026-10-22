@@ -925,8 +925,9 @@ KEYWORD_ALIASES = {"AMP": "AMPLITUDE"}
 # parameter names, so parse_keyword_line maps ``REFNODE=`` / ``POSITIONTOLERANCE=`` to these.
 MULTIWORD_PARAMS = (
     "ANALYTICAL SURFACE", "CHANGE NUMBER", "CONSTANT RESULTANT", "CONSTRAINT NAME",
-    "CONTACT ELEMENTS", "CONVERSION CRITERION", "CYCLIC SYMMETRY", "DIRECT USER CONTROL",
-    "DISTORTION CONTROL", "DRILL STIFFNESS", "ELEMENT CONVERSION", "ELEMENT DELETION",
+    "CONTACT ELEMENTS", "CONVERSION CRITERION", "CYCLIC SYMMETRY", "DAMPING PROJECTION",
+    "DIRECT USER CONTROL", "DISTORTION CONTROL", "DRILL STIFFNESS", "ELEMENT CONVERSION",
+    "ELEMENT DELETION",
     "ELEMENT SHIFT", "EXPONENTIAL DECAY", "FILLET RADIUS", "FIXED INTERVAL",
     "HYBRID FORMULATION", "IMPROVED DT METHOD", "INFLUENCE RADIUS", "INITIAL GAP OPENING",
     "KINEMATIC SPLIT", "LAST ITERATIONS", "LAST MODE", "LENGTH RATIO", "LOAD CASE", "MAX DEGRADATION",
@@ -936,7 +937,8 @@ MULTIWORD_PARAMS = (
     "REDUCED POLYNOMIAL", "REF NODE", "RELATIVE TO ABSOLUTE", "ROT NODE", "SCALE FACTOR",
     "SCALE STRESS", "SECOND ORDER ACCURACY", "SECTION FORCES", "SECTION POINTS", "SHELL THICKNESS",
     "SHIFT NODES", "SHOCK SMOOTHING", "SMALL SLIDING", "SPH FORMULATION", "SPH SMOOTHING LENGTH",
-    "SPH TENSILE INSTABILITY CONTROL", "STACK DIRECTION", "STEADY STATE", "TEST DATA INPUT",
+    "SPH TENSILE INSTABILITY CONTROL", "STACK DIRECTION", "STEADY STATE", "SUBSPACE PROJECTION",
+    "TEST DATA INPUT",
     "THERMAL NETWORK", "TIE NSET", "TIED NSET", "TIME DELAY", "TIME INTERVAL", "TIME POINTS",
     "TIME RESET", "TOTAL FORCE", "TOTAL TIME AT START", "TWO STEP", "VAN DER WAALS",
     "WEIGHT FACTOR", "WEIGHTING METHOD")
@@ -7567,7 +7569,21 @@ class _Mesh:
         (probed: a mass 1, 4, 9 node moved alike in x, y and z), so the card is written as the
         isotropic mass m0 = min M_ii with one card per axis with more on the new elements
         _plan_anisotropic_masses tied along it — exact; where the three are equal as that one
-        mass; where the axes are unknown as M11, reduced physics, warned."""
+        mass; where the axes are unknown as M11, reduced physics, warned.  ALPHA and
+        COMPOSITE (the point mass's damping, which ccx's *MASS lacks) are not written:
+        _plan_damping takes ALPHA into the model-wide *DAMPING, which follows the *MASS that
+        carries it (_damping_carrier) where the deck has no *DAMPING card."""
+        out = self._mass_lines(b)
+        if id(b) == self._damping_carrier:
+            out += [emit_keyword("DAMPING", OrderedDict([("ALPHA", short_real(self._damping[0], 12)),
+                                                         ("BETA", short_real(self._damping[1], 12))]))]
+        return out
+
+    def _mass_lines(self, src: Block) -> List[str]:
+        """handle_mass's *MASS card(s)."""
+        b = src if not (src.has("ALPHA") or src.has("COMPOSITE")) else \
+            Block(src.keyword, OrderedDict((k, v) for k, v in src.params.items()
+                                           if k not in ("ALPHA", "COMPOSITE")), src.data)
         if not b.uparam("TYPE").startswith("ANISO") or not b.data:
             return self._mass_scaled(b, self.passthrough(b))
         f = trimmed_fields(b.data[0].split(","))
@@ -7578,8 +7594,8 @@ class _Mesh:
         if not f or not m:
             return self._mass_scaled(b, self.passthrough(b))
         params = OrderedDict((k, v) for k, v in b.params.items() if k not in ("TYPE", "ORIENTATION"))
-        if id(b) in self._amass:
-            m0, cards = self._amass[id(b)]
+        if id(src) in self._amass:
+            m0, cards = self._amass[id(src)]
             self.report.note("*MASS, TYPE=ANISOTROPIC (ccx 2.23 has none) -> the isotropic mass of the "
                              "smallest principal value, and per axis with more the rest on a new node "
                              "that *EQUATIONs tie to the mass's node along that axis and hold across "
@@ -7705,12 +7721,19 @@ class _Mesh:
             if k not in used:
                 self.report.note(f"*{b.keyword} parameter {k} dropped.", once=True)
 
+    def _u1_lines(self, b: Block) -> List[str]:
+        """The U1 cards of section ``b`` (_plan_u1_beams), its material copy's *DAMPING as
+        handle_damping writes it once _plan_damping has run."""
+        damp = self._u1_damping
+        return [x for ln in self._u1_cards[id(b)]
+                for x in (self.handle_damping(damp[ln]) if ln in damp else [ln])]
+
     def handle_beam_section(self, b: Block) -> List[str]:
         sec = b.uparam("SECTION")
         self.emit.u1_last = id(b) in self._u1_cards
         if self.emit.u1_last:
             self._note_dropped_params(b, ("ELSET", "MATERIAL", "SECTION"))
-            return self._u1_cards[id(b)]
+            return self._u1_lines(b)
         # ccx 2.22 beam profiles: RECT, CIRC (ellipse), PIPE, BOX.  Anything else is a
         # hard "unknown section" error, so comment it out with the escape hatches.
         if sec not in ("", "RECT", "CIRC", "PIPE", "BOX", "THICK PIPE"):
@@ -7820,7 +7843,7 @@ class _Mesh:
         self.emit.u1_last = id(b) in self._u1_cards
         if self.emit.u1_last:
             self._note_dropped_params(b, ("ELSET", "SECTION", "DENSITY"))
-            return self._u1_cards[id(b)]
+            return self._u1_lines(b)
         sec = (b.param("SECTION") or "GENERAL").strip().upper()
         if sec in GENERAL_EXPANDED:
             done = self._general_as_beam_section(b, sec)
@@ -12923,8 +12946,9 @@ class _Mesh:
                 out += ["*DENSITY", density]
             if b.keyword == "BEAM SECTION":
                 for g in groups[mat.upper()]:
-                    if g.keyword == "DAMPING":
-                        out += [emit_keyword("DAMPING", g.params)] + list(g.data)
+                    if g.keyword == "DAMPING":           # (written at emission: _u1_lines)
+                        out.append(f"\0DAMPING {id(g)}")
+                        self._u1_damping[out[-1]] = g
         many = len(dirs) > 1
         elset = (b.param("ELSET") or "").strip()
         for d, members in dirs.values():
@@ -15587,6 +15611,225 @@ class _Materials:
                 why, kept = None, True
             self._damage_plan[id(b)] = (m, evolution, why)
         self._jc_damage_kept = kept
+
+    # -- *DAMPING ------------------------------------------------------------
+    @staticmethod
+    def _rayleigh_values(b: Block) -> Tuple[Optional[float], Optional[float]]:
+        """The ALPHA and BETA of *DAMPING card ``b`` as Abaqus reads them: 0 where one is not
+        given (Abaqus' default), a TABULAR one's value where its rows all give the same, else
+        None (it varies with temperature or field variables, or does not read)."""
+        tab = [k for k in ("ALPHA", "BETA") if b.uparam(k) == "TABULAR"]
+        rows = material_rows(b, len(tab)) if tab else None
+        out: List[Optional[float]] = []
+        for k in ("ALPHA", "BETA"):
+            try:
+                if k not in tab:
+                    out.append(pf(b.param(k) or "") if (b.param(k) or "").strip() else 0.0)
+                    continue
+                vals = {pf(r[tab.index(k)]) if r[tab.index(k)] else 0.0 for r in rows or []}
+            except ValueError:
+                out.append(None)
+                continue
+            out.append(vals.pop() if len(vals) == 1 else None)
+        return out[0], out[1]
+
+    def _plan_damping(self, blocks: List[Block]) -> None:
+        """The model-wide ALPHA and BETA every *DAMPING card writes (``_damping``), after
+        _plan_material_cards (the materials sections use).
+
+        Abaqus' *DAMPING is a material option: ALPHA times each element's mass and BETA times
+        its elastic stiffness, per material (a parameter not given is 0: 2017 Keywords); a
+        point mass has its own *MASS / *ROTARY INERTIA, ALPHA= (default 0); springs get no
+        BETA (2017 "Material damping"), contact, which has no material, none.  ccx 2.23 reads
+        ALPHA and BETA into one pair for the whole model (dampings.f: the last card naming one
+        wins, one a card omits keeps the earlier card's or 0, probed) and applies C = alpha M +
+        beta K in *DYNAMIC steps only (nonlingeo.c; dyna.c and steadystate.c take them from
+        *MODAL DAMPING, RAYLEIGH alone): M the whole mass matrix, K the tangent one, so point
+        masses (implicit and explicit), SPRINGA springs and node-to-surface contact are damped
+        too (probed); its explicit solver stops on a BETA (nonlingeo.c: without massless
+        contact, which the converter does not write; probed).  So each
+        parameter is written as the one value of every source it acts on (exact), else left
+        out: reduced physics where a step uses it, or under --approximate the materials' one
+        value where only point masses, springs or contact differ.  STRUCTURAL stays with its
+        material (ccx: per material, *STEADY STATE DYNAMICS); COMPOSITE is not written."""
+        self._damping = (0.0, 0.0)
+        self._damping_carrier = None            # id(*MASS) that writes the card: none else
+        cards = [b for b in blocks if b.keyword == "DAMPING"]
+        self._composite_damping = any(c.keyword == "MODAL DAMPING" and "COMPOSITE" in (
+            c.uparam("VISCOUS"), c.uparam("MODAL")) for c in blocks)
+        point = [b for b in blocks if b.keyword == "MASS" and
+                 self.geom.elset((b.param("ELSET") or "").strip()) or id(b) in self._rotary_done]
+        if not cards and not any(b.has("ALPHA") for b in point):
+            return
+
+        def mass_of(card: Optional[Block], given: Optional[str] = None) -> bool:
+            """Whether a *DENSITY card (or a section's DENSITY= ``given``) gives mass."""
+            try:
+                if card is None:
+                    return bool(given) and pf(given) != 0.0
+                return any(pf(r[0]) != 0.0 for r in material_rows(card, 1) or [["1"]] if r[0])
+            except ValueError:
+                return True
+
+        # (label, value) of every material / section the parameter acts on: ALPHA on those
+        # with mass, BETA on all; and STRUCTURAL's, for the modal steps
+        alpha_src: List[Tuple[str, Optional[float]]] = []
+        beta_src: List[Tuple[str, Optional[float]]] = []
+        structural = False
+        for g in self._material_groups(blocks):
+            name = g[0].uparam("NAME")
+            if name not in self._used_materials:
+                continue
+            damp = [c for c in g[1:] if c.keyword == "DAMPING"]
+            a, bt = self._rayleigh_values(damp[-1]) if damp else (0.0, 0.0)
+            label = f"material {g[0].param('NAME') or name}" + ("" if damp else " (no *DAMPING)")
+            if mass_of(next((c for c in g[1:] if c.keyword == "DENSITY"), None)):
+                alpha_src.append((label, a))
+            beta_src.append((label, bt))
+            structural |= any(self._damping_structural(c) for c in damp)
+        section: Optional[Block] = None
+        for b in blocks:
+            if b.keyword.endswith("SECTION"):
+                section = b
+            elif b.keyword == "DAMPING" and id(b) not in self._card_material and section is not None:
+                a, bt = self._rayleigh_values(b)
+                label = f"*{section.keyword}, ELSET={section.param('ELSET') or ''}"
+                if mass_of(None, section.param("DENSITY")):
+                    alpha_src.append((label, a))
+                beta_src.append((label, bt))
+        dyn = [s for s in self.steps if s.proc == "DYNAMIC"]
+        implicit, explicit = any(not s.explicit for s in dyn), any(s.explicit for s in dyn)
+        extra_a: List[Tuple[str, Optional[float]]] = []
+        for b in point:
+            try:
+                a = pf(b.param("ALPHA") or "") if (b.param("ALPHA") or "").strip() else 0.0
+            except ValueError:
+                a = None
+            extra_a.append((f"*{b.keyword}, ELSET={b.param('ELSET') or ''}"
+                            + ("" if b.has("ALPHA") else " (no ALPHA)"), a))
+        extra_b: List[Tuple[str, Optional[float]]] = []
+        if implicit:
+            if any(b.keyword == "SPRING" and (b.has("NONLINEAR") or any(
+                    pf(x) != 0.0 for x in trimmed_fields((b.data or [""])[-1].split(","))
+                    if re.fullmatch(r"\s*[-+]?(\d+\.?\d*|\.\d+)([eEdD][-+]?\d+)?\s*", x)))
+                   for b in blocks):
+                extra_b.append(("springs (Abaqus damps none)", 0.0))
+            if any(b.keyword in ("CONTACT PAIR", "CONTACT") for b in blocks):
+                extra_b.append(("contact (Abaqus damps none)", 0.0))
+
+        def text(v: Optional[float]) -> str:
+            return "temperature-dependent" if v is None else f"{v:g}"
+
+        written: List[float] = []
+        for par, own, extra, what in (("ALPHA", alpha_src, extra_a, "mass-proportional"),
+                                      ("BETA", beta_src, extra_b, "stiffness-proportional")):
+            vals = {v for _, v in own + extra}
+            if len(vals) <= 1 and None not in vals:
+                written.append(vals.pop() if vals else 0.0)
+                continue
+            mine = {v for _, v in own}
+            approx = next(iter(mine)) if len(mine) == 1 and None not in mine else None
+            listed = ", ".join(f"{label}: {text(v)}" for label, v in own + extra)
+            why = (f"*DAMPING, {par} ({what} Rayleigh damping) differs between the parts of the "
+                   f"model it acts on ({listed}): ccx 2.23 has one {par} for the whole model")
+            written.append(0.0)
+            if not dyn:
+                self.report.note(f"{why}. No *DYNAMIC step uses it (ccx applies it there only), "
+                                 f"so it is left out.", once=True)
+            elif self._approx and approx is not None:
+                written[-1] = approx
+                self.report.warn(f"[APPROX] {why}; written as the materials' {text(approx)}, which "
+                                 f"ccx also applies to "
+                                 f"{', '.join(label for label, v in extra if v != approx)}. Verify.",
+                                 once=True)
+            else:
+                self.report.warn(f"{why}, so it is left out: the *DYNAMIC steps run without it"
+                                 + (" (rerun with --approximate to write the materials' "
+                                    f"{text(approx)} for the whole model)" if approx is not None
+                                    else "") + ".", once=True)
+                self._reduces(f"*DAMPING, {par} ({what} damping) that differs within the model")
+        alpha, beta = written
+        if explicit and beta:
+            self.report.warn("*DAMPING, BETA (stiffness-proportional Rayleigh damping) in a deck with "
+                             "an explicit dynamic step: ccx 2.23's explicit solver takes mass-"
+                             "proportional damping only (it stops on a BETA, probed), so BETA is "
+                             "left out" + (" of every *DYNAMIC step" if implicit else "") + ".",
+                             once=True)
+            self._reduces("*DAMPING, BETA (stiffness-proportional damping) in explicit dynamics")
+            beta = 0.0
+        if any(a for _, a in extra_a) and alpha and not cards:
+            self._damping_carrier = next((id(b) for b in point if b.keyword == "MASS"), None)
+        self._damping = (alpha, beta)
+        if beta and implicit:
+            self.report.note("*DAMPING, BETA: ccx's stiffness-proportional damping is BETA times the "
+                             "tangent stiffness matrix (geometric and plastic tangent, hourglass "
+                             "stiffness too), Abaqus' BETA times the elastic material stiffness: "
+                             "they agree for linear elastic materials at small strain.", once=True)
+        # Abaqus' mode-based steps use material damping projected onto the modes (the SIM
+        # architecture of a Lanczos or AMS *FREQUENCY, both defaults), or directly (*STEADY
+        # STATE DYNAMICS, DIRECT / SUBSPACE PROJECTION), but no *MASS, ALPHA (2017 Keywords);
+        # ccx's take *MODAL DAMPING only (and STRUCTURAL in *STEADY STATE DYNAMICS)
+        modal = [s for s in self.steps if s.proc in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS")]
+        proj = any(f.uparam("SIM") != "NO" and f.uparam("DAMPING PROJECTION") != "OFF"
+                   for f in blocks if f.keyword == "FREQUENCY")
+        direct = any(s.procedure is not None and s.proc == "STEADY STATE DYNAMICS" and
+                     (s.procedure.has("DIRECT") or s.procedure.has("SUBSPACE PROJECTION"))
+                     for s in modal)
+        rayleigh = any(v != 0.0 for _, v in alpha_src + beta_src)
+        lost = [x for x, on in (("Rayleigh (ALPHA, BETA)", rayleigh),
+                                ("STRUCTURAL", structural and proj and
+                                 any(s.proc == "MODAL DYNAMIC" for s in modal))) if on]
+        if modal and (proj or direct) and lost:
+            self.report.warn(f"Material {' and '.join(lost)} damping with a *MODAL DYNAMIC / *STEADY "
+                             f"STATE DYNAMICS step: Abaqus projects it onto the modes (the SIM "
+                             f"architecture, its *FREQUENCY default) or applies it directly, ccx 2.23 "
+                             f"applies only *MODAL DAMPING there (and STRUCTURAL in *STEADY STATE "
+                             f"DYNAMICS), so those steps run without it. Give it as *MODAL DAMPING.",
+                             once=True)
+            self._reduces("material damping in mode-based steps")
+
+    def handle_damping(self, b: Block) -> List[str]:
+        """``*DAMPING``: _plan_damping's model-wide ALPHA and BETA (both, where either is not 0:
+        ccx's manual asks for both) and the card's own STRUCTURAL where it is not 0 (per
+        material in ccx too).  COMPOSITE (composite modal damping, which ccx lacks) and TABULAR
+        data lines are not written; a card left with nothing is commented out — what that
+        loses, _plan_damping reported."""
+        params: "OrderedDict[str, Optional[str]]" = OrderedDict()
+        alpha, beta = self._damping
+        if alpha or beta:
+            params["ALPHA"], params["BETA"] = short_real(alpha, 12), short_real(beta, 12)
+        if self._damping_structural(b):
+            params["STRUCTURAL"] = (b.param("STRUCTURAL") or "").strip()
+        if b.has("COMPOSITE"):
+            msg = ("*DAMPING, COMPOSITE (the fraction of critical damping for composite modal "
+                   "damping) dropped: ccx 2.23 has no composite modal damping.")
+            if self._composite_damping:
+                self.report.warn(msg, once=True)
+                self._reduces("composite modal damping")
+            else:
+                self.report.note(msg + " No *MODAL DAMPING of this deck uses it.", once=True)
+        if not params:
+            return self._comment_out("*DAMPING left out: its ALPHA and BETA are 0 or not written "
+                                     "(see the other *DAMPING messages), and a STRUCTURAL of 0 is "
+                                     "Abaqus' default.",
+                                     [emit_keyword("DAMPING", b.params)] + list(b.data),
+                                     reduces=False, warn=False)
+        if (alpha or beta) and any(b.uparam(k) == "TABULAR" for k in ("ALPHA", "BETA")) and \
+                None not in self._rayleigh_values(b):
+            self.report.note("*DAMPING, ALPHA / BETA=TABULAR whose rows all give one value: "
+                             "written as that constant (ccx's damping depends on no temperature "
+                             "or field variable).", once=True)
+        return [emit_keyword("DAMPING", params)]
+
+    @staticmethod
+    def _damping_structural(b: Block) -> bool:
+        """Whether *DAMPING card ``b`` gives a STRUCTURAL that is not 0 (one that does not
+        read counts: ccx stops on it, as Abaqus would)."""
+        s = (b.param("STRUCTURAL") or "").strip()
+        try:
+            return bool(s) and pf(s) != 0.0
+        except ValueError:
+            return True
 
     def _materials_after_deck(self, blocks: List[Block]) -> Optional[str]:
         """The last material the converter writes after the deck's last *MATERIAL, as words
@@ -35932,6 +36175,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # INITIATION) -> (material, evolution follows, why commented or None) (_plan_material_cards)
         self._card_material: Dict[int, str] = {}
         self._used_materials: set = set()
+        self._damping: Tuple[float, float] = (0.0, 0.0)     # (_plan_damping)
+        self._damping_carrier: Optional[int] = None
+        self._composite_damping = False
         self._copied_materials: set = set()      # the originals _material_copy copied (upper case)
         self._damage_plan: Dict[int, Tuple[Optional[str], bool, Optional[str]]] = {}
         self._jc_damage_kept = False
@@ -36290,6 +36536,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # GRAV line's other elements (line set -> set), and why U1 was not used (or None)
         self._u1: Dict[int, dict] = {}
         self._u1_cards: Dict[int, List[str]] = {}
+        self._u1_damping: Dict[str, Block] = {}  # a U1 copy's *DAMPING (_u1_lines): its line there
         self._u1_rest: Dict[str, str] = {}
         self._u1_refused: Optional[str] = None
         self._u1_taken: set = set()                # names given to U1 sets and materials
@@ -36503,6 +36750,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "DENSITY": "handle_dependent_material",
         "SPECIFIC HEAT": "handle_dependent_material",
         "MASS": "handle_mass",
+        "DAMPING": "handle_damping",
         "DASHPOT": "handle_dashpot",
         "SPRING": "handle_spring",
         "CONDUCTIVITY": "handle_dependent_material",
@@ -36784,6 +37032,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_initial_temperatures(blocks)     # after the mesh planners: their new nodes
         self._order_material_cards(blocks)      # after the planners that add material cards
         self._plan_material_cards(blocks)
+        self._plan_damping(blocks)              # after it: the materials sections use
         self._undefined_parameter_data(blocks)
         self._plan_deformation_plasticity(blocks)
         self._plan_expansion_as_ortho(blocks)

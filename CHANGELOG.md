@@ -61,7 +61,16 @@ physics.
   * labels past 16 wrap onto another data line (they were cut: ccx stops on a 17-entry line),
     and SDV<n> of three digits is SDV like shorter ones (each printed every state variable
     again). Node output A stays dropped: ccx 2.23 writes no accelerations.
-
+* **`*DAMPING` per material** — Abaqus' Rayleigh damping is a material option; ccx 2.23 has one
+  `ALPHA`, `BETA` pair for the whole model (the last card wins), so the passed-through cards ran
+  every material at the last one's values. Values that every material with mass (`ALPHA`) or
+  stiffness (`BETA`) shares are now written as that pair, both given (a missing one is Abaqus'
+  0); a value that differs, also against a point mass (ccx damps it, Abaqus only by the `*MASS`'s
+  own `ALPHA`) or a spring or contact (ccx's `BETA` damps them, Abaqus' does not), is left out as
+  reduced physics (`--approximate`: the materials' value). `BETA` with an explicit step is left
+  out too (ccx's explicit solver stops on it), and material damping with a `*MODAL DYNAMIC` /
+  `*STEADY STATE DYNAMICS` step is flagged (ccx applies only `*MODAL DAMPING` there).
+  `STRUCTURAL` stays per material; a zero one and `COMPOSITE` are not written.
 * **Explicit mass scaling on part of the model** — `*FIXED MASS SCALING, FACTOR=f, ELSET=...`
   on part of the model (a local factor overriding the global one) was dropped (ccx ran the true
   mass); each section whose elements share a factor now gets a copy of its materials with the

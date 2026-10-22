@@ -226,7 +226,14 @@ TRANSLATED = {
         "the smallest principal mass on the node, the rest per principal axis on new nodes that "
         "`*EQUATION`s tie to it along that axis (exact; reduced physics under `NLGEOM` at a node "
         "with rotations, whose axes Abaqus turns, and where the `ORIENTATION`'s axes are unknown: "
-        "then M11 alone).",
+        "then M11 alone). `ALPHA` goes into the model-wide `*DAMPING` (see there).",
+    "*DAMPING": "ccx 2.23 has one `ALPHA`, `BETA` pair for the whole model, applied in `*DYNAMIC` "
+        "steps to all mass and stiffness (point masses, springs, contact too): a value every "
+        "material, section and point mass it acts on shares → that pair, both given (a missing one "
+        "is 0); one that differs → left out, reduced physics (`--approximate`: the materials' "
+        "value where only point masses, springs or contact differ). `BETA` with an explicit step "
+        "→ left out (ccx stops on it). `STRUCTURAL` stays per material; `COMPOSITE` and a zero "
+        "`STRUCTURAL` are not written. Proved by `validate_with_ccx.py` (`rayleigh_*`).",
     "*DASHPOT": "of `DASHPOT1` / `DASHPOT2` elements: written without its DOF line, which ccx reads as "
         "a coefficient and stops on in a dynamic step, and without `ORIENTATION` (see the elements); "
         "of `DASHPOTA` elements without a DOF line where Abaqus has a blank one (ccx stops on `1, 1`).",

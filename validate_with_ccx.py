@@ -5464,6 +5464,58 @@ def dashpot2_dofs_answer(t=2.0):
     return (total + diff) / 2.0, (total - diff) / 2.0, t * t / 2.0
 
 
+RAYLEIGH_COLUMNS = ((1000.0, 1.0), (4000.0, 0.5))      # E, density of materials MA, MB
+
+
+def rayleigh_columns_deck(a="*Damping, alpha=4., beta=1e-3", b="*Damping, beta=1e-3, alpha=4."):
+    """Two one-element columns (C3D8, unit cube, nu = 0) of materials MA and MB
+    (RAYLEIGH_COLUMNS) with *DAMPING ``a`` and ``b``: lateral DOFs and the bottom held, the top
+    moving up at 1; implicit *DYNAMIC, ALPHA=0 (no numerical damping) over 0.2.  Each column
+    has one mode, k = E, m = rho / 3 (consistent mass): rayleigh_column_answer."""
+    corner = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+    nodes = "".join(f"{i + 1 + 10 * k}, {x + 2 * k}., {y}., {z}.\n" for k in (0, 1)
+                    for i, (x, y, z) in enumerate(corner))
+    (ea, ra), (eb, rb) = RAYLEIGH_COLUMNS
+    return ("*Node\n" + nodes + "*Element, type=C3D8, elset=CA\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Element, type=C3D8, elset=CB\n2, 11, 12, 13, 14, 15, 16, 17, 18\n"
+            "*Nset, nset=ALL\n1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18\n"
+            "*Nset, nset=BOT\n1, 2, 3, 4, 11, 12, 13, 14\n*Nset, nset=TOP\n5, 6, 7, 8, 15, 16, 17, 18\n"
+            "*Nset, nset=TIPS\n7, 17\n"
+            "*Solid Section, elset=CA, material=MA\n*Solid Section, elset=CB, material=MB\n"
+            f"*Material, name=MA\n*Elastic\n{ea}, 0.\n*Density\n{ra}\n{a}\n"
+            f"*Material, name=MB\n*Elastic\n{eb}, 0.\n*Density\n{rb}\n{b}\n"
+            "*Boundary\nALL, 1, 2\nBOT, 3, 3\n*Initial Conditions, type=VELOCITY\nTOP, 3, 1.\n"
+            "*Step, inc=100000\n*Dynamic, alpha=0., direct\n1e-4, 0.2\n"
+            "*Node Print, nset=TIPS, frequency=50\nU\n*End Step\n")
+
+
+def rayleigh_column_answer(e_mod, rho, alpha, beta, t):
+    """A rayleigh_columns_deck column's top at time ``t``: a damped oscillator of omega^2 =
+    3 E / rho, zeta = alpha / 2 omega + beta omega / 2, started at velocity 1."""
+    w = math.sqrt(3.0 * e_mod / rho)
+    z = alpha / (2.0 * w) + beta * w / 2.0
+    wd = w * math.sqrt(1.0 - z * z)
+    return math.exp(-z * w * t) * math.sin(wd * t) / wd
+
+
+def rayleigh_explicit_deck(b="*Damping, alpha=2."):
+    """Two free unit cubes (C3D8) of materials MA (E 1e6, density 1, *DAMPING, ALPHA=2) and MB
+    (E 4e6, density 2, *DAMPING ``b``), moving along x at 1: *DYNAMIC, EXPLICIT over 1, so u =
+    (1 - e^(-2 t)) / 2 where both have ALPHA 2 (no BETA: Abaqus' 0)."""
+    corner = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+    nodes = "".join(f"{i + 1 + 10 * k}, {x + 2 * k}., {y}., {z}.\n" for k in (0, 1)
+                    for i, (x, y, z) in enumerate(corner))
+    return ("*Node\n" + nodes + "*Element, type=C3D8, elset=CA\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Element, type=C3D8, elset=CB\n2, 11, 12, 13, 14, 15, 16, 17, 18\n"
+            "*Nset, nset=ALL\n1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18\n"
+            "*Nset, nset=PROBE\n1, 11\n"
+            "*Solid Section, elset=CA, material=MA\n*Solid Section, elset=CB, material=MB\n"
+            "*Material, name=MA\n*Elastic\n1e6, 0.3\n*Density\n1.\n*Damping, alpha=2.\n"
+            f"*Material, name=MB\n*Elastic\n4e6, 0.3\n*Density\n2.\n{b}\n"
+            "*Initial Conditions, type=VELOCITY\nALL, 1, 1.\n*Step\n*Dynamic, Explicit\n, 1.\n"
+            "*Node Print, nset=PROBE, frequency=100000\nU\n*End Step\n")
+
+
 ANISO_MASS_AXES = ((1.0, 2.0, 2.0), (-2.0, 2.0, -1.0))   # ORIENTATION a, b: v1 = a / 3, v2 = b / 3
 
 
@@ -12943,6 +12995,59 @@ def main():
               f"{side[0]:.6f} ({across:g}); {err:.1e} off")
     else:
         print("FAIL  dashpot2_dofs: no displacements of the four masses")
+    failures += 0 if ok else 1
+
+    # *DAMPING is a material option in Abaqus and one model-wide card in ccx 2.23, the last
+    # one read winning: the converter passed every material's through. Two materials with the
+    # same ALPHA and BETA (given in either order) are that card, exact; an ALPHA that differs
+    # is left out (reduced physics), and the columns then run with BETA alone
+    def tip_history(dat):
+        out = {}
+        for _, title, _, t, rows in A.dat_blocks(dat):
+            if title.startswith("displacements") and t is not None:
+                for r in rows:
+                    out.setdefault(int(r[0]), []).append((t, r[3]))
+        return out
+    for tag, b, alpha_b, reduced in (("rayleigh_two_materials", "*Damping, beta=1e-3, alpha=4.", 4.0, False),
+                                     ("rayleigh_alpha_differs", "*Damping, alpha=1., beta=1e-3", 0.0, True)):
+        src = os.path.join(tmp, f"{tag}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(rayleigh_columns_deck(b=b))
+        _, conv = convert(src, os.path.join(tmp, f"{tag}_check.inp"))
+        h = review_run(rayleigh_columns_deck(b=b), tag, tip_history)
+        ok = bool(h) and all(len(h.get(n, ())) > 20 and abs(h[n][-1][0] - 0.2) < 1e-9 for n in (7, 17))
+        if ok:
+            errs, decay = [], []
+            for n, (e_mod, rho), alpha in zip((7, 17), RAYLEIGH_COLUMNS, (alpha_b if reduced else 4.0, alpha_b)):
+                amp = max(abs(u) for _, u in h[n])
+                errs.append(max(abs(u - rayleigh_column_answer(e_mod, rho, alpha, 1e-3, t)) for t, u in h[n]) / amp)
+                decay.append(max(abs(u - rayleigh_column_answer(e_mod, rho, 0.0, 0.0, t)) for t, u in h[n]) / amp)
+            flagged = any("ALPHA" in r for r in conv.reduced_physics)
+            ok = max(errs) < 5e-3 and min(decay) > 0.1 and flagged == reduced
+            what = ("ALPHA 4 and 1: left out, reduced physics" if reduced else
+                    "both ALPHA 4, BETA 1e-3, in either order")
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (two one-mode C3D8 columns of different E and "
+                  f"density, *DAMPING {what}; implicit *DYNAMIC, ALPHA=0): tip histories "
+                  f"{errs[0]:.1e} / {errs[1]:.1e} of their amplitude from the damped oscillators "
+                  f"(ALPHA {4.0 if not reduced else 0.0:g}, BETA 1e-3), {min(decay):.2f} from the "
+                  f"undamped ones; flagged {flagged}")
+        else:
+            print(f"FAIL  {tag}: no tip displacement histories")
+        failures += 0 if ok else 1
+
+    # explicit: ALPHA without BETA is Abaqus' BETA = 0, which ccx's explicit solver needs (it
+    # stops on a BETA); two free cubes slow down as u = (1 - e^(-2 t)) / 2
+    u = review_run(rayleigh_explicit_deck(), "rayleigh_explicit", dat_displacements)
+    ok = bool(u) and 1 in u and 11 in u
+    if ok:
+        want = (1.0 - math.exp(-2.0)) / 2.0
+        err = max(abs(u[n][0] / want - 1.0) for n in (1, 11))
+        ok = err < 2e-3
+        print(f"{'PASS' if ok else 'FAIL'}  rayleigh_explicit (two free cubes of different materials, "
+              f"*DAMPING, ALPHA=2 without BETA, *DYNAMIC, EXPLICIT): moved {u[1][0]:.6f} and "
+              f"{u[11][0]:.6f} (1 - e^-2) / 2 = {want:.6f}; {err:.1e} off (undamped: 1)")
+    else:
+        print("FAIL  rayleigh_explicit: no displacements of the cubes")
     failures += 0 if ok else 1
 
     # *MASS, TYPE=ANISOTROPIC: ccx 2.23 read its first value as an isotropic mass (frequencies

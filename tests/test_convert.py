@@ -3848,8 +3848,131 @@ def test_u1_material_copy_keeps_the_damping():
             "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n2, 4, 1.\n*End Step\n")
     body, conv, rep = convert_str(deck)
     copy = body.split("*MATERIAL, NAME=ABQ2CCX_U1_M\n")[1].split("*BEAM SECTION")[0]
-    assert copy.startswith("*ELASTIC\n3000000., 0.4498") and "*DENSITY\n7800.\n*DAMPING, ALPHA=0.2, BETA=1e-4\n" in copy
+    assert copy.startswith("*ELASTIC\n3000000., 0.4498") and "*DENSITY\n7800.\n*DAMPING, ALPHA=0.2, BETA=0.0001\n" in copy
     assert "*BEAM SECTION, ELSET=B, MATERIAL=ABQ2CCX_U1_M, SECTION=GENERAL\n" in body and conv.reduced_physics == []
+
+
+def damping_deck(a="*Damping, alpha=2.", b="*Damping, alpha=2., beta=0.", step="*Dynamic\n0.01, 1.",
+                 extra="", density_b="*Density\n2.\n"):
+    """Two bricks, materials MA (with ``a``) and MB (``b``, ``density_b``), in one step."""
+    nodes = "".join(f"{i + 1 + 10 * k}, {x + 2 * k}., {y}., {z}.\n" for k in (0, 1)
+                    for i, (x, y, z) in enumerate([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0),
+                                                   (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]))
+    return ("*Node\n" + nodes + "*Element, type=C3D8, elset=A\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Element, type=C3D8, elset=B\n2, 11, 12, 13, 14, 15, 16, 17, 18\n"
+            "*Solid Section, elset=A, material=MA\n*Solid Section, elset=B, material=MB\n"
+            f"*Material, name=MA\n*Elastic\n1000., 0.3\n*Density\n1.\n{a}\n"
+            f"*Material, name=MB\n*Elastic\n2000., 0.3\n{density_b}{b}\n{extra}"
+            f"*Boundary\n1, 1, 3\n11, 1, 3\n*Step\n{step}\n*Cload\n7, 3, 1.\n*End Step\n")
+
+
+def damping_lines(body):
+    return [ln for ln in body.splitlines() if ln.startswith("*DAMPING")]
+
+
+def test_damping_one_value_set_is_the_model_wide_card():
+    # ccx 2.23 has one ALPHA and BETA for the whole model (the last card naming one wins): the
+    # same values in every material are that card, written with both (a missing BETA is
+    # Abaqus' 0, which ccx reads too)
+    body, conv, rep = convert_str(damping_deck())
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0."] * 2
+    assert conv.reduced_physics == [] and "differs between" not in rep.text()
+    # a material without mass takes no ALPHA, so MB needs none
+    body, conv, rep = convert_str(damping_deck(b="", density_b=""))
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0."] and conv.reduced_physics == []
+    # explicit: mass-proportional damping only, which ccx's explicit solver takes
+    body, conv, rep = convert_str(damping_deck(step="*Dynamic, explicit\n, 1e-3"))
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0."] * 2
+    assert not [r for r in conv.reduced_physics if "DAMPING" in r]
+
+
+def test_damping_that_differs_between_materials_is_left_out():
+    body, conv, rep = convert_str(damping_deck(b="*Damping, alpha=3."))
+    assert damping_lines(body) == [] and "** *Damping, alpha=3." in body.replace("*DAMPING, ALPHA=3.", "*Damping, alpha=3.")
+    assert conv.reduced_physics == ["*DAMPING, ALPHA (mass-proportional damping) that differs within the model"]
+    assert "material MA: 2, material MB: 3" in rep.text()
+    # BETA given in one material only: MB's is Abaqus' default 0; ALPHA, the same, stays
+    body, conv, rep = convert_str(damping_deck(a="*Damping, alpha=2., beta=1e-3", b="*Damping, alpha=2."))
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0."] * 2
+    assert conv.reduced_physics == ["*DAMPING, BETA (stiffness-proportional damping) that differs within the model"]
+    # a material with mass and no *DAMPING has ALPHA 0
+    body, conv, rep = convert_str(damping_deck(b=""))
+    assert damping_lines(body) == [] and "material MB (no *DAMPING): 0" in rep.text()
+    assert len(conv.reduced_physics) == 1
+    # no step that damping acts in: nothing lost, noted
+    body, conv, rep = convert_str(damping_deck(b="*Damping, alpha=3.", step="*Static"))
+    assert damping_lines(body) == [] and conv.reduced_physics == []
+    assert "No *DYNAMIC step uses it" in rep.text()
+
+
+def test_damping_beta_in_an_explicit_step_is_left_out():
+    # ccx 2.23's explicit solver stops on a BETA (probed)
+    deck = damping_deck(a="*Damping, alpha=2., beta=1e-4", b="*Damping, alpha=2., beta=1e-4",
+                        step="*Dynamic, explicit\n, 1e-3")
+    body, conv, rep = convert_str(deck)
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0."] * 2
+    assert conv.reduced_physics == ["*DAMPING, BETA (stiffness-proportional damping) in explicit dynamics"]
+
+
+def test_damping_with_point_masses_springs_and_contact():
+    # ccx's ALPHA damps point masses too (probed), Abaqus' only with the *MASS's own ALPHA
+    # (default 0); ccx's BETA damps springs and contact, Abaqus' neither
+    pm = "*Element, type=MASS, elset=PM\n30, 7\n*Mass, elset=PM{}\n0.5\n"
+    body, conv, rep = convert_str(damping_deck(extra=pm.format("")))
+    assert damping_lines(body) == [] and "*MASS, ELSET=PM (no ALPHA): 0" in rep.text()
+    assert len(conv.reduced_physics) == 1 and "--approximate" in rep.text()
+    body, conv, rep = convert_str(damping_deck(extra=pm.format("")), approximate=True)
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0."] * 2
+    assert "[APPROX] *DAMPING, ALPHA" in rep.text()
+    body, conv, rep = convert_str(damping_deck(extra=pm.format(", alpha=2.")))
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0."] * 2 and conv.reduced_physics == []
+    assert "*MASS, ELSET=PM\n0.5\n" in body            # (ccx's *MASS has no ALPHA)
+    spring = "*Element, type=SpringA, elset=S\n31, 7, 17\n*Spring, elset=S\n\n10.\n"
+    beta = "*Damping, alpha=2., beta=1e-3"
+    body, conv, rep = convert_str(damping_deck(a=beta, b=beta, extra=spring))
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0."] * 2
+    assert "springs (Abaqus damps none): 0" in rep.text() and len(conv.reduced_physics) == 1
+    body, conv, rep = convert_str(damping_deck(a=beta, b=beta, extra=spring.replace("10.", "0.")))
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0.001"] * 2 and conv.reduced_physics == []
+    # point masses alone: their ALPHA, on a *DAMPING after the *MASS
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n*Element, type=SpringA, elset=S\n1, 1, 2\n"
+            "*Spring, elset=S\n\n100.\n*Element, type=MASS, elset=PM\n2, 2\n*Mass, elset=PM, alpha=2.\n1.\n"
+            "*Boundary\n1, 1, 3\n2, 2, 3\n*Step\n*Dynamic\n0.01, 1.\n*Cload\n2, 1, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*MASS, ELSET=PM\n1.\n*DAMPING, ALPHA=2., BETA=0.\n" in body and conv.reduced_physics == []
+
+
+def test_damping_structural_tabular_and_composite():
+    # STRUCTURAL is per material in ccx too; 0 is the default; COMPOSITE has no ccx form
+    body, conv, rep = convert_str(damping_deck(a="*Damping, alpha=2., structural=0.02",
+                                               b="*Damping, alpha=2., structural=0., composite=0.1"))
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0., STRUCTURAL=0.02",
+                                   "*DAMPING, ALPHA=2., BETA=0."]
+    assert conv.reduced_physics == [] and "*DAMPING, COMPOSITE" in rep.text()
+    body, conv, rep = convert_str(damping_deck(a="*Damping, structural=0.", b="", step="*Static"))
+    assert damping_lines(body) == [] and conv.reduced_physics == []
+    # TABULAR (Abaqus/Explicit): rows that give one value are that value; ccx has no other
+    tab = "*Damping, alpha=TABULAR\n2., 0.\n2., 100."
+    step = "*Dynamic, explicit\n, 1e-3"
+    body, conv, rep = convert_str(damping_deck(a=tab, b=tab, step=step))
+    assert damping_lines(body) == ["*DAMPING, ALPHA=2., BETA=0."] * 2 and "2., 100." not in body
+    body, conv, rep = convert_str(damping_deck(a=tab.replace("2., 100.", "4., 100."), b=tab, step=step))
+    assert damping_lines(body) == [] and "material MA: temperature-dependent" in rep.text()
+    assert len(conv.reduced_physics) == 1
+
+
+def test_damping_in_mode_based_steps_is_flagged():
+    # Abaqus projects material damping onto the modes (SIM, the *FREQUENCY default); ccx's
+    # modal steps take *MODAL DAMPING only
+    modal = "*Frequency\n4\n*End Step\n*Step\n*Modal Dynamic\n0.01, 1."
+    body, conv, rep = convert_str(damping_deck(step=modal))
+    assert "material damping in mode-based steps" in conv.reduced_physics
+    body, conv, rep = convert_str(damping_deck(step=modal.replace("*Frequency", "*Frequency, sim=NO")))
+    assert "material damping in mode-based steps" not in conv.reduced_physics
+    # a *MASS's ALPHA acts in direct integration only (2017 Keywords *MASS)
+    pm = "*Element, type=MASS, elset=PM\n30, 7\n*Mass, elset=PM, alpha=2.\n0.5\n"
+    body, conv, rep = convert_str(damping_deck(a="", b="", step=modal, extra=pm))
+    assert "material damping in mode-based steps" not in conv.reduced_physics
 
 
 def test_u1_in_space_needs_approximate_for_open_sections():
