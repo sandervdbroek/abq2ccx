@@ -426,7 +426,8 @@ def test_step_model_of_model_data_only():
 def test_step_model_general_and_perturbation_steps():
     # a perturbation step's NLGEOM switches nothing on; it runs at its base state's, and
     # NLGEOM stays on over the later general steps (NLGEOM=NO too, which handle_step writes as
-    # NLGEOM); a perturbation step's NLGEOM over a linear base state is dropped
+    # NLGEOM, and drops on a perturbation step); a perturbation step's NLGEOM over a linear base
+    # state is dropped
     blocks, m = _step_model("""*BOUNDARY\n1, 1, 3\n*STEP\n*STATIC\n*END STEP
 *STEP, NLGEOM\n*FREQUENCY\n3\n*END STEP\n*STEP, PERTURBATION\n*STATIC\n*END STEP
 *STEP, NLGEOM=YES, AMPLITUDE=step\n*STATIC\n*END STEP\n*STEP\n*BUCKLE\n2\n*END STEP
@@ -440,7 +441,7 @@ def test_step_model_general_and_perturbation_steps():
     assert [s.nlgeom_card for s in m] == [None, True, None, True, None, False, False]
     assert m.nl_before == 3
     assert [s.nlgeom for s in m] == [False] * 3 + [True] * 4
-    assert [s.nlgeom_written for s in m] == [None, None, None, True, None, False, True]
+    assert [s.nlgeom_written for s in m] == [None, None, None, True, None, None, True]
     assert [s.ccx_nlgeom for s in m] == [False] * 3 + [True, False, False, True]
     assert (m.nl_any, m.nl_all, len(m)) == (True, False, 7)
     assert all(s.between == () for s in m)
@@ -11596,8 +11597,9 @@ def test_nlgeom_no_after_an_nlgeom_step_is_written_nlgeom():
     # "Once the NLGEOM option has been switched on, it will be active during all subsequent
     # steps" (Abaqus 2017, *STEP): ccx would run a general step with NLGEOM=NO linear
     # (validate_with_ccx.py nlgeom_no_after_nlgeom), so it is written NLGEOM there; a
-    # perturbation step keeps its NLGEOM=NO (ccx ignores it on *FREQUENCY), the general step
-    # after it gets NLGEOM again (ccx forgets it there), and a first step's NLGEOM=NO stays
+    # perturbation step's NLGEOM=NO goes (Abaqus linearizes about the NLGEOM base state; ccx
+    # ignores it on *FREQUENCY, task 155), the general step after it gets NLGEOM again (ccx
+    # forgets it there), and a first step's NLGEOM=NO stays
     def heads(body):
         return [s.split("\n")[0] for s in body.split("*STEP")[1:]]
 
@@ -11605,7 +11607,7 @@ def test_nlgeom_no_after_an_nlgeom_step_is_written_nlgeom():
     no = _deck_step("Static", load, ", nlgeom=NO")
     body, conv, rep = convert_str(BUCKLE_CUBE + _deck_step("Static", load, ", nlgeom") + no +
                                   _deck_step("Frequency\n2", head=", nlgeom=NO") + no)
-    assert heads(body) == [", NLGEOM", ", NLGEOM", ", NLGEOM=NO, PERTURBATION", ", NLGEOM"]
+    assert heads(body) == [", NLGEOM", ", NLGEOM", ", PERTURBATION", ", NLGEOM"]
     assert rep.text().count("*STEP, NLGEOM=NO after an NLGEOM step written as NLGEOM") == 1
     assert [s.nlgeom for s in conv.steps] == [True] * 4 and not conv.reduced_physics
     body, _, rep = convert_str(BUCKLE_CUBE + no + _deck_step("Static", load))
@@ -21878,15 +21880,17 @@ def test_surface_heat_loads_become_element_based_cards():
     assert not re.search(r"^\*(DFLUX|FILM|RADIATE)\b", body, re.M)
     assert "** TOP, SNU, 1." in body and "is a node-based surface" in rep.text()
     assert "a *FILM PROPERTY table" in rep.text() and "(approximate cavity radiation)" in rep.text()
-    # where ccx would act otherwise the card stays commented: faces an element-based *DFLUX
-    # also loads (Abaqus applies both, ccx keeps one value), an OP=NEW beside *DFLUX cards
+    # faces an element-based *DFLUX also loads: ccx adds a step's lines on one amplitude, as
+    # Abaqus adds the two (other steps: _flush_heat, task 155)
+    body, conv, rep = convert_str(base + "*DFLUX\nEALL, S2, 5.\n*DSFLUX\nTOP, S, 100.\n*END STEP\n")
+    assert "*DFLUX\nEALL, S2, 5.\n" in body and "*DFLUX\nEALL, S2, 100.\n" in body
+    assert not conv.reduced_physics
+    # where ccx would act otherwise the card stays commented: an OP=NEW beside *DFLUX cards
     # (Abaqus' removes its own form only)
-    for loads, why in (("*DFLUX\nEALL, S2, 5.\n*DSFLUX\nTOP, S, 100.\n", "also loaded by another"),
-                       ("*DFLUX\nEALL, BF, 5.\n*END STEP\n*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 1.\n"
-                        "*DSFLUX, OP=NEW\nTOP, S, 100.\n", "Abaqus' OP=NEW removes")):
-        body, conv, rep = convert_str(base + loads + "*END STEP\n")
-        assert "** TOP, S, 100." in body and why in rep.text(), rep.text()
-        assert "*DSFLUX" in conv.reduced_physics
+    body, conv, rep = convert_str(base + "*DFLUX\nEALL, BF, 5.\n*END STEP\n*STEP\n*HEAT TRANSFER, "
+                                         "STEADY STATE\n1., 1.\n*DSFLUX, OP=NEW\nTOP, S, 100.\n*END STEP\n")
+    assert "** TOP, S, 100." in body and "Abaqus' OP=NEW removes" in rep.text(), rep.text()
+    assert "*DSFLUX" in conv.reduced_physics
 
 
 def test_mass_on_a_rigid_member_node_in_no_other_element_gets_a_tetrahedron():
@@ -24190,6 +24194,117 @@ def test_imperfection_first_pass_refusals():
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
+
+
+def test_rigid_rotation_bcs_with_a_transformed_reference_node():
+    # task 155: members of a rigid constraint whose reference node has a *TRANSFORM are tied to
+    # a ROT NODE in its local axes; their rotation BCs go through _plan_coupled_bcs as without
+    # the *TRANSFORM (they bypassed it: no warning, and --approximate kept them)
+    tr = "*Nset, nset=R\n10\n*Transform, nset=R\n0.8660254, 0.5, 0., -0.5, 0.8660254, 0.\n"
+    beam = ("*Node\n" + "".join(f"{i}, {0.5 * (i - 1)}, 0., 0.\n" for i in range(1, 6)) +
+            "10, 2.5, 0.3, 0.\n*Element, type=B31, elset=E\n" +
+            "".join(f"{i}, {i}, {i + 1}\n" for i in range(1, 5)) +
+            "*Beam Section, elset=E, material=M, section=RECT\n0.2, 0.1\n0., 0., -1.\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n{tr}*Nset, nset=T\n4, 5\n{con}"
+            "*Boundary\n1, 1, 6\n{ref}*Step\n*Static\n*Boundary\n{bc}*Cload\n5, 2, 1e-3\n*End Step\n")
+    kin = "*Surface, type=NODE, name=S\nT\n*Coupling, ref node=10, surface=S, constraint name=C\n*Kinematic\n"
+    rb = "*Rigid Body, ref node=10, tie nset=T\n"
+    clash = "Possible overconstraint: node 5 DOF 6"
+    for t in ("", tr):
+        body, conv, rep = convert_str(beam.format(tr=t, con=kin, ref="", bc="5, 6, 6, 0.01\n"))
+        assert clash in rep.text() and \
+            "*BOUNDARY on rotations a rigid constraint ties kept as written" in conv.reduced_physics, t
+        body, conv, rep = convert_str(beam.format(tr=t, con=kin, ref="", bc="5, 6, 6, 0.01\n"),
+                                      approximate=True)
+        assert "\n5, 6, 6, 0.01" not in body and "[APPROX] *BOUNDARY taken off 1 DOF(s)" in rep.text(), t
+    # a *RIGID BODY: identical member BCs and one the reference node imposes (its local 3-axis is
+    # the global z) stay, exact (the tie turns round); different ones are warned, as Abaqus stops
+    for ref, bc, warned in (("", "4, 6, 6, 0.01\n5, 6, 6, 0.01\n", False), ("10, 6, 6\n", "5, 6, 6\n", False),
+                            ("", "4, 6, 6, 0.01\n5, 6, 6, 0.02\n", True)):
+        body, conv, rep = convert_str(beam.format(tr=tr, con=rb, ref=ref, bc=bc))
+        assert ("Possible overconstraint: node" in rep.text()) == warned, bc
+        assert ("*BOUNDARY on rotations a rigid constraint ties kept as written" in conv.reduced_physics) \
+            == warned, bc
+
+
+def test_perturbation_step_nlgeom_no_over_an_nlgeom_base_state():
+    # task 155: Abaqus keeps NLGEOM on after it was switched on ('active during all subsequent
+    # steps', *STEP) and linearizes a perturbation step about that base state; written NLGEOM=NO,
+    # ccx ran a static perturbation step linear (a taut string 12x too soft): the parameter goes
+    deck = ("*Node\n" + "".join(f"{i}, {i - 1}., 0., 0.\n" for i in range(1, 12)) +
+            "*Element, type=B31, elset=E\n" + "".join(f"{i}, {i}, {i + 1}\n" for i in range(1, 11)) +
+            "*Beam Section, elset=E, material=M, section=RECT\n0.1, 0.1\n0., 0., -1.\n"
+            "*Material, name=M\n*Elastic\n1e5, 0.3\n*Boundary\n1, 1, 4\n11, 2, 4\n"
+            "*Step, nlgeom\n*Static\n*Boundary\n11, 1, 1, 0.01\n*End Step\n{}")
+    for proc, head in (("*Static\n*Cload\n6, 2, 1e-3\n", "*STEP\n*STATIC"),
+                       ("*Frequency\n3\n", "*STEP, PERTURBATION\n*FREQUENCY")):
+        body, _, _ = convert_str(deck.format("*Step, perturbation, nlgeom=NO\n" + proc + "*End Step\n"))
+        assert "NLGEOM=NO" not in body and "\n" + head in body, proc
+    # a frequency step in between (ccx forgets NLGEOM there): NLGEOM written again
+    body, _, _ = convert_str(deck.format("*Step, perturbation\n*Frequency\n2\n*End Step\n"
+                                         "*Step, perturbation, nlgeom=NO\n*Static\n*Cload\n6, 2, 1e-3\n"
+                                         "*End Step\n"))
+    assert "NLGEOM=NO" not in body and body.count("*STEP, NLGEOM\n") == 2
+
+
+def test_heat_loads_of_another_source_across_steps():
+    # task 155: Abaqus adds the heat loads of two sources (node, element or set as written) on
+    # a node DOF or face across steps ('the loads will be added', About loads), ccx 2.23 keeps
+    # one value per entry, which the later step's line replaced: the earlier flux is given again
+    # at the end of the step, two films become one, a radiation condition is lost (warned)
+    deck = (HEX.replace("C3D8", "DC3D8") + "*Material, name=MH\n*Conductivity\n1.\n*Solid Section, "
+            "elset=EALL, material=MH\n*Nset, nset=TIP\n2, 3, 6, 7\n*Nset, nset=TIP2\n2, 3\n"
+            "*Elset, elset=E2\n1\n*Surface, name=SE\nEALL, S4\n"
+            "*Physical Constants, absolute zero=-273.15, stefan boltzmann=5.67e-8\n"
+            "*Boundary\n1, 11, 11, 0.\n4, 11, 11, 0.\n5, 11, 11, 0.\n8, 11, 11, 0.\n"
+            "*Step\n*Heat Transfer, steady state\n1., 1.\n{}*End Step\n"
+            "*Step\n*Heat Transfer, steady state\n1., 1.\n{}*End Step\n")
+    again = "heat loads of earlier steps on what the step loads above"
+    for first, second, tail in (
+            ("*Cflux\nTIP, 11, 1.\n", "*Cflux\nTIP2, 11, 0.5\n", "*CFLUX\nTIP, 11, 1.\n"),
+            ("*Dsflux\nSE, S, 1.\n", "*Dflux\nEALL, S4, 0.5\n", "*DFLUX\nEALL, S4, 1.\n"),
+            ("*Film\nEALL, F4, 10., 1.\n", "*Film\nE2, F4, 20., 2.\n", "*FILM\n1, F4, 16.6666666667, 3.\n")):
+        body, conv, rep = convert_str(deck.format(first, second))
+        step2 = body[body.rindex("*STEP"):]
+        assert again in step2 and tail in step2[step2.index(again):] and not conv.reduced_physics, first
+    # two earlier films on the face under a third: one film of them all (h 4 at 90 / 4)
+    body, conv, _ = convert_str(deck.format("*Film\nEALL, F4, 10., 1.\n", "*Film\nE2, F4, 20., 2.\n")
+                                + "*Step\n*Heat Transfer, steady state\n1., 1.\n*Film\n1, F4, 40., 1.\n*End Step\n")
+    step3 = body[body.rindex("*STEP"):]
+    assert "*FILM\n1, F4, 22.5, 4.\n" in step3 and not conv.reduced_physics
+    # the same source replaces its load: nothing given again
+    body, conv, _ = convert_str(deck.format("*Cflux\nTIP, 11, 1.\n", "*Cflux\nTIP, 11, 0.5\n"))
+    assert again not in body and not conv.reduced_physics
+    body, conv, rep = convert_str(deck.format("*Radiate\nEALL, R4, 10., 0.5\n", "*Radiate\nE2, R4, 20., 0.3\n"))
+    assert "the earlier one cannot be given again here" in rep.text() and conv.reduced_physics
+
+
+def test_s8r_strips_one_element_wide_in_iterated_steps_warned():
+    # task 155: ccx's C3D20R expansion of an S8R with two opposite free edges has a zero-energy
+    # mode its nonlinear solver drifts along (9-410 % of |u| off the linear step); warned where
+    # the model has a step ccx iterates (here: a never-reached *PLASTIC)
+    def strip(width, plastic):
+        pts = {}
+        for i in range(5):
+            for j in range(2 * width + 1):
+                if not (i % 2 == 1 and j % 2 == 1):
+                    pts[(i, j)] = len(pts) + 1
+        els = [[pts[(2 * a + i, 2 * b + j)] for i, j in ((0, 0), (2, 0), (2, 2), (0, 2), (1, 0), (2, 1),
+                                                         (1, 2), (0, 1))]
+               for a in range(2) for b in range(width)]
+        return ("*Node\n" + "".join(f"{n}, {0.5 * i}, {0.5 * j / width}, 0.\n" for (i, j), n in pts.items()) +
+                "*Element, type=S8R, elset=E\n" + "".join(f"{k}, " + ", ".join(map(str, c)) + "\n"
+                                                          for k, c in enumerate(els, 1)) +
+                "*Shell Section, elset=E, material=M\n0.1\n*Material, name=M\n*Elastic\n1000., 0.3\n" +
+                ("*Plastic\n1e6, 0.\n" if plastic else "") + "*Boundary\n" +
+                "".join(f"{n}, 1, 6\n" for (i, j), n in pts.items() if i == 0) +
+                "*Step\n*Static\n*Cload\n" + "".join(f"{n}, 3, 1e-4\n" for (i, j), n in pts.items() if i == 4) +
+                "*End Step\n")
+    flag = "S8R strips one element wide in a step ccx iterates (C3D20R zero-energy mode)"
+    for width, plastic, warned in ((1, True, True), (1, False, False), (2, True, False)):
+        _, conv, rep = convert_str(strip(width, plastic))
+        assert ("2 S8R element(s) (e.g. element 1) have two opposite edges" in rep.text()) == warned
+        assert (flag in conv.reduced_physics) == warned, (width, plastic)
 
 if __name__ == "__main__":
     import inspect

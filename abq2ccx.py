@@ -5947,6 +5947,9 @@ class StepModel:
           ccx would misread the law (_plan_deformation_plasticity);
         * NLGEOM=NO on a general step after NLGEOM was switched on becomes NLGEOM: Abaqus keeps
           it on, ccx would run the step linear (probed: a cantilever's tip 8.13 against 5.05);
+          on a perturbation step it is dropped, as without it: Abaqus linearizes about the
+          NLGEOM base state, stress stiffening included (probed: a taut string's static
+          perturbation 2.47e-2 under NLGEOM=NO in ccx against 2.02e-3);
         * NLGEOM on a perturbation step whose base state is linear is dropped: Abaqus runs the
           step linear about it, ccx a static perturbation step (a general one there) nonlinear;
         * NLGEOM is added on an explicit step without it (Abaqus/Explicit's default), and on a
@@ -5955,8 +5958,8 @@ class StepModel:
           ccx forgets it after a *FREQUENCY or *BUCKLE step."""
         if given is False and dp:
             given = None
-        elif given is False and base and not pert:
-            given = True
+        elif given is False and base:
+            given = None if pert else True
         elif given and pert and not base:
             given = None
         if given is None and (explicit or again):
@@ -6905,6 +6908,12 @@ class EmitState:
         # the step's *CFLUX / *DFLUX / *FILM / *RADIATE entries (node DOF or element face) ->
         # the amplitude of its line (Converter._track_heat)
         self.heat_taken: Dict[tuple, tuple] = {}
+        # their lines as emitted, per source (keyword, node / element or set as written, DOF or
+        # label) -> [(line, card parameters, the entries it loads, the line in a later step:
+        # _heat_later)], as cl_state (_flush_heat); the sources given in the current step
+        self.heat_state: "OrderedDict[tuple, List[Tuple[str, tuple, frozenset, Optional[tuple]]]]" = \
+            OrderedDict()
+        self.heat_fresh: set = set()
         # the deck's temperatures in force, node -> its values (temperature, then gradients;
         # none: 0, Abaqus' default), for the nodes the converter put between two
         # (Converter._midside_temperatures): the initial conditions', the general steps' up to
@@ -6980,7 +6989,7 @@ class EmitState:
         self.nodal_fresh, self.nodal_reset, self.cload_new = set(), set(), False
         self.dl_fresh, self.dl_wiped, self.dl_taken = set(), False, {}
         self.cl_fresh, self.cl_taken = set(), {}
-        self.heat_taken = {}
+        self.heat_taken, self.heat_fresh = {}, set()
         self.temps_now, self.temps_amp = {} if step.perturbation else self.temps, {}
         self.temps_loose = set()
         if step.perturbation and (self.prev is None or not self.prev.perturbation):
@@ -24546,6 +24555,46 @@ class _Constraints:
         self._reduces("shell/beam rotations turned with the finite rotation in a geometrically "
                       "linear step")
 
+    def _warn_s8r_strips(self) -> None:
+        """Warn (reduced physics) where an S8R element has two opposite edges that no other
+        shell shares — a strip one element wide, a lone element, one hanging off a plate by
+        an edge — in a model with a step ccx runs through its nonlinear solver (_solver_steps,
+        NLGEOM too).  ccx 2.23 expands an S8R into one C3D20R brick, whose zero-energy mode
+        such an element leaves free; the linear solve stays on the right answer, the
+        iterations drift along the mode (probed against the linear *STATIC step, cantilever
+        strips of 1 x 1 to 1 x 8 elements, an L of strips: 9-410 % of max |u| under a
+        never-reached *PLASTIC, 30-78 % under NLGEOM at a load 1e-4 as small, 60-25000 x in a
+        *DYNAMIC step of near-zero mass; holding the long edges in z makes it worse; two
+        elements across, a plate's corner elements and S8 on any mesh exact)."""
+        steps = [why for why in self._solver_steps if why]
+        if not steps or not self._mechanical:
+            return
+        shells = [(e, conn) for e, (typ, conn) in self.geom.elements.items() if ccx_type(typ) in SHELL_TYPES]
+        count: Dict[frozenset, int] = {}
+        for _e, conn in shells:
+            corners = conn[:len(conn) // 2] if len(conn) in (6, 8) else conn
+            for i in range(len(corners)):
+                k = frozenset((corners[i], corners[(i + 1) % len(corners)]))
+                count[k] = count.get(k, 0) + 1
+        hit = []
+        for e, conn in shells:
+            if ccx_type(self.geom.elements[e][0]) != "S8R" or len(conn) != 8:
+                continue
+            free = [count[frozenset((conn[i], conn[(i + 1) % 4]))] == 1 for i in range(4)]
+            if (free[0] and free[2]) or (free[1] and free[3]):
+                hit.append(e)
+        if not hit:
+            return
+        self.report.warn(f"{len(hit)} S8R element(s) (e.g. element {min(hit)}) have two opposite edges "
+                         f"that no other shell shares (a strip one element wide, a lone element), in "
+                         f"a model with {steps[0]}, which ccx 2.23 runs through its nonlinear solver: "
+                         f"ccx expands an S8R into one C3D20R brick, whose zero-energy mode such an "
+                         f"element leaves free, and the iterations drift along it (probed against the "
+                         f"linear step: 9-410 % of max |u| with a never-reached *PLASTIC, 30-78 % under "
+                         f"NLGEOM, far off in *DYNAMIC; two elements across, or S8, exact). Mesh such "
+                         f"strips at least two elements wide, or use S8.", once=True)
+        self._reduces("S8R strips one element wide in a step ccx iterates (C3D20R zero-energy mode)")
+
     def handle_mpc(self, b: Block) -> List[str]:
         """Abaqus ``*MPC``, converted line by line (a line ccx cannot take is commented out
         on its own, the rest of the card is kept), from the deck-wide plan of _plan_mpcs:
@@ -29732,7 +29781,9 @@ class _Constraints:
         reference node's BCs — with 'stops' those of them ccx eliminates (its own coupling,
         _ccx_coupled_translations).  'elim': per member the global translations ccx
         eliminates (an equation's dependent term must avoid them): 'trans', but along an
-        ORIENTATION those of _ccx_coupled_translations."""
+        ORIENTATION those of _ccx_coupled_translations.  'rframe': the local axes of a reference
+        node with a *TRANSFORM whose members' rotations are tied to a ROT NODE that has them
+        (_tie_frame), else None."""
         out: List[dict] = []
 
         def body_emit(ref: int, rot: Optional[int], members) -> str:
@@ -29781,8 +29832,12 @@ class _Constraints:
                 if planar and kind == "kin":
                     self._planar_kin.add(id(b))
                 top = 2 if planar and not rb else 3
-                tie_ok = tied and self._tie_rotations and ref not in self._transformed and \
-                    rot not in self._transformed
+                rframe = self._tie_frame(ref, rot if rot is not None else self._rb_rot_synth.get(ref)
+                                         if b.keyword == "RIGID BODY" else
+                                         self._coupling_plan[id(b)].get("rot")
+                                         if plan in ("rb", "rbk", "kdyn") else None)
+                tie_ok = tied and self._tie_rotations and rot not in self._transformed and \
+                    (ref not in self._transformed or rframe is not None)
                 trans: Dict[int, set] = {}
                 rots: Dict[int, set] = {}
                 elim: Dict[int, set] = {}
@@ -29819,7 +29874,8 @@ class _Constraints:
                 if frame is not None:     # some rotations about an ORIENTATION's axes: no tie
                     rots = {n: ds for n, ds in rots.items() if len(ds) in (0, 3)}   # per DOF
                 out.append(dict(kind=kind, emit=emit, ref=ref, rot=rot, planar=planar,
-                                trans=trans, rots=rots, across=across, stops=stops, elim=elim))
+                                trans=trans, rots=rots, across=across, stops=stops, elim=elim,
+                                rframe=rframe))
         # the rigid bodies of *MPC BEAM lines and rigid connectors ('conn': rigid connectors
         # alone, whose member BCs are a *RIGID BODY's), emitted as *RIGID BODY with a ROT NODE:
         # the dependent nodes follow the independent one in displacement and rotation
@@ -29829,10 +29885,11 @@ class _Constraints:
                 members = set(body["members"]) - {ref, body["rot"]}
                 if not members:
                     continue
-                tie_ok = self._tie_rotations and ref not in self._transformed
+                rframe = self._tie_frame(ref, body["rot"])
+                tie_ok = self._tie_rotations and (ref not in self._transformed or rframe is not None)
                 out.append(dict(kind="conn" if body.get("conn") else "mpc",
                                 emit=body_emit(ref, body["rot"], body["members"]),
-                                ref=ref, rot=None,
+                                ref=ref, rot=None, rframe=rframe,
                                 planar=all(n in self._plane_only for n in members),
                                 trans={n: {1, 2, 3} for n in members},
                                 elim={n: {1, 2, 3} for n in members},
@@ -29840,6 +29897,16 @@ class _Constraints:
                                       if tie_ok and n in self._knots and n in self._rot_nodes
                                       and n not in self._transformed}))
         return out
+
+    def _tie_frame(self, ref: int, tgt: Optional[int]) -> Optional[Tuple[Vec, Vec, Vec]]:
+        """The local axes of reference node ``ref`` with a *TRANSFORM where the rotation ties go
+        to ROT NODE ``tgt``, which has them (_plan_rot_axes; _rotation_ties writes the members'
+        global rotations in them), else None."""
+        if ref not in self._transformed or tgt is None or tgt in self._transformed or \
+                tgt not in self._rot_axes:
+            return None
+        a, b = self._rot_axes[tgt]
+        return a, b, vcross(a, b)
 
     def _bc_states(self, blocks: List[Block], nodes: set):
         """The *BOUNDARY in force on ``nodes`` in each step, as ccx applies them (bc_steps): a
@@ -29932,6 +29999,18 @@ class _Constraints:
             return False                 # (across an ORIENTATION's coupled axes: not imposed)
         if d == 3 and c["planar"]:
             return True                  # no DOF 3 on a 2-D node in Abaqus; ccx's is held anyway
+        if d > 3 and c.get("rframe") and m not in self._transformed:
+            # the member's global rotation d is sum_j e_j[d] theta_j over the reference node's
+            # local rotations theta_j: held at zero by zero BCs on each of them it takes, or the
+            # same BC on the one local axis that is that global one
+            js = [j for j in range(3) if abs(c["rframe"][j][d - 4]) > 1e-9]
+            rs = [step["ref"][4 + j] for j in js]
+            if any(r is None for r in rs):
+                return False
+            if e[1] == 0.0:
+                return all(self._same_bc(e, r, step["z0"][4 + j]) for j, r in zip(js, rs))
+            return len(js) == 1 and abs(c["rframe"][js[0]][d - 4] - 1.0) <= 1e-9 and \
+                self._same_bc(e, rs[0], step["z0"][4 + js[0]])
         if m in self._transformed or c["ref"] in self._transformed:
             return False                 # local DOFs
         r = step["ref"][d]
@@ -30119,12 +30198,25 @@ class _Constraints:
         'approx' (the reasons it is not the same constraint: 'history', 'overlap'; the
         caller adds 'geometry') with the lines the reference node needs: {DOF: value} — the
         BC itself unless the reference node has its own, zero rotations about the other axes
-        unless it holds them already."""
+        unless it holds them already; 'keep' for a rotation tied in the local axes of a
+        reference node with a *TRANSFORM ('rframe'), which stays on the member, exact."""
         step = c["steps"][s]
         ms = step["S"][d]
         if all(self._bc_implied(c, m, d, s) for m in ms):
             return "implied", set(), {}
         es = [step["st"][(m, d)] for m in ms]
+        if d > 3 and c.get("rframe") and all(e[3] for e in es) and \
+                not any(m in self._transformed for m in ms):
+            # tied to a ROT NODE in the reference node's local axes: the BC stays on the
+            # member, whose tie _settle_dependents turns round, so the body follows it — the
+            # same constraint as the move, where the reference node holds none of the local
+            # rotations the member's global one takes (else: local DOFs, as below)
+            if not all(self._same_bc(e, es[0], False) for e in es):
+                return "differ", set(), {}
+            if any(step["ref"][4 + j] is not None for j in range(3)
+                   if abs(c["rframe"][j][d - 4]) > 1e-9):
+                return "kind", set(), {}
+            return "keep", set(), {}
         if not all(e[3] for e in es) or c["ref"] in self._transformed or \
                 any(m in self._transformed for m in ms):
             return "kind", set(), {}
@@ -31728,6 +31820,7 @@ class _Loads:
         self._dload_op_new_first(out)
         out.extend(self._flush_dloads())
         out.extend(self._flush_cloads())
+        out.extend(self._flush_heat())
         out.extend(self._flush_nodal_loads())
         if self.emit.no not in self._pert_idx:
             self._hold_nodal_loads()
@@ -37008,8 +37101,8 @@ class _Loads:
             return self.passthrough(b)
         return ([emit_keyword(b.keyword, b.params)] + kept if kept else []) + side
 
-    def _track_heat(self, kw: str, params: "OrderedDict[str, Optional[str]]", lines: List[str]
-                    ) -> Tuple[List[str], List[str]]:
+    def _track_heat(self, kw: str, params: "OrderedDict[str, Optional[str]]", lines: List[str],
+                    sources: Optional[List[str]] = None) -> Tuple[List[str], List[str]]:
         """The data lines of a ccx *CFLUX / *DFLUX / *FILM / *RADIATE card (``params``: its
         parameters) that ccx 2.23 applies as Abaqus does, and those it would not, left out.
         Abaqus adds what one step gives a node or face twice ("applied additively", About
@@ -37018,15 +37111,22 @@ class _Loads:
         face or body flux (*DFLUX: loadadd), which adds a step's lines on one amplitude and
         stops on two ('*ERROR in forcadd / loadadd', probed); a *FILM or *RADIATE line on a
         face the step gave one already replaces it (probed, also on another amplitude).
-        With TIME DELAY, ccx gives each card a copy of its amplitude of its own."""
+        With TIME DELAY, ccx gives each card a copy of its amplitude of its own.  Each line kept
+        is recorded per source (emit.heat_state, as _track_cloads), where a step's first line
+        replaces the source's lines of earlier steps (_flush_heat); OP=NEW on the card removes
+        the earlier ones of its keyword.  ``sources``: per line the source Abaqus knows it by
+        where that is not its first field (a surface card's)."""
         if kw not in ("CFLUX", "DFLUX", "FILM", "RADIATE"):
             return lines, []
         amp = tuple((params.get(k) or "").strip().upper() for k in ("AMPLITUDE", "FILM AMPLITUDE")) + \
             ((object(),) if "TIME DELAY" in params else ())
-        taken = self.emit.heat_taken
+        taken, state, fresh = self.emit.heat_taken, self.emit.heat_state, self.emit.heat_fresh
+        if (params.get("OP") or "").strip().upper() == "NEW":
+            for k in [k for k in state if k[0] == kw and k not in fresh]:
+                del state[k]
         kept: List[str] = []
         gone: List[str] = []
-        for ln in lines:
+        for j, ln in enumerate(lines):
             g = [x.strip() for x in ln.split(",")]
             if len(g) < 2 or not g[0] or (kw == "CFLUX" and not re.fullmatch(r"[-+]?\d+", g[1])):
                 kept.append(ln)
@@ -37042,7 +37142,35 @@ class _Loads:
             for x in ents:
                 taken[x] = amp
             kept.append(ln)
+            key = (kw, sources[j] if sources else self._load_source(g[0]),
+                   int(g[1]) if kw == "CFLUX" else g[1].upper())
+            if key not in fresh:                    # (a later step's line replaces them)
+                fresh.add(key)
+                state.pop(key, None)
+            try:
+                zero = len(g) < 3 or not g[2] or pf(g[2]) == 0.0 if kw in ("CFLUX", "DFLUX") else \
+                    len(g) < 4 or not g[3] or pf(g[3]) == 0.0
+            except ValueError:
+                zero = False
+            if not zero:
+                state.setdefault(key, []).append((ln, tuple(params.items()), frozenset(ents),
+                                                  self._heat_later(kw, ln, params, amp)))
         return kept, gone
+
+    def _heat_later(self, kw: str, line: str, params: "OrderedDict[str, Optional[str]]",
+                    amp: tuple) -> Optional[Tuple[str, tuple, tuple]]:
+        """A *CFLUX / *DFLUX / *FILM / *RADIATE line of the current step as it is in later steps
+        (line, card parameters, amplitude as _track_heat compares it): _load_later's rule — on a
+        step-time amplitude a flux at its value at the end of the step, plain; a film or
+        radiation condition on one is not followed (None, as an unknown value)."""
+        kept = tuple((k, v) for k, v in params.items() if k != "OP")
+        names = [n for n in amp[:2] if n]
+        if all(n in self._total_amps for n in names):
+            return line, kept, amp
+        if kw in ("FILM", "RADIATE") or len(names) > 1:
+            return None
+        got = self._load_later(line, kept, self._load_amp(params))
+        return None if got is None else (got[0], got[1], ("", ""))
 
     def _heat_clash(self, kw: str, lines: List[str]) -> List[str]:
         """The lines _track_heat left out, commented out (warned, reduced physics)."""
@@ -37065,6 +37193,103 @@ class _Loads:
         return self._comment_out(f"*{kw} line(s) in step {self.emit.no} on {why}. Left out — verify.",
                                  lines, reduces, f"*{kw} line(s) left out: {why}")
 
+    def _flush_heat(self) -> List[str]:
+        """The deck's heat loads of earlier steps on node DOFs / element faces the step's own
+        *CFLUX / *DFLUX / *FILM / *RADIATE lines load, from another source (a node, element or
+        set as written), at the end of the step.  Abaqus adds them up ("if a node is part of a
+        loaded node set in one step and is loaded as an individual node ... in another step, the
+        loads will be added", About loads; film and radiation conditions alike), ccx 2.23 keeps
+        one value per entry, which a later step's line replaces (probed: a *CFLUX on a node set,
+        then on one of its nodes; *DFLUX faces and BF; *FILM, 14-67 % off).  A flux is given
+        again (_loads_again: ccx adds a step's lines); on a face both film conditions become
+        one, h1 + h2 at sink (h1 T1 + h2 T2) / (h1 + h2) (exact), written after the step's line,
+        which ccx replaces with it.  Lost (warned): a flux on another amplitude, a film on other
+        amplitudes or not plain numbers, a radiation condition."""
+        if not self.emit.heat_taken:
+            return []
+        state, fresh = self.emit.heat_state, self.emit.heat_fresh
+        out: List[str] = []
+        lost: List[str] = []
+        for kw in ("CFLUX", "DFLUX"):
+            taken = {x: a for x, a in self.emit.heat_taken.items() if x[0] == kw}
+            left = [((k, i), ents, later) for k, entries in state.items() if k[0] == kw and k not in fresh
+                    for i, (_, _, ents, later) in enumerate(entries)]
+            again, gone = self._loads_again(left, taken, False) if taken else ([], [])
+            lost += [state[k][i][0] for k, i in gone]
+            groups: "OrderedDict[tuple, List[str]]" = OrderedDict()
+            for k, i in again:
+                line, params, _ = state[k][i][3]
+                groups.setdefault(params, []).append(line)
+            for params, data in groups.items():
+                out += [emit_keyword(kw, OrderedDict(params))] + data
+        for kw in ("FILM", "RADIATE"):
+            mine = {x: (k, i) for k, entries in state.items() if k[0] == kw and k in fresh
+                    for i, (_, _, ents, _) in enumerate(entries) for x in ents}
+            olds = [(k, i) for k, entries in state.items() if k[0] == kw and k not in fresh
+                    for i, (_, _, ents, _) in enumerate(entries) if ents & mine.keys()]
+            if not olds:
+                continue
+            if kw == "RADIATE":
+                lost += [state[k][i][0] for k, i in olds]
+                continue
+            per: "OrderedDict[tuple, List[Tuple[int, int]]]" = OrderedDict()   # face -> the old ones
+            for k, i in olds:
+                for x in sorted(state[k][i][2] & mine.keys(), key=str):
+                    per.setdefault(x, []).append((k, i))
+            combined: "OrderedDict[tuple, List[str]]" = OrderedDict()
+            bad: List[Tuple[int, int]] = []
+            for x, ks in per.items():
+                own = state[mine[x][0]][mine[x][1]][3]
+                row = self._films_combined(x, [own] + [state[k][i][3] for k, i in ks])
+                if row is None:
+                    bad += [ki for ki in ks if ki not in bad]
+                else:
+                    combined.setdefault(own[1], []).append(row)
+            lost += [state[k][i][0] for k, i in olds if (k, i) in bad]
+            for params, data in combined.items():
+                out += [emit_keyword(kw, OrderedDict(params))] + data
+        if out:
+            out.insert(0, "** abq2ccx: heat loads of earlier steps on what the step loads above, from "
+                          "another source, given again / combined (Abaqus adds them up; ccx would "
+                          "replace them)")
+            self.report.note("*CFLUX / *DFLUX / *FILM on node DOFs or element faces that a heat load "
+                             "of an earlier step (another node, element or set) still loads: Abaqus "
+                             "adds the two, ccx 2.23 keeps one value per entry, which a later step's "
+                             "line replaces — the earlier flux is given again in that step, two film "
+                             "conditions become one (h1 + h2, sink (h1 T1 + h2 T2) / (h1 + h2)). "
+                             "Exact.", once=True)
+        if lost:
+            listed = "; ".join(lost[:3]) + ("; ..." if len(lost) > 3 else "")
+            self.report.warn(f"Step {self.emit.no} gives heat loads on node DOFs or element faces that "
+                             f"a heat load of an earlier step from another source still loads "
+                             f"({listed}): Abaqus adds the two, ccx 2.23 keeps one value per entry, "
+                             f"which the later step's line replaces, and the earlier one cannot be "
+                             f"given again here (another amplitude, a step-time amplitude, a "
+                             f"radiation condition), so it is lost there. Verify.")
+            self._reduces("heat load of an earlier step replaced where a later step loads its "
+                          "entries from another source")
+        return out
+
+    def _films_combined(self, x: tuple, lines: List[Optional[Tuple[str, tuple, tuple]]]) -> Optional[str]:
+        """The one *FILM line on face entry ``x`` (("FILM", element, label)) that acts as the
+        film conditions ``lines`` (_heat_later) together: film coefficient h1 + h2, sink
+        temperature (h1 T1 + h2 T2) / (h1 + h2); None where that is not exact (another
+        amplitude, a value that is not a plain number, a label other than F1-F6)."""
+        if any(ln is None for ln in lines) or len({ln[2] for ln in lines}) > 1 or \
+                not isinstance(x[1], int) or not re.fullmatch(r"F[1-6]", x[2]):
+            return None
+        h = t = 0.0
+        for ln in lines:
+            g = [f.strip() for f in ln[0].split(",")]
+            try:
+                hi, ti = pf(g[3]), pf(g[2] or "0")
+            except (IndexError, ValueError):
+                return None
+            h, t = h + hi, t + hi * ti
+        if h == 0.0:
+            return None
+        return f"{x[1]}, {x[2]}, {short_real(t / h, 12)}, {short_real(h, 12)}"
+
     # the surface-based heat loads: their element-based ccx card, its face label letter, and
     # the parameters ccx's card reads
     _SURFACE_HEAT = {"DSFLUX": ("DFLUX", "S", ("OP", "AMPLITUDE")),
@@ -37075,12 +37300,12 @@ class _Loads:
         """Why the *DSFLUX / *SFILM / *SRADIATE cards of the deck cannot be written as ccx's
         element-based *DFLUX / *FILM / *RADIATE (handle_surface_heat), per keyword: where the
         deck has both forms and an OP=NEW (Abaqus' removes the earlier loads of its own card
-        only, ccx's those of both), an OP=NEW in a step with several cards of the pair (ccx acts
-        on the first card's only), or element faces that a surface card and another surface or
-        an element-based card both load (Abaqus applies both, ccx keeps one value per face)."""
+        only, ccx's those of both), or an OP=NEW in a step with several cards of the pair (ccx
+        acts on the first card's only).  Element faces that another surface or an element-based
+        card loads too are the per-source bookkeeping's (_track_heat, _flush_heat)."""
         self._surface_heat_why = {}
         steps = [s.cards for s in self.steps.steps]
-        for skw, (ekw, letter, _) in self._SURFACE_HEAT.items():
+        for skw, (ekw, _, _) in self._SURFACE_HEAT.items():
             cards = [b for b in blocks if b.keyword in (skw, ekw)]
             if not any(b.keyword == skw for b in cards):
                 continue
@@ -37094,27 +37319,6 @@ class _Loads:
                 self._surface_heat_why[skw] = (f"a step has several *{skw} / *{ekw} cards and an "
                                                f"OP=NEW, which ccx acts on on a step's first card "
                                                f"only")
-                continue
-            src: Dict[Tuple[int, str], set] = {}
-            for b in cards:
-                for rec in merged_data_records(b):
-                    g = [x.strip() for x in rec]
-                    if len(g) < 2 or not g[0]:
-                        continue
-                    if b.keyword == ekw:
-                        m = re.fullmatch(letter + r"([1-6])(NU)?", g[1].upper())
-                        for e in self._load_elements(g[0]) if m else []:
-                            src.setdefault((e, m.group(1)), set()).add(("element", g[0].upper()))
-                        continue
-                    sd = self.surfaces.get(g[0].upper())
-                    for token, face in sd[1] if sd and not sd[0].startswith("NODE") else []:
-                        if face and re.fullmatch(r"S[1-6]", face):
-                            for e in self._load_elements(token):
-                                src.setdefault((e, face[1]), set()).add(("surface", g[0].upper()))
-            if any(len(s) > 1 and any(k == "surface" for k, _ in s) for s in src.values()):
-                self._surface_heat_why[skw] = (f"element faces it loads are also loaded by another "
-                                               f"surface or a *{ekw} card: Abaqus applies both, ccx "
-                                               f"keeps one value per face")
 
     def handle_surface_heat(self, b: Block) -> List[str]:
         """``*DSFLUX`` / ``*SFILM`` / ``*SRADIATE`` (surface-based flux, film and radiation):
@@ -37133,6 +37337,7 @@ class _Loads:
         if b.has("USER"):
             return self._user_load_card(b)
         body: List[str] = []
+        srcs: List[str] = []                        # (each line's source: the surface)
         side: List[str] = []
         rigid = set(self.geom.elsets.get(RIGID_SET, []))
         for rec in merged_data_records(b):
@@ -37188,13 +37393,14 @@ class _Loads:
                 side += self._drop_load_line(b, g, bad)
                 continue
             body += lines
+            srcs += [f"SURFACE {g[0].upper()}"] * len(lines)
         out: List[str] = []
         if body or b.uparam("OP") == "NEW":           # (an empty OP=NEW card removes them all)
             self.report.note(f"*{b.keyword} -> ccx's element-based *{ekw}: each face Sn of the "
                              f"surface gets label {letter}n (ccx numbers solid and plane element "
                              f"faces as Abaqus does).", once=True)
             params = self._load_params(b, allowed)
-            body, gone = self._track_heat(ekw, params, body)
+            body, gone = self._track_heat(ekw, params, body, srcs)
             side += self._heat_clash(ekw, gone)
             out = [emit_keyword(ekw, params)] + body
         if not out and not side:
@@ -42627,6 +42833,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_beam_section_axes(blocks)        # after them (_untr); may add knot beams
         self._warn_beam_moment_stops(blocks)        # after it: its knot beams
         self._warn_finite_rotations(blocks)         # after every planner adding knot beams
+        self._warn_s8r_strips()                     # after the mesh planners: the final types
         self._warn_dashpot_steps(blocks)            # after _plan_dashpots: its rows
         self._plan_circ_explicit_increment(blocks)
         self._plan_rigid_contact_increment(blocks)

@@ -50,6 +50,19 @@ physics.
   `*INTEGRATED OUTPUT SECTION`) becomes `*SECTION PRINT` on the surface: the total force, the
   moment about the origin and the area in global axes. A reference node's moment, an
   orientation's axes and `SOCF` are noted: ccx prints none of them.
+* **Recorded suspects probed** — a heat load of an earlier step from another source (a node,
+  element or set as written) on the node DOFs or faces a later step loads is given again
+  there, as Abaqus adds the two (ccx kept only the later value: 14-67 % off); two film
+  conditions on one face become one exact film. A radiation condition, or another amplitude,
+  is warned. A `*DSFLUX` / `*SFILM` / `*SRADIATE` whose faces another card also loads is now
+  converted (it was commented out). A `*STEP, PERTURBATION, NLGEOM=NO` after an NLGEOM step
+  drops the NLGEOM=NO, as Abaqus keeps NLGEOM and linearizes about the deformed base state (ccx
+  ran a static perturbation step linear: a taut string 12x too soft). A rotation BC on a member
+  of a rigid body, kinematic coupling or `*MPC BEAM` whose reference node has a `*TRANSFORM` now
+  follows the same rules as without one: it was kept silently, also under `--approximate`. S8R
+  elements with two opposite free edges (a strip one element wide) are warned in models with a
+  step ccx iterates, where ccx's C3D20R expansion drifts (9-410 % off). Two suspects proved
+  exact and are unchanged.
 * **Batch triage, crash reports, ccx install hint** — `--json` prints one object per deck per
   line (JSON Lines), now with the deck's `status` (`converted`, `reduced`, `commented` or
   `failed`) and `reduced_physics`, and a line with `error` for a deck that failed (none was

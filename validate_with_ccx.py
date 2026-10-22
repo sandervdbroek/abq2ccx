@@ -8267,6 +8267,114 @@ def embedded_field(kind, x, dim):
     return [a - b for a, b in zip(_rotate(tuple(x), axis, 1.0), x)][:dim]
 
 
+def t155_coupling_deck(transform):
+    """A B31 cantilever 1-5 along x (clamped at 1) whose nodes 4 and 5 a *COUPLING, *KINEMATIC
+    ties to reference node 10, with a *TRANSFORM (30 deg about z) on it or none (the twin: the
+    reference node has no BC or load, so Abaqus answers alike), node 5's rotation about z
+    prescribed 0.01 by a *BOUNDARY the coupling's reference node does not impose, a tip load."""
+    tr = ("*NSET, NSET=R\n10\n*TRANSFORM, NSET=R\n0.8660254, 0.5, 0., -0.5, 0.8660254, 0.\n"
+          if transform else "")
+    return ("*NODE, NSET=ALLN\n" + "".join(f"{i}, {0.5 * (i - 1)}, 0., 0.\n" for i in range(1, 6)) +
+            "10, 2.5, 0.3, 0.\n*ELEMENT, TYPE=B31, ELSET=E\n" +
+            "".join(f"{i}, {i}, {i + 1}\n" for i in range(1, 5)) +
+            "*BEAM SECTION, ELSET=E, MATERIAL=M, SECTION=RECT\n0.2, 0.1\n0., 0., -1.\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n" + tr +
+            "*NSET, NSET=T\n4, 5\n*NSET, NSET=BEAM\n1, 2, 3, 4, 5\n*SURFACE, TYPE=NODE, NAME=S\nT\n"
+            "*COUPLING, REF NODE=10, SURFACE=S, CONSTRAINT NAME=C\n*KINEMATIC\n"
+            "*BOUNDARY\n1, 1, 6\n*STEP\n*STATIC\n*BOUNDARY\n5, 6, 6, 0.01\n*CLOAD\n5, 2, 1e-3\n"
+            "*NODE PRINT, NSET=BEAM\nU\n*END STEP\n")
+
+
+def t155_string_deck(perturbation):
+    """A taut B31 string (10 elements of 1, RECT 0.1 x 0.1, E 1e5) stretched 0.01 under NLGEOM,
+    then pushed sideways by 1e-3 at midspan: in a *STEP, PERTURBATION, NLGEOM=NO (Abaqus keeps
+    NLGEOM on, so the tension stiffens it), or in a general NLGEOM step (the reference)."""
+    return ("*NODE, NSET=ALLN\n" + "".join(f"{i}, {i - 1}., 0., 0.\n" for i in range(1, 12)) +
+            "*ELEMENT, TYPE=B31, ELSET=E\n" + "".join(f"{i}, {i}, {i + 1}\n" for i in range(1, 11)) +
+            "*BEAM SECTION, ELSET=E, MATERIAL=M, SECTION=RECT\n0.1, 0.1\n0., 0., -1.\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1e5, 0.3\n*BOUNDARY\n1, 1, 4\n11, 2, 4\n"
+            "*STEP, NLGEOM\n*STATIC\n*BOUNDARY\n11, 1, 1, 0.01\n*NODE PRINT, NSET=ALLN\nU\n*END STEP\n" +
+            ("*STEP, PERTURBATION, NLGEOM=NO\n" if perturbation else "*STEP, NLGEOM\n") +
+            "*STATIC\n*CLOAD\n6, 2, 1e-3\n*NODE PRINT, NSET=ALLN\nU\n*END STEP\n")
+
+
+def t155_heat_deck(case, ref=False):
+    """Three DC3D8 in a row (x 0-3), the x = 0 face at temperature 0, steady heat transfer in two
+    steps; the second loads the end element's x = 3 face (S4) or its nodes from another source
+    than the first: ``cflux`` *CFLUX 1 on the end nodes, then 0.5 on two of them as another set;
+    ``dflux`` *DSFLUX 1 on a surface, then *DFLUX 0.5 on the element set; ``film`` *FILM 10 / 1
+    on one element set, then 20 / 2 on another.  Abaqus adds the two sources ('the loads will be
+    added', About loads); ``ref``: the totals on one card with OP=NEW (film: h 3 at 50 / 3)."""
+    nodes = []
+    for i in range(4):
+        for y, z in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            nodes.append(f"{len(nodes) + 1}, {i}., {y}., {z}.\n")
+    els = "".join(f"{e}, {4 * e - 3}, {4 * e + 1}, {4 * e + 2}, {4 * e - 2}, {4 * e}, {4 * e + 4}, "
+                  f"{4 * e + 3}, {4 * e - 1}\n" for e in (1, 2, 3))
+    model = ("*NODE, NSET=ALLN\n" + "".join(nodes) + "*ELEMENT, TYPE=DC3D8, ELSET=E\n" + els +
+             "*ELSET, ELSET=EEND\n3\n*ELSET, ELSET=EEND2\n3\n*NSET, NSET=ROOT\n1, 2, 3, 4\n"
+             "*NSET, NSET=TIP\n13, 14, 15, 16\n*NSET, NSET=TIP2\n13, 14\n"
+             "*SURFACE, NAME=SE\nEEND, S4\n*SOLID SECTION, ELSET=E, MATERIAL=M\n"
+             "*MATERIAL, NAME=M\n*CONDUCTIVITY\n1.\n*BOUNDARY\nROOT, 11, 11, 0.\n")
+    first, second = {"cflux": ("*CFLUX\nTIP, 11, 1.\n", "*CFLUX\nTIP2, 11, 0.5\n"),
+                     "dflux": ("*DSFLUX\nSE, S, 1.\n", "*DFLUX\nEEND, S4, 0.5\n"),
+                     "film": ("*FILM\nEEND, F4, 10., 1.\n", "*FILM\nEEND2, F4, 20., 2.\n")}[case]
+    if ref:
+        second = {"cflux": "*CFLUX, OP=NEW\nTIP, 11, 1.\nTIP2, 11, 0.5\n",
+                  "dflux": "*DFLUX, OP=NEW\nEEND, S4, 1.5\n",
+                  "film": f"*FILM, OP=NEW\nEEND, F4, {50 / 3:.12g}, 3.\n"}[case]
+    step = "*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 1.\n{}*NODE PRINT, NSET=ALLN\nNT\n*END STEP\n"
+    return model + step.format(first) + step.format(second)
+
+
+def t155_temperatures(dat_path):
+    """The *NODE PRINT temperature blocks of a ccx .dat file, in order, as {node: T}."""
+    blocks, cur = [], None
+    if not os.path.exists(dat_path):
+        return blocks
+    for ln in open(dat_path, encoding="utf-8", errors="replace"):
+        if ln.strip().startswith("temperatures"):
+            cur = {}
+            blocks.append(cur)
+            continue
+        f = ln.split()
+        if cur is not None and len(f) == 2 and f[0].isdigit():
+            cur[int(f[0])] = float(f[1])
+        elif cur is not None and f:
+            cur = None
+    return blocks
+
+
+def t155_s8r_deck(width, plastic):
+    """An S8R cantilever strip 2 long (two elements along it), ``width`` elements across its
+    width 1, thickness 0.1, E 1000, clamped at x = 0 and loaded by 1e-3 out of plane at its
+    tip; ``plastic``: a *PLASTIC yield stress (1e6) it never reaches, so ccx runs the step
+    through its nonlinear solver."""
+    pts, nid = {}, 0
+    for i in range(5):
+        for j in range(2 * width + 1):
+            if i % 2 == 1 and j % 2 == 1:
+                continue
+            nid += 1
+            pts[(i, j)] = nid
+    els, e = [], 0
+    for a in range(2):
+        for b in range(width):
+            e += 1
+            corner = [pts[(2 * a + i, 2 * b + j)] for i, j in ((0, 0), (2, 0), (2, 2), (0, 2), (1, 0),
+                                                                (2, 1), (1, 2), (0, 1))]
+            els.append(f"{e}, " + ", ".join(map(str, corner)) + "\n")
+    tip = [n for (i, j), n in pts.items() if i == 4]
+    return ("*NODE, NSET=ALLN\n" + "".join(f"{n}, {0.5 * i}, {0.5 * j / width}, 0.\n"
+                                          for (i, j), n in pts.items()) +
+            "*ELEMENT, TYPE=S8R, ELSET=E\n" + "".join(els) +
+            "*SHELL SECTION, ELSET=E, MATERIAL=M\n0.1\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n" +
+            ("*PLASTIC\n1e6, 0.\n" if plastic else "") + "*BOUNDARY\n" +
+            "".join(f"{n}, 1, 6\n" for (i, j), n in pts.items() if i == 0) + "*STEP\n*STATIC\n*CLOAD\n" +
+            "".join(f"{n}, 3, {1e-3 / len(tip):.8g}\n" for n in tip) +
+            "*NODE PRINT, NSET=ALLN\nU\n*END STEP\n")
+
+
 def main():
     A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
     ccx, env = find_ccx()
@@ -17205,6 +17313,77 @@ def main():
               f"{', '.join(f'{x:.7g}' for x in got)} (1.001 = sigma / E + 0.01 t; before: ccx "
               f"stopped at 4.4 h, 'matrix found to be singular')")
     failures += 0 if u and ok else 1
+
+    # --- task 155: unprobed suspects ---
+    # a kinematic coupling whose reference node has a *TRANSFORM, and a BC on a coupled beam
+    # node's rotation the reference node does not impose: warned as without the *TRANSFORM, and
+    # under --approximate taken off as Abaqus does (it eliminates the coupled DOFs), the twin's
+    # answer (before: kept silently, the body followed it: 0.13 of 0.155 off)
+    runs = [review_run(t155_coupling_deck(tr), "t155_coupling_transform" + ("" if tr else "_ref"),
+                       dat_node_blocks, approximate=True) for tr in (True, False)]
+    rep, _ = convert(os.path.join(tmp, "t155_coupling_transform_src.inp"),
+                     os.path.join(tmp, "t155_coupling_transform_flag.inp"))
+    ok = all(runs)
+    if ok:
+        err, moved = same(runs)
+        warned = "Possible overconstraint: node 5 DOF 6" in rep.text()
+        ok = err <= 1e-9 * moved and moved > 1e-2 and warned
+        print(f"{'PASS' if ok else 'FAIL'}  t155_coupling_transform (a B31 cantilever's nodes 4-5 "
+              f"kinematically coupled to a reference node with a *TRANSFORM, node 5's rotation "
+              f"prescribed): --approximate {err:.1e} apart from the untransformed twin (|u| "
+              f"{moved:.5g}), {'warned' if warned else 'NOT warned'} without it (before: kept "
+              f"silently, 0.13 off)")
+    failures += 0 if ok else 1
+    # a *STEP, PERTURBATION, NLGEOM=NO over an NLGEOM base state: Abaqus keeps NLGEOM ('active
+    # during all subsequent steps', *STEP) and linearizes about the stretched string (stress
+    # stiffening); ccx ran the step written NLGEOM=NO linear
+    runs = [review_run(t155_string_deck(p), "t155_pert_nlgeom_no" + ("" if p else "_ref"),
+                       dat_node_blocks) for p in (True, False)]
+    ok = all(runs) and len(runs[0]) == len(runs[1]) == 2
+    if ok:
+        err, moved = same(runs, -1)
+        dv = runs[0][-1][6][1] - runs[0][0][6][1]
+        ok = err <= 1e-9 * moved and 1.5e-3 < dv < 3e-3
+        print(f"{'PASS' if ok else 'FAIL'}  t155_pert_nlgeom_no (a taut B31 string stretched 0.01 "
+              f"under NLGEOM, then pushed by 1e-3 at midspan in a *STEP, PERTURBATION, NLGEOM=NO): "
+              f"midspan {dv:.5g} as in a general NLGEOM step ({err:.1e} apart; P / (4 N / L + 48 EI "
+              f"/ L^3) = 2.3e-3; before: 2.47e-2, the bending alone)")
+    failures += 0 if ok else 1
+    # heat loads of two sources on one entry in two steps: Abaqus adds them ('the loads will be
+    # added', About loads), ccx keeps one value per entry, which the later step's line replaced
+    # (the *DSFLUX was commented out); the end temperatures against the totals on one card
+    for case, was in (("cflux", "46 % off"), ("dflux", "67 % off, the *DSFLUX commented out"),
+                      ("film", "14 % off")):
+        runs = [review_run(t155_heat_deck(case, r), f"t155_heat_{case}" + ("_ref" if r else ""),
+                           t155_temperatures) for r in (False, True)]
+        ok = all(runs) and len(runs[0]) == len(runs[1]) == 2
+        if ok:
+            err = max(abs(runs[0][-1].get(n, math.inf) - t) for n, t in runs[1][-1].items())
+            top = max(abs(t) for t in runs[1][-1].values())
+            ok = err <= 1e-9 * top and top > 1.0
+            print(f"{'PASS' if ok else 'FAIL'}  t155_heat_{case} (three DC3D8 in a row, steady heat "
+                  f"transfer, the end loaded from another source in the second step): {err:.1e} "
+                  f"from the totals on one card (T up to {top:.5g}; before: {was})")
+        failures += 0 if ok else 1
+    # an S8R cantilever strip one element wide in a *STATIC step ccx runs through its nonlinear
+    # solver (a *PLASTIC never reached): off its linear answer (the C3D20R's zero-energy mode),
+    # warned; two elements across: exact, not warned
+    runs = [review_run(t155_s8r_deck(w, p), f"t155_s8r_strip_{w}" + ("_plastic" if p else ""),
+                       dat_node_blocks) for w in (1, 2) for p in (True, False)]
+    flags = []
+    for w in (1, 2):
+        rep, _ = convert(os.path.join(tmp, f"t155_s8r_strip_{w}_plastic_src.inp"),
+                         os.path.join(tmp, f"t155_s8r_strip_{w}_flag.inp"))
+        flags.append("S8R element(s)" in rep.text())
+    ok = all(runs)
+    if ok:
+        (d1, m1), (d2, m2) = same(runs[0:2]), same(runs[2:4])
+        ok = 0.03 * m1 < d1 < 0.3 * m1 and d2 <= 1e-9 * m2 and flags == [True, False]
+        print(f"{'PASS' if ok else 'FAIL'}  t155_s8r_strip (an S8R cantilever strip, a never-reached "
+              f"*PLASTIC): one element wide {d1 / m1:.3g} of |u| {m1:.4g} off the linear step, "
+              f"{'warned' if flags[0] else 'NOT warned'}; two wide {d2:.1e} apart, "
+              f"{'warned' if flags[1] else 'not warned'}")
+    failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)
