@@ -3,6 +3,7 @@
 
     python corpus/fetch.py               # the decks and the files they read
     python corpus/fetch.py --companions  # only the files the decks already here read
+    python corpus/fetch.py --umat        # only the UMAT tier's sources (manifest.UMAT_SOURCES)
 
 Files land in ``corpus/files/`` (gitignored). Re-run any time; existing files are
 overwritten. Requires network access (uses urllib from the standard library).
@@ -11,8 +12,14 @@ A deck's companions, the files its cards read with ``INPUT=`` (``*INCLUDE`` and 
 such as ``*NODE`` or ``*DISTRIBUTION``, nested ones too), are fetched from next to it and
 saved at the relative path the card names, where Abaqus (and abq2ccx) look for them.  A
 path two decks need with different contents is left out, so no deck reads another's.
+
+The UMAT tier's sources come from the commit the manifest pins, each checked against its
+sha256 (a file that differs is not saved), into ``corpus/files/umat/<owner>__<repository>/``
+at their paths in the repository; tests/test_corpus.py compiles them only when asked to
+(ABQ2CCX_CCX_SRC, docs/testing.md).
 """
 
+import hashlib
 import os
 import re
 import sys
@@ -21,9 +28,10 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from manifest import CORPUS  # noqa: E402
+from manifest import CORPUS, UMAT_SOURCES  # noqa: E402
 
 DEST = os.path.join(HERE, "files")
+UMAT_DEST = os.path.join(DEST, "umat")
 MAX_BYTES = 64 << 20                      # a companion larger than this is not fetched
 _INPUT = re.compile(r'(?i)\binput\s*=\s*("[^"]*"|[^,]*)')
 
@@ -101,7 +109,50 @@ def companions(entry, text, dest, written, reserved):
     return fetched, missing, conflicts
 
 
+def umat_files(repo, src, dest):
+    """Fetch the files of UMAT source repository ``repo`` (``src``: manifest.UMAT_SOURCES[repo],
+    the commit and each file's sha256) into ``dest``/<owner>__<repository>/ at their paths; a
+    file already there with the pinned contents is kept.  Returns (fetched, failed) lists."""
+    root = os.path.join(dest, repo.replace("/", "__"))
+    fetched, failed = [], []
+    for path, sha in sorted(src["files"].items()):
+        parts = path.split("/")
+        if path.startswith("/") or ".." in parts or ":" in path:
+            failed.append(f"{path}: not a path inside the repository")
+            continue
+        local = os.path.join(root, *parts)
+        if os.path.exists(local):
+            with open(local, "rb") as fh:
+                if hashlib.sha256(fh.read()).hexdigest() == sha:
+                    continue
+        url = f"https://raw.githubusercontent.com/{repo}/{src['sha']}/{urllib.parse.quote(path)}"
+        try:
+            data = download(url)
+            if hashlib.sha256(data).hexdigest() != sha:
+                raise ValueError("its sha256 is not the manifest's")
+        except Exception as exc:  # noqa: BLE001
+            failed.append(f"{path}: {exc}")
+            continue
+        os.makedirs(os.path.dirname(local), exist_ok=True)
+        with open(local, "wb") as fh:
+            fh.write(data)
+        fetched.append(path)
+    return fetched, failed
+
+
 def main():
+    if "--umat" in sys.argv[1:]:
+        fail = 0
+        for repo, src in sorted(UMAT_SOURCES.items()):
+            got, failed = umat_files(repo, src, UMAT_DEST)
+            print(f"  {'FAIL' if failed else 'ok  '} {repo} @ {src['sha'][:12]}  [{src['license']}]")
+            for path in got:
+                print(f"       + {path}")
+            for msg in failed:
+                print(f"       - {msg}")
+            fail += bool(failed)
+        print(f"\n{len(UMAT_SOURCES) - fail} repositories ok, {fail} failed -> {UMAT_DEST}")
+        return 1 if fail else 0
     only = "--companions" in sys.argv[1:]
     os.makedirs(DEST, exist_ok=True)
     ok = fail = 0

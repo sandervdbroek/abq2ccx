@@ -206,6 +206,17 @@ Unpack the ccx 2.23 sources (`ccx_2.23.src.tar.bz2`, <https://www.dhondt.de>) an
    macOS), which large local arrays overrun, corrupting ccx's memory:
    `-fmax-stack-var-size=4096` puts them in static memory, so run with `OMP_NUM_THREADS=1`.
 
+The repository's `tools/build_ccx_umat.py` does the three steps in one command, in the
+environment above (ccx's objects once per source tree, cached), with the Abaqus utility routines a UMAT may call (`XIT`,
+`GETOUTDIR`, `GETJOBNAME`, `SINV`, `SPRINC`, `SPRIND`, `ROTSIG`, the SMA arrays, …):
+
+```bash
+python3 tools/build_ccx_umat.py --src CalculiX/ccx_2.23/src -o ccx_umat umat_deck.for
+```
+
+`--stretch` hands the UMAT U in place of DFGRD0 and DFGRD1 (see below), `--uexternaldb` calls
+its `UEXTERNALDB` as Abaqus does, `--patch` and `--fflags` port Intel Fortran source.
+
 Then `abq2ccx --abaqus-umat --run --ccx ./ccx_umat model.inp` converts and runs the deck.
 Built this way with an elastic and a J2 UMAT (isotropic hardening, radial return), cantilevers
 of ten element types bent past yield give exactly the reactions, displacements and stresses of

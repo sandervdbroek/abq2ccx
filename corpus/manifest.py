@@ -49,6 +49,19 @@ references). Each entry carries one of three expectations:
   or invalid source decks (see each entry's ``note``). Each was verified to fail no
   worse than the original unconverted deck.
 
+The UMAT tier: 13 of the user-material decks carry ``umat=dict(...)``, the recipe to build
+ccx 2.23 with the deck's own UMAT (tools/build_ccx_umat.py) from pinned sources
+(``UMAT_SOURCES``: each repository's commit and the sha256 of each file; ``python
+corpus/fetch.py --umat`` downloads them): ``repo``, the ``build`` files, and ``fflags``,
+``patch`` (regex, replacement) pairs for Intel Fortran extensions, ``stretch`` /
+``uexternaldb`` (the helper's shims).  Converted with --abaqus-umat they must solve in that ccx
+under the expect_solve rules, ``reduced_physics`` flagging exactly what else the conversion
+drops, and match a ``twin`` (the same model with Abaqus' built-in material: a corpus ``deck``,
+or the deck with ``edit`` (old, new) text replacements) within ``tol`` (1e-6 by default) in the
+last displacements and stresses, or a ``reference`` curve of the source repository.  Their
+expectations stay as they are: a stock ccx stops on the UMAT or runs its example.  Run by
+tests/test_corpus.py when ABQ2CCX_CCX_SRC names ccx 2.23's source folder (docs/testing.md).
+
 A deck with a published answer (the benchmark decks, and the copy of Abaqus' LE1 CPS3
 deck) carries ``reference=dict(quantity, read, target, abaqus, tol, source)``: what to read
 from ccx's results, the NAFEMS target and Abaqus' result for the deck's mesh, which
@@ -64,6 +77,12 @@ bulk-downloading and running every deck through convert -> referential-integrity
 repos appears once). That stress test plus adversarial code review drove real converter
 fixes - see docs/testing.md.
 """
+
+# the transversely isotropic UMAT's twin: its 5 constants as Abaqus' anisotropic elasticity
+TRANSVERSALISO_ANISO = ('*User Material, constants=5\n114400, 28800, 40800, 18800, 5500',
+                        '*Elastic, type=ANISO\n'
+                        '114400., 40800., 28800., 40800., 18800., 28800., 0., 0.\n'
+                        '0., 5500., 0., 0., 0., 0., 5500., 0.\n0., 0., 0., 0., 5000.')
 
 CORPUS = [
     # --- solve in CalculiX 2.23: an analysis step runs to completion ---
@@ -2370,7 +2389,14 @@ CORPUS = [
     dict(name='bristolcompositesinstitute_single_element', expect_solve=False, license='MIT',
          exercises='CPE4R — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
-         url='https://raw.githubusercontent.com/BristolCompositesInstitute/abaqus-modern-fortran/main/jobs/single-element.inp'),
+         url='https://raw.githubusercontent.com/BristolCompositesInstitute/abaqus-modern-fortran/main/jobs/single-element.inp',
+         umat=dict(repo='BristolCompositesInstitute/abaqus-modern-fortran', build=['src/umat.f'],
+                   fflags='-ffree-form -ffree-line-length-none',
+                   patch=[("#include '([^']+)'", '#include "\\1"')],
+                   reduced_physics='*HOURGLASS STIFFNESS',
+                   twin=dict(edit=[('*user material, constants=2, type=mechanical\n 1000.0, 0.3\n'
+                                    '** This defines the number of state variables (none in this '
+                                    'case)\n*DEPVAR\n1\n', '*Elastic\n1000., 0.3\n')]))),
     dict(name='burakbayramli_beam_problem_keyword', expect_solve=True, license='see source repo',
          exercises='B21 -> U1 (SECTION=I) — mesh-gen',
          reduced_physics='B21 -> U1: an Euler-Bernoulli beam (ccx has no I profile; its U1 beam carries the section exactly, without shear deformation)',
@@ -2413,7 +2439,8 @@ CORPUS = [
     dict(name='cmmai_uplate', expect_solve=False, license='see source repo',
          exercises='CPE3, CPE4 — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
-         url='https://raw.githubusercontent.com/CMMAi/ABAQUS_UMAT/master/Ch3/UPLATE.inp'),
+         url='https://raw.githubusercontent.com/CMMAi/ABAQUS_UMAT/master/Ch3/UPLATE.inp',
+         umat=dict(repo='CMMAi/ABAQUS_UMAT', build=['Ch3/elastic.for'], twin=dict(deck='cmmai_plate'))),
     dict(name='collinsjesurobo_expansion', expect_solve=False, license='see source repo',
          exercises='PIPE31H — *Parameter; contact; mesh-gen',
          note="incomplete source: a template: its *PARAMETER wt = <wt> (the pipe's wall thickness) is filled in outside the deck, so wt and what is computed from it stay unresolved and ccx stops on them ('*ERROR reading *BEAM SECTION')",
@@ -2693,7 +2720,8 @@ CORPUS = [
     dict(name='irfancn_viscoelastic_input', expect_solve=False, license='MIT',
          exercises='C3D8 — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
-         url='https://raw.githubusercontent.com/irfancn/Abaqus-UMAT-viscoelastic/master/viscoelastic_input.inp'),
+         url='https://raw.githubusercontent.com/irfancn/Abaqus-UMAT-viscoelastic/master/viscoelastic_input.inp',
+         umat=dict(repo='irfancn/Abaqus-UMAT-viscoelastic', build=['umat_viscoelastic.for'])),
     dict(name='irfancn_wedge_elast', expect_solve=False, license='MIT',
          exercises='U1, CPS3 — UMAT; *User Element',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
@@ -2705,15 +2733,22 @@ CORPUS = [
     dict(name='jenspfeifle_umat_iso', expect_solve=False, license='none stated',
          exercises='C3D8 — parts/instances/assembly; UMAT',
          note='ccx limitation / source: *ERROR in umat: no user material subroutine',
-         url='https://raw.githubusercontent.com/JensPfeifle/abaqus-usermat/master/UserMat-Job-Iso.inp'),
+         url='https://raw.githubusercontent.com/JensPfeifle/abaqus-usermat/master/UserMat-Job-Iso.inp',
+         umat=dict(repo='JensPfeifle/abaqus-usermat', build=['umat-hooke-iso.f'],
+                   twin=dict(edit=[('*User Material, constants=2\n210000., 0.3',
+                                    '*Elastic\n210000., 0.3')]))),
     dict(name='jenspfeifle_umat_v0', expect_solve=False, license='none stated',
          exercises='C3D8 — parts/instances/assembly; UMAT; *Orientation',
          note='ccx limitation / source: *ERROR in umat: no user material subroutine',
-         url='https://raw.githubusercontent.com/JensPfeifle/abaqus-usermat/master/UserMat-Job-Verbund-0.inp'),
+         url='https://raw.githubusercontent.com/JensPfeifle/abaqus-usermat/master/UserMat-Job-Verbund-0.inp',
+         umat=dict(repo='JensPfeifle/abaqus-usermat', build=['umat-hooke-transversaliso.f'],
+                   twin=dict(edit=[TRANSVERSALISO_ANISO]))),
     dict(name='jenspfeifle_umat_v90', expect_solve=False, license='none stated',
          exercises='C3D8 — parts/instances/assembly; UMAT; *Orientation',
          note='ccx limitation / source: *ERROR in umat: no user material subroutine',
-         url='https://raw.githubusercontent.com/JensPfeifle/abaqus-usermat/master/UserMat-Job-Verbund-90.inp'),
+         url='https://raw.githubusercontent.com/JensPfeifle/abaqus-usermat/master/UserMat-Job-Verbund-90.inp',
+         umat=dict(repo='JensPfeifle/abaqus-usermat', build=['umat-hooke-transversaliso.f'],
+                   twin=dict(edit=[TRANSVERSALISO_ANISO]))),
     dict(name='jgerstmayr_blockc3d10', expect_solve=False, license='BSD-3-Clause',
          exercises='C3D10 — parts/instances/assembly',
          note="ccx stops without 'Job finished' (an unsupported procedure was commented out — see the report)",
@@ -3054,7 +3089,10 @@ CORPUS = [
     dict(name='migueljgoliveira_abaqus_solid1', expect_solve=False, license='see source repo',
          exercises='C3D8 — *Parameter; *Orientation; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
-         url='https://raw.githubusercontent.com/migueljgoliveira/unified-material-model-driver-for-plasticity/main/example/abaqus-solid1.inp'),
+         url='https://raw.githubusercontent.com/migueljgoliveira/unified-material-model-driver-for-plasticity/main/example/abaqus-solid1.inp',
+         umat=dict(repo='migueljgoliveira/unified-material-model-driver-for-plasticity',
+                   build=['example/ummdp_abaqus.f'], fflags='-fdec-format-defaults',
+                   patch=[(r'([(,/]\d+)x([A-Za-z])', r'\1x,\2')])),
     dict(name='migueljgoliveira_abaqus_tensile1', expect_solve=False, license='see source repo',
          exercises='CPS4R — parts/instances/assembly; *Orientation; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
@@ -4036,11 +4074,19 @@ CORPUS = [
     dict(name='sergiolucarini_crystalplasticity', expect_solve=False, license='MIT',
          exercises='C3D10 — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
-         url='https://raw.githubusercontent.com/sergiolucarini/UMAT4COMSOL/main/crystalplasticity/crystalplasticity.inp'),
+         url='https://raw.githubusercontent.com/sergiolucarini/UMAT4COMSOL/main/crystalplasticity/crystalplasticity.inp',
+         umat=dict(repo='sergiolucarini/UMAT4COMSOL', build=['crystalplasticity/umat.f'],
+                   # a unit cube: the force is the stress, the time the strain; ccx 0.25 % off
+                   # Abaqus at most, but 1.1 % at the yield knee (Abaqus' curve overshoots there)
+                   reference=dict(output='*NODE PRINT, NSET=Set-2, TOTALS=ONLY\nRF', set='SET-2',
+                                  direction=3, tol=0.003, knee=(0.025, 0.035, 0.015),
+                                  curve='result_files/crystalplasticity/abaqus_stress_strain.txt'))),
     dict(name='sergiolucarini_elastoplastic', expect_solve=False, license='MIT',
          exercises='CPS6 — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
-         url='https://raw.githubusercontent.com/sergiolucarini/UMAT4COMSOL/main/elastoplastic/elastoplastic.inp'),
+         url='https://raw.githubusercontent.com/sergiolucarini/UMAT4COMSOL/main/elastoplastic/elastoplastic.inp',
+         umat=dict(repo='sergiolucarini/UMAT4COMSOL', build=['elastoplastic/umat.f'],
+                   twin=dict(edit=[('material=MATERIAL-1_UMAT', 'material=MATERIAL-1')]))),
     dict(name='shridhar_cfrp_2d_hashin', expect_solve=False, license='none stated',
          exercises='S4R — parts/instances/assembly',
          note='runs in ccx (its composite S4R shells as S8R) without its HASHIN *DAMAGE INITIATION and *DAMAGE EVOLUTION, which have no ccx form (reduced physics): not gated',
@@ -4052,15 +4098,21 @@ CORPUS = [
     dict(name='sina_taghizadeh_neohookeansimpleextensionumat', expect_solve=False, license='GPL-3.0',
          exercises='C3D8 — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
-         url='https://raw.githubusercontent.com/Sina-Taghizadeh/UMAT_Hyperelastic/main/NeoHookeanSimpleExtensionUMAT.inp'),
+         url='https://raw.githubusercontent.com/Sina-Taghizadeh/UMAT_Hyperelastic/main/NeoHookeanSimpleExtensionUMAT.inp',
+         umat=dict(repo='Sina-Taghizadeh/UMAT_Hyperelastic', build=['CompresibleNeoHookean.for'],
+                   stretch=True, twin=dict(deck='sina_taghizadeh_neohookeansimpleextensioncae'))),
     dict(name='sina_taghizadeh_neohookeansimpleshearumat', expect_solve=False, license='GPL-3.0',
          exercises='C3D8 — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
-         url='https://raw.githubusercontent.com/Sina-Taghizadeh/UMAT_Hyperelastic/main/NeoHookeanSimpleShearUMAT.inp'),
+         url='https://raw.githubusercontent.com/Sina-Taghizadeh/UMAT_Hyperelastic/main/NeoHookeanSimpleShearUMAT.inp',
+         umat=dict(repo='Sina-Taghizadeh/UMAT_Hyperelastic', build=['CompresibleNeoHookean.for'],
+                   stretch=True, twin=dict(deck='sina_taghizadeh_neohookeansimpleshearcae'))),
     dict(name='springnuance_job_1', expect_solve=False, license='see source repo',
          exercises='C3D8R — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
-         url='https://raw.githubusercontent.com/SpringNuance/Abaqus-Fortran-Subroutine/main/cube_simple/Job-1.inp'),
+         url='https://raw.githubusercontent.com/SpringNuance/Abaqus-Fortran-Subroutine/main/cube_simple/Job-1.inp',
+         umat=dict(repo='SpringNuance/Abaqus-Fortran-Subroutine', build=['cube_simple/UMAT.f90'],
+                   reduced_physics='*SECTION CONTROLS (HOURGLASS=ENHANCED on C3D8R)')),
     dict(name='stevedoyle2_single_block', expect_solve=False, license='BSD-3-Clause',
          exercises='C3D8R — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
@@ -4394,7 +4446,8 @@ CORPUS = [
     dict(name='xjtu_zhou_group_316sstest_es', expect_solve=False, license='see source repo',
          exercises='C3D8 — parts/instances/assembly; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
-         url='https://raw.githubusercontent.com/XJTU-Zhou-group/ABAQUS_UMAT_316ss_Zr4/main/316sstest_es.inp'),
+         url='https://raw.githubusercontent.com/XJTU-Zhou-group/ABAQUS_UMAT_316ss_Zr4/main/316sstest_es.inp',
+         umat=dict(repo='XJTU-Zhou-group/ABAQUS_UMAT_316ss_Zr4', build=['316ss_isoEVP.for'])),
     dict(name='xjtu_zhou_group_zr4testcwsr_es', expect_solve=False, license='none stated',
          exercises='C3D8 — parts/instances/assembly; *Orientation; UMAT',
          note='ccx limitation: UMAT (no user material subroutine in ccx)',
@@ -4528,3 +4581,46 @@ CORPUS = [
          note='ccx limitation: UMAT (no user material subroutine in ccx; ccx 2.23 stops on it in step 1); behind it, *GEOSTATIC / *SOILS consolidation has no ccx procedure (step 1 prints "No analysis was selected" yet starts an increment), and the CAX8RP pore pressure goes with the P suffix and its DOF 8 BC with it',
          url='https://raw.githubusercontent.com/ZhouChaunge/PMT-Traversal-in-Abauqs/main/abaqus/basic%20model.inp'),
 ]
+
+# The UMAT tier's sources (the decks' ``umat`` entries): repository -> the commit and the sha256
+# of each file the builds read; corpus/fetch.py --umat saves them at their paths under
+# corpus/files/umat/<owner>__<repository>/.  Read as data and scanned before they were pinned:
+# no system calls, and no file opened outside the job folder.
+UMAT_SOURCES = {
+    'BristolCompositesInstitute/abaqus-modern-fortran': dict(
+        sha='20f721cd913625b87bb27fd567aa34945ceb0320', license='MIT', files={
+            'src/umat.f': 'c5512e4965dac51698e58bbcc53acc4f2bd4d935eda872447c6eee5d6a57bd45',
+            'src/Abaqus_Definitions.f90':
+                '4c3027785bc04e63c35bddd510015daa15f922c8d3f4f6676d300c169b94d3bd',
+            'src/Elastic_mod.f90': '1cee11f9c576240ab107cf66b3d2475c3dc7c7c123f773002e40e6485cccf5df'}),
+    'CMMAi/ABAQUS_UMAT': dict(
+        sha='789645d2756755b3c06afaea5de58dbdb5b9298d', license='see source repo', files={
+            'Ch3/elastic.for': '35909acbf07edc99200e49d17389d511ca77b6d2f140da39a580ea84a8029e82'}),
+    'JensPfeifle/abaqus-usermat': dict(
+        sha='2279058433ab2ddc981b4872d814642d22868f8a', license='none stated', files={
+            'umat-hooke-iso.f': 'cc5ed810fbc76601813ee9b22007093c7f1d7bf9e9b0340d96965caf33b188ae',
+            'umat-hooke-transversaliso.f':
+                'e937f9da44fda4b13b0022658733e9c3a6c4296f16971a5b024c7a225c3f4dea'}),
+    'Sina-Taghizadeh/UMAT_Hyperelastic': dict(
+        sha='e3ade702c9b6d95ec5654e93d8d85ad87566382e', license='GPL-3.0', files={
+            'CompresibleNeoHookean.for':
+                'bc8d9e5ede5dc5e0b57591bbab0d05d994a786fd0fa4540e6c396d953be408b1'}),
+    'SpringNuance/Abaqus-Fortran-Subroutine': dict(
+        sha='1d932bce9d4aa65680de4b5e6ccd790a84903f38', license='see source repo', files={
+            'cube_simple/UMAT.f90': 'edc324e43802cb41e468a7b5f8a817d1a373394ccbd4b29bc40d2e381e3248c6'}),
+    'XJTU-Zhou-group/ABAQUS_UMAT_316ss_Zr4': dict(
+        sha='331e362e44bb71abd82297749d480962aab6bb8a', license='see source repo', files={
+            '316ss_isoEVP.for': 'ede30a21132ccd264700c1d044e353bfdf36c9dac23407a8b8cb08cb316e0eb6'}),
+    'irfancn/Abaqus-UMAT-viscoelastic': dict(
+        sha='95fdcc7d82e6837649d2bfae2e1fa4065a994f61', license='MIT', files={
+            'umat_viscoelastic.for': '794840d3b3bc26679277fc9588d1bb2e8a942e03ccd6d1ec048119bdf4452c85'}),
+    'migueljgoliveira/unified-material-model-driver-for-plasticity': dict(
+        sha='64165d0552ae1b3cb43e9c3512767d73331b7764', license='see source repo', files={
+            'example/ummdp_abaqus.f': '2e40fdc39bd899cc8e827f3ad2286aae369cf33143fe572c6bf12dd554afbd7f'}),
+    'sergiolucarini/UMAT4COMSOL': dict(
+        sha='e62506fd842611566bac5b19ae1041b52b40ddc6', license='MIT', files={
+            'crystalplasticity/umat.f': '8e17d7614676e8b4afb99c5e90548b09b493f3a9371c437cf1ef4fb4035ab784',
+            'elastoplastic/umat.f': 'dafd083b99b2dc3fa14a9332505e6a69ccaee5c0d9d0e58edf1738718dfb2015',
+            'result_files/crystalplasticity/abaqus_stress_strain.txt':
+                '6a91885b6e91766feda79b7e83f93fb0088164eb539a377b56e32bb644847082'}),
+}

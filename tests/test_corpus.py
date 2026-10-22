@@ -23,6 +23,11 @@ Two layers of checking:
      ANSWERS   — optional, with ccx: an ``expect_solve`` deck with a ``reference`` (the
                  Abaqus benchmark decks) must give its published answer (see
                  ``reference_check``).
+  4. UMAT      — optional: with ABQ2CCX_CCX_SRC naming ccx 2.23's source folder (and the
+                 compilers and libraries at hand: docs/testing.md), each deck with a ``umat``
+                 recipe, converted with --abaqus-umat, solves in a ccx built with its own UMAT
+                 (tools/build_ccx_umat.py, from the sources ``corpus/fetch.py --umat``
+                 downloads) under the deck's own loads, and matches its twin or reference.
 
 Usage:
     python corpus/fetch.py          # first, download the decks (network)
@@ -33,6 +38,7 @@ If ``corpus/files/`` is empty the corpus checks skip cleanly, so this file is sa
 run without network. The bundled ``examples/`` are exercised by ``test_convert.py``.
 """
 
+import hashlib
 import os
 import shutil
 import sys
@@ -43,24 +49,25 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "corpus"))
 import abq2ccx as A          # noqa: E402
 import validate_with_ccx as V  # noqa: E402  (reuse find_ccx, ccx_job)
-from manifest import CORPUS  # noqa: E402
+from manifest import CORPUS, UMAT_SOURCES  # noqa: E402
 
 FILES = os.path.join(ROOT, "corpus", "files")
 
 
-def _opt():
-    return type("O", (), {"solid_dof": False})()
+def _opt(abaqus_umat=False):
+    return type("O", (), {"solid_dof": False, "abaqus_umat": abaqus_umat})()
 
 
 def present():
     return [e for e in CORPUS if os.path.exists(os.path.join(FILES, e["name"] + ".inp"))]
 
 
-def convert(name):
-    """The converted deck text, its report and the converter (for its load audit)."""
+def convert(name, abaqus_umat=False, path=None):
+    """The converted deck text, its report and the converter (for its load audit); ``path``:
+    another deck than the corpus deck ``name``."""
     rep = A.Report()
-    blocks = A.read_blocks(os.path.join(FILES, name + ".inp"), rep)
-    conv = A.Converter(rep, _opt())
+    blocks = A.read_blocks(path or os.path.join(FILES, name + ".inp"), rep)
+    conv = A.Converter(rep, _opt(abaqus_umat))
     body = conv.convert(blocks)                           # convert first: the header
     text = "\n".join(rep.header_comment_lines() + body) + "\n"   # lists its warnings
     return text, rep, conv
@@ -121,15 +128,15 @@ def expected_solve(text):
                              for c in cards) else "solved"
 
 
-def run_ccx(ccx, env, text, read=None):
-    """The solve judge's verdict on ``text`` in ccx; with ``read`` (a function of the job path
-    without its extension, run on the result files before they are deleted) the pair
-    (verdict, what it returns): None when the job did not solve, the exception when the
-    results do not hold what it reads."""
+def run_ccx(ccx, env, text, read=None, timeout=300):
+    """The solve judge's verdict on ``text`` in ccx ("timeout" after ``timeout`` seconds); with
+    ``read`` (a function of the job path without its extension, run on the result files before
+    they are deleted) the pair (verdict, what it returns): None when the job did not solve, the
+    exception when the results do not hold what it reads."""
     d = tempfile.mkdtemp()
     open(os.path.join(d, "job.inp"), "w", encoding="utf-8", newline="\n").write(text)
     try:
-        status = V.ccx_job(ccx, env, d, 300).status(os.path.join(d, "job"))   # "timeout" after 300 s
+        status = V.ccx_job(ccx, env, d, timeout).status(os.path.join(d, "job"))
         if read is None:
             return status
         if status != "solved":
@@ -554,6 +561,255 @@ def test_hood_hinge_keeps_one_mechanism_mode():
     assert len(lam) == 10 and sum(abs(x) < 1.0 for x in lam) == 7 and lam[7] > 1e6, lam
 
 
+# --- the UMAT tier ----------------------------------------------------------------
+# A deck's ``umat`` recipe (corpus/manifest.py): its UMAT's pinned sources (UMAT_SOURCES), the
+# files to build and how, and a twin or reference its ccx results must match.
+
+UMAT_FILES = os.path.join(FILES, "umat")
+UMAT_KEYS = {"repo", "build", "fflags", "patch", "stretch", "uexternaldb", "reduced_physics",
+             "twin", "reference"}
+UMAT_TIMEOUT = 900          # seconds per ccx run (the crystal-plasticity deck: 160 s here)
+
+
+def umat_root(repo):
+    """The folder corpus/fetch.py --umat saves repository ``repo``'s pinned files in."""
+    return os.path.join(UMAT_FILES, repo.replace("/", "__"))
+
+
+def umat_missing(u):
+    """Why the sources of recipe ``u`` cannot be built (a file missing, or not the pinned
+    one), or None.  Checked right before they are compiled."""
+    for path, sha in UMAT_SOURCES[u["repo"]]["files"].items():
+        local = os.path.join(umat_root(u["repo"]), *path.split("/"))
+        if not os.path.exists(local):
+            return f"{u['repo']}/{path} not fetched (python corpus/fetch.py --umat)"
+        with open(local, "rb") as fh:
+            if hashlib.sha256(fh.read()).hexdigest() != sha:
+                return f"{local}: not the pinned file (its sha256 differs)"
+    return None
+
+
+def umat_twin_text(e):
+    """The source text of deck ``e``'s twin: the corpus deck it names, or the deck with its
+    ``edit`` replacements, each of whose text occurs once."""
+    twin = e["umat"]["twin"]
+    name = twin.get("deck", e["name"])
+    with open(os.path.join(FILES, name + ".inp"), encoding="latin-1", newline="") as fh:
+        text = fh.read().replace("\r\n", "\n")
+    for old, new in twin.get("edit", ()):
+        if text.count(old) != 1:
+            raise ValueError(f"twin edit {old[:40]!r} occurs {text.count(old)} times, not once")
+        text = text.replace(old, new)
+    return text
+
+
+def last_results(job):
+    """{name: {node: values}} of the last DISP and STRESS blocks of ``job``.frd."""
+    last = {name: off for _, _, name, off in A.frd_index(job + ".frd") if name in ("DISP", "STRESS")}
+    return {name: dict(A.frd_rows(job + ".frd", off)) for name, off in last.items()}
+
+
+def twin_difference(got, want):
+    """{name: the largest difference over the largest value of ``want``} of the DISP and STRESS
+    blocks (last_results) both have, on their common nodes."""
+    out = {}
+    for name, k in (("DISP", 3), ("STRESS", 6)):
+        common = set(got.get(name, ())) & set(want.get(name, ()))
+        if common:
+            scale = max(abs(x) for n in common for x in want[name][n][:k]) or 1.0
+            out[name] = max(abs(x - y) for n in common
+                            for x, y in zip(got[name][n][:k], want[name][n][:k])) / scale
+    return out
+
+
+def umat_reference_deviations(job, ref, repo):
+    """[(time, relative deviation)] of the total force of set ``ref["set"]`` along
+    ``direction`` (*NODE PRINT TOTALS blocks of ``job``.dat, one per increment, interpolated) from
+    the ``curve`` (time, force) of source repository ``repo``, at the curve's points ccx covers."""
+    with open(os.path.join(umat_root(repo), *ref["curve"].split("/")), encoding="utf-8") as fh:
+        curve = [tuple(map(float, ln.split()[:2])) for ln in fh if ln.strip()]
+    got = [(0.0, 0.0)] + [(t, rows[0][ref["direction"] - 1]) for _, title, nset, t, rows
+                          in A.dat_blocks(job + ".dat") if title == "total force"
+                          and nset == ref["set"] and rows]
+    out = []
+    for x, want in curve:
+        if 0 < x <= got[-1][0] + 1e-12:
+            i = next(i for i in range(1, len(got)) if got[i][0] >= x - 1e-12)
+            (t0, f0), (t1, f1) = got[i - 1], got[i]
+            out.append((x, abs(f0 + (f1 - f0) * (x - t0) / (t1 - t0) - want) / abs(want)))
+    if not out:
+        raise ValueError(f"no total force of set {ref['set']} in the .dat")
+    return out
+
+
+def reference_tolerance(ref, x):
+    """The tolerance of ``ref`` at time ``x``: ``tol``, or the ``knee``'s (start, end, tol)."""
+    knee = ref.get("knee")
+    return knee[2] if knee and knee[0] <= x <= knee[1] else ref["tol"]
+
+
+def reference_verdict(ref, devs):
+    """(line, why) for the deviations ``devs`` (umat_reference_deviations): why is None when
+    each is within its tolerance."""
+    tols = [reference_tolerance(ref, x) for x, _ in devs]
+    groups = {}
+    for (x, d), tol in zip(devs, tols):
+        groups[tol] = max(groups.get(tol, 0.0), d)
+    line = f"the source repository's curve at {len(devs)} points: " + ", ".join(
+        f"{d:.2%} off at most{' at the yield knee' if tol != ref['tol'] else ''}"
+        for tol, d in groups.items())
+    bad = [(x, d, tol) for (x, d), tol in zip(devs, tols) if d > tol]
+    return line, (f"{line}; {bad[0][1]:.2%} at time {bad[0][0]:g}, tolerance {bad[0][2]:.1%}"
+                  if bad else None)
+
+
+def umat_tier(echo=print):
+    """Build and run the UMAT tier: a list of problems (empty: every deck passed), each deck's
+    result echoed as it comes.  None when ABQ2CCX_CCX_SRC is not set."""
+    src = os.environ.get("ABQ2CCX_CCX_SRC")
+    if not src:
+        return None
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import build_ccx_umat as B
+    prefix = os.environ.get("CONDA_PREFIX")
+    if not prefix:
+        return ["ABQ2CCX_CCX_SRC is set, but no conda environment with ccx's libraries is active"]
+    env = {"OMP_NUM_THREADS": "1"}      # ccx's threads would overrun with a UMAT's large locals
+    problems, built = [], {}
+    with tempfile.TemporaryDirectory(prefix="umat-tier-") as bin_dir:
+        for e in sorted((e for e in CORPUS if e.get("umat")), key=lambda x: x["name"]):
+            u, name = e["umat"], e["name"]
+            why = (umat_missing(u) or (None if os.path.exists(os.path.join(FILES, name + ".inp"))
+                                       else f"{name}.inp not fetched"))
+            if why:
+                echo(f"SKIP  {name}: {why}")
+                continue
+            key = repr([u.get(k) for k in ("repo", "build", "fflags", "patch", "stretch",
+                                           "uexternaldb")])
+            if key not in built:
+                files = [os.path.join(umat_root(u["repo"]), *p.split("/")) for p in u["build"]]
+                try:
+                    built[key] = B.build(files, os.path.join(bin_dir, f"ccx{len(built)}"), src,
+                                         prefix, fflags=u.get("fflags", "").split(),
+                                         patches=u.get("patch", ()), stretch=u.get("stretch", False),
+                                         uexternaldb=u.get("uexternaldb", False), echo=lambda m: None)
+                except B.BuildError as exc:
+                    built[key] = exc
+            ccx = built[key]
+            if isinstance(ccx, Exception):
+                problems.append(f"{name}: the build failed: {ccx}")
+                echo(f"FAIL  {name}: the build failed")
+                continue
+            text, _, conv = convert(name, abaqus_umat=True)
+            reduced = [x for x in conv.reduced_physics if not x.startswith("*USER MATERIAL")]
+            why = load_problem({}, conv) or (
+                f"the conversion drops {'; '.join(reduced)}: flag it reduced_physics" if reduced
+                and not u.get("reduced_physics") else "reduced_physics is set, but the conversion "
+                "drops nothing else" if u.get("reduced_physics") and not reduced else None)
+            if why:
+                problems.append(f"{name}: {why}")
+                echo(f"FAIL  {name}: {why}")
+                continue
+            ref, line = u.get("reference"), "solved"
+            if ref:
+                cut = text.upper().index("*END STEP")
+                text = text[:cut] + ref["output"] + "\n" + text[cut:]
+            status, got = run_ccx(ccx, env, text, last_results if not ref else
+                                  lambda job: umat_reference_deviations(job, ref, u["repo"]), UMAT_TIMEOUT)
+            if status != "solved" or isinstance(got, Exception):
+                why = f"expected 'solved' from ccx, got {status!r}" + (f" ({got})" if got else "")
+            elif ref:
+                line, why = reference_verdict(ref, got)
+            elif u.get("twin"):
+                try:
+                    tpath = os.path.join(bin_dir, "twin.inp")
+                    with open(tpath, "w", encoding="latin-1", newline="\n") as fh:
+                        fh.write(umat_twin_text(e))
+                    tstatus, want = run_ccx(ccx, env, convert(name, True, tpath)[0], last_results,
+                                            UMAT_TIMEOUT)
+                except ValueError as exc:
+                    tstatus, want = f"not made: {exc}", None
+                diff = twin_difference(got, want) if tstatus == "solved" and \
+                    not isinstance(want, Exception) else {}
+                tol = u["twin"].get("tol", 1e-6)
+                line = "twin: " + ", ".join(f"{k} {v:.1e} off" for k, v in diff.items())
+                why = (f"its twin did not solve ({tstatus})" if tstatus != "solved" else
+                       "no displacements to compare with the twin" if "DISP" not in diff else
+                       f"{line}; tolerance {tol:g}" if max(diff.values()) > tol else None)
+            else:
+                why = None
+            if why:
+                problems.append(f"{name}: {why}")
+            echo(f"{'FAIL' if why else 'PASS'}  {name}: {why or line}")
+    return problems
+
+
+def test_umat_manifest():
+    """Every ``umat`` recipe names pinned sources, files among them, known keys and a twin or
+    reference that can be read; it sits on a deck that stops on a stock ccx (no expectation
+    of its own).  Offline."""
+    names = {e["name"] for e in CORPUS}
+    for repo, s in UMAT_SOURCES.items():
+        assert len(s["sha"]) == 40 and int(s["sha"], 16) >= 0, repo
+        for path, sha in s["files"].items():
+            assert not path.startswith("/") and ".." not in path.split("/") and ":" not in path, path
+            assert len(sha) == 64 and int(sha, 16) >= 0, path
+    used = set()
+    for e in CORPUS:
+        u = e.get("umat")
+        if not u:
+            continue
+        assert set(u) <= UMAT_KEYS, f"{e['name']}: unknown keys {set(u) - UMAT_KEYS}"
+        assert not e["expect_solve"] and not e.get("parse_only"), e["name"]
+        files = UMAT_SOURCES[u["repo"]]["files"]
+        assert u["build"] and all(f in files for f in u["build"]), e["name"]
+        assert bool(u.get("twin")) + bool(u.get("reference")) <= 1, e["name"]
+        if u.get("twin"):
+            assert u["twin"].get("deck", e["name"]) in names, e["name"]
+            assert set(u["twin"]) <= {"deck", "edit", "tol"}, e["name"]
+        if u.get("reference"):
+            assert u["reference"]["curve"] in files, e["name"]
+        used.add(u["repo"])
+    assert used == set(UMAT_SOURCES), f"sources no recipe uses: {set(UMAT_SOURCES) - used}"
+
+
+def test_fetch_umat():
+    """corpus/fetch.py --umat saves a pinned file at its path, keeps one that is already there,
+    and saves no file whose sha256 differs (offline: a fake download)."""
+    import fetch as F
+    good, bad = b"      SUBROUTINE UMAT\n", b"      SUBROUTINE OTHER\n"
+    src = dict(sha="0" * 40, files={"src/umat.f": hashlib.sha256(good).hexdigest(),
+                                     "b.f": hashlib.sha256(good).hexdigest(), "../x.f": "0" * 64})
+    calls = []
+
+    def fake(url):
+        calls.append(url)
+        return good if url.endswith("/src/umat.f") else bad
+    real, F.download = F.download, fake
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            got, failed = F.umat_files("o/r", src, d)
+            assert got == ["src/umat.f"] and len(failed) == 2, (got, failed)
+            assert calls[-1] == "https://raw.githubusercontent.com/o/r/" + "0" * 40 + "/src/umat.f"
+            assert open(os.path.join(d, "o__r", "src", "umat.f"), "rb").read() == good
+            assert not os.path.exists(os.path.join(d, "o__r", "b.f"))
+            n = len(calls)
+            assert F.umat_files("o/r", dict(src, files={"src/umat.f": src["files"]["src/umat.f"]}),
+                                d) == ([], []) and len(calls) == n
+    finally:
+        F.download = real
+
+
+def test_corpus_umat():
+    """The UMAT tier (umat_tier): with ABQ2CCX_CCX_SRC set, each deck with a ``umat`` recipe
+    solves in a ccx built with its own UMAT and matches its twin or reference."""
+    problems = umat_tier()
+    if problems is None:
+        print("ABQ2CCX_CCX_SRC not set — skipping the UMAT tier (docs/testing.md).")
+        return
+    assert not problems, "UMAT tier:\n" + "\n".join(problems)
+
+
 # --- standalone runner with a summary table -----------------------------------
 
 def main():
@@ -635,6 +891,10 @@ def main():
               f"{sum(v == 'MISS' for v, _ in answers)} missed):")
         for verdict, line in answers:
             print(f"  {verdict:7s} {line}")
+    tier = umat_tier(lambda m: print("  " + m))
+    if tier is not None:
+        print(f"\nUMAT tier: {len(tier)} problem(s)" + "".join(f"\n  {p}" for p in tier))
+        failures += len(tier)
     print("All corpus checks passed." if not failures else f"{failures} failure(s).")
     print("\n(the remaining decks are source-deck/analysis limitations — see corpus/manifest.py.)")
     return 1 if failures else 0

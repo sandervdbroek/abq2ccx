@@ -410,6 +410,17 @@ physics.
   and ccx's worker threads (512 KB of stack on macOS) need large UMAT arrays out of the stack.
   The U0 warning no longer says that a DFGRD1-based UMAT runs right; the user guide builds
   ccx once and links each deck's UMAT, compiled as Abaqus compiles it, ahead of its archive.
+* **Build ccx with a deck's UMAT in one command, and a UMAT tier of the corpus** —
+  `tools/build_ccx_umat.py --src CalculiX/ccx_2.23/src -o ccx_umat umat.for` does the user
+  guide's `--abaqus-umat` recipe: ccx's objects once per source tree (with the U0 fix,
+  cached), the UMAT compiled as Abaqus compiles it, and the Abaqus utility routines a UMAT may
+  call (`XIT`, `GETOUTDIR`, `SINV`, `SPRINC`, `ROTSIG`, the SMA arrays, …); `--stretch` and
+  `--uexternaldb` hand the UMAT the stretch tensors and call its `UEXTERNALDB`. 13 corpus
+  decks now carry their UMAT's pinned sources (`corpus/fetch.py --umat`) and build recipe:
+  with `ABQ2CCX_CCX_SRC` set, `tests/test_corpus.py` builds each and checks that the deck
+  solves under its own loads and matches the same model with Abaqus' built-in material (8
+  decks, within 2e-10), or the repository's Abaqus stress–strain curve (a polycrystal
+  crystal-plasticity deck, within 0.25 %, 1.1 % at the yield knee).
 
 * **ccx stops the conversion now avoids** — a `*TIE` line naming one surface as slave and master
   is left out (Abaqus ties nothing there; ccx 2.23 looped without end), and a solid or node slave

@@ -5,6 +5,7 @@
 | Unit tests | `python tests/test_convert.py` (or `pytest tests/`) | nothing | exact conversion behaviour on small inline decks and the bundled examples |
 | End-to-end | `python validate_with_ccx.py` | CalculiX | the converted examples solve and match independent references |
 | Corpus | `python corpus/fetch.py`, then `python tests/test_corpus.py` | network once; CalculiX for the solve test | 1052 real decks convert cleanly, keep their loads and solve; 26 of Abaqus' NAFEMS benchmark decks give their published answer |
+| UMAT tier | `python corpus/fetch.py --umat`, then `ABQ2CCX_CCX_SRC=<ccx 2.23 src> python tests/test_corpus.py` | the user guide's `--abaqus-umat` build environment | 13 user-material decks solve in a ccx built with their own UMAT and match a twin or a published curve |
 
 Each layer skips cleanly when its prerequisite is missing, so the unit tests always run
 offline. Before handing over a change, run all three and check that
@@ -226,6 +227,7 @@ Each entry has its URL, license, what it exercises, and:
 | `solver_differs='<why>'` | the conversion keeps the deck's physics, but ccx's solution is not the deck's: the deck relies on solver behaviour ccx 2.23 lacks (a part that only contact holds drifts away before the contact closes; a `*BUCKLE` step loaded far above its lowest buckling load, whose lowest factors ccx does not return); found in the results; out of the headline count |
 | `note` | why a deck does not solve, or what a gated one depends on |
 | `reference=dict(...)` | its published answer: the quantity and where ccx writes it (`read`), the NAFEMS `target`, Abaqus' result for the deck's mesh (`abaqus`), a tolerance (`tol`), the `source` page; `ccx` and `why` where ccx answers differently for a reason traced to ccx |
+| `umat=dict(...)` | the [UMAT tier](#the-umat-tier)'s recipe: the deck's UMAT sources (`repo`, pinned in `UMAT_SOURCES`), the files to `build`, `fflags`, `patch`, `stretch` / `uexternaldb`, `reduced_physics` besides the UMAT, and a `twin` or `reference` to match |
 
 The tests:
 
@@ -258,6 +260,9 @@ The tests:
   published answer in ccx ([published answers](#published-answers)).
 * `test_hood_hinge_keeps_one_mechanism_mode` — the hood-hinge deck's hinge leaves exactly
   one mechanism mode besides the six rigid-body modes.
+* `test_umat_manifest`, `test_fetch_umat` — the `umat` recipes and their pinned sources hang
+  together; `fetch.py --umat` saves only files with the pinned sha256. Always run.
+* `test_corpus_umat` — [the UMAT tier](#the-umat-tier), with `ABQ2CCX_CCX_SRC` set.
 
 **Results on ccx 2.23** (the FreeCAD 1.1.4 build): all 1052 decks convert with no dangling
 reference. 235 are gated `expect_solve`: **177 solve the deck's own physics**; 14 are
@@ -276,7 +281,7 @@ decks are accepted. The other 596 stop first on, or (the last row) run without, 
 
 | Decks | First blocker |
 | ---: | --- |
-| 354 | a user material (UMAT/VUMAT) |
+| 354 | a user material (UMAT/VUMAT; 13 solve with their own UMAT: [the UMAT tier](#the-umat-tier)) |
 | 66 | a user element (UEL) |
 | 47 | an incomplete or invalid source deck (undefined sets or materials, a template's values, missing *INCLUDE files, CAE fragments) |
 | 34 | an explicit coupled temperature–displacement step (28), or `*MATRIX GENERATE` (6) |
@@ -290,6 +295,35 @@ Every one of them was checked to fail no worse than the original, unconverted de
 a first error often only exposes a second, fundamental one behind it, so the converter aims
 to translate or clearly flag each incompatibility rather than to make a deck run at any
 cost.
+
+### The UMAT tier
+
+13 user-material decks carry a `umat` recipe: their UMAT's sources, pinned to a commit with each
+file's sha256 (`corpus/fetch.py --umat` downloads them into `corpus/files/umat/`; they were read
+as data and scanned for system calls and file access outside the job folder before they were
+pinned), and how to build them. With `ABQ2CCX_CCX_SRC` naming ccx 2.23's source folder, in the
+user guide's `--abaqus-umat` build environment (an active conda environment with its compilers,
+SPOOLES, ARPACK and LAPACK), `test_corpus_umat` builds one ccx per UMAT with
+`tools/build_ccx_umat.py` (ccx's objects once, cached in `~/.cache/abq2ccx`), converts each deck
+with `--abaqus-umat` and runs it with `OMP_NUM_THREADS=1`: it must solve under the expect_solve
+rules with its own loads, `reduced_physics` flagging what else the conversion drops, and match
+its twin (the same model with Abaqus' built-in material, run in the same ccx: the last
+displacements and stresses within 1e-6) or the source repository's published curve:
+
+| Decks | UMAT | Checked against | Found |
+| --- | --- | --- | --- |
+| `jenspfeifle_umat_iso`, `_v0`, `_v90` | isotropic and transversely isotropic Hooke | the deck with `*ELASTIC` / `*ELASTIC, TYPE=ANISO` | 2e-10 |
+| `cmmai_uplate` | elastic, `CPE3` / `CPE4` | the corpus' `cmmai_plate` | 8e-15 |
+| `sina_taghizadeh_neohookeansimpleextensionumat`, `…simpleshearumat` | compressible neo-Hookean from DFGRD1, NLGEOM (built with `--stretch`) | the repository's decks with `*HYPERELASTIC, NEO HOOKE` | 1e-15 (in shear 37 % off without `--stretch`) |
+| `bristolcompositesinstitute_single_element` | elastic, modern Fortran (`-ffree-form`, an `#include` patch) | `*ELASTIC` | 3e-17 (`reduced_physics`: `*HOURGLASS STIFFNESS`) |
+| `sergiolucarini_elastoplastic` | J2 plasticity, `CPS6` | the deck's own `*ELASTIC` + `*PLASTIC` material | 8e-16 |
+| `sergiolucarini_crystalplasticity` | polycrystal crystal plasticity: 3954 `C3D10`, NLGEOM, 172 state variables (160 s) | the repository's Abaqus stress–strain curve | 0.25 %; 1.1 % at the yield knee, where Abaqus' curve overshoots |
+| `irfancn_viscoelastic_input`, `xjtu_zhou_group_316sstest_es`, `migueljgoliveira_abaqus_solid1`, `springnuance_job_1` | viscoelastic; viscoplastic 316 steel (80 s); UMMDp's plasticity driver (`-fdec-format-defaults`, a format patch); elastic `.f90` | solve only | (`springnuance_job_1`: `reduced_physics`, `HOURGLASS=ENHANCED`) |
+
+The tier takes about six minutes. A twin catches an interface error: the shear deck built
+without `--stretch` is 37 % off its twin.
+
+The decks' own expectations stay as they are: a stock ccx stops on the UMAT (or runs its example).
 
 ### Published answers
 
