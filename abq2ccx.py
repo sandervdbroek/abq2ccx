@@ -241,8 +241,19 @@ CCX_ELEMENTS = {
     "CAX3", "CAX4", "CAX4R", "CAX6", "CAX8", "CAX8R",
     "B21", "B31", "B31R", "B32", "B32R", "T2D2", "T3D2", "T3D3",
     "SPRING1", "SPRING2", "SPRINGA", "DASHPOTA", "GAPUNI", "MASS", "DCOUP3D",
-    "DC3D4", "DC3D6", "DC3D8", "DC3D10", "DC3D15", "DC3D20", "U1",
+    "DC3D4", "DC3D6", "DC3D8", "DC3D10", "DC3D15", "DC3D20",
 }
+# An Abaqus user element type: U<n> (Abaqus/Standard), VU<n> (Abaqus/Explicit).  ccx 2.23 runs
+# none of them (a deck's *USER ELEMENT is warned, its elements kept as written): it reads a
+# type starting with U1 (U1, U10, U1003) as its own beam element U1 (e_c3d_u.f), which then
+# stops ('no nonzero cross moment of inertia'), and any other as a substructure, after which
+# it stops without results ('cannot open substructure stiffness file'; both probed).  The
+# converter's own U1 beams are not the deck's elements (_plan_u1_beams, U1_CARD).
+USER_ELEMENT_TYPE = re.compile(r"V?U\d+")
+USER_ELEMENT_MSG = ("*USER ELEMENT: an Abaqus user element (its UEL / VUEL subroutine) has no ccx "
+                    "counterpart: ccx 2.23 reads a type starting with U1 as its own beam element U1 "
+                    "and any other as a substructure, and stops on both; the card and its elements "
+                    "are kept as written.")
 # Element families with no geometric CalculiX equivalent at all.
 UNSUPPORTED_ELEM_PREFIXES = ("COH", "GK", "GKPS", "GKAX", "CONN", "ROTARYI")
 
@@ -340,6 +351,9 @@ def ccx_element_type(typ: str, report: "Report") -> str:
     """Return the CalculiX element name for an Abaqus type, substituting where
     needed (node-count preserving) and warning on anything not directly supported."""
     typ = typ.upper()
+    if USER_ELEMENT_TYPE.fullmatch(typ):
+        report.warn(USER_ELEMENT_MSG, once=True)
+        return typ
     if typ in ELEMENT_TYPE_MAP:
         sub = ELEMENT_TYPE_MAP[typ]
         seen = {typ}
@@ -3257,6 +3271,63 @@ def system_point(v: Sequence[float], system: str) -> Vec:
     return v[0], v[1], v[2]
 
 
+# a *SYSTEM frame: its origin and unit axes X1, Y1, Z1, in global coordinates
+Frame = Tuple[Vec, Vec, Vec, Vec]
+
+
+def system_frame(block: Block) -> Tuple[Optional[Frame], str]:
+    """(frame, problem) of a *SYSTEM card (Abaqus "Node definition", *SYSTEM): the origin a
+    and a point b on the X1 axis on the first line, a point c in the X1-Y1 plane (on the
+    side of +Y1) on the second.  Without b a translation; without c Z1 stays Z and X1 is
+    b - a projected onto the X-Y plane.  None for a card without data (back to global
+    coordinates); ``problem`` names axes the points leave undefined (read as a translation).
+    ValueError on a field that is not a number."""
+    recs = [r for r in merged_data_records(block) if any(x.strip() for x in r)]
+    if not recs:
+        return None, ""
+    a: Vec = tuple(fields_at(recs[0], 3))                                   # type: ignore
+    shift: Frame = (a, (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    if not any(x.strip() for x in recs[0][3:6]):
+        return shift, ""
+    x1 = vsub(tuple(fields_at(recs[0][3:6], 3)), a)                          # type: ignore
+    if len(recs) > 1:
+        y1 = vsub(tuple(fields_at(recs[1], 3)), a)                           # type: ignore
+        z1 = vcross(x1, y1)
+        if vnorm(z1) <= 1e-12 * vnorm(x1) * vnorm(y1) or not vnorm(x1):
+            return shift, "a, b and c on one line"
+    else:
+        x1, z1 = (x1[0], x1[1], 0.0), (0.0, 0.0, 1.0)
+        if not vnorm(x1):
+            return shift, "b straight above a, so no X1 direction in the X-Y plane"
+    x1, z1 = vunit(x1), vunit(z1)
+    return (a, x1, vcross(z1, x1), z1), ""
+
+
+def frame_vector(frame: Frame, v: Sequence[float]) -> Vec:
+    """Global components of a direction given in a *SYSTEM frame's axes."""
+    return (v[0] * frame[1][0] + v[1] * frame[2][0] + v[2] * frame[3][0],
+            v[0] * frame[1][1] + v[1] * frame[2][1] + v[2] * frame[3][1],
+            v[0] * frame[1][2] + v[1] * frame[2][2] + v[2] * frame[3][2])
+
+
+def frame_point(frame: Frame, v: Sequence[float]) -> Vec:
+    """Global coordinates of a point given in a *SYSTEM frame."""
+    return vadd(frame[0], frame_vector(frame, v))
+
+
+def user_element_nodes(blocks: Sequence[Block]) -> Dict[str, int]:
+    """Type -> node count (NODES=) of the *USER ELEMENT cards in ``blocks``: how many nodes
+    each element of the type lists (_register_elements); an unreadable count is left out."""
+    out: Dict[str, int] = {}
+    for b in blocks:
+        if b.keyword == "USER ELEMENT" and b.uparam("TYPE"):
+            try:
+                out[b.uparam("TYPE")] = int(b.uparam("NODES"))
+            except ValueError:
+                pass
+    return out
+
+
 def expand_ngen(block: Block, geom: Geometry, report: Report) -> List[int]:
     """``*NGEN`` -> nodes between two existing end nodes, on a straight line (default),
     a circular arc about a centre (LINE=C) or a parabola through a midside point (LINE=P).
@@ -4065,9 +4136,6 @@ DROP_KEYWORDS = {
 }
 # Dropped, but loudly (they can change the model -> the user must check).
 DROP_WARN_KEYWORDS = {
-    "SYSTEM": "*SYSTEM (local coordinate system for following *NODE cards) is unsupported "
-              "by ccx and was dropped; node coordinates defined under it may be in a rotated "
-              "frame — verify they are global.",
     "UNIT SYSTEM": "*UNIT SYSTEM is unsupported by ccx and was dropped (informational only).",
 }
 # Keywords that exist in BOTH but mean something different in ccx -> warn, then emit.
@@ -4078,7 +4146,7 @@ SEMANTIC_TRAP = {
 }
 # Supported by ccx but worth a heads-up about a behavioural/interface difference.
 PASS_WITH_NOTE = {
-    "USER ELEMENT": "*USER ELEMENT kept; ensure the matching ccx user-element routine is built in.",
+    "USER ELEMENT": USER_ELEMENT_MSG,
 }
 # ccx hands a mechanical *USER MATERIAL to the routine its name starts with (umat_main.f, the
 # same in FreeCAD's 2.23 build): ABAQUS / ABAQUSNL -> the Abaqus-UMAT interface (a stock ccx has
@@ -7635,6 +7703,8 @@ class _Mesh:
                 self._register_nodes(b)
             elif kw == "ELEMENT":
                 self._register_elements(b)
+            elif kw == "USER ELEMENT":
+                self._uel_nodes.update(user_element_nodes([b]))
             elif kw == "NSET":
                 self._register_set(b, "N")
             elif kw == "ELSET":
@@ -7711,54 +7781,129 @@ class _Mesh:
                              f"{', '.join(map(str, conn))}): Abaqus stops on such elements, and ccx "
                              f"does too ('nonpositive jacobian' or a similar error).", once=True)
 
-    def _cartesian_nodes(self, blocks: List[Block]) -> List[Block]:
-        """``blocks`` with every *NODE, SYSTEM=C / S card rewritten in Cartesian coordinates
-        (before an assembly is flattened: instance transforms move Cartesian points).  Abaqus
-        "Node definition" / *NODE: SYSTEM=C gives R, theta, Z; SYSTEM=S gives R, theta, phi,
-        with theta about Z from X and phi up from the X-Y plane, both in degrees; SYSTEM=R
-        (the default) is Cartesian already.  A normal on such a line is given in the same form
-        (Abaqus 2017 Keywords *NODE: its second entry is an angle in degrees, in a spherical
-        system its third too), so it is converted like a point and left to be normalised."""
-        out: List[Block] = []
-        for b in blocks:
-            system = (b.param("SYSTEM") or "R").strip().upper()[:1] if b.keyword == "NODE" else "R"
-            if system == "R":
-                out.append(b)
-                continue
-            if system not in ("C", "S"):
-                self.report.warn(f"*NODE, SYSTEM={b.param('SYSTEM')} is not an Abaqus coordinate "
-                                 f"system (R, C or S); its coordinates are read as Cartesian.",
-                                 once=True)
-                self._reduces(f"*NODE, SYSTEM={b.param('SYSTEM')} coordinates")
-                out.append(b)
-                continue
-            def cartesian(v: List[str]) -> Tuple[float, float, float]:
-                return system_point(fields_at(v, 3), system)
+    # cards that start or end a part's or instance's definition, and so the *SYSTEM in force
+    # ("Node definition": one defined in a part or instance is in effect only within it)
+    _SYSTEM_SCOPE = {"PART", "END PART", "INSTANCE", "END INSTANCE", "ASSEMBLY", "END ASSEMBLY"}
 
-            data = []
-            for rec in merged_data_records(b):
-                f = [x.strip() for x in rec]
-                if not any(f):
-                    continue
-                given = (f[1:4] + ["", "", ""])[:3]
-                nrm = (f[4:7] + ["", "", ""])[:3]
+    def _cartesian_nodes(self, blocks: List[Block]) -> List[Block]:
+        """``blocks`` with node coordinates given in global Cartesian form (before an assembly
+        is flattened: instance transforms move Cartesian points), Abaqus "Node definition":
+        * *NODE, SYSTEM=C gives R, theta, Z; SYSTEM=S gives R, theta, phi, with theta about Z
+          from X and phi up from the X-Y plane, both in degrees; SYSTEM=R (the default) is
+          Cartesian already.  A normal on such a line is given in the same form (Abaqus 2017
+          Keywords *NODE: its second entry is an angle in degrees, in a spherical system its
+          third too), so it is converted like a point and left to be normalised;
+        * a *SYSTEM card's frame (system_frame) applies to "all nodal coordinates entered or
+          generated after" it, until the next *SYSTEM (one without data returns to global
+          coordinates) or the end of the part or instance definition it is in: the *NODE
+          coordinates (after the SYSTEM=C / S conversion) and the extra point of a *NGEN
+          arc or parabola; their normals turn with its axes, as with a turned instance.  The
+          *SYSTEM cards are left out."""
+        out: List[Block] = []
+        frame: Optional[Frame] = None
+        for b in blocks:
+            kw = b.keyword
+            if kw == "SYSTEM":
                 try:
-                    xyz = cartesian(given)
-                    nxyz = cartesian(nrm) if any(nrm) else None
+                    new, problem = system_frame(b)
                 except ValueError:
-                    data.append(", ".join(f))         # _register_nodes reports the bad record
-                    continue
-                rest = ([repr(x) for x in nxyz] + f[7:]) if nxyz else f[4:]
-                data.append(", ".join([f[0]] + [repr(x) for x in xyz] + rest))
-            params = OrderedDict((k, v) for k, v in b.params.items() if k != "SYSTEM")
-            out.append(Block(b.keyword, params, data))
+                    _skip_unreadable(self.report, "*SYSTEM card")
+                    new, problem = None, ""
+                if problem:
+                    self.report.warn(f"*SYSTEM with {problem}: Abaqus' axes are undefined; read as "
+                                     f"a translation to its first point.", once=True)
+                    self._reduces("*SYSTEM axes undefined (read as a translation)")
+                if new is not None:
+                    self.report.note("*SYSTEM: the *NODE coordinates (and *NGEN extra points) after "
+                                     "it are given in its frame and were transformed into global "
+                                     "coordinates, their normals turned with its axes (Abaqus 'Node "
+                                     "definition'; a *SYSTEM without data, or the end of the part "
+                                     "or instance, returns to global coordinates).", once=True)
+                elif frame is None:
+                    self.report.note("Bare *SYSTEM (reset to global coordinates) dropped — no "
+                                     "effect.", once=True)
+                frame = new
+                continue
+            if kw in self._SYSTEM_SCOPE:
+                frame = None
+            elif kw == "NODE":
+                b = self._cartesian_node_card(b, frame)
+            elif kw == "NGEN" and frame is not None:
+                b = self._framed_ngen_card(b, frame)
+            elif kw in ("NCOPY", "NMAP") and frame is not None:
+                self.report.warn(f"*{kw} after a *SYSTEM card: Abaqus does not say whether its "
+                                 f"coordinates are in the *SYSTEM frame; read as global.", once=True)
+                self._reduces(f"*{kw} coordinates under a *SYSTEM frame")
+            out.append(b)
+        return out
+
+    def _cartesian_node_card(self, b: Block, frame: Optional[Frame]) -> Block:
+        """*NODE card ``b`` in global Cartesian coordinates (_cartesian_nodes): its SYSTEM=C / S
+        converted, then the *SYSTEM ``frame`` in force applied."""
+        system = (b.param("SYSTEM") or "R").strip().upper()[:1]
+        if system not in ("R", "C", "S"):
+            self.report.warn(f"*NODE, SYSTEM={b.param('SYSTEM')} is not an Abaqus coordinate "
+                             f"system (R, C or S); its coordinates are read as Cartesian.",
+                             once=True)
+            self._reduces(f"*NODE, SYSTEM={b.param('SYSTEM')} coordinates")
+            if frame is None:
+                return b
+            system = "R"
+        if system == "R" and frame is None:
+            return b
+        data = []
+        for rec in merged_data_records(b):
+            f = [x.strip() for x in rec]
+            if not any(f):
+                continue
+            given = (f[1:4] + ["", "", ""])[:3]
+            nrm = (f[4:7] + ["", "", ""])[:3]
+            try:
+                xyz = system_point(fields_at(given, 3), system)
+                nxyz = system_point(fields_at(nrm, 3), system) if any(nrm) else None
+            except ValueError:
+                data.append(", ".join(f))         # _register_nodes reports the bad record
+                continue
+            if frame is not None:
+                xyz = frame_point(frame, xyz)
+                nxyz = frame_vector(frame, nxyz) if nxyz else None
+            rest = ([repr(x) for x in nxyz] + f[7:]) if nxyz else f[4:]
+            data.append(", ".join([f[0]] + [repr(x) for x in xyz] + rest))
+        if system != "R":
             self.report.note("*NODE, SYSTEM=C / S: cylindrical (R, theta, Z) and spherical (R, "
                              "theta, phi) coordinates converted to Cartesian (Abaqus 'Node "
                              "definition': angles in degrees, theta about Z from X, phi up from "
                              "the X-Y plane), and so are normals given on those lines, which "
                              "Abaqus reads in the same form (*NODE: their second entry is an "
                              "angle, in a spherical system their third too).", once=True)
-        return out
+        params = OrderedDict((k, v) for k, v in b.params.items() if k != "SYSTEM")
+        return Block(b.keyword, params, data)
+
+    @staticmethod
+    def _framed_ngen_card(b: Block, frame: Frame) -> Block:
+        """*NGEN card ``b`` with the extra point of an arc or parabola (fields 5-7, in its
+        SYSTEM= form) and an arc's normal (fields 8-10) given globally, from the *SYSTEM
+        ``frame`` (_cartesian_nodes).  A straight line has no point to transform."""
+        if (b.param("LINE") or "S").strip().upper()[:1] not in ("C", "P"):
+            return b
+        system = (b.param("SYSTEM") or "R").strip().upper()[:1]
+        data = []
+        for rec in merged_data_records(b):
+            g = [x.strip() for x in rec]
+            if any(g):
+                g += [""] * (7 - len(g))
+                try:                            # (a blank coordinate is 0 in the local frame)
+                    point = frame_point(frame, system_point(fields_at(g[4:7], 3), system))
+                    normal = frame_vector(frame, fields_at(g[7:10], 3)) if any(g[7:10]) else None
+                except ValueError:
+                    data.append(", ".join(rec))     # expand_ngen reports the bad record
+                    continue
+                g[4:7] = [repr(x) for x in point]
+                if normal:
+                    g[7:10] = [repr(x) for x in normal]
+            data.append(", ".join(g))
+        params = OrderedDict((k, v) for k, v in b.params.items() if k != "SYSTEM")
+        return Block(b.keyword, params, data)
 
     def _register_nodes(self, b: Block) -> None:
         ids = []
@@ -7808,7 +7953,7 @@ class _Mesh:
         if typ in CONN_TYPES or typ == "JOINTC":
             self._register_connectors(b, typ)
             return
-        nn = element_node_count(typ)
+        nn = self._uel_nodes.get(typ) or element_node_count(typ)
         rows = [r for r in ([t for t in map(str.strip, ln.split(",")) if t != ""] for ln in b.data) if r]
         if nn is None:
             nn = len(rows[0]) - 1 if rows else 0
@@ -7980,6 +8125,10 @@ class _Mesh:
             loss = substitution_loss(typ)
             if loss and typ.upper() not in SLAB_TYPES:    # (_plan_incompatible_slabs says why)
                 self._reduces(loss)
+            for c in self._uel_cards:               # a user type's card first: its node count
+                if c.uparam("TYPE") == typ.upper() and id(c) not in self._uel_written:
+                    out += [emit_keyword(c.keyword, c.params)] + list(c.data)
+                    self._uel_written.add(id(c))
             out.append(f"*ELEMENT, TYPE={out_typ}")
             for eid, conn in items:
                 if len(conn) < MAX_ENTRIES_PER_LINE:        # (reflow: one line)
@@ -14801,6 +14950,65 @@ class _Mesh:
                              f"nonlinear MPC's depend on each other': the MPCs of its truss "
                              f"expansion; probed on 2.23); only implicit steps can run them.",
                              once=True)
+
+    def _warn_model_change_readds(self) -> None:
+        """Warn where a *MODEL CHANGE, ADD gives back elements ccx 2.23 expands (beams, trusses,
+        shells, membranes, plane elements: CCX_EXPANDED_PREFIXES) that the first step removed:
+        ccx expands its elements after reading the first step and leaves the removed ones out,
+        so the ADD never brings them back — without a message on shells and beams, a crash on
+        plane elements (probed on 2.23; its manual: they "cannot be removed in the first
+        step").  A removal in a later step, and adding such elements back after it, run as in
+        Abaqus (probed: S4, CPS4, B31)."""
+        removed: set = set()
+        for st in self.steps or ():
+            for c in st.cards:
+                if c.keyword != "MODEL CHANGE" or c.uparam("TYPE") not in ("", "ELEMENT"):
+                    continue
+                named = {e for rec in merged_data_records(c) for tok in rec if tok.strip()
+                         for e in self._resolve_elements(tok.strip())}
+                if st.no == 1 and c.has("REMOVE"):
+                    removed |= {e for e in named if e in self.geom.elements and e not in self._u1
+                                and e not in self._qmem and
+                                ccx_type(self.geom.elements[e][0]).startswith(CCX_EXPANDED_PREFIXES)}
+                elif c.has("ADD") and removed & named:
+                    back = sorted(removed & named)
+                    self.report.warn(f"*MODEL CHANGE, ADD in step {st.no} gives back {len(back)} "
+                                     f"beam, truss, shell, membrane or plane element(s) (element "
+                                     f"{back[0]}) that the first step removed: ccx 2.23 expands such "
+                                     f"elements only after the first step, leaving the removed ones "
+                                     f"out, so it never adds them back (no message; a crash on plane "
+                                     f"elements). Removing them in a later step works.", once=True)
+                    self._reduces("*MODEL CHANGE, ADD of beam/shell/plane elements removed in the "
+                                  "first step (ccx never adds them back)")
+
+    def handle_submodel(self, b: Block) -> List[str]:
+        """*SUBMODEL: ccx reads the global model's results from the .frd that INPUT= names
+        (2.23 manual *SUBMODEL, a required parameter; without it ccx 2.23 crashes, probed),
+        while Abaqus takes the global model from the command line (globalmodel=): the user
+        must add it.  ccx's GLOBAL ELSET is a set of this deck holding global element numbers.
+        TYPE=NODE (Abaqus' default, and ccx's) is written where the card has none: ccx 2.23
+        stops without it ('increase nset_': allocation.f sets the set's kind only from TYPE=;
+        probed, with TYPE=NODE and INPUT= the card runs)."""
+        self.report.warn("*SUBMODEL: ccx reads the global model's results from a .frd named by "
+                         "INPUT= (Abaqus takes the global model from its command line), and "
+                         "crashes without it: run the converted global model in ccx and add "
+                         "INPUT=<its .frd> to this card (with GLOBAL ELSET, ccx wants that set "
+                         "defined in this deck with the global element numbers).", once=True)
+        if b.has("TYPE"):
+            return self.passthrough(b)
+        return self.passthrough(Block(b.keyword, OrderedDict([("TYPE", "NODE"), *b.params.items()]),
+                                      b.data))
+
+    def handle_model_change(self, b: Block) -> List[str]:
+        """*MODEL CHANGE: ccx 2.23 stops without TYPE= ('model change can only be used for
+        contact pairs or elements', modelchanges.f), so Abaqus' default TYPE=ELEMENT is written
+        (_warn_model_change_readds: what ccx cannot add back)."""
+        if b.has("TYPE"):
+            return self.passthrough(b)
+        self.report.note("*MODEL CHANGE without TYPE: TYPE=ELEMENT written (Abaqus' default; ccx "
+                         "2.23 stops without TYPE).", once=True)
+        return self.passthrough(Block(b.keyword, OrderedDict([("TYPE", "ELEMENT"), *b.params.items()]),
+                                      b.data))
 
     def _plan_section_thick(self, blocks: List[Block]) -> None:
         """The plane elements' section thicknesses (a *SOLID SECTION's first data line; 1 where
@@ -34890,6 +35098,21 @@ class _Loads:
                 out.append((t0 + (t1 - t0) * x, a))
         return out
 
+    def handle_controls(self, b: Block) -> List[str]:
+        """*CONTROLS, ANALYSIS=DISCONTINUOUS sets the time incrementation controls I0 = 8 and
+        IR = 10 (Abaqus 2017 Keywords *CONTROLS; "Commonly used control parameters": it
+        overrides the values given before, the last definition in a step wins, and controls
+        hold for the rest of the analysis or until reset) -> ccx's *CONTROLS, PARAMETERS=TIME
+        INCREMENTATION with those two first on its line (2.23 manual: I0, IR, IP, IC, ...;
+        controlss.f keeps a field left out), which ccx keeps likewise until a RESET.  Numerical
+        only.  Any other card as given (ANALYSIS with PARAMETERS or RESET: Abaqus rejects it)."""
+        if b.uparam("ANALYSIS") != "DISCONTINUOUS" or b.has("PARAMETERS") or b.has("RESET"):
+            return self.passthrough(b)
+        self.report.note("*CONTROLS, ANALYSIS=DISCONTINUOUS -> *CONTROLS, PARAMETERS=TIME "
+                         "INCREMENTATION with I0 = 8, IR = 10, the values Abaqus sets (numerical "
+                         "only).", once=True)
+        return ["*CONTROLS, PARAMETERS=TIME INCREMENTATION", "8, 10"]
+
     def handle_static(self, b: Block) -> List[str]:
         """``*STATIC, RIKS``: ccx has no arc-length solver, and passed through it would
         silently run a load-controlled *STATIC (it only warns 'parameter not recognized').
@@ -40235,6 +40458,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._slab_eq: List[str] = []
         self._slab_bc: List[str] = []
         self._node_normals: Dict[int, Vec] = {}    # *NODE fields 5-7: the node's shell normal
+        self._uel_nodes: Dict[str, int] = {}       # *USER ELEMENT type -> its node count
+        self._uel_cards: List[Block] = []          # the deck's *USER ELEMENT cards (emit_geometry)
+        self._uel_written: set = set()             # those written before their elements
         self._param_values: set = set()            # the deck's parameter values (_plan_material_facts)
         self._sc_types: Dict[str, set] = {}        # *SECTION CONTROLS name -> its Abaqus types
         self._sc_damage = False
@@ -40639,6 +40865,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "MOHR COULOMB": "handle_dependent_material",
         "MOHR COULOMB HARDENING": "handle_dependent_material",
         "SECTION CONTROLS": "handle_section_controls",
+        "CONTROLS": "handle_controls",
+        "MODEL CHANGE": "handle_model_change",
+        "SUBMODEL": "handle_submodel",
         "PRE-TENSION SECTION": "handle_pretension_section",
         **dict.fromkeys(OUTPUT_CARDS, "handle_output"),
         **dict.fromkeys(ENERGY_CARDS, "handle_energy_output"),
@@ -40673,17 +40902,11 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             self.report.note("*PARAMETER card dropped; its <name> substitutions were already "
                              "applied to the deck (ccx has no parametric input).", once=True)
             return []
-        if kw == "SYSTEM" and not any(x.strip() for x in b.data):
-            # a bare *System resets to the global frame — a no-op, not worth a warning
-            self.report.note("Bare *SYSTEM (reset to global coordinates) dropped — no effect.", once=True)
-            return []
         if kw in DROP_KEYWORDS:
             self.report.note(f"*{kw} dropped (Abaqus-only organisational card; no ccx meaning).", once=True)
             return []
         if kw in DROP_WARN_KEYWORDS:
             self.report.warn(DROP_WARN_KEYWORDS[kw], once=True)
-            if kw == "SYSTEM":
-                self._reduces("*SYSTEM (nodes given in a local frame read as global)")
             return []
         return self.passthrough(b)
 
@@ -40705,10 +40928,13 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             self._reduces("*SURFACE BEHAVIOR, NO SEPARATION")
         if kw in SEMANTIC_TRAP:
             self.report.warn(SEMANTIC_TRAP[kw], once=True)
+        elif kw == "USER ELEMENT":
+            self.report.warn(PASS_WITH_NOTE[kw], once=True)
+            self._reduces(f"*{kw} (the Abaqus subroutine does not run in ccx)")
+            if id(b) in self._uel_written:      # (emit_geometry wrote it before its elements)
+                return []
         elif kw in PASS_WITH_NOTE:
             self.report.note(PASS_WITH_NOTE[kw], once=True)
-            if kw == "USER ELEMENT":
-                self._reduces(f"*{kw} (the Abaqus subroutine does not run in ccx)")
         elif kw not in CCX_KEYWORDS:
             if kw in OUTPUT_ONLY_KEYWORDS:
                 return self._commented(b, f"*{kw}: an output / diagnostics request ccx has no "
@@ -40838,6 +41064,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
     def _convert(self, blocks: List[Block]) -> List[str]:
         blocks = close_open_steps(blocks, self.report)     # (read_blocks' decks: none open)
         blocks = self._bc_dofs_in_range(self._cartesian_nodes(blocks))
+        self._uel_nodes.update(user_element_nodes(blocks))     # (an instance's too)
         raw = blocks
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
@@ -40911,6 +41138,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_velocity_bcs(blocks)         # after _plan_coupled_bcs: reads its card rewrites
         self._warn_explicit_plane_rigid(blocks)     # after the constraint plans, _plan_ref_nodes
         self._warn_explicit_trusses()           # after the mesh planners: the final element types
+        self._warn_model_change_readds()        # likewise
         self._check_transforms()
         self._plan_held_bcs(blocks)             # before the first reader of midside BC lines
         self._plan_default_amplitudes(blocks)   # reads the ROT NODE axes (_plan_rot_axes)
@@ -40980,6 +41208,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                 out.append("*HEADING")
                 out.extend(b.data)
                 break
+        self._uel_cards = [b for b in blocks if b.keyword == "USER ELEMENT"]
         out.extend(self.emit_geometry())
         mesh = len(out)                         # (the post-passes leave its cards unread)
         out.extend(self._knot_section())
@@ -42218,7 +42447,8 @@ def _instance_transform(inst: dict, report: Report) -> Tuple[Vec, Optional[Tuple
 
 
 def _emit_instance(inst: dict, parts, namer, report: Report, options,
-                   gmax_node: int, gmax_elem: int, turned_eqs: Optional[list] = None):
+                   gmax_node: int, gmax_elem: int, turned_eqs: Optional[list] = None,
+                   uel: Optional[Dict[str, int]] = None):
     """Emit one *INSTANCE as flat global geometry: build its mesh (from the *Part and/or
     the instance's own blocks — CAE 'dependent' instances keep the mesh in the *Part,
     'independent' ones put it inside *Instance...*End Instance), offset node/element ids
@@ -42228,6 +42458,7 @@ def _emit_instance(inst: dict, parts, namer, report: Report, options,
     if the instance has no mesh.  The part's *EQUATIONs turned with a rotated instance go to
     ``turned_eqs`` as (instance name, written card) (_warn_assembly_transformed_terms)."""
     geo_conv = Converter(report, options)
+    geo_conv._uel_nodes.update(uel or {})          # (the deck's *USER ELEMENT cards)
     geo_conv.build_geometry(parts.get(inst["part"], []) + inst["extra"])
     geo = geo_conv.geom
     if not geo.nodes and not geo.elements:
@@ -42685,8 +42916,9 @@ def flatten_assembly(blocks: List[Block], report: Report, options) -> List[Block
     maps: Dict[str, Tuple[int, int]] = {}      # instance -> (node_off, elem_off)
     gmax_node, gmax_elem = asm_max_node, asm_max_elem
     turned_eqs: List[Tuple[str, Block]] = []
+    uel = user_element_nodes(blocks)
     for inst in instances:
-        res = _emit_instance(inst, parts, namer, report, options, gmax_node, gmax_elem, turned_eqs)
+        res = _emit_instance(inst, parts, namer, report, options, gmax_node, gmax_elem, turned_eqs, uel)
         if res is None:
             continue
         inst_blocks, gmax_node, gmax_elem, offs, entry = res

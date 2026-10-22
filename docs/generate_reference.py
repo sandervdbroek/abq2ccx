@@ -39,6 +39,10 @@ TRANSLATED = {
         "Abaqus. `*NMAP` maps the coordinates (`RECTANGULAR`, `CYLINDRICAL`, `SPHERICAL`, `ROTATION`, "
         "`TRANSLATION`, `SCALE`; `*NODE` normals turn with the local axes); `DIAMOND`, `TOROIDAL`, "
         "`BLENDED` are not converted (reduced physics).",
+    "*SYSTEM": "its frame (origin, a point on X1, one in the X1-Y1 plane; without the third Z1 stays Z, "
+        "with the origin alone a translation) applied to the `*NODE` coordinates and normals and the "
+        "`*NGEN` arc / parabola points after it, until the next `*SYSTEM` (one without data: global "
+        "again) or the end of its part or instance; then dropped.",
     "*PART / *INSTANCE / *ASSEMBLY": "flattened into one global numbering (instance transform "
         "applied, references resolved, names kept ≤80 chars); part-level constraints (`*EQUATION`, "
         "`*MPC`, `*RIGID BODY`, `*COUPLING`, `*DISTRIBUTING COUPLING`, `*PRE-TENSION SECTION`, ...) "
@@ -614,6 +618,15 @@ TRANSLATED = {
         "`DEFINITION=USER` (Abaqus `UAMP`) commented, naming ccx's `uamplitude.f`. (`*AMP` alias "
         "accepted.)",
     "*RESTART": "keeps `WRITE`/`READ`/`FREQUENCY`/`STEP`; other params dropped.",
+    "*CONTROLS": "`ANALYSIS=DISCONTINUOUS` → `PARAMETERS=TIME INCREMENTATION` with I0 = 8, IR = 10, "
+        "the values Abaqus sets (numerical only); otherwise emitted as-is.",
+    "*MODEL CHANGE": "`TYPE=ELEMENT` (Abaqus' default) written where none is given: ccx 2.23 stops "
+        "without `TYPE`. Beam, truss, shell, membrane and plane elements the first step removes never "
+        "come back in ccx (it expands its elements after that step): an `ADD` of them is warned, "
+        "reduced physics.",
+    "*SUBMODEL": "`TYPE=NODE` (Abaqus' default) written where none is given: ccx 2.23 stops without "
+        "`TYPE`. Warned: ccx needs `INPUT=` the global model's `.frd`, which the Abaqus deck cannot "
+        "name.",
     "*SURFACE": "only `NAME`/`TYPE` kept; a line without a face label → its continuum elements' faces "
         "on the model's exterior, trimmed as Abaqus trims an open free surface (`TRIM`); shell edges "
         "`E1..E4` → `S3..S6` (plane elements "

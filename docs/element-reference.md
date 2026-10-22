@@ -4,7 +4,7 @@
 
 Every Abaqus element type the converter recognises, its node count, and how it is emitted for CalculiX. **Substitutions preserve the node count** so connectivity stays valid. Solid/shell node *ordering* is identical between the two codes, so connectivity is passed through unchanged. A substitution is exact only where noted; any other replaces Abaqus' element formulation, which the converter records as reduced physics (`Converter.reduced_physics`, a header warning): ccx then solves a different discretization than Abaqus.
 
-Direct CalculiX types: **68**. Total recognised: **176**.
+Direct CalculiX types: **67**. Total recognised: **176**.
 
 ## 3D continuum
 

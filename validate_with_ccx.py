@@ -16574,6 +16574,115 @@ def main():
                   f"{len(common)} nodes; |u| {moved:.6g})")
         failures += 0 if ok else 1
 
+    # --- task 139: *SYSTEM frames, *CONTROLS ANALYSIS=DISCONTINUOUS, *MODEL CHANGE w/o TYPE ---
+    def t139_run(tag, deck):
+        """(displacement blocks of the .dat, ccx's output, the report) of ``deck`` converted and
+        solved without reduced physics, or None (FAIL printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        rep, conv = convert(src, inp)
+        d = tempfile.mkdtemp(prefix="ccxval_")
+        shutil.copy(inp, os.path.join(d, "job.inp"))
+        r = ccx_job(ccx, env, d, 120)
+        rc, out = r.stopped or r.returncode, r.stdout + r.stderr
+        ok = rc == 0 and "Job finished" in out and "*ERROR" not in out and \
+            not A.ccx_nonfinite_result(os.path.join(d, "job")) and not conv.reduced_physics
+        blocks = dat_node_blocks(os.path.join(d, "job.dat")) if ok else []
+        shutil.rmtree(d, ignore_errors=True)
+        if not blocks:
+            print(f"FAIL  {tag}: did not solve (rc {rc}) or reduced physics: "
+                  + "; ".join(conv.reduced_physics))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return blocks, out, rep.text()
+
+    # a C3D8 bar (4 x 1 x 1, clamped at x = 0, pulled and bent at x = 4) given in a turned,
+    # shifted *SYSTEM frame (Abaqus' three points), one node in its cylindrical form there,
+    # against the same bar given globally: Abaqus reads the frame's coordinates as these
+    # global ones ("Node definition").  Loads and BCs are global in both.
+    c, s = math.cos(0.6), math.sin(0.6)
+    e1, e2, e3 = (c, s, 0.0), (-s * 0.8, c * 0.8, 0.6), (s * 0.6, -c * 0.6, 0.8)
+    origin = (5.0, -2.0, 3.0)
+    glob = {n: (float(i), float(j), float(k)) for n, (i, j, k) in enumerate(
+        ((i, j, k) for k in (0, 1) for j in (0, 1) for i in range(5)), 1)}
+    elems = "".join(f"{i}, {i}, {i + 1}, {i + 6}, {i + 5}, {i + 10}, {i + 11}, {i + 16}, {i + 15}\n"
+                    for i in range(1, 5))
+    tail = ("*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=E, material=M\n"
+            "*Nset, nset=FIX\n1, 6, 11, 16\n*Nset, nset=TIP\n5, 10, 15, 20\n*Boundary\nFIX, 1, 3\n"
+            "*Step\n*Static\n*Cload\nTIP, 1, 2.\nTIP, 2, -0.5\nTIP, 3, 0.25\n"
+            "*Node Print, nset=ALL\nU\n*End Step\n")
+
+    def t139_local(p):
+        v = tuple(p[k] - origin[k] for k in range(3))
+        return tuple(sum(v[k] * e[k] for k in range(3)) for e in (e1, e2, e3))
+
+    def t139_nodes(where):
+        return "".join(f"{n}, {', '.join(repr(x) for x in where(p))}\n" for n, p in glob.items() if n != 7)
+    loc7 = t139_local(glob[7])
+    cyl7 = (math.hypot(loc7[0], loc7[1]), math.degrees(math.atan2(loc7[1], loc7[0])), loc7[2])
+    framed = ("*System\n" + ", ".join(repr(x) for x in origin + tuple(origin[k] + e1[k] for k in range(3)))
+              + "\n" + ", ".join(repr(origin[k] + 2 * e2[k] + 0.3 * e1[k]) for k in range(3)) + "\n"
+              "*Node, nset=ALL\n" + t139_nodes(t139_local) + "*Node, nset=ALL, system=C\n7, "
+              + ", ".join(repr(x) for x in cyl7) + "\n*System\n*Element, type=C3D8, elset=E\n" + elems + tail)
+    flat = ("*Node, nset=ALL\n" + t139_nodes(lambda p: p) + f"7, {', '.join(repr(x) for x in glob[7])}\n"
+            "*Element, type=C3D8, elset=E\n" + elems + tail)
+    runs = [t139_run("t139_system", framed), t139_run("t139_system_flat", flat)]
+    ok = all(runs)
+    if ok:
+        err, moved = t124_apart(runs[0][0][-1], runs[1][0][-1])
+        ok = err <= 1e-9 * moved and moved > 1e-3 and "*SYSTEM: the *NODE coordinates" in runs[0][2]
+        print(f"{'PASS' if ok else 'FAIL'}  t139_system (a C3D8 bar given in a turned and shifted "
+              f"*SYSTEM frame, a node of it cylindrical): the displacements of the bar given globally "
+              f"({err:.1e} apart; |u| {moved:.6g}; before: the frame's coordinates read as global)")
+    failures += 0 if ok else 1
+
+    # *CONTROLS, ANALYSIS=DISCONTINUOUS: ccx reads the TIME INCREMENTATION card without a word
+    # (the 2.23 release does not echo I0 and IR) and solves as without it (numerical only);
+    # before: '*WARNING in controlss: parameter not recognized', the defaults kept
+    deck = ("*Node, nset=NALL\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+            "5, 0., 0., 1.\n6, 1., 0., 1.\n7, 1., 1., 1.\n8, 0., 1., 1.\n*Element, type=C3D8, elset=E\n"
+            "1, 1, 2, 3, 4, 5, 6, 7, 8\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=E, material=M\n*Boundary\n1, 1, 3\n2, 2, 3\n3, 3, 3\n4, 1, 1\n"
+            "4, 3, 3\n*Step, nlgeom\n*Static\n0.25, 1.\n{}*Cload\n5, 3, -20.\n6, 3, -20.\n7, 3, -20.\n"
+            "8, 3, -20.\n*Node Print, nset=NALL\nU\n*End Step\n")
+    runs = [t139_run("t139_controls", deck.format("*Controls, analysis=discontinuous\n")),
+            t139_run("t139_controls_ref", deck.format(""))]
+    ok = all(runs)
+    if ok:
+        err, moved = t124_apart(runs[0][0][-1], runs[1][0][-1])
+        ok = err <= 1e-12 * moved and moved > 1e-3 and "controlss" not in runs[0][1] and \
+            runs[0][1].count("WARNING") == runs[1][1].count("WARNING")
+        print(f"{'PASS' if ok else 'FAIL'}  t139_controls (*CONTROLS, ANALYSIS=DISCONTINUOUS in an "
+              f"NLGEOM step -> PARAMETERS=TIME INCREMENTATION 8, 10): read without a warning, solved "
+              f"as without it ({err:.1e} apart; |u| {moved:.6g}; before: 'parameter not recognized')")
+    failures += 0 if ok else 1
+
+    # *MODEL CHANGE, REMOVE without TYPE: two C3D8 in a row, clamped at both ends, pulled at the
+    # middle; the second removed in step 2 -> the middle moves as with the first element alone
+    # (Abaqus removes its forces over the step); before: ccx stopped ('model change can only
+    # be used for contact pairs or elements')
+    nodes = "".join(f"{n}, {x}., {y}., {z}.\n" for n, (x, y, z) in enumerate(
+        ((x, y, z) for z in (0, 1) for y in (0, 1) for x in range(3)), 1))
+    deck = ("*Node, nset=ALL\n" + nodes + "*Element, type=C3D8, elset=E1\n1, 1, 2, 5, 4, 7, 8, 11, 10\n{}"
+            "*Elset, elset=E\nE1{}\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Solid Section, elset=E, material=M\n*Boundary\n1, 1, 3\n4, 1, 3\n7, 1, 3\n10, 1, 3\n"
+            "3, 1, 3\n6, 1, 3\n9, 1, 3\n12, 1, 3\n*Nset, nset=MID\n2, 5, 8, 11\n*Step\n*Static\n"
+            "*Cload\nMID, 1, 1.\n{}*Node Print, nset=ALL\nU\n*End Step\n")
+    two = "*Element, type=C3D8, elset=E2\n2, 2, 3, 6, 5, 8, 9, 12, 11\n"
+    runs = [t139_run("t139_model_change", deck.format(two, ", E2", "*Node Print, nset=ALL\nU\n*End Step\n"
+                                                      "*Step\n*Static\n*Model Change, remove\nE2\n")),
+            t139_run("t139_model_change_ref", deck.format("", "", ""))]
+    ok = all(runs) and len(runs[0][0]) == 2
+    if ok:
+        err, moved = t124_apart(runs[0][0][-1], runs[1][0][-1])
+        both = max(abs(x) for v in runs[0][0][0].values() for x in v)
+        ok = err <= 1e-9 * moved and moved > 1.5 * both > 0.0
+        print(f"{'PASS' if ok else 'FAIL'}  t139_model_change (*MODEL CHANGE, REMOVE without TYPE: the "
+              f"second of two clamped C3D8 left out in step 2): the first element alone ({err:.1e} "
+              f"apart; |u| {moved:.6g}, {both:.6g} with both; before: ccx stopped)")
+    failures += 0 if ok else 1
+
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)
     for name in ("composite_shell", "assembly_two_blocks"):

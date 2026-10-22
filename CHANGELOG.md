@@ -112,6 +112,17 @@ physics.
   match their closed forms (validate_with_ccx.py `connector_*`, `jointc_*`). U1 beams may now
   carry such connectors.
 
+* **Small conversions** — `*SYSTEM` frames are applied: the `*NODE` coordinates and normals and
+  the `*NGEN` arc and parabola points after a `*SYSTEM` card are given in its frame, as Abaqus
+  reads them, until the next one or the end of the part (they were read as global, warned).
+  `*CONTROLS, ANALYSIS=DISCONTINUOUS` becomes ccx's `*CONTROLS, PARAMETERS=TIME INCREMENTATION`
+  with I0 = 8, IR = 10 (ccx ignored it). `*MODEL CHANGE` and `*SUBMODEL` without `TYPE` get
+  Abaqus' default (`ELEMENT`, `NODE`), without which ccx 2.23 stops; a `*SUBMODEL` deck is told
+  that ccx needs `INPUT=` the global model's `.frd`, and an `ADD` of beam, shell or plane
+  elements the first step removed is warned (ccx never adds them back). An Abaqus user element
+  is no longer read as ccx's own `U1` beam: its elements take the `*USER ELEMENT`'s node count
+  (they were read with none) and the report says ccx cannot run it.
+
 * **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
   DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
   load case now becomes its own ccx step with the step's loads, BCs and output requests and the

@@ -5288,9 +5288,9 @@ def test_step_and_procedure_options_ccx_lacks():
                 "*DYNAMIC APPLICATION=TRANSIENT FIDELITY dropped"):
         assert msg in text, msg
     assert conv.reduced_physics == []
-    # a *SYSTEM with data: the nodes after it are read as global (reduced physics)
+    # a *SYSTEM with data: the nodes after it are given in its frame (test_system_frame)
     _, conv, rep = convert_str("*System\n1., 2., 3.\n*Node\n1, 0., 0., 0.\n")
-    assert conv.reduced_physics == ["*SYSTEM (nodes given in a local frame read as global)"]
+    assert conv.geom.nodes[1] == (1.0, 2.0, 3.0) and conv.reduced_physics == []
 
 
 def test_rigid_body_pin_and_tie_sets_united():
@@ -16064,6 +16064,118 @@ def test_node_system_cylindrical_and_spherical():
     assert abs(nz) < 1e-12
     nx, ny, nz = conv._node_normals[2]
     assert abs(nx) < 1e-12 and abs(ny - math.sqrt(3) / 2) < 1e-12 and abs(nz - 0.5) < 1e-12
+
+
+def test_system_frame():
+    # Abaqus "Node definition": *SYSTEM gives the origin a and a point b on X1 (first line),
+    # a point c in the X1-Y1 plane (second line); without c, Z1 stays Z and X1 is b - a
+    # projected onto the X-Y plane; without b a translation; a *SYSTEM without data returns
+    # to global coordinates.  *NODE, SYSTEM=C is converted first, then the frame applied.
+    def near(p, q):
+        return max(abs(u - v) for u, v in zip(p, q)) < 1e-12
+    deck = ("*Node\n1, 0., 0., 0.\n*System\n1., 2., 3., 1., 3., 7.\n"
+            "*Node\n2, 1., 0., 0., 1., 0., 0.\n3, 0., 1., 0.\n*Node, system=C\n4, 1., 90., 2.\n"
+            "*System\n1., 2., 3., 2., 2., 3.\n1., 2., 4.\n*Node\n5, 0., 1., 0.\n6, 0., 0., 1.\n"
+            "*System\n*Node\n7, 5., 5., 5.\n")
+    _, conv, rep = convert_str(deck)
+    nodes = conv.geom.nodes
+    assert nodes[1] == (0.0, 0.0, 0.0) and nodes[7] == (5.0, 5.0, 5.0)
+    # two points: X1 = (0, 1, 0) (b's z offset projected away), Y1 = (-1, 0, 0), Z1 = Z
+    assert near(nodes[2], (1., 3., 3.)) and near(nodes[3], (0., 2., 3.)) and near(nodes[4], (0., 2., 5.))
+    assert near(conv._node_normals[2], (0., 1., 0.))           # the normal turns with the axes
+    # three points: X1 = X, Y1 toward c = Z, Z1 = -Y
+    assert near(nodes[5], (1., 2., 4.)) and near(nodes[6], (1., 1., 3.))
+    assert conv.reduced_physics == [] and "*SYSTEM: the *NODE coordinates" in rep.text()
+    # the frame ends with the part it is in; a *NGEN arc's centre is given in it
+    deck = ("*Part, name=P\n*System\n10., 0., 0.\n*Node\n1, 1., 0., 0.\n3, -1., 0., 0.\n"
+            "*Ngen, line=C, nset=G\n1, 3, 1, , 0., 0., 0., 0., 0., 1.\n*End Part\n"
+            "*Part, name=Q\n*Node\n1, 0., 0., 0.\n*End Part\n*Assembly, name=A\n"
+            "*Instance, name=P1, part=P\n*End Instance\n*Instance, name=Q1, part=Q\n*End Instance\n"
+            "*End Assembly\n")
+    _, conv, _ = convert_str(deck)
+    xs = sorted(conv.geom.nodes.values())
+    assert near(xs[0], (0., 0., 0.)) and near(xs[1], (9., 0., 0.)) and near(xs[-1], (11., 0., 0.))
+    assert any(near(p, (10., 1., 0.)) for p in xs)            # the arc's midpoint about (10, 0, 0)
+    # points that leave the axes undefined: a translation, warned; *NCOPY under a frame warned
+    _, conv, rep = convert_str("*System\n1., 0., 0., 1., 0., 5.\n*Node\n1, 1., 1., 1.\n"
+                               "*Nset, nset=N\n1\n*Ncopy, old set=N, change number=10, shift\n1., 0., 0.\n")
+    assert conv.geom.nodes[1] == (2.0, 1.0, 1.0)
+    assert "*SYSTEM with b straight above a" in rep.text() and "*NCOPY after a *SYSTEM card" in rep.text()
+    assert conv.reduced_physics == ["*SYSTEM axes undefined (read as a translation)",
+                                    "*NCOPY coordinates under a *SYSTEM frame"]
+
+
+def test_controls_analysis_discontinuous():
+    # Abaqus: ANALYSIS=DISCONTINUOUS sets I0 = 8 and IR = 10; ccx: the first two values of
+    # *CONTROLS, PARAMETERS=TIME INCREMENTATION (a field left out keeps its value)
+    step = "*Step, nlgeom\n*Static\n0.1, 1.\n{}*Cload\n7, 3, 1.\n*End Step\n"
+    body, conv, rep = convert_str(HEX_MODEL + step.format("*Controls, reset\n*Controls, analysis=discontinuous\n"
+                                                          "*Controls, parameters=time incrementation\n"
+                                                          ", , , , , , , 15\n"))
+    assert ("*CONTROLS, RESET\n*CONTROLS, PARAMETERS=TIME INCREMENTATION\n8, 10\n"
+            "*CONTROLS, PARAMETERS=time incrementation\n, , , , , , , 15\n") in "\n".join(_live(body))
+    assert "ANALYSIS=DISCONTINUOUS -> *CONTROLS, PARAMETERS=TIME INCREMENTATION" in rep.text()
+    assert conv.reduced_physics == []
+
+
+def test_model_change_type_and_first_step_removals():
+    # ccx 2.23 stops on *MODEL CHANGE without TYPE: Abaqus' default TYPE=ELEMENT is written
+    deck = (S4 + "*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Static\n*Model Change, remove\n{}\n*Cload\n2, 1, 1.\n"
+            "*End Step\n*Step\n*Static\n*Model Change, add\n{}\n*End Step\n")
+    body, conv, rep = convert_str(deck.format("2", "2"))
+    live = "\n".join(_live(body))
+    assert "*MODEL CHANGE, TYPE=ELEMENT, REMOVE\n2\n" in live and "*MODEL CHANGE, TYPE=ELEMENT, ADD\n2\n" in live
+    # ccx expands shells after the first step, without the removed ones: it never adds them back
+    assert "*MODEL CHANGE, ADD in step 2 gives back 1 beam, truss, shell, membrane or plane " \
+           "element(s) (element 2)" in rep.text()
+    assert "*MODEL CHANGE, ADD of beam/shell/plane elements removed in the first step " \
+           "(ccx never adds them back)" in conv.reduced_physics
+    # solids, and shells removed in a later step, are added back
+    _, conv, rep = convert_str(HEX_MODEL + "*Step\n*Static\n*Model Change, remove, type=element\nEALL\n"
+                               "*End Step\n*Step\n*Static\n*Model Change, add\n1\n*End Step\n")
+    assert "gives back" not in rep.text()
+    _, conv, rep = convert_str(deck.format("1", "2").replace("*Model Change, remove\n1\n", ""))
+    assert "gives back" not in rep.text() and "MODEL CHANGE, ADD of" not in str(conv.reduced_physics)
+
+
+def test_submodel_needs_the_global_frd():
+    # ccx reads the global results from INPUT=<.frd>, which an Abaqus deck cannot name; ccx
+    # 2.23 stops without TYPE= ('increase nset_'), so Abaqus' default TYPE=NODE is written
+    body, conv, rep = convert_str(HEX_MODEL + "*Nset, nset=D\n1, 2\n*Submodel, exterior tolerance=0.05\nD\n"
+                                  "*Step\n*Static\n*Boundary, submodel, step=1\nD, 1, 3\n*End Step\n")
+    assert "*SUBMODEL, TYPE=NODE, EXTERIOR TOLERANCE=0.05\nD\n" in "\n".join(_live(body))
+    assert "add INPUT=<its .frd> to this card" in rep.text()
+
+
+def test_user_elements_are_never_ccx_elements():
+    # an Abaqus user element U1 is not ccx's U1 beam: its node count is the *USER ELEMENT's
+    # NODES (element records continued after a trailing comma), its type kept as written
+    deck = ("*Node\n" + "".join(f"{i}, {i}., 0., 0.\n" for i in range(1, 13)) +
+            "*User Element, nodes=12, type=U1, properties=1, coordinates=2\n1, 2\n"
+            "*Element, type=U1, elset=E\n1,\n1, 2, 3, 4, 5, 6,\n7, 8, 9, 10, 11, 12\n"
+            "*Uel Property, elset=E\n1.\n")
+    body, conv, rep = convert_str(deck)
+    assert conv.geom.elements[1] == ("U1", list(range(1, 13)))
+    live = "\n".join(_live(body))
+    # its card goes before its elements (ccx, and a reader of the deck, need the node count)
+    assert ("*USER ELEMENT, NODES=12, TYPE=U1, PROPERTIES=1, COORDINATES=2\n1, 2\n*ELEMENT, TYPE=U1\n"
+            "1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12\n") in live and live.count("*USER ELEMENT") == 1
+    text = rep.text()
+    assert "an Abaqus user element (its UEL / VUEL subroutine) has no ccx counterpart" in text
+    assert "inferred" not in text and "unknown to this converter" not in text
+    assert "*USER ELEMENT (the Abaqus subroutine does not run in ccx)" in conv.reduced_physics
+    # another type, in a part: its instance reads the deck's *USER ELEMENT
+    deck = ("*User Element, nodes=3, type=U4, properties=1, coordinates=2\n1, 2\n*Part, name=P\n"
+            "*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 0., 1., 0.\n*Element, type=U4\n1,\n1, 2, 3\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I, part=P\n*End Instance\n*End Assembly\n")
+    _, conv, rep = convert_str(deck)
+    assert [c for t, c in conv.geom.elements.values()] == [[1, 2, 3]]
+    assert "inferred" not in rep.text() and "has no ccx counterpart" in rep.text()
+    # the card inside the *INSTANCE (left out when flattened) still gives the node count
+    deck = deck.replace("*User Element, nodes=3, type=U4, properties=1, coordinates=2\n1, 2\n", "")
+    _, conv, rep = convert_str(deck.replace("*Instance, name=I, part=P\n", "*Instance, name=I, part=P\n"
+                                            "*User Element, nodes=3, type=U4, coordinates=2\n1, 2\n"))
+    assert [c for t, c in conv.geom.elements.values()] == [[1, 2, 3]] and "inferred" not in rep.text()
 
 
 def test_nmap_maps_nodes_and_their_normals():
