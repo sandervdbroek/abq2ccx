@@ -4480,6 +4480,26 @@ def static_pert_adds_deck(between="", ref=False):
     return text + between + "*STEP, PERTURBATION\n*STATIC\n" + cards.format(", OP=NEW", 0.5, 0.5, 500., 0.5, 0.02)
 
 
+def load_case_deck(case=None, first=False):
+    """static_pert_adds_deck's base state (none if ``first``), then a *STEP, PERTURBATION *STATIC
+    step with a pressure for every load case and two *LOAD CASE blocks: A loads node 3, B moves
+    node 7's x by 0.02 more and pulls the side by a traction (``first``: each case releases the
+    BCs with OP=NEW and gives its own, B node 8's x held too, as TexGen's homogenisation decks
+    do).  ``case`` "A" / "B": the hand-written step of that load case alone instead."""
+    text = static_pert_adds_deck()
+    text = text[:text.index("*STEP, PERTURBATION")]
+    if first:
+        text = text[:text.index("*STEP")]
+    bcs = "*BOUNDARY, OP=NEW\n1, 1, 3\n2, 2, 3\n4, 3, 3\n"
+    cases = {"A": (bcs if first else "") + "*CLOAD\n3, 1, 1.\n",
+             "B": bcs + "8, 1, 1\n*CLOAD\n7, 3, 1.\n" if first else
+                  "*BOUNDARY\n7, 1, 1, 0.02\n*DSLOAD\nSIDE, TRVEC, 1., 0., 0., 1.\n"}
+    text += "*STEP, PERTURBATION\n*STATIC\n*DLOAD\n1, P2, 0.5\n*NODE PRINT, NSET=NALL\nU\n"
+    if case:
+        return text + cases[case] + "*END STEP\n"
+    return text + "".join(f"*LOAD CASE, NAME={k}\n{v}*END LOAD CASE\n" for k, v in cases.items()) + "*END STEP\n"
+
+
 def step_time_deck(case, ref=False):
     """modal_own_loads_deck's cube, unloaded.  ``case`` "zero": a static step of time period 0
     (Abaqus and ccx 2.23: 1.0) under a traction on an amplitude of 1 at time 1 (0 at 0), a
@@ -11545,6 +11565,26 @@ def main():
                   f"{'then ' + ('*FREQUENCY and *MODAL DYNAMIC' if 'MODAL' in between else '*FREQUENCY') + ', ' if between else ''}"
                   f"then a *STEP, PERTURBATION *STATIC step changing each of them): its displacements "
                   f"are the ones of a static step with the sums ({err:.1e} apart, nodes moved {moved:.3g})")
+        failures += 0 if ok else 1
+    # a static perturbation step's two *LOAD CASE blocks, one ccx step each (the converter
+    # superposed them into one solution): each step is the hand-written step of its case alone
+    for first in (False, True):
+        tag = "load_cases" + ("_first" if first else "")
+        got = review_run(load_case_deck(first=first), tag, dat_node_blocks)
+        refs = [review_run(load_case_deck(c, first), f"{tag}_{c}", dat_node_blocks) for c in "AB"]
+        ok = bool(got and all(refs)) and len(got) == 2
+        if ok:
+            errs = [same([got[k:k + 1], r[-1:]], 0) for k, r in enumerate(refs)]
+            err, moved = max(e for e, _ in errs), min(m for _, m in errs)
+            apart = same([refs[0][-1:], refs[1][-1:]], 0)[0]
+            ok = err < 1e-9 * moved and moved > 1e-3 and apart > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (a cube{': ' if first else ' loaded statically, then '}"
+                  f"a *STEP, PERTURBATION *STATIC step with a pressure and two load cases"
+                  f"{', each releasing the BCs (OP=NEW)' if first else ''}): ccx steps "
+                  f"{'1 and 2' if first else '2 and 3'} are the hand-written steps of each case alone "
+                  f"({err:.1e} apart, nodes moved {moved:.3g}; the cases differ by {apart:.3g})")
+        elif got:
+            print(f"FAIL  {tag}: {len(got)} steps printed, not 2")
         failures += 0 if ok else 1
     # a static perturbation step's temperatures change the base state's (from the initial ones
     # before any general step), an amplitude counts at its value at time 0, and a zero BC on a

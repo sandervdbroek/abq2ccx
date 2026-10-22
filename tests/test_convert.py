@@ -5520,9 +5520,45 @@ def test_surface_interaction_thickness_line_dropped():
 
 
 def test_load_case_superposition_warned():
-    _, _, rep = convert_str(HEX + "*Step, perturbation\n*Static\n*Load Case, name=LC1\n*Cload\n"
-                            "7, 1, 1.\n*End Load Case\n*End Step\n")
-    assert "SUPERPOSED" in rep.text()
+    # Abaqus allows load cases only in a linear perturbation *STATIC or *STEADY STATE DYNAMICS
+    # step (_split_load_cases); in a general step they stay superposed, warned
+    _, conv, rep = convert_str(HEX + "*Step\n*Static\n*Load Case, name=LC1\n*Cload\n"
+                               "7, 1, 1.\n*End Load Case\n*End Step\n")
+    assert "SUPERPOSED" in rep.text() and conv.reduced_physics == ["*LOAD CASE"]
+
+
+def test_load_cases_split_into_perturbation_steps():
+    # one ccx step per load case: the step's own cards in each, a load case's own in its step
+    # only, the base state given again between them (as after any perturbation step)
+    model = MODAL.split("*Step")[0]
+    g = "*Step\n*Static\n*Cload\n6, 2, 1.\n*End Step\n"
+    sp = ("*Step, name=SP, perturbation\n*Static\n*Dload\n1, P2, 0.5\n*Node Print, nset=EALL\nU\n"
+          "*Load Case, name=A\n*Cload\n3, 1, 1.\n*End Load Case\n"
+          "*Load Case, name=B\n*Boundary\n7, 1, 1, 0.02\n*End Load Case\n*End Step\n")
+    body, conv, rep = convert_str(model + g + sp)
+    assert body.count("*STEP") == 3 and "SUPERPOSED" not in rep.text()
+    a, b = _step(body, 2), _step(body, 3)
+    assert "load case A of the deck's step 2 (1 of 2)" in a and "load case B" in b
+    assert all("*DLOAD\n1, P2, 0.5\n" in x and "*NODE PRINT" in x for x in (a, b))
+    assert "*CLOAD\n3, 1, 1.\n" in a and "7, 1, 1" not in a
+    assert "*BOUNDARY\n7, 1, 1, 0.02\n" in b and "3, 1, 1." not in b and "6, 2, 1." in b
+    assert "Step 2: its 2 load cases (A, B) -> ccx steps 2-3" in rep.text()
+    # "if any boundary condition is removed in a step with load cases, the base state boundary
+    # conditions will not be propagated to any load case": OP=NEW on every case's *BOUNDARY,
+    # an empty one where a case has none
+    sp = ("*Step, perturbation\n*Static\n*Load Case, name=A\n*Boundary, op=new\n1, 1, 3\n2, 2, 3\n"
+          "4, 3, 3\n*Cload\n3, 1, 1.\n*End Load Case\n*Load Case, name=B\n*Boundary\n1, 1, 3\n"
+          "*End Load Case\n*Load Case, name=C\n*Cload\n7, 3, 1.\n*End Load Case\n*End Step\n")
+    body, _, rep = convert_str(model + sp)
+    assert _step(body, 1).startswith("\n*STATIC\n** abq2ccx: this step is Abaqus' load case A")
+    assert "\n*BOUNDARY, OP=NEW\n1, 1, 3\n" in _step(body, 2)
+    assert "\n*BOUNDARY, OP=NEW\n** abq2ccx: this step is Abaqus' load case C" in _step(body, 3)
+    # a steady-state dynamics step's load cases too; a load case left open closes at the next
+    body, _, rep = convert_str(model + "*Step\n*Frequency\n3\n*End Step\n*Step\n*Steady State Dynamics\n"
+                               "1., 10., 2\n*Load Case, name=A\n*Cload\n3, 1, 1.\n*Load Case, name=B\n"
+                               "*Cload\n7, 3, 1.\n*End Load Case\n*End Step\n")
+    assert body.count("*STEADY STATE DYNAMICS") == 2 and "*LOAD CASE without *END LOAD CASE" in rep.text()
+    assert "7, 3, 1." not in _step(body, 2) and "3, 1, 1." not in _step(body, 3)
 
 
 def test_abaqus_output_filter_commented():

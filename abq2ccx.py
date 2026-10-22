@@ -3966,9 +3966,11 @@ SPECIAL_UNSUPPORTED = {
     "PIEZORESISTIVITY": "Abaqus 2024 piezoresistive coupling has no ccx equivalent; drop.",
     "STEP CYCLING": "Abaqus 2025 step cycling has no ccx equivalent; remodel as repeated steps.",
     "STEP CYCLING CONTROL": "Abaqus 2025 step-cycling controls have no ccx equivalent; drop.",
-    "LOAD CASE": "ccx solves one load case per step: the loads of all *LOAD CASE blocks in this "
-                 "step are now SUPERPOSED into one solution — split each load case into its own "
-                 "step (with OP=NEW on the loads).",
+    # (a linear perturbation *STATIC / *STEADY STATE DYNAMICS step's: one ccx step per load case,
+    # Converter._split_load_cases)
+    "LOAD CASE": "Abaqus allows load cases only in a linear perturbation *STATIC or *STEADY STATE "
+                 "DYNAMICS step, and ccx solves one load case per step: the loads of all *LOAD "
+                 "CASE blocks in this step are SUPERPOSED into one solution.",
 }
 
 # ---- output variable maps (Abaqus identifier -> ccx) --------------------------
@@ -35334,6 +35336,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._frame_bound_mats: set = set()        # *DEFORMATION PLASTICITY ones (_dp_axes)
         self._dp_nlgeom = False                    # one stays: ccx runs NLGEOM (_plan_dp_materials)
         self._dp_unused: Dict[int, str] = {}       # cards of an unused one -> why commented out
+        self._lc_marks: Dict[int, str] = {}        # *LOAD CASE of a step split per case -> its case
         self._ic_ori: Dict[int, Tuple[str, str]] = {}  # element -> its section, orientation (_plan_ic_axes)
         self._ic_shell: Dict[int, tuple] = {}      # continuum shell / ply solid -> how its axes form (ditto)
         # (id(split composite section), ply group's set) -> ply solid -> its axes (_ply_group_axes)
@@ -35836,6 +35839,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                              "FREQUENCY / NUMBER INTERVAL / TIME INTERVAL / TIME POINTS onto the "
                              "step's first output card.", once=True)
             return self._anchored_output(b)        # a preselected request's cards
+        if id(b) in self._lc_marks:                     # _split_load_cases
+            return [f"** abq2ccx: this step is Abaqus' {self._lc_marks[id(b)]}"]
         if kw == "PARAMETER":
             self.report.note("*PARAMETER card dropped; its <name> substitutions were already "
                              "applied to the deck (ccx has no parametric input).", once=True)
@@ -36009,6 +36014,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         if any(b.keyword in ("PART", "INSTANCE", "ASSEMBLY") for b in blocks):
             blocks = flatten_assembly(blocks, self.report, self.opt)
         blocks = self._move_between_cards(blocks)     # before anything splits the deck into steps
+        blocks = self._split_load_cases(blocks)       # after it: its moved cards are the step's
         blocks = self._sp_amplitudes(blocks)          # before anything reads load amplitudes
         blocks = self._blank_periods(blocks)          # before the step model reads the periods
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
@@ -36225,6 +36231,72 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                 j += 1
             j = j + 1 if j < len(out) and out[j].keyword in STEP_PROCS else at + 1
             out[j:j] = move[at]
+        return out
+
+    def _split_load_cases(self, blocks: List[Block]) -> List[Block]:
+        """A linear perturbation *STATIC or *STEADY STATE DYNAMICS step with *LOAD CASE blocks
+        -> one such step per load case, as Abaqus reads them ("conceptually equivalent to"
+        consecutive perturbation steps; Analysis User's Guide, multiple load case analysis):
+        the step's cards outside the blocks (procedure, loads, BCs, output requests) in each,
+        and the load case's own in its step, in place.  "If any boundary condition is removed
+        in a step with load cases, the base state boundary conditions will not be propagated
+        to any load case", so then every *BOUNDARY of each step gets OP=NEW (an empty one
+        after the procedure where a step has none).  The base state comes back in each step
+        as after any perturbation step (_plan_base_restore).  The *LOAD CASE card stays as a
+        comment (``_lc_marks``); a step of another procedure, where Abaqus rejects load cases,
+        is left as it is (passthrough: the cases superposed, warned)."""
+        if not any(b.keyword == "LOAD CASE" for b in blocks):
+            return blocks
+        pert = self._perturbation_steps(blocks)
+        out: List[Block] = []
+        s = extra = 0                             # the deck's steps so far, the steps added
+        for step, cards in deck_parts(blocks):
+            if not step:
+                out += cards
+                continue
+            s += 1
+            owner: Dict[int, int] = {}            # id of a card in a load case -> its case
+            names: List[str] = []
+            case, open_end = None, False
+            for b in cards[1:]:
+                if b.keyword == "LOAD CASE":
+                    open_end = open_end or case is not None
+                    case = len(names)
+                    names.append((b.param("NAME") or "").strip() or str(case + 1))
+                elif b.keyword in ("END LOAD CASE", "END STEP"):
+                    open_end = open_end or b.keyword == "END STEP" and case is not None
+                    case = None
+                if case is not None:
+                    owner[id(b)] = case
+            proc = next((b for b in cards[1:] if b.keyword in STEP_PROCS), None)
+            if not names or proc is None or id(proc) in owner or not (
+                    proc.keyword == "STEADY STATE DYNAMICS" or proc.keyword == "STATIC" and s in pert):
+                out += cards
+                continue
+            if open_end:
+                self.report.warn(f"Step {s}: *LOAD CASE without *END LOAD CASE (Abaqus requires "
+                                 f"one): closed at the next *LOAD CASE or *END STEP.", once=True)
+            release = any(b.keyword == "BOUNDARY" and b.uparam("OP") == "NEW" for b in cards)
+            for k in range(len(names)):
+                group = [b if k == 0 else Block(b.keyword, OrderedDict(b.params), list(b.data))
+                         for b in cards if b.keyword != "END LOAD CASE" and owner.get(id(b), k) == k]
+                if release:
+                    group = [Block(b.keyword, OrderedDict(b.params, OP="NEW"), list(b.data))
+                             if b.keyword == "BOUNDARY" and b.uparam("OP") != "NEW" else b for b in group]
+                    if not any(b.keyword == "BOUNDARY" for b in group):
+                        at = next(i for i, b in enumerate(group) if b.keyword in STEP_PROCS)
+                        group.insert(at + 1, Block("BOUNDARY", OrderedDict(OP="NEW"), []))
+                self._lc_marks.update((id(b), f"load case {names[k]} of the deck's step {s} "
+                                              f"({k + 1} of {len(names)})")
+                                      for b in group if b.keyword == "LOAD CASE")
+                out += group
+            self.report.note(f"Step {s}: its {len(names)} load cases ({', '.join(names)}) -> ccx "
+                             f"steps {s + extra}-{s + extra + len(names) - 1}, one *{proc.keyword} "
+                             f"perturbation step each, with the step's own loads, BCs and output "
+                             f"requests and those of its load case, about the same base state "
+                             f"(Abaqus: equivalent to consecutive perturbation steps). Later step "
+                             f"numbers in this report count the ccx steps.")
+            extra += len(names) - 1
         return out
 
     def _plan_deck_facts(self, blocks: List[Block]) -> None:

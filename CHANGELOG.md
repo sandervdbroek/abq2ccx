@@ -6,6 +6,12 @@ physics.
 
 ## Unreleased
 
+* **`*LOAD CASE`: one step per load case** — a linear perturbation `*STATIC` or `*STEADY STATE
+  DYNAMICS` step with several load cases was solved as one, the cases superposed (warned). Each
+  load case now becomes its own ccx step with the step's loads, BCs and output requests and the
+  case's own, about the same base state, as Abaqus reads them; a `*BOUNDARY, OP=NEW` in any case
+  releases the base-state BCs in every case. A two-case step after a loaded static step now
+  matches the hand-written single-case steps exactly (the superposed answer was 0.02 off).
 * **Explicit mass scaling on part of the model** — `*FIXED MASS SCALING, FACTOR=f, ELSET=...`
   on part of the model (a local factor overriding the global one) was dropped (ccx ran the true
   mass); each section whose elements share a factor now gets a copy of its materials with the

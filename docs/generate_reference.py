@@ -147,6 +147,10 @@ TRANSLATED = {
         "2.23 (warned). `*CENTROID` and `*BEAM SECTION OFFSET` off the axis and `TAPER` keep the "
         "beams off `U1`; after a `U1` section `*CENTROID`, `*SHEAR CENTER`, `*TRANSVERSE SHEAR "
         "STIFFNESS` and `*SECTION POINTS` are commented out with a note.",
+    "*LOAD CASE": "in a linear perturbation `*STATIC` or `*STEADY STATE DYNAMICS` step: one ccx "
+        "step per load case, holding the step's cards outside the blocks and the case's own, each "
+        "about the base state (a `*BOUNDARY, OP=NEW` anywhere releases the base-state BCs in every "
+        "case, as in Abaqus); elsewhere, where Abaqus rejects it, the cases are superposed, warned.",
     "*STEP": "`NAME` dropped; `NLGEOM`, `INC`, `AMPLITUDE=RAMP/STEP` kept (dropped on explicit "
         "steps, which Abaqus/Explicit runs without it; `NLGEOM=NO` with `*DEFORMATION "
         "PLASTICITY`, see there); `PERTURBATION` kept only for "
