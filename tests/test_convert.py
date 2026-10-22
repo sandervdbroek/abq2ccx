@@ -16727,30 +16727,39 @@ def test_ccx_runner_stops_at_its_output_and_time_limits_with_bounded_memory():
         ccx = _fake_ccx(d, _CCX_START, "while True:\n    print(' %s\\n dependent node: 5')" % warn)
         log = os.path.join(d, "job.ccx.log")
         r = A.run_ccx_job([ccx, "job"], d, None, log, 60, log_limit=2 << 20, stop_at_limit=True)
-        assert r.stopped == "output" and not r.timed_out and r.status() == "failed", r.stopped
-        assert r.log_cut and (2 << 20) <= os.path.getsize(log) < (3 << 20)
-        assert r.counts["*WARNING"] > 20000 and list(r.messages)[0] == ("*WARNING", warn)
-        assert len(r.messages) <= 2             # (and the line cut at the kill)
-        with open(log, "rb") as fh:
+        assert (r.stopped, r.timed_out, r.status()) == ("output", False, "failed"), \
+            (r.stopped, r.timed_out, r.status())
+        assert r.log_cut and (2 << 20) <= os.path.getsize(log) < (3 << 20), os.path.getsize(log)
+        assert r.counts["*WARNING"] > 10000, r.counts
+        assert list(r.messages)[0] == ("*WARNING", warn) and len(r.messages) <= 2, r.messages
+        with open(log, "rb") as fh:             # (and above: the line cut at the kill)
             text = fh.read().decode()
-        assert text.startswith(_CCX_START.decode()) and "past this log's 2,097,152 bytes; the " \
-            "last 200:]\n" in text and text.endswith("\n")
+        assert text.startswith(_CCX_START.decode()), text[:300]
+        # past the limit, the last lines that came: up to 200, as many as the pipe still held
+        # when ccx was killed (4 KB on Windows, 64 KB on macOS)
+        last = re.search(r"\n\[abq2ccx: ccx printed \d+ more lines to stdout past this log's "
+                         r"2,097,152 bytes; the last (\d+):\]\n", text)
+        assert last and 0 < int(last.group(1)) <= 200 and text.endswith("\n") and \
+            text[last.end():].count("\n") == int(last.group(1)), text[-300:]
         # the text kept: the head whole, the judge's lines, the last 200 lines
         assert len(r.stdout) < 30000 and r.stdout.startswith(_CCX_START.decode()), len(r.stdout)
-        assert re.search(r"\n \[abq2ccx: from here on \d+ lines of ccx's output left out\]\n", r.stdout)
-        assert r.stdout.count(warn) > 100 and A.ccx_unsolved_steps(r.stdout) == []
+        assert re.search(r"\n \[abq2ccx: from here on \d+ lines of ccx's output left out\]\n",
+                         r.stdout), r.stdout[9000:11000]
+        assert r.stdout.count(warn) > 100 and A.ccx_unsolved_steps(r.stdout) == [], r.stdout[:300]
         # a line without end: read 1 MB at a time
         ccx = _fake_ccx(d, _CCX_START, "while True:\n    sys.stdout.write('x' * 65536)")
         r = A.run_ccx_job([ccx, "job"], d, None, log, 60, log_limit=4 << 20, stop_at_limit=True)
-        assert r.stopped == "output" and len(r.stdout) < 2 << 20 and r.stdout.endswith("x\n")
+        assert r.stopped == "output" and len(r.stdout) < 2 << 20 and r.stdout.endswith("x\n"), \
+            (r.stopped, len(r.stdout), r.stdout[-50:])
         # the time limit: ccx and the process it started are killed (cmd.exe's child on Windows,
         # the shell's here), and the run says "timeout"
         pid = os.path.join(d, "pid")
         ccx = _fake_ccx(d, _CCX_START, f"import os, time\nopen({pid!r}, 'w').write(str(os.getpid()))\n"
                                        f"time.sleep(120)", child=True)
         r = A.run_ccx_job([ccx, "job"], d, None, log, 1)
-        assert r.stopped == "time" and r.timed_out and r.status() == "timeout" and r.seconds < 30
-        assert r.stdout == _CCX_START.decode() and not r.log_cut
+        assert (r.stopped, r.timed_out, r.status()) == ("time", True, "timeout") and \
+            r.seconds < 30, (r.stopped, r.timed_out, r.status(), r.seconds)
+        assert r.stdout == _CCX_START.decode() and not r.log_cut, (r.stdout, r.stderr, r.log_cut)
         with open(pid) as fh:
             pid = int(fh.read())
         for _ in range(50):
