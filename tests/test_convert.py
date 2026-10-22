@@ -13173,6 +13173,72 @@ def test_truss_at_shell_node_ends_at_a_copy_through_a_hub():
     assert body.upper().split("*BOUNDARY, OP=NEW")[1].split("*END STEP")[0].count(f"\n{hub}, 4, 6\n") == 1
 
 
+def test_truss_bc_index_moved_past_the_bcs():
+    # ccx 2.23 overwrites one entry of its BC index per truss node (gen3dtruss.f), at place
+    # (MPCs so far) + 2 of its sorted BC list: a clamped B31 beside an unconnected, held truss
+    # lost its rotation about z (tip 3.2e11 for -1.145).  One-term equations on new unconnected
+    # nodes, one per BC DOF at step 1 plus one, move every hit past the BCs
+    # (validate_with_ccx.py truss_bc_index_*)
+    def deck(bc="1, 1, 6\n3, 1, 3\n4, 1, 3\n", step="*Static\n", later=""):
+        return ("*Node, nset=ALL\n1, 0., 0., 0.\n2, 1000., 0., 0.\n3, 0., 500., 0.\n4, 1000., 500., 0.\n"
+                "*Element, type=B31, elset=BM\n1, 1, 2\n*Element, type=T3D2, elset=TR\n2, 3, 4\n"
+                "*Material, name=M\n*Elastic\n210000., 0.3\n*Density\n7.85e-9\n"
+                "*Beam Section, elset=BM, material=M, section=RECT\n100., 50.\n0., 0., 1.\n"
+                "*Solid Section, elset=TR, material=M\n100.\n*Boundary\n" + bc
+                + f"*Step\n{step}*Cload\n2, 2, -1000.\n*End Step\n" + later)
+    body, conv, rep = convert_str(deck())
+    eqs = [eq for eq in _equation_terms(body) if len(eq) == 1]
+    assert [(n, d, c) for (n, d, c), in eqs] == [(5 + i // 3, i % 3 + 1, 1.0) for i in range(13)]
+    assert "\n*NODE\n5, 0., 0., 0.\n" in body and "9, 0., 0., 0.\n*EQUATION\n" in body
+    assert body.index("*EQUATION") < body.index("*STEP") and not conv.reduced_physics
+    assert "13 one-term *EQUATIONs on 5 new unconnected nodes" in rep.text() and rep.n_warnings == 0
+    assert conv.rotation_holds == {1: ("B", ((4, (1.0, 0.0, 0.0)), (5, (0.0, 1.0, 0.0)), (6, (0.0, 0.0, 1.0))))}
+    # a later step's BC on a DOF held at step 1 (its value went to the truss); a step ccx runs
+    # through its nonlinear solver in a model with knots / rigid constraints (their SPC updates)
+    pinned, later = "1, 1, 3\n3, 1, 3\n4, 1, 3\n", "*Step\n*Static\n*Boundary\n1, 3, 3, 1.\n*End Step\n"
+    for kw in (dict(bc=pinned, later=later), dict(bc=pinned, step="*Dynamic\n0.001, 0.01\n")):
+        body, conv, rep = convert_str(deck(**kw))
+        assert len([eq for eq in _equation_terms(body) if len(eq) == 1]) == 10, kw
+    # where no hit can do harm: none (translations alone, one linear step; an explicit deck,
+    # whose trusses stop ccx; no BC at step 1)
+    for kw in (dict(bc=pinned), dict(step="*Dynamic, explicit\n, 0.001\n"), dict(bc="", later=later)):
+        body, conv, rep = convert_str(deck(**kw))
+        assert not [eq for eq in _equation_terms(body) if len(eq) == 1] and "one-term" not in rep.text(), kw
+    # a BC line the converter cannot count (a set it does not know): warned, nothing moved
+    body, conv, rep = convert_str(deck(bc="1, 1, 6\nNOSUCH, 1, 3\n"))
+    assert not [eq for eq in _equation_terms(body) if len(eq) == 1]
+    assert "a BC at step 1 the converter cannot count" in rep.text() and rep.n_warnings >= 1
+
+
+def test_rotation_holds_of_shell_nodes_and_free_rotations():
+    # --run checks the job's .12d: a mean-rotation MPC per held beam rotation, as many per shell
+    # node as its held axes span in the shell plane (the drilling one dropped); knots skipped
+    deck = ("*Node, nset=ALL\n1, 0., 0., 0.\n2, 100., 0., 0.\n3, 0., 1000., 0.\n4, 100., 1000., 0.\n"
+            "5, 0., 0., 500.\n6, 0., 1000., 500.\n*Element, type=S4, elset=SH\n1, 1, 2, 4, 3\n"
+            "*Element, type=T3D2, elset=TR\n2, 5, 6\n*Material, name=M\n*Elastic\n210000., 0.3\n"
+            "*Shell Section, elset=SH, material=M\n10.\n*Solid Section, elset=TR, material=M\n100.\n"
+            "*Boundary\n1, 1, 6\n2, 1, 3\n2, 6, 6\n5, 1, 3\n6, 1, 3\n*Step\n*Static\n*Cload\n3, 3, -10.\n*End Step\n")
+    _, conv, _ = convert_str(deck)
+    assert conv.rotation_holds == {1: ("S", 2, (4, 5, 6))}     # node 2: its drilling DOF alone
+    fd, path = tempfile.mkstemp(suffix=".12d")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(" a MEAN ROTATION MPC was generated in node            1\n"
+                 "                 about the axis (   1.0000000000000000      ,   0.0000000000000000      ,"
+                 "   0.0000000000000000      )\n\n"
+                 " a MEAN ROTATION MPC was generated in node            7\n"
+                 "                 about the axis (   0.0000000000000000      ,   1.0000000000000000      ,"
+                 "   0.0000000000000000      )\n\n a KNOT was generated in node            9\n\n")
+    try:
+        holds = dict(conv.rotation_holds)
+        holds[7] = ("B", ((4, (1.0, 0.0, 0.0)), (5, (0.0, 1.0, 0.0))))
+        holds[9] = ("B", ((6, (0.0, 0.0, 1.0)),))
+        assert A.free_rotations(path, holds) == ["node 1: 1 of its 2 in-plane rotations (DOFs 4/5/6)",
+                                                 "node 7 DOF 4"]
+        assert A.ccx_mean_rotations(path) == ({1: [(1.0, 0.0, 0.0)], 7: [(0.0, 1.0, 0.0)]}, {9})
+    finally:
+        os.unlink(path)
+
+
 def test_legacy_distributing_coupling_as_equations():
     # *DISTRIBUTING COUPLING (DCOUP3D): Abaqus' element is the distributing constraint (DOFs
     # 1-6, moments from the reference node's offset); ccx's card ties the translations alone
@@ -17313,23 +17379,27 @@ def test_json_has_the_instances_and_the_run():
     # --run: what run_ccx returns lands under "run" and "results" (ccx itself: validate_with_ccx)
     seen = {}
 
-    def fake_run(out_path, override, quiet, digest, instances, model, expanded=None, timeout=None):
-        seen.update(digest=digest, instances=instances, model=model, timeout=timeout)
+    def fake_run(out_path, override, quiet, digest, instances, model, expanded=None, timeout=None,
+                 holds=None):
+        seen.update(digest=digest, instances=instances, model=model, timeout=timeout, holds=holds)
         return {"code": 0, "ccx": "ccx", "ccx_version": "2.23", "status": "solved",
-                "log": "x.ccx.log", "results": [{"step": 1, "time": 1.0}]}
+                "log": "x.ccx.log", "results": [{"step": 1, "time": 1.0}], **extra}
     real = A.run_ccx
     A.run_ccx = fake_run
     try:
-        with tempfile.TemporaryDirectory() as d:
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                assert A.main([path, "--outdir", d, "--run", "--json", "--quiet"]) == 0
+        for extra in ({}, {"free_rotations": ["node 1 DOF 6"]}):
+            with tempfile.TemporaryDirectory() as d:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    assert A.main([path, "--outdir", d, "--run", "--json", "--quiet"]) == 0
+            doc = json.loads(out.getvalue())
+            assert doc["run"] == {"ccx": "ccx", "ccx_version": "2.23", "status": "solved",
+                                  "log": "x.ccx.log", **extra}
     finally:
         A.run_ccx = real
-    doc = json.loads(out.getvalue())
-    assert doc["run"] == {"ccx": "ccx", "ccx_version": "2.23", "status": "solved", "log": "x.ccx.log"}
     assert doc["results"] == [{"step": 1, "time": 1.0}]
-    assert seen == {"digest": False, "instances": doc["instances"], "model": (16, 2), "timeout": None}
+    assert seen == {"digest": False, "instances": doc["instances"], "model": (16, 2), "timeout": None,
+                    "holds": {}}
 
 
 def test_ccx_version_is_read_and_checked():

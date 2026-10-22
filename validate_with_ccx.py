@@ -759,6 +759,37 @@ def shell_truss_deck(typ="S4", plane="xy", d=(0.0, -0.5, -1.0), first=True, spri
                      + ["*NODE PRINT, NSET=NALL", "U", "*END STEP"]) + "\n"
 
 
+def truss_bc_index_deck(case, truss=True):
+    """A B31 cantilever 1-2 (length 1000, RECT 100 x 50, E 210000) clamped at node 1, beside a
+    T3D2 3-4 held at both ends that carries nothing (``truss``): ``case`` "static", a tip load
+    of 1000 across; "buckle", 1000 along the beam, *BUCKLE; "step2", no load, then a step that
+    moves node 1 by 1 along z.  "shell": an S4 strip 100 x 1000 (t 10) clamped along y = 0, 10
+    across at each tip node, with two such trusses."""
+    if case == "shell":
+        nodes = ["1, 0., 0., 0.", "2, 100., 0., 0.", "3, 0., 1000., 0.", "4, 100., 1000., 0."]
+        els = ["*ELEMENT, TYPE=S4, ELSET=EM", "1, 1, 2, 4, 3"]
+        sec, bcs = ["*SHELL SECTION, ELSET=EM, MATERIAL=M", "10."], ["1, 1, 6", "2, 1, 6"]
+        trusses = [("5, 0., 0., 500.", "6, 0., 1000., 500."), ("7, 100., 0., 500.", "8, 100., 1000., 500.")]
+        step = ["*STEP", "*STATIC", "*CLOAD", "3, 3, -10.", "4, 3, -10."]
+    else:
+        nodes, els = ["1, 0., 0., 0.", "2, 1000., 0., 0."], ["*ELEMENT, TYPE=B31, ELSET=EM", "1, 1, 2"]
+        sec, bcs = ["*BEAM SECTION, ELSET=EM, MATERIAL=M, SECTION=RECT", "100., 50.", "0., 0., 1."], ["1, 1, 6"]
+        trusses = [("3, 0., 500., 0.", "4, 1000., 500., 0.")]
+        step = {"static": ["*STEP", "*STATIC", "*CLOAD", "2, 2, -1000."],
+                "buckle": ["*STEP", "*BUCKLE", "2", "*CLOAD", "2, 1, -1000."],
+                "step2": ["*STEP", "*STATIC", "*NODE PRINT, NSET=NALL", "U", "*END STEP", "*STEP", "*STATIC",
+                          "*BOUNDARY", "1, 3, 3, 1."]}[case]
+    tr = []
+    if truss:
+        for k, (a, b) in enumerate(trusses):
+            nodes += [a, b]
+            tr += [f"{k + 2}, {a.split(',')[0]}, {b.split(',')[0]}"]
+            bcs += [f"{a.split(',')[0]}, 1, 3", f"{b.split(',')[0]}, 1, 3"]
+    return "\n".join(["*NODE, NSET=NALL"] + nodes + els + (["*ELEMENT, TYPE=T3D2, ELSET=ET"] + tr if tr else [])
+                     + ["*MATERIAL, NAME=M", "*ELASTIC", "210000., 0.3"] + sec
+                     + (["*SOLID SECTION, ELSET=ET, MATERIAL=M", "100."] if tr else []) + ["*BOUNDARY"] + bcs
+                     + step + ["*NODE PRINT, NSET=NALL", "U", "*END STEP"]) + "\n"
+
 
 def plane_two_thickness_deck(coupling, loads):
     """A 4 x 2 strip of unit CPS4 (E 1000, nu 0.3) held along y = 0, its left half of thickness 1
@@ -9629,6 +9660,60 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  {tag} ({kw['typ']} strip in the {kw['plane'][0]}-{kw['plane'][1]} plane, a "
               f"T3D2 at an inner node): every node {err:.1e} of max |u| ({big:.4g}, tip node {tip}) from the truss "
               f"as an axial spring (ccx's own knot: {base})")
+        failures += 0 if ok else 1
+    # --- ccx 2.23 overwrites one entry of its BC index per truss node (gen3dtruss.f): a beam or
+    # shell rotation held there went free without a message (a cantilever beside a held truss that
+    # carries nothing: tip 3.2e11 for -1.145; the shell strip twisted), a later step's BC went to
+    # the truss, a *BUCKLE factor 7.87 for 654.8.  One-term equations on new unconnected nodes
+    # move every overwritten entry past the BCs; the reference is the deck without its trusses.
+    # The cantilever's emitted deck without the equations shows what ccx did, which --run's .12d
+    # check (free_rotations) finds
+
+    def tbi_run(tag, text, strip=False):
+        src, inp = os.path.join(tmp, tag + "_src.inp"), os.path.join(tmp, tag + ".inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        _, conv = convert(src, inp)
+        if strip:                                   # (the emitted deck without the equations)
+            with open(inp, encoding="utf-8") as fh:
+                lines = fh.read().split("\n")
+            a = next(i for i, ln in enumerate(lines) if "one-term equations on" in ln)
+            b = next(i for i in range(a, len(lines)) if lines[i].upper().startswith("*STEP"))
+            with open(inp, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("\n".join(lines[:a] + lines[b:]))
+        d, status, _ = run_ccx(ccx, env, inp)
+        dat, twelve = os.path.join(d, "job.dat"), os.path.join(d, "job.12d")
+        res = (dat_eigen_table(dat, "B U C K L I N G") if "*BUCKLE" in text else dat_displacements(dat)) \
+            if status == "solved" else None
+        free = A.free_rotations(twelve, conv.rotation_holds) if os.path.exists(twelve) else None
+        shutil.rmtree(d, ignore_errors=True)
+        return res, status, free
+    for case, at in (("static", (2,)), ("shell", (3, 4)), ("step2", (1, 2)), ("buckle", ())):
+        tag = f"truss_bc_index_{case}"
+        got, status, free = tbi_run(tag, truss_bc_index_deck(case))
+        ref, rstatus, _ = tbi_run(tag + "_ref", truss_bc_index_deck(case, truss=False))
+        if not got or not ref or (at and any(n not in got for n in at)):
+            print(f"FAIL  {tag}: no solution ({status} / {rstatus})")
+            failures += 1
+            continue
+        if case == "buckle":
+            big = abs(ref[0])
+            err = ccx_ratio(max(abs(x - y) for x, y in zip(got, ref)), big) if len(got) == len(ref) else math.inf
+            shown = f"buckling factors {', '.join(f'{x:.7g}' for x in got)}"
+        else:
+            big = max(abs(x) for n in at for x in ref[n])
+            err = ccx_ratio(max(abs(x - y) for n in at for x, y in zip(got[n], ref[n])), big)
+            shown = "; ".join(f"node {n} u {', '.join(f'{x:.7g}' for x in got[n])}" for n in at)
+        ok = err < 1e-9 and big > 0.1 and free == []
+        before = ""
+        if case == "static":
+            raw, rstatus, rfree = tbi_run(tag + "_raw", truss_bc_index_deck(case), strip=True)
+            ok = ok and bool(raw) and abs(raw[2][1]) > 1e6 and rfree == ["node 1 DOF 6"]
+            before = (f"; without the equations ccx moves the tip {raw[2][1]:.4g} ({rstatus}), and --run's "
+                      f".12d check finds {rfree}" if raw else f"; without the equations: {rstatus}")
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} ({'an S4 strip' if case == 'shell' else 'a B31 cantilever'} "
+              f"clamped beside held T3D2s that carry nothing): {shown}, {err:.1e} from the deck without the "
+              f"trusses; every held rotation has its mean-rotation MPC{before}")
         failures += 0 if ok else 1
     # --- the legacy *DISTRIBUTING COUPLING (DCOUP3D) vs Abaqus' own results: the Verification
     # Guide's linear problem, whose tables the equations of the distributing constraint give back

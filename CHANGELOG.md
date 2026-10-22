@@ -92,6 +92,14 @@ physics.
   faces on shells; shell edges at an angle or of other sections; a step solving for
   temperatures), the deck's surfaces stay, warned, as reduced physics. Also for `*CONTACT PAIR,
   TIED`. Shell edges tied to coplanar edges of the same section stay as they were: exact.
+* **Trusses beside held beam / shell rotations** — ccx 2.23 overwrites one entry of its BC index
+  per truss node (`gen3dtruss.f`), so a truss anywhere in the model, even an unconnected one held
+  at both ends, could free a held beam or shell rotation without a message (a clamped `B31` tip
+  3.2e11 for -1.145; a `*BUCKLE` factor 7.87 for 654.8) or send a later step's BC value to the
+  truss. Where that can do harm the deck now gets one-term `*EQUATION`s on new unconnected nodes,
+  one per BC DOF at step 1 plus one: they move every such entry past the BCs and hold nothing of
+  the model (the decks without their trusses to the last digit). `--run` checks the job's `.12d`
+  for a mean-rotation MPC per rotation held at step 1 and reports any it lacks (exit code 1).
 * **Explicit mass scaling on part of the model** — `*FIXED MASS SCALING, FACTOR=f, ELSET=...`
   on part of the model (a local factor overriding the global one) was dropped (ccx ran the true
   mass); each section whose elements share a factor now gets a copy of its materials with the

@@ -1004,7 +1004,10 @@ def gen_output():
              "and `.dat` (`ccx_results_digest`), to set beside the Abaqus results; `--json` gives "
              "it under `results`, one object per step, with `run` (the ccx, its version, the "
              "status, `timeout` after `--timeout`, and `log`, the `<output>.ccx.log` its output "
-             "went to). Values are at the step's last increment.\n",
+             "went to). Values are at the step's last increment. `--run` also checks the job's "
+             "`.12d` for a mean-rotation MPC per rotation a beam or shell node holds at step 1 "
+             "(not at a knot): one it lacks, which ccx leaves free, is reported "
+             "(`run.free_rotations` in `--json`) and the exit code is 1.\n",
              md_table(["Key", "What"], [
                  ("`time`", "the total time reached, as ccx writes it"),
                  ("`max_u`, `max_mises`", "the largest \\|U\\| and von Mises stress and their node "

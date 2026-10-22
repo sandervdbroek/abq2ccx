@@ -36339,6 +36339,149 @@ class _PostPasses:
             deck.swap(j, lines)
         return deck.edited()
 
+    # ccx 2.23's truss elements: gen3dnor expands each of their nodes with gen3dtruss
+    _CCX_TRUSSES = frozenset(("T2D2", "T3D2", "T3D3"))
+    # cards whose ccx constraints may carry an SPC its nonlinear solver updates (nonlinmpc)
+    _NONLINEAR_SPC_CARDS = frozenset(("RIGID BODY", "MPC", "COUPLING", "DISTRIBUTING COUPLING"))
+
+    def _truss_bc_index(self, deck: EmittedDeck) -> EmittedDeck:
+        """ccx 2.23 overwrites one entry of its boundary-condition index per truss node:
+        gen3dtruss.f ends with ``ilboun(id)=nboun``, ``id`` a place in its MPC list (the MPCs
+        made so far + 2 in a mechanical analysis), so the BC at that place of its sorted BC
+        list (by node and DOF) points at the truss's twist SPC.  Read through that entry, a
+        beam or shell rotation BC gets no mean-rotation MPC (gen3dboun: free, exit 0, no
+        message; probed: a clamped B31 tip 3.2E+11 for -1.145 beside an unconnected, held
+        truss), a later step's value for the DOF goes to the twist SPC (bounadd; probed), and
+        so would the nonlinear solver's update of a knot / RIGID / *MPC constraint's SPC
+        (nonlinmpc).  Each one-term *EQUATION counts in that list (probed: K of them move
+        every hit K places), so (the BC DOFs of the model and step 1) + 1 of them, on new
+        unconnected nodes, put every truss node's hit at or past its own twist SPC (each SPC
+        ccx adds comes with an MPC): no BC is hit, and they hold nothing of the model (probed:
+        a cantilever, a shell strip, a step-2 BC, *FREQUENCY, *BUCKLE, NLGEOM: the results
+        of the trusses numbered first, which no hit reaches).  Written where a hit can do
+        harm: a beam / shell rotation held at step 1, a later step's BC on a DOF held then,
+        knots or rigid / *MPC constraints in a model ccx runs through its nonlinear solver;
+        not in a deck of explicit steps alone (ccx stops on trusses there:
+        _warn_explicit_trusses).  Also records rotation_holds for --run's check of the job's
+        .12d."""
+        if not self._mechanical or not deck.steps:
+            return deck
+        kinds: Dict[int, set] = {}             # node -> "B" beam, "S" shell, "T" truss
+        for e, (typ, conn) in self.geom.elements.items():
+            t = ccx_type(typ)
+            k = ("T" if t in self._CCX_TRUSSES else "B" if t[:1] == "B" and e not in self._u1
+                 else "S" if t in SHEET_SHELLS else "")
+            for n in conn[:element_node_count(typ) or len(conn)] if k else ():
+                kinds.setdefault(n, set()).add(k)
+        if not kinds:
+            return deck
+        sets = self._mesh_sets.read(deck)
+
+        def held(card: EmittedCard) -> Optional[set]:
+            """The (node, DOF) pairs a *BOUNDARY card holds (None: not known)."""
+            got: set = set()
+            for rec in card.records():
+                g = trimmed_fields(rec)
+                ns, dofs = sets.members("NSET", g[0]) if g else None, bc_dof_range(g)
+                if ns is None or dofs is None:
+                    return None
+                got.update((n, d) for n in ns for d in range(dofs[0], dofs[1] + 1))
+            return got
+
+        first: Optional[set] = set()            # the pairs held at step 1 (None: not known)
+        frames: Dict[int, Union[Tuple[Vec, Vec, Vec], str]] = {}   # the *TRANSFORM cards' axes
+        for c in deck.cards:
+            if c.keyword == "BOUNDARY" and c.step in (0, 1):
+                p = held(c)
+                first = None if p is None or first is None else first | p
+            elif c.keyword == "TRANSFORM":
+                f = [x for r in c.records() for x in trimmed_fields(r)]
+                try:
+                    a, b = tuple(pf(x) for x in f[:3]), tuple(pf(x) for x in f[3:6])
+                except ValueError:
+                    a = b = ()
+                for n in sets.members("NSET", c.uparam("NSET")) or ():
+                    frames[n] = self._transform_axes(n, c.uparam("TYPE") or "R", a, b) \
+                        if len(a) == len(b) == 3 else "unread"
+        self._record_rotation_holds(first or set(), kinds, frames)
+        trusses = sorted({ccx_type(t) for t, _ in self.geom.elements.values()} & self._CCX_TRUSSES)
+        if not trusses or all(st.explicit for st in self.steps.steps) or first == set():
+            return deck
+        why = ("ccx 2.23 overwrites one entry of its boundary-condition index per truss node "
+               "(gen3dtruss.f), which can leave a held beam or shell rotation free or send a later "
+               "step's BC value to the truss, without a message (probed: a clamped B31 tip 3.2E+11 "
+               "for -1.145 beside an unconnected, held truss)")
+        beams = any(k - {"T"} for k in kinds.values())
+        if first is None:
+            if beams:
+                self.report.warn(f"Truss elements ({', '.join(trusses)}) beside beams or shells, with a BC "
+                                 f"at step 1 the converter cannot count (a set or DOF it does not know): "
+                                 f"{why}. Check that the job's .12d has a 'MEAN ROTATION' line for every "
+                                 f"held rotation (--run checks it).", once=True)
+            return deck
+        later = [held(c) for c in deck.cards if c.keyword == "BOUNDARY" and c.step > 1]
+        harms = [w for w, on in (
+            ("a beam or shell rotation held at step 1",
+             any(4 <= d <= 6 and kinds.get(n, set()) - {"T"} for n, d in first)),
+            ("a later step's BC on a DOF held at step 1", any(p is None or p & first for p in later)),
+            ("knots or rigid / *MPC constraints in a step ccx runs through its nonlinear solver",
+             any(self._solver_steps) and (beams or any(c.keyword in self._NONLINEAR_SPC_CARDS
+                                                       for c in deck.cards))))
+            if on]
+        if not harms:
+            return deck
+        top = max(self.geom.nodes, default=0)
+        for c in deck.cards:
+            if c.keyword == "NODE":
+                top = max([top] + [int(r[0]) for r in c.records() if r and r[0].strip().isdigit()])
+        k = len(first) + 1
+        nodes = [top + 1 + i for i in range((k + 2) // 3)]
+        lines = [f"** abq2ccx: {k} one-term equations on {len(nodes)} new unconnected nodes, which "
+                 f"hold nothing of the model: ccx 2.23 overwrites one entry of its BC index per "
+                 f"truss node (gen3dtruss.f), at a place these move past every BC", "*NODE"]
+        lines += [f"{n}, 0., 0., 0." for n in nodes] + ["*EQUATION"]
+        for i in range(k):
+            lines += ["1", f"{nodes[i // 3]}, {i % 3 + 1}, 1."]
+        deck.insert_before(deck.steps[0].head, lines)
+        self.report.note(f"Truss elements ({', '.join(trusses)}) with {' and '.join(harms)}: {why}. {k} "
+                         f"one-term *EQUATIONs on {len(nodes)} new unconnected nodes (node {nodes[0]} up) "
+                         f"move every such entry past the deck's BCs; they hold nothing of the model "
+                         f"(probed: exact).", once=True)
+        return deck.edited()
+
+    def _record_rotation_holds(self, first: set, kinds: Dict[int, set],
+                               frames: Dict[int, Union[Tuple[Vec, Vec, Vec], str]]) -> None:
+        """``rotation_holds``: the rotations nodes of beams alone or of shells alone hold at
+        step 1 (``first``: their (node, DOF) pairs), for which ccx 2.23 makes mean-rotation
+        MPCs (gen3dboun) unless the node is a knot: a beam node -> ("B", ((DOF, axis), ...)),
+        an MPC about each axis (its *TRANSFORM's, ``frames``, if it has one); a shell node ->
+        ("S", rank, DOFs), as many MPCs as the axes projected on the shell plane span (ccx's
+        normal, _ccx_shell_normal; ccx drops an axis within 2.6 deg of it as the drilling
+        rotation).  The converter's knot nodes are left out."""
+        self.rotation_holds = {}
+        by_node: Dict[int, set] = {}
+        for n, d in first:
+            if 4 <= d <= 6 and kinds.get(n) in ({"B"}, {"S"}) and n not in self._knots:
+                by_node.setdefault(n, set()).add(d)
+        shells = {n for n in by_node if kinds[n] == {"S"}}
+        at = self._elements_at(shells) if shells else {}
+        ident: Tuple[Vec, Vec, Vec] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        for n, ds in sorted(by_node.items()):
+            axes = frames.get(n, ident)
+            if isinstance(axes, str):
+                continue
+            if kinds[n] == {"B"}:
+                self.rotation_holds[n] = ("B", tuple((d, axes[d - 4]) for d in sorted(ds)))
+                continue
+            nrm = self._ccx_shell_normal(n, at)
+            if nrm is None:
+                continue
+            proj = [vunit(vsub(axes[d - 4], vscale(nrm, vdot(axes[d - 4], nrm)))) for d in sorted(ds)
+                    if abs(vdot(axes[d - 4], nrm)) <= 0.999]
+            rank = 0 if not proj else 1 if all(abs(vdot(proj[0], p)) > 0.999 for p in proj) else 2
+            if rank:
+                self.rotation_holds[n] = ("S", rank, tuple(sorted(ds)))
+
 
 class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _Output,
                 _PostPasses):
@@ -36688,6 +36831,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._conn_beam: List[Tuple[int, int, int]] = []    # rigid links: (a, b, id(section))
         self._conn_knots: List[int] = []           # shell/beam nodes whose rotations they use
         self.model_labels: Optional[Tuple[int, int]] = None    # set by convert()
+        # beam / shell node -> the rotations it holds at step 1 (_record_rotation_holds; --run)
+        self.rotation_holds: Dict[int, tuple] = {}
         self._conn_bcs: List[str] = []             # their *BOUNDARY lines (held in every step)
         self._dashpot_cards: set = set()           # *DASHPOTs of DASHPOT1 / 2 elements (_plan_dashpots)
         self._dashpot_rows: List[List[Tuple[int, int, float]]] = []   # their ground nodes' *EQUATIONs
@@ -37359,6 +37504,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._audit_loads(blocks, deck)
         self._warn_knot_equations(blocks, deck)     # after _settle_dependents: the terms as written
         deck = self._shift_total_time(deck)     # after every pass that writes load cards
+        deck = self._truss_bc_index(deck)       # after every pass that writes *BOUNDARY
         out = self._short_fields(deck.render())     # last: every card is written
         if self.reduced_physics:
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
@@ -40221,6 +40367,55 @@ def format_results_digest(digest: Sequence[dict], sums: int = 3, values: int = 8
     return lines
 
 
+def ccx_mean_rotations(path: str) -> Tuple[Dict[int, List[Vec]], set]:
+    """What a ccx job's .12d says of its beam and shell nodes: node -> the axes of the
+    mean-rotation MPCs ccx made there (gen3dboun for rotational BCs, gen3dforc for moments),
+    and the nodes it made knots, which carry their rotations otherwise."""
+    axes: Dict[int, List[Vec]] = {}
+    knots: set = set()
+    node: Optional[int] = None
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for ln in fh:
+            s = ln.split()
+            if s[:3] == ["a", "MEAN", "ROTATION"] and s[-1].isdigit():
+                node = int(s[-1])
+            elif s[:3] == ["about", "the", "axis"] and node is not None:
+                try:
+                    v = tuple(float(x) for x in ln[ln.index("(") + 1:ln.rindex(")")].split(","))
+                except ValueError:
+                    v = ()
+                if len(v) == 3:
+                    axes.setdefault(node, []).append(v)
+                node = None
+            elif s[:2] == ["a", "KNOT"] and s[-1].isdigit():
+                knots.add(int(s[-1]))
+    return axes, knots
+
+
+def free_rotations(path: str, holds: Dict[int, tuple]) -> List[str]:
+    """The rotations of ``holds`` (Converter.rotation_holds) at nodes ccx made no knot for
+    which the job's .12d at ``path`` lists no mean-rotation MPC, which ccx leaves free (ccx
+    2.23's truss nodes overwrite its BC index: Converter._truss_bc_index): "node 1 DOF 6"
+    for a beam node, "node 2: 1 of its 2 in-plane rotations (DOFs 4/5/6)" for a shell node."""
+    axes, knots = ccx_mean_rotations(path)
+    free: List[str] = []
+    for n, h in sorted(holds.items()):
+        got = axes.get(n, [])
+        if n in knots:
+            continue
+        if h[0] == "B":
+            free += [f"node {n} DOF {d}" for d, a in h[1] if all(abs(vdot(a, v)) <= 0.999 for v in got)]
+            continue
+        apart: List[Vec] = []
+        for v in got:
+            if all(abs(vdot(v, w)) <= 0.999 for w in apart):
+                apart.append(v)
+        if len(apart) < h[1]:
+            free.append(f"node {n}: {h[1] - len(apart)} of its {h[1]} in-plane rotations (DOFs "
+                        f"{'/'.join(map(str, h[2]))})")
+    return free
+
+
 CCX_VERSIONS = ("2.22", "2.23")      # the ccx versions the converter targets (validated on 2.23)
 _ccx_versions: Dict[str, Optional[str]] = {}
 _ccx_warned: set = set()
@@ -40279,7 +40474,8 @@ def _ccx_messages_text(r: CcxRun, show: int = 10) -> List[str]:
 
 def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = True,
             instances: Sequence[dict] = (), model: Optional[Tuple[int, int]] = None,
-            expanded: Optional[Dict[int, int]] = None, timeout: Optional[float] = None) -> dict:
+            expanded: Optional[Dict[int, int]] = None, timeout: Optional[float] = None,
+            holds: Optional[Dict[int, tuple]] = None) -> dict:
     """Run CalculiX on a converted deck.  Returns ``{"code", "ccx", "ccx_version", "status",
     "log", "results"}``: ``code`` 0 if the analysis solves with finite results (or ccx accepts
     a mesh-only deck that has nothing to solve), else 1; ``status`` as CcxRun.status (None
@@ -40287,7 +40483,10 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
     shown as it comes unless ``quiet``; stopped after ``timeout`` seconds); ``results`` a
     solved run's ccx_results_digest (``instances``, ``model``), which is also printed unless
     ``quiet`` or not ``digest``.  ccx's own *ERROR and *WARNING lines end the report unless
-    ``quiet``.  Warns once per executable when its version is not one the converter targets."""
+    ``quiet``.  Warns once per executable when its version is not one the converter targets.
+    ``holds`` (Converter.rotation_holds): the rotations its job's .12d must show mean-rotation
+    MPCs for; those it lacks (free_rotations, ``"free_rotations"``) are reported, and make
+    ``code`` 1."""
     run: dict = {"code": 1, "ccx": None, "ccx_version": None, "status": None, "log": None,
                  "results": None}
     if not out_path.endswith(".inp"):           # ccx reads <job>.inp: another file
@@ -40331,6 +40530,14 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
         _warn_ccx_version(exe, version)
     job = os.path.join(cwd, stem)
     status = run["status"] = r.status(job)
+    free = free_rotations(job + ".12d", holds) if holds and "Job finished" in r.stdout and \
+        os.path.exists(job + ".12d") else []
+    if free:
+        run["free_rotations"] = free
+        sys.stderr.write(f"abq2ccx: {stem}.12d lists no mean-rotation MPC for {len(free)} rotation(s) "
+                         f"the deck holds at step 1 ({'; '.join(free[:5])}{'; ...' if len(free) > 5 else ''}): "
+                         f"ccx left them free, so its results are not the deck's (ccx 2.23 does so where a "
+                         f"truss node overwrote the BC's index entry, gen3dtruss.f).\n")
     if status == "timeout":
         sys.stderr.write(f"abq2ccx: ccx did not finish within --timeout {timeout:g} s and was "
                          f"stopped (its output so far: {log}).\n")
@@ -40355,7 +40562,7 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
                "no 'Job finished'")
         sys.stderr.write(f"abq2ccx: ccx did NOT finish cleanly: {why}\n")
     else:
-        run["code"] = 0
+        run["code"] = 1 if free else 0
         try:
             run["results"] = ccx_results_digest(job, instances, model, expanded)
         except Exception as exc:    # a convenience: never let it fail a solved run
@@ -40434,8 +40641,8 @@ def _convert_one(path: str, args) -> int:
 
     strict = args.strict and (report.n_warnings > 0 or report.n_commented > 0)
     run = run_ccx(out_path, args.ccx, args.quiet, not args.json_out, report.instances,
-                  conv.model_labels, expanded=conv._qmem_copies,
-                  timeout=args.timeout) if args.run and wrote and not strict else None
+                  conv.model_labels, expanded=conv._qmem_copies, timeout=args.timeout,
+                  holds=conv.rotation_holds) if args.run and wrote and not strict else None
     if args.json_out:
         doc = {
             "tool": "abq2ccx", "version": __version__, "input": path,
@@ -40449,6 +40656,8 @@ def _convert_one(path: str, args) -> int:
         }
         if run is not None:
             doc["run"] = {k: run.get(k) for k in ("ccx", "ccx_version", "status", "log")}
+            if run.get("free_rotations"):
+                doc["run"]["free_rotations"] = run["free_rotations"]
             doc["results"] = run["results"]
         print(json.dumps(doc))
     if strict:
