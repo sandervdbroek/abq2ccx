@@ -74,8 +74,9 @@ moves the nodes by its modes.
 `commented` (cards commented out, the physics kept) or `converted`. `--summary FILE.csv` writes a
 row per deck: deck, status, nodes, elements, warnings, commented cards, reduced
 physics, ccx's status and the last step's digest line (`--run`), and the error. The rows go to
-`FILE.csv.part` as the batch runs, which replaces `FILE.csv` when it ends; a deck, an input or
-a file that is no summary is never overwritten, and a cell starting with `=`, `+`, `-` or `@`
+`FILE.csv.part` as the batch runs, which replaces `FILE.csv` when it ends (a pipe or device,
+such as `/dev/stdout`, gets them directly); a deck, an input or a file that is no summary is
+never overwritten, and a cell starting with `=`, `+`, `-` or `@`
 gets a `'` before it (spreadsheets read it as a formula).
 
 ```bash

@@ -106,8 +106,9 @@ physics.
   printed). `--summary FILE.csv` writes a row per deck: status, counts, reduced physics, and
   with `--run` ccx's status and the last step's digest line; it overwrites no deck, input or
   other file (`--summary *.inp` is a usage error), replaces `FILE.csv` when the batch ends
-  (`FILE.csv.part` holds the rows meanwhile), and puts `'` before a cell a spreadsheet would
-  read as a formula. An internal error (exit 4) writes its traceback into the `.log` (with
+  (`FILE.csv.part` holds the rows meanwhile; a pipe or device such as `/dev/stdout` is written
+  directly), and puts `'` before a cell a spreadsheet would read as a formula. An internal
+  error (exit 4) writes its traceback into the `.log` (with
   `--debug` also to stderr; the home folder written `~`) and points to the issues page;
   it suggested PYTHONFAULTHANDLER, which could not show it. `--run` without a ccx, and its
   version warning, say how to get ccx 2.23: `conda install -c conda-forge calculix=2.23`. The
@@ -186,10 +187,14 @@ physics.
   cylinder, R/t 1000, 8 × 8 cells: u_r −2.9 to 7.6 times the membrane value). The new node now
   lies on the surface the shells' averaged nodal normals define (exact on cylinder and sphere
   meshes, free and symmetry edges included: 0.999–1.003), and stays on the straight edge where
-  the shell is flat or folds (Abaqus' 20° rule for averaging normals), or where a 2-node beam
-  runs along the edge (it becomes a 3-node beam through that node, straight as in Abaqus). A
-  node whose shells are coplanar keeps their normal, as Abaqus does, so the edges into a shallow
-  fold sag alike. Flat meshes are unchanged.
+  the shell is flat or folds (Abaqus' 20° rule for averaging normals). A 2-node beam along an
+  upgraded edge becomes a 3-node beam through that node, so a beam on a curved edge follows its
+  arc, where Abaqus' beam is straight: the shells on both sides share the node, and on the chord
+  it kinked them along the beam (a ring-stiffened quarter cylinder, 8 × 8 cells: u_r −23 % to
+  +14 % off a 32 × 32 mesh, against a uniform 0.9 % on the arc; a straight beam with a node of
+  its own tied to the shells' was 2 % off, and not axisymmetric). A node whose shells are
+  coplanar keeps their normal, as Abaqus does, so the edges into a shallow fold sag alike. Flat
+  meshes are unchanged.
 * **General contact under `--approximate`** — Abaqus general contact (`*CONTACT` with
   `*CONTACT INCLUSIONS`, `ALL EXTERIOR` or named surfaces, `*CONTACT EXCLUSIONS` and
   `*CONTACT PROPERTY ASSIGNMENT`), which ccx lacks, is written as node-to-surface `*CONTACT
@@ -199,11 +204,13 @@ physics.
   against the union of its masters, the assigned property or Abaqus' hard frictionless default,
   `ADJUST` where a pair starts overclosed. Embedded elements are no part of it, as in Abaqus
   (a sheet or bar embedded in a block was a body of its own, contacted against its host). A
-  `*TIE` or `*CONTACT PAIR` leaves only the faces it joins out of its bodies' pair, not the
-  pair. Self-contact, edge-to-edge contact and pairs of two rigid bodies are left out (warned).
-  Two blocks pressed together carry what a hand-written pair carries, to all digits, also with
-  an embedded sheet or bar, or partly tied. Without the option the cards stay commented out,
-  and the warning names `--approximate`.
+  `*TIE` or `*CONTACT PAIR` leaves only its slave surface's faces out of its bodies' pair, not
+  the pair, as Abaqus leaves only that surface pair to it: the rest of the slave's body still
+  meets the master surface, also where the master is wider than what it joins. Self-contact,
+  edge-to-edge contact and pairs of two rigid bodies are left out (warned). Two blocks pressed
+  together carry what a hand-written pair carries, to all digits, also with an embedded sheet
+  or bar, or partly tied (to a master over the whole top as well). Without the option the
+  cards stay commented out, and the warning names `--approximate`.
 * **Linear connector behaviour and JOINTC** — a connector with a `*CONNECTOR BEHAVIOR` was
   commented out, and a JOINTC element stopped ccx. Linear `*CONNECTOR ELASTICITY` / `DAMPING`
   (uncoupled or coupled) on the components of `CARTESIAN`, `BUSHING`, `CARDAN`, `ROTATION` and
@@ -318,9 +325,10 @@ physics.
   with ccx's own `*ERROR` and `*WARNING` lines, each once with its count (ccx runs without the
   log where it cannot be written). `--timeout SECONDS` stops ccx and what it started after
   that much wall-clock time (status `timeout`; no limit by default), and a process ccx leaves
-  holding its output is killed a few seconds after ccx ends; `--json`'s `run` gives the log's
-  path. `validate_with_ccx.py` and the corpus test run ccx the same way, stopped after their
-  time limit or 100 MB of output.
+  holding its output no longer holds up the run, which ends a few seconds after ccx: that
+  process is killed then where abq2ccx can find it (Linux, or with `lsof`), else left running
+  (Windows); `--json`'s `run` gives the log's path. `validate_with_ccx.py` and the corpus test
+  run ccx the same way, stopped after their time limit or 100 MB of output.
 * **`*TIE` on conventional shells** — Abaqus ties a shell's nodes, its reference surface; ccx
   2.23 ties the faces of the solids it expands shells to, half the thickness off. A slave
   surface on shells whose nodes lie on solid master faces (a skin on a solid, a shell edge on a

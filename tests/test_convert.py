@@ -8260,18 +8260,28 @@ def test_general_contact_leaves_embedded_elements_out():
 def test_general_contact_leaves_out_only_the_faces_a_tie_joins():
     # Abaqus leaves the surfaces a tie or contact pair joins to it, not their bodies: "interactions
     # between these surfaces are modeled only with the contact pair algorithm" (general contact
-    # in Abaqus/Standard).  The pair of bodies stays, without the tied faces (it was dropped
-    # whole, with a note blaming the reach).  validate_with_ccx general_contact_tied: the force of
-    # the hand pair of the untied faces
+    # in Abaqus/Standard).  The pair of bodies stays, without the tie's slave faces (it was
+    # dropped whole, with a note blaming the reach); the master's stay, as only that surface
+    # pair leaves general contact (code check D2-1: a tie master over all of the lower top took
+    # the whole top out, and the upper block passed into it).  validate_with_ccx
+    # general_contact_tied, general_contact_tied_wide: the force of the hand pair
     import validate_with_ccx as V
-    body, conv, rep = convert_str(V.general_contact_deck("general", tie=True), approximate=True)
-    pairs, surfs = _gc_lines(body)
-    assert pairs == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1M1")]
-    assert _card_at(body, "*ELSET, ELSET=ABQ2CCX_GC1B1S2") == ["3, 4, 7, 8, 11, 12, 15, 16"]   # slave
-    assert surfs["ABQ2CCX_GC1M1"][0] == "ABQ2CCX_GC1B2S1X1, S1"                                 # master
-    assert _card_at(body, "*ELSET, ELSET=ABQ2CCX_GC1B2S1X1") == ["18, 19, 21, 22, 24, 25"]
-    assert "stay in general contact but for the faces of those surfaces" in rep.text()
-    assert "can meet over the analysis" not in rep.text()
+    for tie in (True, "wide"):
+        body, conv, rep = convert_str(V.general_contact_deck("general", tie=tie), approximate=True)
+        pairs, surfs = _gc_lines(body)
+        assert pairs == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1M1")], tie
+        assert conv.geom.elsets["ABQ2CCX_GC1B1S2"] == list(range(1, 17)), tie          # slave: all its top
+        assert surfs["ABQ2CCX_GC1M1"][0] == "ABQ2CCX_GC1B2S1X1, S1"                    # master
+        assert _card_at(body, "*ELSET, ELSET=ABQ2CCX_GC1B2S1X1") == ["18, 19, 21, 22, 24, 25"]
+        assert "stay in general contact but for the faces of its slave surface" in rep.text()
+        assert "can meet over the analysis" not in rep.text()
+    # the tie the other way round (the lower top its slave, the lower block the general contact
+    # slave): out of the slave body's surface, the master body whole
+    rev = V.general_contact_deck("general", tie=True).replace("*Tie, name=T\nBT, AT\n", "*Tie, name=T\nAT, BT\n")
+    body, conv, rep = convert_str(rev, approximate=True)
+    assert _gc_lines(body)[0] == [("ABQ2CCX_GC1B1", "ABQ2CCX_GC1B2")]
+    assert conv.geom.elsets["ABQ2CCX_GC1B1S2"] == [3, 4, 7, 8, 11, 12, 15, 16]
+    assert conv.geom.elsets["ABQ2CCX_GC1B2S1"] == list(range(17, 26))
     # a tie over all the faces of one body leaves the pair out, and the note says so; so do
     # exclusions
     cubes = _cubes([(0, 0, 0), (0, 0, 1)], (
@@ -13311,10 +13321,15 @@ def test_connector_load_on_a_determined_component_drops_only_the_load():
     # adds to the reactions in Abaqus: the load is left out (noted), the connector — its spring
     # and rigid component — kept (it was commented out whole).  validate_with_ccx
     # connector_load_held: node 2 at uy = 0.01 tan 30 as without the load
-    body, conv, rep = convert_str(CONN_LOAD_HELD.format(LOAD="*Connector Load\n10, 1, 5.\n"))
+    held = CONN_LOAD_HELD.format(LOAD="*Connector Load\n10, 1, 5.\n")
+    body, conv, rep = convert_str(held)
     plain, _, _ = convert_str(CONN_LOAD_HELD.format(LOAD=""))
     assert not conv.reduced_physics and "*CONNECTOR LOAD on component 1 of connector element 10 left out: " \
         "BCs in every step and the connector's rigid components determine" in rep.text()
+    # at the card's line (code check D2-5: it had no file:line)
+    line = held.splitlines().index("*Connector Load") + 1
+    assert re.search(rf"\.inp:{line}: \*CONNECTOR LOAD on component 1 of connector element 10 left out",
+                     rep.text()), rep.text()
     assert _all_equations(body) == _all_equations(plain) and len(_all_equations(body)) == 2
     assert "*SPRING, ELSET=ABQ2CCX_CONN_SPRINGA_1\n100." in body and _card_at(body, "*CLOAD") == []
     # a component whose node is a rigid-body member is not fixed by it: warned, reduced physics
@@ -13324,6 +13339,9 @@ def test_connector_load_on_a_determined_component_drops_only_the_load():
         "*Boundary\n1, 1, 6\n3, 2, 6\n")
     body, conv, rep = convert_str(deck)
     assert conv.reduced_physics == ["*CONNECTOR LOAD on a component no DOF of which is free for it"]
+    line = deck.splitlines().index("*Connector Load") + 1
+    assert re.search(rf"\.inp:{line}: \*CONNECTOR LOAD on component 1 of connector element 10 left out",
+                     rep.text()), rep.text()
     assert len(_all_equations(body)) == 1                   # (the spring's row)
     # a motion there still leaves the connector out
     body, conv, rep = convert_str(CONN_LOAD_HELD.format(LOAD="*Connector Motion\n10, 1, 0.001\n"))
@@ -19573,6 +19591,43 @@ def test_summary_never_overwrites_a_deck_and_replaces_its_csv_at_the_end():
     assert [r[0] for r in rows] == ["deck", a, b] and left == made + ["out", "s.csv"], (rows, left)
 
 
+def test_summary_to_a_pipe_or_device_is_written_directly():
+    # --summary to a FIFO hung (the guard read its first line first) and to /dev/null or
+    # /dev/stdout failed (no FILE.part can go beside them) (code check D2-3): a pipe or device
+    # is written directly, without the guard and the .part
+    import threading
+    if os.name == "nt" or not hasattr(os, "mkfifo"):
+        return
+    d = tempfile.mkdtemp()
+    got, res = [], []
+    try:
+        a, fifo, outdir = (os.path.join(d, n) for n in ("a.inp", "f.fifo", "out"))
+        with open(a, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(HEX_MODEL)
+        assert A._summary_direct("/dev/stdout") and A._summary_direct(os.devnull)
+        assert not A._summary_direct(a) and not A._summary_direct(os.path.join(d, "new.csv"))
+        os.mkfifo(fifo)
+
+        def reader():
+            with open(fifo, encoding="utf-8") as fh:
+                got.append(fh.read())
+        threads = [threading.Thread(target=f, daemon=True) for f in (
+            reader, lambda: res.append(_main_code(["--quiet", "--outdir", outdir, "--summary", fifo, a])))]
+        for t in threads:
+            t.start()
+        threads[1].join(60)
+        hung = threads[1].is_alive()
+        if hung:                                # (release the blocked opens)
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        threads[0].join(10)
+        null = _main_code(["--quiet", "--outdir", outdir, "--summary", os.devnull, a])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert not hung and res and res[0][0] == 0, (hung, res)
+    assert got and got[0].splitlines()[0] == ",".join(A.SUMMARY_COLUMNS) and len(got[0].splitlines()) == 2
+    assert null[0] == 0 and not null[1], null
+
+
 def test_ccx_runner_ends_with_ccx_not_with_a_process_left_holding_its_output():
     # a process ccx started (a wrapper script's) and left running with ccx's output pipes: the
     # runner waited 60 s for each pipe (120 s, with a --timeout too) and left it running (code
@@ -19800,6 +19855,20 @@ def test_crash_log_shows_the_home_folder_as_a_tilde():
     shown = os.path.join("~", "private", "x.inp")
     assert code == 4 and home not in text and shown in text, text
     assert "check it" in text and "before posting" in err.getvalue(), err.getvalue()
+    # a Windows home also as _shown_path writes a file outside the deck's folder, with / (code
+    # check D2-4), and as a repr shows it; another user's folder stays
+    import ntpath
+    real_home, real_abs = os.path.expanduser, os.path.isabs
+    os.path.expanduser = lambda p: "C:\\Users\\sander" if p == "~" else real_home(p)
+    os.path.isabs = ntpath.isabs
+    try:
+        got = [A._home_as_tilde(x) for x in (
+            "[WARNING] C:/Users/sander/inc/mesh.inp:3: x", "C:\\Users\\sander\\inc\\mesh.inp",
+            "KeyError('C:\\\\Users\\\\sander\\\\x.inp')", "C:/Users/sander2/inc/mesh.inp")]
+    finally:
+        os.path.expanduser, os.path.isabs = real_home, real_abs
+    assert got == ["[WARNING] ~/inc/mesh.inp:3: x", "~\\inc\\mesh.inp", "KeyError('~\\\\x.inp')",
+                   "C:/Users/sander2/inc/mesh.inp"], got
 
 
 G54_MODEL = (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
@@ -19952,10 +20021,12 @@ def test_upgraded_shells_midside_nodes_lie_on_the_curved_surface():
     assert new and max(abs(math.hypot(p[0], p[1]) - 1.0) for p in new) < 1e-12
 
 
-def test_beams_along_upgraded_curved_shell_edges_stay_straight():
+def test_beams_along_upgraded_curved_shell_edges_follow_the_arc():
     # code check G2-5: a 2-node beam along an upgraded shell edge becomes a 3-node beam through
-    # the edge's new node; the Abaqus beam is straight, so that node stays on the chord (it
-    # made the beam a circular arc), the shells' other new nodes on the cylinder
+    # the edge's new node, which the shells on both sides share: it stays on the cylinder, so
+    # the beam follows the arc (Abaqus' beam is straight), and the warning says so.  On the
+    # chord (code check D2-2) it kinked the shells along the beam: a ring-stiffened cylinder's
+    # u_r -23 % to +14 % off a refined mesh (validate_with_ccx ring_stiffened_cylinder)
     deck, corners = _cylinder_panel(8, 90.0)
     deck += ("*Element, type=B31, elset=RING\n" + "".join(f"{100 + i}, {19 + i}, {20 + i}\n" for i in range(8)) +
              "*Beam Section, elset=RING, material=STEEL, section=RECT\n0.02, 0.02\n0., 0., 1.\n"
@@ -19965,11 +20036,11 @@ def test_beams_along_upgraded_curved_shell_edges_stay_straight():
     ring = set()
     for i in range(8):
         typ, (a, m, c) = conv.geom.elements[100 + i]
-        assert typ == "B32R" and nodes[m] == tuple((x + y) / 2 for x, y in zip(nodes[a], nodes[c]))
+        assert typ == "B32R" and abs(math.hypot(nodes[m][0], nodes[m][1]) - 1.0) < 1e-12
         ring.add(m)
-    new = {k: p for k, p in nodes.items() if k > corners and k not in ring}
-    assert len(new) == 8 * 2 + 9 * 2 and max(abs(math.hypot(p[0], p[1]) - 1.0) for p in new.values()) < 1e-12
-    assert "on the straight edge there (Abaqus' beam is straight)" in rep.text()
+    new = {k: p for k, p in nodes.items() if k > corners}
+    assert len(new) == 8 * 3 + 9 * 2 and max(abs(math.hypot(p[0], p[1]) - 1.0) for p in new.values()) < 1e-12
+    assert "so they follow the shell's curved edge (Abaqus' beam is straight" in rep.text()
 
 
 def test_upgraded_shells_midside_nodes_at_a_shallow_fold():
@@ -22317,6 +22388,17 @@ def test_tie_no_rotation_acts_where_both_surfaces_turn():
         [ln for ln in convert_str(solids.replace(", NO ROTATION", ""))[0].splitlines() if not ln.startswith("**")]
     _, conv, _ = convert_str(SHELL_TEE.format(TIE="*Tie, name=T, no rotation\nSE, PT\n"))
     assert "*TIE, NO ROTATION" in conv.reduced_physics
+    # which surfaces turn is asked only for NO ROTATION: it scans the model for a node surface
+    # (code check D2-7: 200 ties on a 37k-element model took 7.2 s for 5.7)
+    calls, real = [], A.Converter._surface_turns
+    A.Converter._surface_turns = lambda self, surf: calls.append(surf) or real(self, surf)
+    try:
+        convert_str(solids.replace(", NO ROTATION", ""))
+        plain = len(calls)
+        convert_str(solids)
+    finally:
+        A.Converter._surface_turns = real
+    assert plain == 0 and calls, calls
 
 
 def test_tied_pair_keeps_a_faceless_shell_slave_line():

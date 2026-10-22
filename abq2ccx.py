@@ -55,6 +55,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -9594,7 +9595,8 @@ class _Mesh:
             f = [x.strip() for x in line.split(",")]
             master = f[1] if len(f) > 1 else ""
             plain = bool(f[0]) and not (b.has("CYCLIC SYMMETRY") or b.has("MULTISTAGE"))
-            rotation_free += not (self._surface_turns(f[0]) and self._surface_turns(master))
+            if b.has("NO ROTATION"):            # (_surface_turns scans the model for a node surface)
+                rotation_free += not (self._surface_turns(f[0]) and self._surface_turns(master))
             if plain and f[0].upper() == master.upper():
                 out += self._comment_out(
                     f"*TIE {params.get('NAME') or ''}: {f[0]} is both its slave and its master "
@@ -10935,8 +10937,11 @@ class _Mesh:
 
         # the deck's own pairs and ties: 'interactions between these surfaces are modeled only
         # with the contact pair algorithm' (Interactions Guide, general contact in Abaqus/
-        # Standard) — the rest of their bodies stays in general contact, so a pair of bodies
-        # leaves only those faces out (_gc_joined_faces; a named surface's pair: all of it)
+        # Standard) — only that surface pair leaves general contact: the rest of each body still
+        # meets all of the other, the master surface included.  So a pair of bodies leaves out
+        # the faces of the deck's slave surface only (_gc_joined_faces: from the slave body's
+        # surface, or from the line where its body is the master), never the master's: a master
+        # wider than what it joins is still met (a named surface's pair: all of it)
         joined = []
         for b in blocks:
             if b.keyword in ("CONTACT PAIR", "TIE"):
@@ -10961,14 +10966,14 @@ class _Mesh:
                 continue
             elif a["node_based"] and b["node_based"]:
                 continue
-            js = [(xa, xb) for x1, x2 in joined for xa, xb in ((x1, x2), (x2, x1))
-                  if covers(a, xa) and covers(b, xb)]
-            if js:
+            sa = [xs for xs, xm in joined if covers(a, xs) and covers(b, xm)]     # deck slaves on a
+            sb = [xs for xs, xm in joined if covers(b, xs) and covers(a, xm)]
+            if sa or sb:
                 if "faces" not in a or "faces" not in b:
                     n_joined += 1
                     continue                    # (a named surface: the joined one itself)
-                fa = set().union(*(self._gc_joined_faces(xa, a) for xa, _xb in js))
-                fb = set().union(*(self._gc_joined_faces(xb, b) for _xa, xb in js))
+                fa = set().union(*(self._gc_joined_faces(xs, a) for xs in sa))
+                fb = set().union(*(self._gc_joined_faces(xs, b) for xs in sb))
                 if fa >= self._gc_face_set(a) or fb >= self._gc_face_set(b):
                     n_joined += 1
                     continue                    # (one body joined over all its faces)
@@ -11091,10 +11096,11 @@ class _Mesh:
                              "the whole bodies their surfaces touch.", once=True)
         if cut:
             self.report.note("*CONTACT (--approximate): bodies that the deck's own *TIE or *CONTACT "
-                             "PAIR joins stay in general contact but for the faces of those surfaces, "
-                             "which Abaqus leaves to the tie or pair; a slave body's faces so joined "
-                             "are also out of its contact with its other masters (one line per slave "
-                             "body).", once=True)
+                             "PAIR joins stay in general contact but for the faces of its slave "
+                             "surface: Abaqus leaves only that surface pair to the tie or pair, so the "
+                             "rest of the slave's body still meets the master surface; a slave body's "
+                             "faces so left out are also out of its contact with its other masters "
+                             "(one line per slave body).", once=True)
         if not incl:
             self.report.note("*CONTACT (--approximate): the general contact domain has no "
                              "inclusion, so no contact pair is written.", once=True)
@@ -11504,9 +11510,9 @@ class _Mesh:
         facing the nearest body it meets, SPOS where it meets none with a finite box), a
         *SURFACE per body and per union of masters, a hard frictionless *SURFACE INTERACTION
         where Abaqus' default property applies, and a *CONTACT PAIR per interaction.  The
-        faces a tie or deck pair joins (``cut``: (slave, master) -> their faces) are left out:
-        a slave's from its surface, a master's from that line's.  -> (the lines written, the
-        lines or masters left out with no face left)."""
+        faces of a tie's or deck pair's slave surface (``cut``: (slave, master) -> their faces)
+        are left out: a slave body's from its surface, a master body's from that line's.  ->
+        (the lines written, the lines or masters left out with no face left)."""
         self._gc_blocks = []
         if not lines_of:
             return 0, 0
@@ -13119,8 +13125,8 @@ class _Mesh:
                         f"an edge were upgraded too ({', '.join(others)}), so no midside node hangs"
                         if others else "")
                      + (f"; {beams} 2-node beam(s) along an upgraded edge became 3-node beams "
-                        f"through its midside node, on the straight edge there (Abaqus' beam is "
-                        f"straight)" if beams else "")
+                        f"through its midside node, so they follow the shell's curved edge (Abaqus' "
+                        f"beam is straight: a difference of the order of the edge's sag)" if beams else "")
                      + ". BCs, temperatures and initial conditions on both ends of an edge reach its "
                        "midside node, and so do the node sets of BCs, couplings, ties and output.")
         self.report.warn(f"[APPROX] Element {what} written as {parts[0]}: {why}. ccx's "
@@ -13447,12 +13453,12 @@ class _Mesh:
         on S3, S4, S4R and S8), so the linear shells of a composite section become S8R / S6
         (COMPOSITE_SHELL_UPGRADE) with a node at the middle of every edge, on the curved
         surface the shells' nodal normals define (_surface_midsides; on the straight edge where
-        it is flat or folds, or carries a beam): the same layup, thicknesses, orientations,
-        element ids and sets.  Every linear shell joined to them through an edge is upgraded
-        too — a linear neighbour would leave the midside node of their shared edge hanging —
-        and a 2-node beam along an upgraded edge (*BEAM SECTION) becomes the 3-node beam
-        through its midside node, so a stiffener stays joined along the whole edge (and
-        straight, as in Abaqus: that node is on the chord).  The new nodes join the node sets
+        it is flat or folds): the same layup, thicknesses, orientations, element ids and sets.
+        Every linear shell joined to them through an edge is upgraded too — a linear neighbour
+        would leave the midside node of their shared edge hanging — and a 2-node beam along an
+        upgraded edge (*BEAM SECTION) becomes the 3-node beam through its midside node, so a
+        stiffener stays joined along the whole edge (and follows a curved edge's arc, where
+        Abaqus' beam is straight: see _upgrade_linear_shells).  The new nodes join the node sets
         that hold both ends of their edge (_extend_edge_sets), and BCs, temperatures and
         initial conditions on both ends reach them (_midside_records)."""
         corners = self._linear_shell_corners()
@@ -13473,7 +13479,8 @@ class _Mesh:
             + (f"; {extra} other linear shell(s) joined to them by an edge were upgraded too, so no "
                f"midside node hangs" if extra else "")
             + (f"; {beams} 2-node beam(s) along an upgraded edge became 3-node beams through its "
-               f"midside node, on the straight edge there (Abaqus' beam is straight)" if beams else "")
+               f"midside node, so they follow the shell's curved edge (Abaqus' beam is straight: a "
+               f"difference of the order of the edge's sag)" if beams else "")
             + ". BCs, temperatures and initial conditions on both ends of an edge reach its midside "
               "node, and so do the node sets of BCs, couplings, ties and output. The quadratic "
               "shell is more accurate than the linear one on the same mesh, so results differ "
@@ -13504,8 +13511,14 @@ class _Mesh:
         under --approximate, _plan_s4r_shells): (the upgraded elements, 'S4R -> S8R'-like kind
         -> count, the new nodes' span, the 2-node beams along an upgraded edge made 3-node).
         A shell's new node lies on the curved surface its nodal normals define
-        (_surface_midsides), on the straight edge where the surface is flat there or folds, or
-        where a 2-node beam runs along the edge (straight in Abaqus).  ``plane``: linear plane
+        (_surface_midsides), on the straight edge where the surface is flat there or folds; a
+        2-node beam along the edge shares it, so the beam follows the arc where Abaqus' is
+        straight.  That node stays on the arc as the shells on both sides share it: on the
+        chord it kinked the shells along the beam line (code check D2-2: a ring-stiffened
+        quarter cylinder of 8 x 8 composite S4R under pressure, u_r -23 % to +14 % off a 32 x
+        32 mesh, against a uniform 0.9 % on the arc; a chord node of the beam's own, its
+        translations tied to the shell's, 2.0 % off and not uniform; one tied to nothing, as
+        Abaqus' beam joins at its ends only, 3.0 %).  ``plane``: linear plane
         and axisymmetric elements (``corners`` from _linear_shell_corners(plane=True)) ->
         PLANE_QUADRATIC_UPGRADE (plastic CPE4 / CAX4 under --approximate,
         _plan_plastic_plane_quads), the deck's suffixes kept where Abaqus has the quadratic
@@ -13538,12 +13551,6 @@ class _Mesh:
         curved = {} if plane else self._surface_midsides(blocks, corners, comp)
         general = {e for b in blocks if b.keyword == "BEAM GENERAL SECTION"
                    for e in self.geom.elset((b.param("ELSET") or "").strip())}
-        # the edges of 2-node beams that become 3-node ones through the edge's new node (below):
-        # it stays on the chord there, as the Abaqus beam is straight
-        straight = {(min(conn), max(conn)) for e, (typ, conn) in els.items()
-                    if len(conn) == 2 and e not in comp and e not in self._midside and
-                    e not in general and e not in self._u1 and QUADRATIC_UPGRADE.get(ccx_type(typ))
-                    } if curved else set()
         for e in sorted(comp):
             typ, conn = els[e]
             mids = []
@@ -13551,8 +13558,7 @@ class _Mesh:
                 key = (min(a, c), max(a, c))
                 if key not in mid:
                     next_id += 1
-                    self.geom.add_node(next_id, (None if key in straight else curved.get(key)) or
-                                       vscale(vadd(nodes[a], nodes[c]), 0.5))
+                    self.geom.add_node(next_id, curved.get(key) or vscale(vadd(nodes[a], nodes[c]), 0.5))
                     mid[key] = next_id
                     made.append((a, c, next_id))
                     na, nc = self._node_normals.get(a), self._node_normals.get(c)
@@ -29807,6 +29813,9 @@ class _Constraints:
                         continue
             for spec, fixed_by_bcs in unloaded:
                 h = spec["h"]
+                # (the entry is at the first *CONNECTOR LOAD card on it: its *CLOAD's place)
+                src = next((card for card in self._conn_load_cards
+                            if any(ln.split(",")[0].strip() == str(h) for ln in card.data)), None)
                 for card in self._conn_load_cards:
                     card.data[:] = [ln for ln in card.data if ln.split(",")[0].strip() != str(h)]
                 comp = "+".join(str(c) for c in spec["w"])
@@ -29815,13 +29824,13 @@ class _Constraints:
                                      f"{it['eid']} left out: BCs in every step and the connector's "
                                      f"rigid components determine that component, so the load only "
                                      f"adds to the reactions (as in Abaqus); the connector is kept.",
-                                     once=True)
+                                     once=True, at=src)
                 else:
                     self.report.warn(f"*CONNECTOR LOAD on component {comp} of connector element "
                                      f"{it['eid']} left out: no DOF of that component is free for it "
                                      f"(all eliminated by other constraints, held, or local DOFs of a "
                                      f"node with a *TRANSFORM); the rest of the connector is kept.",
-                                     once=True)
+                                     once=True, at=src)
                     self._reduces("*CONNECTOR LOAD on a component no DOF of which is free for it")
             if twin is not None:
                 self._mpc_twin(twin[0])          # made now, under the id its rows name
@@ -46401,18 +46410,27 @@ def _pipe_holders(pipes: Sequence) -> List[int]:
     """The processes other than this one that hold the other end of ``pipes`` (ccx's output
     pipes, read here): ones ccx started and left running after it ended, which the process
     tree no longer links to it.  Looked for in this process' group, which ccx's stay in, by
-    /proc (Linux) or lsof; none where neither tells (Windows)."""
+    /proc (Linux) or ps and lsof; none where they cannot tell (Windows, or no lsof)."""
     if os.name == "nt":
         return []
+    me, group = os.getpid(), os.getpgrp()
     try:
-        ps = subprocess.run(["ps", "-A", "-o", "pid=,pgid="], capture_output=True, text=True,
-                            timeout=30).stdout
         fds = [f.fileno() for f in pipes]
+        if os.path.isdir("/proc/self/fd"):      # (Linux: also without ps, as in slim containers)
+            pids = []
+            for name in os.listdir("/proc"):
+                try:
+                    if name.isdigit() and int(name) != me and os.getpgid(int(name)) == group:
+                        pids.append(int(name))
+                except OSError:                 # (ended meanwhile)
+                    pass
+        else:
+            ps = subprocess.run(["ps", "-A", "-o", "pid=,pgid="], capture_output=True, text=True,
+                                timeout=30).stdout
+            pids = [int(f[0]) for f in map(str.split, ps.splitlines()) if len(f) == 2 and
+                    f[0].isdigit() and f[1].isdigit() and int(f[1]) == group and int(f[0]) != me]
     except (OSError, ValueError, subprocess.SubprocessError):
         return []
-    me, group = os.getpid(), os.getpgrp()
-    pids = [int(f[0]) for f in map(str.split, ps.splitlines()) if len(f) == 2 and
-            f[0].isdigit() and f[1].isdigit() and int(f[1]) == group and int(f[0]) != me]
     if not pids:
         return []
     if os.path.isdir("/proc/self/fd"):          # Linux: a pipe's two ends share an inode
@@ -47601,7 +47619,8 @@ def _home_as_tilde(text: str) -> str:
     home = os.path.expanduser("~").rstrip("\\/")
     if len(home) < 2 or not os.path.isabs(home):
         return text
-    for form in dedup([home, home.replace("\\", "\\\\")]):     # (and as a repr shows it)
+    # (and as a repr shows it, and with / as _shown_path writes a file outside the deck's folder)
+    for form in dedup([home, home.replace("\\", "\\\\"), home.replace("\\", "/")]):
         text = re.sub(re.escape(form) + r"(?![\w.-])", "~", text,
                       flags=re.IGNORECASE if os.name == "nt" else 0)
     return text
@@ -47747,10 +47766,32 @@ def _summary_row(doc: dict) -> list:
             for c in row]
 
 
+def _summary_direct(path: str) -> bool:
+    """Whether --summary ``path`` is written directly, not through ``path``.part: a pipe,
+    terminal or device (a FIFO, process substitution, /dev/stdout, /dev/null, NUL), or a file
+    reached through a link or descriptor under /dev or /proc (/dev/stdout or /dev/fd/1
+    redirected to a file), whose first line cannot be read without blocking or beside which no
+    .part can go."""
+    try:
+        mode = os.stat(path).st_mode
+    except (OSError, ValueError):                   # new
+        return False
+    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+        return True
+    where = os.path.abspath(path)
+    if os.name == "nt" or not stat.S_ISREG(mode) or not where.startswith(("/dev/", "/proc/")):
+        return False
+    try:                                            # (a file in /dev/shm is a file)
+        return not stat.S_ISREG(os.lstat(path).st_mode) or not os.access(os.path.dirname(where), os.W_OK)
+    except OSError:
+        return False
+
+
 def _summary_problem(path: str, inputs: Sequence[str]) -> Optional[str]:
     """Why --summary ``path`` is not a file to write the CSV to, or None: --summary takes one
     value, so a glob after it (--summary *.inp) gives it the first deck; no deck, input,
-    folder or file that is no summary abq2ccx wrote is overwritten."""
+    folder or file that is no summary abq2ccx wrote is overwritten (a pipe or device is
+    written as it is: _summary_direct)."""
     if path.lower().endswith(".inp"):
         return "ends in .inp: name a .csv file (a glob right after --summary gives it a deck)"
     here = os.path.normcase(os.path.abspath(path))
@@ -47758,6 +47799,8 @@ def _summary_problem(path: str, inputs: Sequence[str]) -> Optional[str]:
         return "is one of the inputs"
     if os.path.isdir(path):
         return "is a folder"
+    if _summary_direct(path):
+        return None
     try:
         with open(path, encoding="utf-8-sig", errors="replace") as fh:
             first = fh.readline(1000).strip()
@@ -47880,18 +47923,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     summary = part = None
     if args.summary:
-        # the rows go to <FILE>.part as the batch runs, which replaces FILE when it has ended
-        part = args.summary + ".part"
+        # the rows go to <FILE>.part as the batch runs, which replaces FILE when it has ended;
+        # to a pipe or device (/dev/stdout, a FIFO) directly
+        part = None if _summary_direct(args.summary) else args.summary + ".part"
         why = _summary_problem(args.summary, inputs) or (
-            f"is beside {part}, which is no summary abq2ccx wrote" if _summary_problem(part, ())
+            f"is beside {part}, which is no summary abq2ccx wrote" if part and _summary_problem(part, ())
             else None)
         if why:
             ap.error(f"--summary {args.summary} {why}")
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(args.summary)), exist_ok=True)
-            with open(args.summary, "a"):           # (in use, read-only: said now)
-                pass
-            summary = open(part, "w", encoding="utf-8", errors="backslashreplace", newline="")
+            if part:
+                os.makedirs(os.path.dirname(os.path.abspath(args.summary)), exist_ok=True)
+                with open(args.summary, "a"):       # (in use, read-only: said now)
+                    pass
+            summary = open(part or args.summary, "w", encoding="utf-8", errors="backslashreplace",
+                           newline="")
         except OSError as exc:
             sys.stderr.write(f"abq2ccx: cannot write --summary {args.summary}: {exc}\n")
             return 1
@@ -47913,6 +47959,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     finally:
         if summary:
             summary.close()
+        if summary and part:
             lost: Optional[str] = "the batch did not end"
             if ended:
                 try:

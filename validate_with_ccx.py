@@ -2393,6 +2393,35 @@ def sheet_sphere_deck(typ, n=16, t=0.01, p=1.0, load="P", offset=None, nlgeom=Fa
     return "\n".join(lines) + "\n"
 
 
+def ring_cylinder_deck(n=8, edge=False):
+    """A ring-stiffened quarter cylinder (code check D2-2): R 10, length 10, t 0.05, composite
+    S4R (0 / 90), n x n cells, a B31 ring (RECT 0.2 x 0.5) along the circumference at mid-length
+    (``edge``: on the free end z = 10), under internal pressure 1; symmetry on x = 0 and y = 0,
+    the end z = 0 held axially.  Every node prints U; node 1 + i + 1000 j is at angle 90 i / n
+    degrees and z = 10 j / n."""
+    nid = lambda i, j: 1 + i + 1000 * j                                     # noqa: E731
+    lines = ["*Node, nset=ALLN"]
+    for j in range(n + 1):
+        for i in range(n + 1):
+            a = math.pi / 2 * i / n
+            lines.append(f"{nid(i, j)}, {10 * math.cos(a)!r}, {10 * math.sin(a)!r}, {10 * j / n!r}")
+    lines.append("*Element, type=S4R, elset=SH")
+    for j in range(n):
+        lines += [f"{1 + i + n * j}, {nid(i, j)}, {nid(i + 1, j)}, {nid(i + 1, j + 1)}, {nid(i, j + 1)}"
+                  for i in range(n)]
+    ring = n if edge else n // 2
+    lines.append("*Element, type=B31, elset=RING")
+    lines += [f"{n * n + 1 + i}, {nid(i, ring)}, {nid(i + 1, ring)}" for i in range(n)]
+    lines += ["*Beam Section, elset=RING, material=M, section=RECT", "0.2, 0.5", "0., 0., 1.",
+              "*Material, name=M", "*Elastic", "2.e5, 0.3",
+              "*Shell Section, elset=SH, composite", "0.025, 3, M, 0.", "0.025, 3, M, 90."]
+    for name, pick in (("Y0", lambda i, j: i == 0), ("X0", lambda i, j: i == n), ("Z0", lambda i, j: j == 0)):
+        lines += [f"*Nset, nset={name}"] + _ids([nid(i, j) for j in range(n + 1) for i in range(n + 1) if pick(i, j)])
+    lines += ["*Boundary", "Y0, YSYMM", "X0, XSYMM", "Z0, 3, 3", "*Step", "*Static", "*Dload", "SH, P, -1.",
+              "*Node Print, nset=ALLN", "U", "*End Step"]
+    return "\n".join(lines) + "\n"
+
+
 def sheet_cylinder_deck(typ, n=8, t=0.1, p=1.0, nu=0.3):
     """Half a cylinder (radius 1 at the nodes, length 1 along z; shells or membranes ``typ`` of
     thickness t, E 1e5, Poisson's ratio nu), n x n cells over theta 0..180 deg and z, symmetric
@@ -3685,9 +3714,11 @@ def general_contact_deck(form, embed="", tie=False):
     top (slave) on the upper base ("pair", hard), or no contact ("none").  ``embed``: an S4
     sheet at mid-height of the lower block, or a C3D8 bar inside it, embedded in it (Abaqus
     leaves embedded elements out of general contact).  ``tie``: the upper block's first
-    column of elements tied to the lower block's top under it, and only the upper block's
-    far edge pushed down 0.02 (it turns about the tie into the lower block); the pair then
-    leaves the tied faces out (Abaqus leaves the tied surfaces to the tie, not the bodies)."""
+    column of elements tied to the lower block's top under it ("wide": to all of the lower
+    block's top), and only the upper block's far edge pushed down 0.02 (it turns about the tie
+    into the lower block); the pair then leaves the tie's slave faces out of its master (Abaqus
+    leaves only the tie's surface pair to the tie: the lower top, the tie's master, still meets
+    the rest of the upper base)."""
     nodes, elems, n, e = [], [], 0, 0
 
     def block(x0, w, z0, m):
@@ -3710,9 +3741,10 @@ def general_contact_deck(form, embed="", tie=False):
     base = ", ".join(str(v) for (i, j, k), v in low.items() if k == 0)
     top = ", ".join(str(v) for (i, j, k), v in up.items() if k == 1)
     push = "PUSH" if tie else "UTOP"
-    tied_up, tied_low = ((17, 20, 23), (1, 2, 5, 6, 9, 10, 13, 14)) if tie else ((), ())
+    tied_up, tied_low = ((17, 20, 23), tuple(range(1, 17)) if tie == "wide" else
+                         (1, 2, 5, 6, 9, 10, 13, 14)) if tie else ((), ())
     contact = {"general": "*Contact\n*Contact Inclusions, all exterior\n",
-               "pair": ("*Surface, name=LTOP\n" + "".join(f"{k}, S2\n" for k in range(1, 17) if k not in tied_low) +
+               "pair": ("*Surface, name=LTOP\n" + "".join(f"{k}, S2\n" for k in range(1, 17)) +
                         "*Surface, name=UBASE\n" + "".join(f"{k}, S1\n" for k in range(17, 26) if k not in tied_up) +
                         "*Surface Interaction, name=I\n*Surface Behavior, pressure-overclosure=HARD\n"
                         "*Contact Pair, interaction=I, type=NODE TO SURFACE\nLTOP, UBASE\n"),
@@ -11863,6 +11895,36 @@ def main():
               f"composite {typ} -> {quad}): u_r / (p R^2 / E t) {min(ur):.4f} to {max(ur):.4f} at all "
               f"{len(ur)} nodes (tolerance 1 %); the {len(new)} new nodes {off:.1e} off the cylinder")
         failures += 0 if ok else 1
+    # a ring (B31) on a curved composite shell, which becomes a 3-node beam through the shells'
+    # midside node: that node stays on the arc (code check D2-2: on the chord it kinked the
+    # shells along the ring, u_r -23 % to +14 % off the refined mesh, not axisymmetric; with the
+    # beam's own chord node tied to the shells' 2.0 % off, not axisymmetric either)
+    for tag, edge in (("ring_stiffened_cylinder", False), ("ring_stiffened_cylinder_edge", True)):
+        res = [composite_run(ring_cylinder_deck(n, edge), f"{tag}_{n}") for n in (8, 32)]
+        if not all(res):
+            failures += 1
+            continue
+        (u8, _t8), (u32, _t32) = res
+
+        def ur(u, i, j, n):
+            a = math.pi / 2 * i / n
+            v = u.get(1 + i + 1000 * j, (math.nan,) * 3)
+            return v[0] * math.cos(a) + v[1] * math.sin(a)
+        spread, off, rows = 0.0, 0.0, []
+        for j in (0, 4, 8):
+            got = [ur(u8, i, j, 8) for i in range(9)]
+            want = [ur(u32, 4 * i, 4 * j, 32) for i in range(9)]
+            spread = max(spread, (max(got) - min(got)) / abs(sum(got) / 9))
+            off = max([off] + [abs(g / w - 1) for g, w in zip(got, want)])
+            rows.append(f"{min(got):.5g} to {max(got):.5g} (32 x 32: {want[0]:.5g})")
+        ok = spread < 1e-3 and off < 0.02
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (a composite S4R quarter cylinder, R 10, t 0.05, 8 x 8, "
+              f"with a B31 ring {'on its free end' if edge else 'at mid-length'}, under pressure: "
+              f"the shells' midside node under the ring on the arc): u_r at z = 0, 5, 10 "
+              f"{'; '.join(rows)}: spread {spread:.1e} around, {off:.2%} off the 32 x 32 mesh "
+              f"(tolerances 1e-3, 2 %; with that node on the chord 20 to 23 % off and 0.2 to 0.4 "
+              f"around)")
+        failures += 0 if ok else 1
     # ("s4r", "XYD"): the ply angles written with a Fortran exponent, 3.D1, -6.D1, 4.5D1 (one
     # was read as an orientation name, which ccx rejected)
     dexp = lambda t: t.replace("PLY, 30.", "PLY, 3.D1").replace("PLY, -60.", "PLY, -6.D1") \
@@ -15737,10 +15799,12 @@ def main():
     failures += 0 if ok else 1
     # embedded elements are no part of Abaqus' all-inclusive surface: an S4 sheet or a C3D8 bar
     # embedded in the lower block (a body of its own, contacted against its host: the sheet
-    # stopped ccx, 'too many cutbacks'); a tie between the blocks leaves out the tied faces
-    # only, not the pair of blocks (it was dropped: the upper block turned into the lower one)
+    # stopped ccx, 'too many cutbacks'); a tie between the blocks leaves out the tie's slave
+    # faces only, not the pair of blocks (it was dropped: the upper block turned into the lower
+    # one), nor its master's: tied to all of the lower top, the rest of the upper base still
+    # meets it (its whole top was left out, as if there were no contact: -2.137 vs -4.294)
     for tag, embed, tie in (("embedded_s4", "S4", False), ("embedded_c3d8", "C3D8", False),
-                            ("tied", "", True)):
+                            ("tied", "", True), ("tied_wide", "", "wide")):
         runs = {form: review_run(general_contact_deck(form, embed, tie), f"general_contact_{tag}_{form}",
                                  lambda dat: dat_totals(dat)[-1:], approximate=form == "general")
                 for form in ("general", "pair", "none")}
@@ -15750,9 +15814,10 @@ def main():
             err = abs(got / want - 1)
             ok = err < 1e-6 and abs(want - none) > 0.1 * abs(want)
             print(f"{'PASS' if ok else 'FAIL'}  general_contact_{tag} (the blocks of general_contact_approx, "
-                  f"{'an embedded ' + embed if embed else 'the upper one partly tied to the lower and turned into it'};"
+                  f"{'an embedded ' + embed if embed else 'the upper one partly tied to the lower and turned into it'}"
+                  f"{' (the tie master all of the lower top)' if tie == 'wide' else ''};"
                   f" *CONTACT, ALL EXTERIOR under --approximate): force {got:.7g} vs {want:.7g} with a "
-                  f"hand-written pair{' of the untied faces' if tie else ''} ({err:.1e} apart); {none:.4g} "
+                  f"hand-written pair{' without the tie slave faces' if tie else ''} ({err:.1e} apart); {none:.4g} "
                   f"without contact")
         failures += 0 if ok else 1
 
