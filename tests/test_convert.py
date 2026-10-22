@@ -5091,6 +5091,168 @@ def test_field_dependencies_collapsed():
     assert "*DENSITY\n1.\n" in body + "\n"
 
 
+# two C3D8 bricks side by side; the second one's x = 1 face (nodes 13-16) is a node set of
+# its own, tied to the first one's (2, 3, 6, 7) where FIELD_BAR_TIES is added, else shared
+FIELD_BAR = """*Node
+1, 0., 0., 0.
+2, 1., 0., 0.
+3, 1., 1., 0.
+4, 0., 1., 0.
+5, 0., 0., 1.
+6, 1., 0., 1.
+7, 1., 1., 1.
+8, 0., 1., 1.
+9, 2., 0., 0.
+10, 2., 1., 0.
+11, 2., 0., 1.
+12, 2., 1., 1.
+13, 1., 0., 0.
+14, 1., 1., 0.
+15, 1., 0., 1.
+16, 1., 1., 1.
+*Element, type=C3D8, elset=BAR
+1, 1, 2, 3, 4, 5, 6, 7, 8
+2, 13, 9, 10, 14, 15, 11, 12, 16
+*Nset, nset=LEFTN
+1, 2, 3, 4, 5, 6, 7, 8
+*Nset, nset=RIGHTN
+9, 10, 11, 12, 13, 14, 15, 16
+*Solid Section, elset=BAR, material=M
+"""
+FIELD_BAR_STEP = "*Boundary\n1, 1, 3\n4, 1, 1\n4, 3, 3\n5, 1, 2\n8, 1, 1\n*Step\n*Static\n*Cload\n9, 1, 1.\n*End Step\n"
+
+
+def test_field_dependent_materials_one_copy_per_state():
+    # task 148: field values constant per element over the analysis -> the material's tables
+    # at each element's values, one material per state, the section split by element set
+    mat = "*Material, name=M\n*Elastic, dependencies=1\n100., 0.3, , 1.\n300., 0.3, , 3.\n*Density\n2.\n"
+    ic = "*Initial Conditions, type=field, variable=1\nLEFTN, 1.5\nRIGHTN, 2.5\n"
+    body, conv, rep = convert_str(FIELD_BAR + mat + ic + FIELD_BAR_STEP)
+    live = "\n".join(_live(body))
+    assert "*SOLID SECTION, ELSET=BAR_FIELD1, MATERIAL=M\n*SOLID SECTION, ELSET=BAR_FIELD2, " \
+           "MATERIAL=M_FIELD2" in live
+    assert "*MATERIAL, NAME=M\n*ELASTIC\n150., 0.3\n*DENSITY\n2.\n*MATERIAL, NAME=M_FIELD2\n" \
+           "*ELASTIC\n250., 0.3\n*DENSITY\n2." in live
+    assert "*ELSET, ELSET=BAR_FIELD1\n1\n*ELSET, ELSET=BAR_FIELD2\n2" in live
+    assert "*INITIAL CONDITIONS" not in live and "DEPENDENCIES" not in live
+    assert not conv.reduced_physics and "Exact: those values hold" in rep.text()
+    # one state: the material rewritten in place, the section kept; a value beyond the table
+    # holds its end row (Abaqus), a node without one is at 0
+    body, conv, _ = convert_str(FIELD_BAR + mat + "*Initial Conditions, type=field\nBAR, 7.\n"
+                                .replace("BAR", "LEFTN") + "*Initial Conditions, type=field\nRIGHTN, 7.\n"
+                                + FIELD_BAR_STEP)
+    live = "\n".join(_live(body))
+    assert "*SOLID SECTION, ELSET=BAR, MATERIAL=M\n" in live and "*ELASTIC\n300., 0.3\n" in live
+    assert "_FIELD" not in live and not conv.reduced_physics
+    # a step that sets the same values again changes nothing; one that changes them (a ramp
+    # in a static step) is reduced, the values at the end of step 1 kept
+    same = FIELD_BAR_STEP.replace("*Static\n", "*Static\n*Field\nLEFTN, 1.5\n")
+    _, conv, _ = convert_str(FIELD_BAR + mat + ic + same)
+    assert not conv.reduced_physics
+    body, conv, rep = convert_str(FIELD_BAR + mat + ic + same.replace("LEFTN, 1.5", "LEFTN, 2."))
+    assert "*ELASTIC\n200., 0.3\n" in body and "*ELASTIC\n250., 0.3\n" in body
+    assert conv.reduced_physics == ["field-dependent material data on elements whose field values a "
+                                    "*FIELD changes in a step"]
+    assert "M (1 element(s), from step 1)" in rep.text()
+    # ... unless the step applies them at once (a STEP amplitude in step 1): they hold all along
+    _, conv, _ = convert_str(FIELD_BAR + mat + ic + same.replace("LEFTN, 1.5", "LEFTN, 2.")
+                             .replace("*Step\n", "*Step, amplitude=step\n"))
+    assert not conv.reduced_physics
+    # with an amplitude, or in step 2, a change is a change
+    for deck in (same.replace("*Field\n", "*Field, amplitude=A\n").replace("*Boundary", "*Amplitude, name=A\n"
+                                                                           "0., 1., 1., 1.\n*Boundary"),
+                 same.replace("*Field\nLEFTN, 1.5\n", "") + "*Step\n*Static\n*Field\nLEFTN, 2.\n*End Step\n"):
+        _, conv, _ = convert_str(FIELD_BAR + mat + ic + deck)
+        assert len(conv.reduced_physics) == 1, deck
+    # OP=NEW returns the nodes it leaves out to their initial values: no change
+    _, conv, _ = convert_str(FIELD_BAR + mat + ic + same.replace("*Field\n", "*Field, op=new\n"))
+    assert not conv.reduced_physics
+    # shared nodes on the interface: element 1's nodes differ -> their mean, reduced
+    shared = FIELD_BAR.replace("2, 13, 9, 10, 14, 15, 11, 12, 16", "2, 2, 9, 10, 3, 6, 11, 12, 7") \
+        .replace("9, 10, 11, 12, 13, 14, 15, 16", "2, 3, 6, 7, 9, 10, 11, 12")
+    body, conv, rep = convert_str(shared + mat + ic + FIELD_BAR_STEP)
+    assert "*ELASTIC\n200., 0.3\n" in body and "*ELASTIC\n250., 0.3\n" in body
+    assert conv.reduced_physics == ["field-dependent material data on elements whose nodes have "
+                                    "different field values"]
+    # above FIELD_COPY_WARN states a warning; above FIELD_COPY_MAX copies none, the field-0 collapse
+    warn, cap = A.Converter.FIELD_COPY_WARN, A.Converter.FIELD_COPY_MAX
+    try:
+        A.Converter.FIELD_COPY_WARN = 1
+        body, conv, rep = convert_str(FIELD_BAR + mat + ic + FIELD_BAR_STEP)
+        assert "Material M: 2 states of its field-dependent data" in rep.text() and not conv.reduced_physics
+        A.Converter.FIELD_COPY_MAX = 0
+        body, conv, rep = convert_str(FIELD_BAR + mat + ic + FIELD_BAR_STEP)
+        assert "_FIELD" not in body and "*ELASTIC\n100., 0.3" in body and "above the 0 material copies" in rep.text()
+        assert "*ELASTIC field-variable dependence" in conv.reduced_physics
+    finally:
+        A.Converter.FIELD_COPY_WARN, A.Converter.FIELD_COPY_MAX = warn, cap
+
+
+def test_field_dependent_material_tables():
+    # Abaqus interpolates in each field variable, the last first, between blocks given at
+    # increasing values; what is left is written exactly at the union of the blocks' points
+    blk = lambda kw, n, lines: A.Block(kw, A.OrderedDict(DEPENDENCIES=str(n)), lines)  # noqa: E731
+    e = blk("ELASTIC", 1, ["100., 0.3, 0., 1.", "200., 0.3, 100., 1.", "300., 0.3, 50., 3."])
+    assert A.field_table_at(e, [2.]) == ["200., 0.3, 0.", "250., 0.3, 100."]
+    assert A.field_table_at(e, [1.]) == ["100., 0.3, 0.", "200., 0.3, 100."]
+    assert A.field_table_at(e, [-5.]) == A.field_table_at(e, [1.])
+    p = blk("PLASTIC", 1, ["100., 0., , 0.", "200., 1., , 0.", "300., 0., , 10.", "300., 0.5, , 10.",
+                           "400., 1.0, , 10."])
+    assert A.field_table_at(p, [5.]) == ["200., 0.", "225., 0.5", "300., 1."]
+    # three field variables on the regular grid of the Abaqus manual (Input Syntax Rules):
+    # E = 10 k is linear in each, k = f1 + 2 (f2 - 1) + 6 (f3 - 1)
+    rows = [f"{10 * (f1 + 2 * (f2 - 1) + 6 * (f3 - 1))}., 0.3, , {f1}, {f2}, {f3}"
+            for f3 in (1, 2, 3) for f2 in (1, 2, 3) for f1 in (1, 2)]
+    assert A.field_table_at(blk("ELASTIC", 3, rows), [1.5, 2.5, 1.25]) == ["60., 0.3"]
+    # engineering constants: two lines a row, also without the field columns
+    ec = blk("ELASTIC", 1, ["1., 2., 3., 0.1, 0.2, 0.3, 4., 5.", "6., , 0.", "3., 4., 5., 0.1, 0.2, 0.3, 6., 7.",
+                            "8., , 2."])
+    ec.params["TYPE"] = "ENGINEERING CONSTANTS"
+    assert A.field_table_at(ec, [1.]) == ["2., 3., 4., 0.1, 0.2, 0.3, 5., 6.", "7."]
+    # a blank last constant without a temperature keeps the row's second line (as 0)
+    ec.data[:] = [ln.replace("6., , 0.", ", , 0.").replace("8., , 2.", ", , 2.") for ln in ec.data]
+    assert A.field_table_at(ec, [1.]) == ["2., 3., 4., 0.1, 0.2, 0.3, 5., 6.", "0."]
+    # rows that do not read, decreasing blocks, an unknown card: None
+    assert A.field_table_at(blk("ELASTIC", 1, ["1., 0.3, , x"]), [0.]) is None
+    assert A.field_table_at(blk("ELASTIC", 1, ["1., 0.3, , 2.", "2., 0.3, , 1."]), [0.]) is None
+    assert A.field_table_at(blk("DRUCKER PRAGER", 1, ["30., 1., 30., , 0."]), [0.]) is None
+
+
+def test_field_dependent_materials_left_to_the_collapse():
+    # user code that sets field values (USDFLD, *FIELD, USER), a field read by a card the
+    # converter does not rewrite (*FRICTION here): as before, the tables collapsed to field 0
+    # and the field cards reduced physics
+    mat = "*Material, name=M\n*Elastic, dependencies=1\n100., 0.3, , 1.\n300., 0.3, , 3.\n"
+    ic = "*Initial Conditions, type=field, variable=1\nLEFTN, 1.5\nRIGHTN, 2.5\n"
+    for extra, step in (("*User Defined Field\n", FIELD_BAR_STEP),
+                        ("", FIELD_BAR_STEP.replace("*Static\n", "*Static\n*Field, user\nLEFTN\n"))):
+        body, conv, rep = convert_str(FIELD_BAR + mat.replace("*Elastic", extra + "*Elastic") + ic + step)
+        assert "*ELASTIC\n100., 0.3" in body and "_FIELD" not in body
+        assert "*ELASTIC field-variable dependence" in conv.reduced_physics
+    fric = "*Surface Interaction, name=I\n*Friction, dependencies=1\n0.1, , , , 0.\n0.3, , , , 1.\n"
+    body, conv, _ = convert_str(FIELD_BAR + mat + fric + ic + FIELD_BAR_STEP)
+    assert "M_FIELD2" in body and "*INITIAL CONDITIONS" in conv.reduced_physics
+    # fields set, nothing reads them: the cards change nothing
+    body, conv, rep = convert_str(FIELD_BAR + "*Material, name=M\n*Elastic\n100., 0.3\n" + ic
+                                  + FIELD_BAR_STEP.replace("*Static\n", "*Static\n*Field\nLEFTN, 3.\n"))
+    assert not conv.reduced_physics and "nothing in the converted deck reads them" in rep.text()
+    # a composite shell's plies: their materials copied per state, the ply lines renamed
+    shell = FIELD_BAR.split("*Element")[0] + ("*Element, type=S4, elset=P\n1, 1, 2, 3, 4\n2, 13, 9, 10, 14\n"
+                                              "*Nset, nset=LEFTN\n1, 2, 3, 4\n*Nset, nset=RIGHTN\n9, 10, 13, 14\n"
+                                              "*Shell Section, elset=P, composite\n0.1, 3, M, 0.\n0.1, 3, N, 90.\n"
+                                              "*Material, name=N\n*Elastic\n50., 0.3\n")
+    body, conv, _ = convert_str(shell + mat + ic + "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n9, 1, 1.\n*End Step\n")
+    live = "\n".join(_live(body))
+    assert "*SHELL SECTION, ELSET=P_FIELD1, COMPOSITE\n0.1, , M, " in live
+    assert "*SHELL SECTION, ELSET=P_FIELD2, COMPOSITE\n0.1, , M_FIELD2, " in live
+    assert not [r for r in conv.reduced_physics if "field" in r.lower()]
+    # a shell gradient through the section is a variation inside the element
+    body, conv, _ = convert_str(shell + mat + ic.replace("RIGHTN, 2.5", "RIGHTN, 2.5, 1.")
+                                + "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n9, 1, 1.\n*End Step\n")
+    assert conv.reduced_physics[:1] == ["field-dependent material data on elements whose field values "
+                                        "vary through the shell or beam section"]
+
+
 def test_depvar_delete_and_labels():
     body, _, rep = convert_str('*Material,name=M\n*Depvar, delete=3\n3,\n1, PEEQ, "eq"\n')
     assert "*DEPVAR\n3," in body and "PEEQ" not in body and "element deletion" in rep.text()

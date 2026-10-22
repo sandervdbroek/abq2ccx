@@ -556,7 +556,7 @@ TRANSLATED = {
         "DEPENDENT, TYPE=JOHNSON COOK` card ccx needs to switch it on (C = 0 if the deck has "
         "none); `HARDENING=USER` and `DATATYPE=PARAMETERS` commented (ccx would silently skip "
         "them; reduced physics: ccx 2.23 has no user hardening, and its tabulated hardening cannot "
-        "reproduce Chaboche back-stresses); `DEPENDENCIES` collapsed.",
+        "reproduce Chaboche back-stresses); `DEPENDENCIES` as on `*ELASTIC`.",
     "*CYCLIC HARDENING": "kept in tabular form after a kept `*PLASTIC, HARDENING=COMBINED` of its "
         "material; the `PARAMETERS` form (Q_inf, b) is commented out (reduced physics), and so is "
         "a card without that `*PLASTIC` (an error in ccx).",
@@ -580,8 +580,12 @@ TRANSLATED = {
         "commented (ccx would read it as E, ν); `DEPENDENCIES=n` (field variables, which ccx ignores) collapsed to the "
         "Abaqus no-field state, field = 0: the rows of that state, of the end of the table nearest "
         "0 (which Abaqus holds beyond it), or interpolated between the two states around 0 when "
-        "they share their temperatures — exact when the deck sets no field variable; otherwise "
-        "reduced physics. A linear-elastic `*ELASTIC` less anisotropic than its "
+        "they share their temperatures — exact when the deck sets no field variable. Where it sets "
+        "them (`*INITIAL CONDITIONS, TYPE=FIELD`, `*FIELD`; no user routine) the tables are "
+        "written at each element's field values, one material copy per state (`..._FIELD<k>`, "
+        "sections split by element set): exact where an element's nodes share their values all "
+        "the analysis long; reduced physics where they differ, vary through a shell or beam "
+        "section, or change in a step. A linear-elastic `*ELASTIC` less anisotropic than its "
         "material's `*EXPANSION` (isotropic beside `ORTHO`, isotropic / orthotropic / engineering "
         "constants beside `ANISO`) is written as `ENGINEERING CONSTANTS` / `ANISO` with the same "
         "stiffness, since ccx 2.23 otherwise uses a wrong stiffness in linear steps once the deck has "
@@ -613,7 +617,9 @@ TRANSLATED = {
         "turned out of an orientation's axes, or a continuum shell's own, into the global ones ccx "
         "reads (at each integration point on a cylindrical or spherical system), in ccx's component "
         "order and shear measure; `TYPE=STRESS, GEOSTATIC` computed at each integration point from "
-        "its elevation; `REBAR` and `SECTION POINTS` records and unknown types commented.",
+        "its elevation; `REBAR` and `SECTION POINTS` records and unknown types commented "
+        "(`TYPE=FIELD` and `*FIELD` without reducing anything where no card left reads field values: "
+        "see `*ELASTIC`).",
     "*CREEP": "Abaqus `LAW=STRAIN/TIME` → ccx Norton (default, time hardening — warned for "
         "strain hardening with m ≠ 0); other laws → `LAW=USER`.",
     "*AMPLITUDE": "keeps `NAME`/`TIME`/`SHIFTX`/`SHIFTY`; `SCALEX`/`SCALEY` applied to the data; "

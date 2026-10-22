@@ -5750,6 +5750,37 @@ def material_card_deck(kind, twin=False):
     return "\n".join(lines) + "\n"
 
 
+def field_material_deck(twin=False):
+    """A two-region bar (task 148, field-dependent material data): two C3D8 bricks along x,
+    their faces at x = 1 tied by equations, held at x = 0 and pulled by 1 per node at x = 2,
+    at 50 degrees.  Its material's E depends on temperature and field variable 1 (100 / 200 at
+    0 / 100 degrees for field 1, 300 / 500 for field 3), the field 1.5 on the first brick's
+    nodes and 2.5 on the second's (*INITIAL CONDITIONS, TYPE=FIELD): E 212.5 and 337.5.
+    ``twin``: the hand-written deck of two materials with those moduli."""
+    nodes = [(1, 0, 0, 0), (2, 1, 0, 0), (3, 1, 1, 0), (4, 0, 1, 0), (5, 0, 0, 1), (6, 1, 0, 1), (7, 1, 1, 1),
+             (8, 0, 1, 1), (9, 2, 0, 0), (10, 2, 1, 0), (11, 2, 0, 1), (12, 2, 1, 1), (13, 1, 0, 0),
+             (14, 1, 1, 0), (15, 1, 0, 1), (16, 1, 1, 1)]
+    lines = ["*NODE"] + [f"{n}, {x}., {y}., {z}." for n, x, y, z in nodes]
+    one, two = "1, 1, 2, 3, 4, 5, 6, 7, 8", "2, 13, 9, 10, 14, 15, 11, 12, 16"
+    lines += (["*ELEMENT, TYPE=C3D8, ELSET=L", one, "*ELEMENT, TYPE=C3D8, ELSET=R", two] if twin else
+              ["*ELEMENT, TYPE=C3D8, ELSET=BAR", one, two])
+    lines += ["*NSET, NSET=LEFTN", "1, 2, 3, 4, 5, 6, 7, 8", "*NSET, NSET=RIGHTN", "9, 10, 11, 12, 13, 14, 15, 16",
+              "*NSET, NSET=TIP", "9, 10, 11, 12"]
+    for a, b in ((2, 13), (3, 14), (6, 15), (7, 16)):
+        lines += [x for d in (1, 2, 3) for x in ("*EQUATION", "2", f"{a}, {d}, 1., {b}, {d}, -1.")]
+    if twin:
+        lines += ["*SOLID SECTION, ELSET=L, MATERIAL=ML", "*SOLID SECTION, ELSET=R, MATERIAL=MR",
+                  "*MATERIAL, NAME=ML", "*ELASTIC", "212.5, 0.3", "*MATERIAL, NAME=MR", "*ELASTIC", "337.5, 0.3"]
+    else:
+        lines += ["*SOLID SECTION, ELSET=BAR, MATERIAL=M", "*MATERIAL, NAME=M", "*ELASTIC, DEPENDENCIES=1",
+                  "100., 0.3, 0., 1.", "200., 0.3, 100., 1.", "300., 0.3, 0., 3.", "500., 0.3, 100., 3.",
+                  "*INITIAL CONDITIONS, TYPE=FIELD, VARIABLE=1", "LEFTN, 1.5", "RIGHTN, 2.5"]
+    lines += ["*INITIAL CONDITIONS, TYPE=TEMPERATURE", "LEFTN, 50.", "RIGHTN, 50.", "*BOUNDARY", "1, 1, 3",
+              "4, 1, 1", "4, 3, 3", "5, 1, 2", "8, 1, 1", "*STEP", "*STATIC", "*CLOAD", "TIP, 1, 1.",
+              "*NODE PRINT, NSET=RIGHTN", "U", "*END STEP"]
+    return "\n".join(lines) + "\n"
+
+
 ROTATED_INSTANCES ={"I0": None, "I1": ((0., 3., 0.), (1., 3., 0.), 90.),
                      "I2": ((0., 0., 6.), (1., 2., 9.), 40.)}
 
@@ -14118,6 +14149,20 @@ def main():
               f"material on its far face): far-face temperature at t = 0.2 {got[0]:.6g} as the "
               f"C3D8T cube's alone ({want[0]:.6g}, {err:.1e} apart; it was 20.93: the C3D8 cube "
               f"conducted and stored heat)")
+    failures += 0 if ok else 1
+    # task 148: material data that depend on a field variable, at each element's field values
+    res = [review_run(field_material_deck(twin), "field_material" + ("_ref" if twin else ""), dat_displacements)
+           for twin in (False, True)]
+    ok = all(res) and len(res[0]) == len(res[1]) == 8
+    if ok:
+        end = max(abs(x) for v in res[1].values() for x in v)
+        err = ccx_ratio(max(abs(x - y) for n in res[1] for x, y in zip(res[0].get(n, [math.inf] * 3), res[1][n])),
+                        end)
+        ok = err < 1e-6 and end > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  field_material (a two-brick bar pulled at 50 degrees, E "
+              f"depending on temperature and field variable 1, the field 1.5 / 2.5 on the two bricks' "
+              f"nodes): solved, its right brick's displacements as the hand-written two-material deck's "
+              f"(E 212.5 / 337.5; {err:.1e} of max |u| {end:.4g} apart; the field-0 collapse gave both E 150)")
     failures += 0 if ok else 1
     # a part's equation, partial kinematic couplings and SPRING1 / SPRING2 in rotated instances:
     # Abaqus turns them with the instance, so each one's displacements are R u(unturned

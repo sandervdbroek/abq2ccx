@@ -114,7 +114,9 @@ converter comments `*TEMPERATURE` out there.
   [user guide](user-guide.md#--abaqus-umat) has the fix.
 * **Field-variable dependence is gone.** ccx ignores `DEPENDENCIES=`; the converter keeps
   the Abaqus no-field state (field = 0): exact (a note) when the deck sets no field variable
-  and the table gives that state, reduced physics (warned) otherwise.
+  and the table gives that state. Field values the deck sets give one material copy per
+  element state (`..._FIELD<k>`); warned as reduced physics where an element's nodes differ
+  or a step changes them, and where user code sets them.
 * **A rigid body ignores rotations at its reference point.** ccx carries a `*RIGID BODY`'s
   rotation on a separate `ROT NODE`; the converter adds one and moves the reference point's
   rotational BCs and moments to it. Read reaction moments there.

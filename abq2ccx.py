@@ -2247,6 +2247,144 @@ def material_rows(block: Block, nvals: int) -> Optional[List[List[str]]]:
     return rows
 
 
+# a row of a field-dependent material table (field_table_at): its property values as written,
+# then its independent variables, each (value, token as written)
+FieldRow = Tuple[Tuple[str, ...], Tuple[Tuple[float, str], ...]]
+
+
+def field_card_layout(block: Block) -> Optional[Tuple[int, int]]:
+    """(property values, independent variables before the field variables) of a row of
+    material card ``block``: the temperature, after a hardening curve's plastic strain.  None
+    for a card whose rows field_table_at does not know."""
+    kw = block.keyword
+    typ = " ".join((block.param("TYPE") or "ISO").split()).upper()
+    if kw == "ELASTIC":
+        n = {"ISO": 2, "ISOTROPIC": 2, "ORTHO": 9, "ORTHOTROPIC": 9, "ENGINEERING CONSTANTS": 9,
+             "ANISO": 21, "ANISOTROPIC": 21, "LAMINA": 6, "TRACTION": 3, "SHEAR": 1}.get(typ)
+        return (n, 1) if n else None
+    if kw == "PLASTIC":
+        hard = block.uparam("HARDENING") or "ISOTROPIC"
+        ok = hard in ("ISOTROPIC", "KINEMATIC") or \
+            (hard == "COMBINED" and block.uparam("DATATYPE") in ("", "HALF CYCLE"))
+        return (1, 2) if ok else None
+    if kw == "MOHR COULOMB HARDENING":
+        return 1, 2
+    if kw in ("DENSITY", "SPECIFIC HEAT"):
+        return 1, 1
+    if kw == "MOHR COULOMB":
+        return 2, 1
+    if kw in ("CONDUCTIVITY", "EXPANSION") and not block.has("USER"):
+        n = {"ISO": 1, "ISOTROPIC": 1, "ORTHO": 3, "ORTHOTROPIC": 3, "ANISO": 6,
+             "ANISOTROPIC": 6}.get(typ)
+        return (n, 1) if n else None
+    if kw == "CREEP" and (block.uparam("LAW") or "STRAIN") in ("STRAIN", "TIME"):
+        return 3, 1
+    if kw in ("HYPERELASTIC", "HYPERFOAM"):
+        n = hyper_values(block)
+        return (n, 1) if n else None
+    return None
+
+
+def _field_slice(rows: List[FieldRow], t: float) -> Optional[List[FieldRow]]:
+    """Table ``rows`` at its last independent variable = ``t``, as a table of the others:
+    its rows come in blocks, each at one value of that variable, in increasing order, and
+    Abaqus interpolates linearly between the two blocks around ``t`` and holds an end block
+    beyond them.  None where the blocks do not increase."""
+    blocks: List[Tuple[float, List[FieldRow]]] = []
+    for vals, xs in rows:
+        x = xs[-1][0]
+        if blocks and blocks[-1][0] == x:
+            blocks[-1][1].append((vals, xs[:-1]))
+        elif blocks and x < blocks[-1][0]:
+            return None
+        else:
+            blocks.append((x, [(vals, xs[:-1])]))
+    if not blocks:
+        return None
+    if t <= blocks[0][0]:
+        return blocks[0][1]
+    for (a, lo), (c, hi) in zip(blocks, blocks[1:]):
+        if t < c:
+            return _field_mix(lo, hi, (t - a) / (c - a))
+    return blocks[-1][1]
+
+
+def _field_mix(a: List[FieldRow], b: List[FieldRow], w: float) -> Optional[List[FieldRow]]:
+    """(1 - w) a + w b of two tables of the same independent variables, as one table that
+    Abaqus' interpolation (_field_slice, variable by variable) reads exactly as that mix:
+    given at the union of the two tables' values of the last variable (a table with one
+    value there is constant in it), with the tables at each of them mixed the same way.
+    None where that cannot be done (blocks that do not increase, two rows at one point)."""
+    if w == 0.0:
+        return a
+    if w == 1.0:
+        return b
+    if not a[0][1]:
+        if len(a) != 1 or len(b) != 1:
+            return None
+        return [(tuple(x if x == y else "" if not (x or y) else
+                       short_real((1.0 - w) * (pf(x) if x else 0.0) + w * (pf(y) if y else 0.0), 12)
+                       for x, y in zip(a[0][0], b[0][0])), ())]
+    pts: Dict[float, Tuple[float, str]] = {}
+    for t in (a, b):
+        at = {xs[-1][0]: xs[-1] for _v, xs in t}
+        if len(at) > 1:
+            for x, tok in at.items():
+                pts.setdefault(x, tok)
+    if not pts:
+        mixed = _field_mix([(v, xs[:-1]) for v, xs in a], [(v, xs[:-1]) for v, xs in b], w)
+        return None if mixed is None else [(v, xs + (a[0][1][-1],)) for v, xs in mixed]
+    out: List[FieldRow] = []
+    for u in sorted(pts):
+        sa, sb = _field_slice(a, u), _field_slice(b, u)
+        mixed = None if sa is None or sb is None else _field_mix(sa, sb, w)
+        if mixed is None:
+            return None
+        out += [(v, xs + (pts[u],)) for v, xs in mixed]
+    return out
+
+
+def field_table_at(block: Block, target: Sequence[float]) -> Optional[List[str]]:
+    """The data lines of material card ``block`` (DEPENDENCIES=n) at the field values
+    ``target`` (one per variable), for the card without DEPENDENCIES: Abaqus' interpolation
+    (Material data definition: linear in each independent variable between the values
+    given, constant beyond them, the first variable varying fastest), done variable by
+    variable from the last, exact over the variables left (_field_mix).  None where the
+    card's rows are not known (field_card_layout) or do not read."""
+    layout = field_card_layout(block)
+    try:
+        ndep = int(float(block.param("DEPENDENCIES") or "0"))
+    except ValueError:
+        return None
+    if layout is None or not 0 < ndep <= len(target):
+        return None
+    nvals, nind = layout
+    recs = material_rows(block, nvals + nind - 1)
+    if not recs:
+        return None
+    try:
+        rows: Optional[List[FieldRow]] = [
+            (tuple(r[:nvals]), tuple((pf(x) if x else 0.0, x) for x in r[nvals:nvals + nind + ndep]))
+            for r in recs]
+        for j in range(ndep - 1, -1, -1):
+            rows = _field_slice(rows, target[j]) if rows else None
+    except ValueError:
+        return None
+    if not rows:
+        return None
+    # a row keeps its lines: trailing blanks go, not the last line (a blank value is 0)
+    last = 8 * ((nvals + nind - 1) // 8)
+    data: List[str] = []
+    for vals, xs in rows:
+        entries = list(vals) + [tok for _x, tok in xs]
+        while len(entries) > last + 1 and entries[-1] == "":
+            entries.pop()
+        if not any(entries[last:]):
+            entries[last] = "0."
+        data += [", ".join(entries[k:k + 8]) for k in range(0, len(entries), 8)]
+    return data
+
+
 def hyper_values(block: Block) -> Optional[int]:
     """The coefficients per row of a *HYPERELASTIC / *HYPERFOAM card of order N (default 1),
     or None (test data, MARLOW, USER: no coefficients ccx reads)."""
@@ -20093,6 +20231,273 @@ class _Materials:
             self._reduces("*FRICTION table reduced to one coefficient")
         return ["*FRICTION", f"{short_real(mu, 12)},"]
 
+    # _plan_field_materials: a warning above this many states of one material, and no copies
+    # at all above FIELD_COPY_MAX in the deck
+    FIELD_COPY_WARN = 100
+    FIELD_COPY_MAX = 10000
+
+    def _plan_field_materials(self, blocks: List[Block]) -> None:
+        """Material data that depend on field variables (DEPENDENCIES=n), which ccx lacks,
+        written at each element's field values.  Abaqus gives the nodes field values
+        (*INITIAL CONDITIONS, TYPE=FIELD; 0 where none is given; a *FIELD in a step holds in
+        the general steps after it, OP=NEW returning the nodes it leaves out to their initial
+        values) and interpolates them to the material points (Predefined Fields), so where
+        every node of an element has the same values all the analysis long, its material is
+        the deck's tables at those values (field_table_at): exact.  One material per distinct
+        state of its elements: the material itself at the first, a copy {material}_FIELD<k>
+        (_material_copy) at each other, and a section whose elements differ split into an
+        element set per state ({elset}_FIELD<k>, its sub-options copied with it).  Reduced,
+        and warned, where an element's nodes differ (their mean is used), a shell's or beam's
+        values vary through the section (the first value given is used), or a step changes
+        them (the values in force at the end of step 1 are used; a *FIELD applied at once at
+        the start of step 1, a STEP amplitude, holds all along).  Left to
+        _collapse_dependencies where user code sets field values (USDFLD; *FIELD / TYPE=FIELD
+        by a user routine or from a results file), for a user material, a card whose rows are
+        not known (field_card_layout) and above FIELD_COPY_MAX copies.  ``_fields_absorbed``:
+        nothing the conversion leaves reads field values (no other card with DEPENDENCIES, no
+        user material or element), so the cards that set them change nothing in ccx."""
+        self._fields_absorbed = False
+        setters = [b for b in blocks if b.keyword == "FIELD" or
+                   (b.keyword == "INITIAL CONDITIONS" and b.uparam("TYPE") == "FIELD")]
+        if not setters or any(b.keyword == "USER DEFINED FIELD" for b in blocks) or any(
+                b.has(k) for b in setters for k in ("USER", "FILE", "OUTPUT VARIABLE", "NUMBER")):
+            return
+        zero: Tuple[float, Tuple[float, ...]] = (0.0, ())
+
+        def values(b: Block) -> List[Tuple[Tuple[int, int], Tuple[float, Tuple[float, ...]]]]:
+            """((variable, node), (value, the values after it)) of a card's lines."""
+            var = int(float(b.param("VARIABLE") or "1"))
+            out = []
+            for rec in merged_data_records(b):
+                if rec and rec[0]:
+                    vals = [pf(x) if x else 0.0 for x in rec[1:]] or [0.0]
+                    out += [((var, n), (vals[0], tuple(vals[1:]))) for n in self._resolve_nodes(rec[0])]
+            return out
+
+        try:
+            init = dict(kv for b in setters if b.keyword == "INITIAL CONDITIONS" for kv in values(b))
+            state, during = dict(init), None
+            changed: Dict[Tuple[int, int], int] = {}        # (variable, node) -> the first step changing it
+            for step in self.steps:
+                cards = [c for c in step.cards if c.keyword == "FIELD"]
+                # (OP=NEW in a perturbation step: the fields it leaves out are 0, *FIELD keywords)
+                new = (({} if step.perturbation else dict(init))
+                       if any(c.uparam("OP") == "NEW" for c in cards) else dict(state))
+                amp: set = set()
+                for c in cards:
+                    for key, v in values(c):
+                        new[key] = v
+                        if c.has("AMPLITUDE"):
+                            amp.add(key)
+                at_once = step.no == 1 and not step.perturbation and step.defaults.get("ACCELERATION") == "STEP"
+                for key in set(new) | set(state):
+                    a, c = state.get(key, zero), new.get(key, zero)
+                    if (key in amp and (a != zero or c != zero)) or (a != c and not at_once):
+                        changed.setdefault(key, step.no)
+                if not step.perturbation:
+                    state = new
+                if during is None:
+                    during = state
+        except ValueError:
+            return
+        during = init if during is None else during
+        opts = self._material_options(blocks)
+        deps: "OrderedDict[str, List[Block]]" = OrderedDict(
+            (m, [c for c in g[1:] if has_field_dependence(c)]) for m, g in opts.items())
+        deps = OrderedDict((m, cs) for m, cs in deps.items() if cs)
+        ndeps: Dict[str, int] = {}
+        for m, cs in deps.items():
+            try:
+                n = max(int(float(c.param("DEPENDENCIES") or "0")) for c in cs)
+            except ValueError:
+                continue
+            if n > 0 and not any(c.keyword == "USER MATERIAL" for c in opts[m]):
+                ndeps[m] = n
+        # each section of such a material: its elements by state (the materials' field values)
+        els, nodes = self.geom.elements, self.geom.nodes
+        sections: List[Tuple[Block, List[str], "OrderedDict[Tuple[float, ...], List[int]]"]] = []
+        used: set = set()
+        varies: Dict[str, int] = {}             # material -> its elements whose nodes differ
+        through: Dict[str, int] = {}            # ... that vary through the section
+        moving: Dict[str, int] = {}             # ... that a step changes
+        first_change: Dict[str, int] = {}       # material -> the first step changing its elements
+        for b in blocks:
+            if not b.keyword.endswith("SECTION") or not b.param("ELSET"):
+                continue
+            mats = dedup([m.upper() for _t, m, _o in self._section_layers(b, strict=True) if m])
+            used.update(mats)
+            mats = [m for m in mats if m in ndeps]
+            if not mats:
+                continue
+            elset = (b.param("ELSET") or "").strip()
+            layered = b.keyword in ("SHELL SECTION", "BEAM SECTION") and \
+                not self._continuum_shell_elset(elset)
+            gradients = b.uparam("TEMPERATURE") in ("", "GRADIENTS")
+            groups: "OrderedDict[Tuple[float, ...], List[int]]" = OrderedDict()
+            for e in dedup(self._existing(elset)):
+                conn = [x for x in els[e][1] if x in nodes]
+                key: List[float] = []
+                odd = layer = False
+                steps: List[int] = []
+                for j in range(1, max(ndeps[m] for m in mats) + 1):
+                    vs = [during.get((j, x), zero) for x in conn] or [zero]
+                    first = [v for v, _x in vs]
+                    odd = odd or max(first) != min(first)
+                    layer = layer or (layered and any(x != (0.0 if gradients else v)
+                                                      for v, xs in vs for x in xs))
+                    steps += [changed[(j, x)] for x in conn if (j, x) in changed]
+                    key.append(first[0] if max(first) == min(first) else
+                               float(f"{sum(first) / len(first):.12g}"))
+                groups.setdefault(tuple(key), []).append(e)
+                for m in mats:
+                    for flagged, by in ((odd, varies), (layer, through), (steps, moving)):
+                        if flagged:
+                            by[m] = by.get(m, 0) + 1
+                    if steps:
+                        first_change[m] = min(steps + [first_change.get(m, steps[0])])
+            if groups:
+                sections.append((b, mats, groups))
+        # each material's states, in deck order, and its cards' rows at each
+        states: "OrderedDict[str, OrderedDict[Tuple[float, ...], None]]" = OrderedDict()
+        for _b, mats, groups in sections:
+            for key in groups:
+                for m in mats:
+                    states.setdefault(m, OrderedDict())[key[:ndeps[m]]] = None
+        rows: Dict[Tuple[str, Tuple[float, ...]], Dict[int, List[str]]] = {}
+        for m in list(states):
+            done: Dict[int, Dict[Tuple[float, ...], List[str]]] = {}
+            for c in deps[m]:
+                got = {t: field_table_at(c, t) for t in states[m]}
+                if all(v is not None for v in got.values()):
+                    done[id(c)] = got           # (the others: _collapse_dependencies)
+            if not done:
+                del states[m]
+                continue
+            for t in states[m]:
+                rows[(m, t)] = {i: got[t] for i, got in done.items()}
+        copies = sum(len(ts) - 1 for ts in states.values())
+        if copies > self.FIELD_COPY_MAX:
+            self.report.warn(f"Field-dependent material data: the elements' field values make "
+                             f"{copies} distinct states, above the {self.FIELD_COPY_MAX} material "
+                             f"copies the converter writes, so the tables are collapsed to one state "
+                             f"instead (see the next warnings). Group the field values to fewer "
+                             f"states.", once=True)
+            return
+        mine = {id(c) for cs in deps.values() for c in cs}
+        self._fields_absorbed = \
+            not any((has_field_dependence(b) and id(b) not in mine) or
+                    b.keyword in ("USER MATERIAL", "USER ELEMENT") for b in blocks) \
+            and all(m in states and len(rows[(m, next(iter(states[m])))]) == len(deps[m])
+                    for m in deps if m in used) \
+            and not (changed and any(b.keyword == "EXPANSION" and b.has("FIELD") for b in blocks))
+        if not states:
+            return
+        # the copies, after their material in deck order, then the material itself at its first state
+        self._reserve_names()
+        taken = set(opts) | {n.upper() for n in list(self.geom.elsets) + list(self.geom.nsets)}
+        names: Dict[Tuple[str, Tuple[float, ...]], str] = {}
+        for m, ts in states.items():
+            for k, t in enumerate(ts, 1):
+                names[(m, t)] = (opts[m][0].param("NAME") or "").strip() if k == 1 else \
+                    self._fresh_name(f"{m}_FIELD{k}", taken)
+
+        def put(cards: Sequence[Block], m: str, t: Tuple[float, ...]) -> None:
+            for c, orig in zip(cards, opts[m]):
+                if id(orig) in rows[(m, t)]:
+                    c.params.pop("DEPENDENCIES", None)
+                    c.data[:] = rows[(m, t)][id(orig)]
+
+        for m, ts in states.items():
+            for t in list(ts)[:0:-1]:
+                put(self._material_copy(blocks, opts[m], names[(m, t)], set(), ()), m, t)
+            put(opts[m], m, next(iter(ts)))
+
+        def rename(sec: Block, mats: List[str], key: Tuple[float, ...]) -> None:
+            new = {m: names[(m, key[:ndeps[m]])] for m in mats}
+            if sec.has("COMPOSITE"):
+                self._rename_ply_materials(sec, new)
+            elif (sec.param("MATERIAL") or "").strip().upper() in new:
+                sec.params["MATERIAL"] = new[(sec.param("MATERIAL") or "").strip().upper()]
+
+        split = []
+        for b, mats, groups in sections:
+            if len(groups) == 1:
+                rename(b, mats, next(iter(groups)))
+                continue
+            at = next(i for i, x in enumerate(blocks) if x is b)
+            end = at + 1
+            while end < len(blocks) and blocks[end].keyword in SECTION_OPTION_KW:
+                end += 1
+            elset = (b.param("ELSET") or "").strip()
+            out: List[Block] = []
+            for k, (key, members) in enumerate(groups.items(), 1):
+                gname = self._fresh_name(f"{elset}_FIELD{k}")
+                self.geom.elsets[gname] = members
+                sec = Block(b.keyword, OrderedDict(b.params), list(b.data))
+                sec.params["ELSET"] = gname
+                rename(sec, mats, key)
+                out += [sec] + [Block(x.keyword, OrderedDict(x.params), list(x.data)) for x in blocks[at + 1:end]]
+            blocks[at:end] = out
+            split.append(elset)
+
+        def state(t: Tuple[float, ...]) -> str:
+            return ", ".join(f"{x:g}" for x in t)
+
+        for m, ts in states.items():
+            kinds = dedup(f"*{c.keyword}" for c in deps[m] if id(c) in rows[(m, next(iter(ts)))])
+            exact = m not in varies and m not in through and m not in moving
+            listed = "; ".join(f"{names[(m, t)]} at {state(t)}" for t in list(ts)[:6]) + \
+                (f"; ... ({len(ts)} in all)" if len(ts) > 6 else "")
+            fvs = f"variables 1-{ndeps[m]}" if ndeps[m] > 1 else "variable 1"
+            self.report.note(f"Material {names[(m, next(iter(ts)))]}: its field-variable dependence "
+                             f"({', '.join(kinds)}, DEPENDENCIES=; ccx has none) written at the field "
+                             f"values of its elements, one material per state (field {fvs}): {listed}."
+                             + (" Exact: those values hold at every node of its elements all the "
+                                "analysis long." if exact else ""), once=True)
+            if len(ts) > self.FIELD_COPY_WARN:
+                self.report.warn(f"Material {names[(m, next(iter(ts)))]}: {len(ts)} states of its "
+                                 f"field-dependent data, one material copy each (above "
+                                 f"{self.FIELD_COPY_WARN}); the ccx deck grows with them. Group the "
+                                 f"field values to fewer states where that is close enough.", once=True)
+        if split:
+            self.report.note(f"Section(s) of element set(s) {', '.join(split[:5])}"
+                             f"{' ...' if len(split) > 5 else ''} split into one element set "
+                             f"(..._FIELD<k>) and section per field state of their elements, each "
+                             f"with its material's copy at that state.", once=True)
+        for what, by, why in (
+                ("whose nodes have different field values", varies,
+                 "Abaqus interpolates the nodal values to each material point; ccx gets one material "
+                 "per element, at the mean of its nodes' values"),
+                ("whose field values vary through the shell or beam section (gradients or points "
+                 "given)", through, "ccx gets one material per element, at the first value given"),
+                ("whose field values a *FIELD changes in a step", moving,
+                 "ccx's materials hold one state all the analysis long, written at the values in "
+                 "force at the end of step 1")):
+            if by:
+                mats = ", ".join(f"{names[(m, next(iter(states[m])))]} ({n} element(s)"
+                                 + (f", from step {first_change[m]}" if by is moving else "") + ")"
+                                 for m, n in list(by.items())[:5] if m in states)
+                if not mats:
+                    continue
+                self.report.warn(f"Field-dependent material data on elements {what}: {mats}. {why}, "
+                                 f"so its properties differ from Abaqus'.", once=True)
+                self._reduces(f"field-dependent material data on elements {what.split(' (')[0]}")
+
+    def _field_setter_absorbed(self, b: Block, card: str) -> Optional[List[str]]:
+        """A card setting field values (``card``: *FIELD, *INITIAL CONDITIONS, TYPE=FIELD)
+        commented out without reducing anything where nothing in the ccx deck reads field
+        values (_plan_field_materials); None otherwise (ccx has no field variables: the card
+        is commented out as reduced physics)."""
+        if not self._fields_absorbed:
+            return None
+        return self._commented(b, f"{card}: ccx has no field variables, and nothing in the converted "
+                                  f"deck reads them: field-dependent material data are written at "
+                                  f"each element's values (material copies ..._FIELD<k>). Commented "
+                                  f"out.", reduces=False)
+
+    def handle_field(self, b: Block) -> List[str]:
+        return self._field_setter_absorbed(b, "*FIELD") or self.passthrough(b)
+
     def _plan_heatless_materials(self, blocks: List[Block]) -> None:
         """In a thermal step (CCX_THERMAL_PROCS) ccx 2.23 gives every element temperature DOFs,
         an expanded beam's or shell's nodes too, and stops on a singular matrix (exit 255, no
@@ -35652,6 +36057,8 @@ class _Loads:
         typ = b.uparam("TYPE")
         ccx_known = {"DISPLACEMENT", "FLUID VELOCITY", "MASS FLOW", "PLASTIC STRAIN", "PRESSURE",
                      "SOLUTION", "STRESS", "TEMPERATURE", "TOTAL PRESSURE", "VELOCITY"}
+        if typ == "FIELD" and self._fields_absorbed:
+            return self._field_setter_absorbed(b, "*INITIAL CONDITIONS, TYPE=FIELD") or []
         if typ and typ not in ccx_known:
             # e.g. TYPE=ENRICHMENT (XFEM/VCCT), HARDENING, FIELD, RATIO — ccx stops with
             # "unknown type"; comment the card out with the reason instead
@@ -40520,6 +40927,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._n_inactive_rot_truss = 0
         self._depvar_counts: set = set()
         self._fields_set = False
+        self._fields_absorbed = False           # _plan_field_materials
         self.steps: Optional[StepModel] = None     # the deck's steps (_plan_deck_facts, _read_steps)
         self.emit = EmitState()                     # what the emission has written so far
         self._synth_counter = 0
@@ -41170,6 +41578,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "DISTRIBUTING COUPLING": "handle_distributing_coupling",
         "SURFACE INTERACTION": "handle_surface_interaction",
         "INITIAL CONDITIONS": "handle_initial_conditions",
+        "FIELD": "handle_field",
         "TEMPERATURE": "handle_temperature",
         "FILM": "handle_flux_film",
         "DFLUX": "handle_flux_film",
@@ -41438,7 +41847,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_degenerate_elements()
         self._check_sections(blocks)            # the deck's own mesh: before any planner retypes it
         self._check_numeric_data(blocks)
-        self._plan_heatless_materials(blocks)   # before the planners that copy materials
+        self._plan_field_materials(blocks)      # before the planners that copy materials
+        self._plan_heatless_materials(blocks)   # likewise
         self._plan_massless_materials(blocks)   # likewise
         blocks = self._plan_general_contact(blocks)     # before the surface and rigid planners
         self._drop_surface_elements(raw, blocks)

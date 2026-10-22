@@ -18,6 +18,17 @@ physics.
   the report, the converted deck's header and `--json` (`location` in each of `entries`, null
   for an entry about no one card). Lines count through `*INCLUDE` and `*PARAMETER`, and a card
   the converter makes from another (an instance's copy of its part's cards) points to that card.
+* **Field-dependent material data at each element's field values** — material cards with
+  `DEPENDENCIES=n` were collapsed to field 0, and `*INITIAL CONDITIONS, TYPE=FIELD` / `*FIELD`
+  commented out as reduced physics, since ccx has no field variables. Where the deck sets the
+  values itself, each material's tables are now interpolated at its elements' values as
+  Abaqus does (linear in each variable, the last first, held beyond the table; temperature
+  and hardening columns kept exactly), one material copy per distinct state
+  (`{material}_FIELD<k>`), each section split by element set. Exact where every node of an
+  element has the same values all the analysis long (a `*FIELD` applied at once at the start
+  of step 1 included); warned as reduced physics where the nodes differ (their mean), a shell
+  or beam section varies through its thickness, or a step changes the values (those at the
+  end of step 1). User-set fields (USDFLD, `*FIELD, USER`, `FILE=`) keep the field-0 collapse.
 * **Batch triage, crash reports, ccx install hint** — `--json` prints one object per deck per
   line (JSON Lines), now with the deck's `status` (`converted`, `reduced`, `commented` or
   `failed`) and `reduced_physics`, and a line with `error` for a deck that failed (none was
