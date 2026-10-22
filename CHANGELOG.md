@@ -33,6 +33,18 @@ physics.
   small-strain implicit step where its nodes can move across its line (ccx damps along the
   current line). No longer flagged: a knot whose rotations BCs hold at zero in a step ccx runs
   nonlinearly without NLGEOM.
+* **Contact property tables in ccx's meaning** — ccx reads three cards' tables otherwise than
+  Abaqus, and they passed through. A `*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR` curve gets
+  a point far out on its last slope: Abaqus continues it there, ccx held the last pressure (two
+  pressed cubes: 100 for Abaqus' 294.1). `EXPONENTIAL` becomes Abaqus' curve as a TABULAR one
+  (within 0.2 %): ccx's c0 is where the pressure is 1 % of p0, never zero (466.2 for Abaqus'
+  431.4). A `*GAP CONDUCTANCE` table against clearance becomes its closed-gap value for every
+  pressure, as Abaqus keeps it in contact: ccx read it against pressure (no heat flow across the
+  pressed cubes for Abaqus' 49.75); beside a `PRESSURE` card it is left out. ccx 2.23's
+  face-to-face contact reads no TABULAR table (no contact force): a straight line through the
+  origin becomes `LINEAR` there, other curves and `EXPONENTIAL` there are reduced physics. So
+  are conduction across open gaps, which ccx does not model, and a `PRESSURE` conductance table
+  on a node-to-surface pair, which ccx 2.23 reads at a pressure of its own.
 * **Explicit mass scaling on part of the model** — `*FIXED MASS SCALING, FACTOR=f, ELSET=...`
   on part of the model (a local factor overriding the global one) was dropped (ccx ran the true
   mass); each section whose elements share a factor now gets a copy of its materials with the

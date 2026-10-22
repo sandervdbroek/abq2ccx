@@ -76,7 +76,9 @@ beam, buckling and statics references above; *EL FILE requests ccx stopped or cr
 (ENER beside U1 beams, SDV where ccx has no nodal state variables) against beam theory, 100 / E
 and the same decks without them; *EL PRINT ELKE in a linear static and a *BUCKLE step against
 u0 cos 100 t and the same deck without it, and after a *FREQUENCY step against A cos 100 t and
-u0; *CONTACT PRINT CFN for every pair against a rigid punch's reaction; and decks a code review
+u0; *CONTACT PRINT CFN for every pair against a rigid punch's reaction; TABULAR and
+EXPONENTIAL pressure-overclosure laws and *GAP CONDUCTANCE against clearance on two pressed
+cubes against Abaqus' laws; and decks a code review
 found converted wrongly:
 a planar beam's coupled tip, a velocity BC a coupling implies, amplitude points 1e-4 apart at
 time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank Poisson's ratio,
@@ -4311,6 +4313,37 @@ def after_pert_model(plastic=False):
     """after_pert_deck's column model alone (``plastic``: with its *PLASTIC, yield 1e3)."""
     text = after_pert_deck("modal", not plastic)
     return text[:text.index("*STEP")]
+
+
+def pressed_cubes_deck(inter, pair="", thermal=False, push=0.03):
+    """Two unit cubes (E 1e6, nu 0, conductivity 1) stacked in contact through interaction
+    ``inter`` (its cards), the lower one's bottom held, the upper one's top pressed down by
+    ``push`` (NLGEOM static), ``thermal``: in a steady coupled step, the bottom at 0 and the
+    top at 100; the top's total force and heat flux printed."""
+    nodes = "".join(f"{1 + 4 * k + j}, {x}., {y}., {z}\n" for k, z in enumerate((0., 1., 1., 2.))
+                    for j, (x, y) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1))))
+    typ = "C3D8T" if thermal else "C3D8"
+    proc = "*COUPLED TEMPERATURE-DISPLACEMENT, STEADY STATE" if thermal else "*STATIC"
+    return (f"*NODE, NSET=NALL\n{nodes}*ELEMENT, TYPE={typ}, ELSET=LOW\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            f"*ELEMENT, TYPE={typ}, ELSET=UP\n2, 9, 10, 11, 12, 13, 14, 15, 16\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n1e6, 0.\n*CONDUCTIVITY\n1.\n*SOLID SECTION, ELSET=LOW, MATERIAL=M\n"
+            "*SOLID SECTION, ELSET=UP, MATERIAL=M\n*NSET, NSET=BOT\n1, 2, 3, 4\n*NSET, NSET=TOP\n"
+            "13, 14, 15, 16\n*SURFACE, NAME=LTOP\nLOW, S2\n*SURFACE, NAME=UBOT\nUP, S1\n"
+            f"*SURFACE INTERACTION, NAME=SI\n{inter}*CONTACT PAIR, INTERACTION=SI{pair}\nUBOT, LTOP\n"
+            f"*BOUNDARY\nBOT, 1, 3\nNALL, 1, 2\n{'BOT, 11, 11, 0.' * thermal}\n"
+            f"*STEP, NLGEOM, INC=200\n{proc}\n0.05, 1.\n*BOUNDARY\nTOP, 3, 3, {-push}\n"
+            f"{'TOP, 11, 11, 100.' * thermal}\n*NODE PRINT, NSET=TOP, TOTALS=ONLY\n"
+            f"RF{', RFL' * thermal}\n*END STEP\n").replace("\n\n", "\n")
+
+
+def pressed_cubes_force(law, push):
+    """The force pressing pressed_cubes_deck's cubes together by ``push`` with contact pressure
+    law ``law(h)`` (h the overclosure): h + 2 p / E = push."""
+    lo, hi = -1.0, push
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if mid + 2.0 * law(mid) / 1e6 < push else (lo, mid)
+    return law(lo)
 
 
 def plastic_contact_deck(case, twin=False):
@@ -14585,6 +14618,56 @@ def main():
                   f"with *BOUNDARY, FIXED in a static perturbation step): as without the FIXED card, the "
                   f"base BC holding it ({err:.1e} apart; the step moves the model {moved:.4g}; before: "
                   f"{'the global component' if kind == 'sp_tr' else 'twice the base value'})")
+        failures += 0 if ok else 1
+
+    # --- contact property tables ccx reads otherwise than Abaqus -------------------------------
+    # two pressed unit cubes: the force (unit area: the pressure) against Abaqus' law, the heat
+    # flux against 100 / (2 + 1 / k) with Abaqus' conductance k
+    def cubes_totals(dat):
+        f, q = dat_history(dat, "total force", "TOP"), dat_history(dat, "total heat", "TOP")
+        return f and (-f[-1][1][0][2], q[-1][1][0][0] if q else None)
+    tab = "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR\n0., 0.\n100., 0.01\n"
+    hard = "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD\n"
+    clearance = "*GAP CONDUCTANCE\n100., 0.\n0., 0.01\n"
+
+    def abq_exponential(h, c0=2e-4, p0=100.0):
+        u = 1.0 + h / c0
+        return p0 / (math.e - 1.0) * u * math.expm1(u) if u > 0.0 else 0.0
+    for tag, inter, pair, push, want, what, before in (
+            ("contact_tabular_end", tab, "", 0.03,
+             lambda f: (pressed_cubes_force(lambda h: max(0.0, 1e4 * h), 0.03), None),
+             "TABULAR (0, 0), (100, 0.01), node-to-surface, pressed past its last point",
+             "100: ccx holds the last pressure"),
+            ("contact_tabular_s2s", tab, ", TYPE=SURFACE TO SURFACE", 0.03,
+             lambda f: (pressed_cubes_force(lambda h: max(0.0, 1e4 * h), 0.03), None),
+             "the same TABULAR law on a face-to-face pair, written as LINEAR",
+             "0: ccx 2.23's face-to-face contact reads no TABULAR table"),
+            ("contact_exponential", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL\n2e-4, 100.\n",
+             "", 1e-3, lambda f: (pressed_cubes_force(abq_exponential, 1e-3), None),
+             "EXPONENTIAL c0 2e-4, p0 100, node-to-surface",
+             "466.2: ccx's own exponential law"),
+            ("gap_conductance_clearance", hard + clearance, "", 1e-3,
+             lambda f: (None, 100.0 / (2.0 + 1.0 / 100.0)),
+             "*GAP CONDUCTANCE (100, 0), (0, 0.01) against clearance, closed at a pressure "
+             "near 500", "0: ccx read it against pressure"),
+            ("gap_conductance_beside_pressure",
+             hard + "*GAP CONDUCTANCE, PRESSURE\n50., 0.\n150., 1000.\n" + clearance,
+             ", TYPE=SURFACE TO SURFACE", 1e-3,
+             lambda f: (None, 100.0 / (2.0 + 1.0 / (50.0 + 0.1 * f))),
+             "a clearance *GAP CONDUCTANCE after a PRESSURE one, face-to-face",
+             "0: ccx read the later card against pressure")):
+        res = review_run(pressed_cubes_deck(inter, pair, tag.startswith("gap"), push), tag, cubes_totals)
+        (f, q), (f0, q0) = res or (0.0, None), want(res[0] if res else 0.0)
+        got, ref = (q, q0) if f0 is None else (f, f0)
+        ok = got is not None
+        if ok:
+            err = abs(ccx_ratio(got, ref) - 1)
+            ok = err < (3e-3 if "exponential" in tag else 1e-4) and f > 1.0
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): "
+                  f"{'heat flux' if f0 is None else 'contact force'} {got:.7g} vs {ref:.7g} for "
+                  f"Abaqus' law ({err:.1e} apart; pressed by a force {f:.6g}; before: {before})")
+        elif res:
+            print(f"FAIL  {tag}: no heat flux printed")
         failures += 0 if ok else 1
 
     # --- other decks: confirm they are accepted and solve ----------------------

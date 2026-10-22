@@ -485,7 +485,14 @@ TRANSLATED = {
         "that is not meshed is commented out, the card's other lines kept.",
     "*SURFACE INTERACTION": "2D out-of-plane thickness line dropped; `*SURFACE BEHAVIOR, "
         "PRESSURE-OVERCLOSURE=HARD` synthesized when missing (the Abaqus default).",
-    "*FRICTION": "only `mu` emitted (ccx would read Abaqus' slip-rate / mu_k field as its stick "
+    "*SURFACE BEHAVIOR": "`TABULAR`: a point far out on the last slope (ccx holds the last "
+        "pressure); `EXPONENTIAL`: Abaqus' curve as a TABULAR one (ccx's c0 is where p = p0 / 100). "
+        "ccx 2.23's face-to-face contact reads no TABULAR table: a line through the origin becomes "
+        "`LINEAR`, other curves are reduced physics.",
+    "*GAP CONDUCTANCE": "a table against clearance becomes the closed-gap value for every pressure "
+        "(ccx reads it against pressure; it conducts across closed gaps only), and is left out "
+        "beside a `PRESSURE` card.",
+    "*FRICTION":"only `mu` emitted (ccx would read Abaqus' slip-rate / mu_k field as its stick "
         "slope); tables / exponential decay / anisotropy warned; `ROUGH` and `mu<=0` dropped.",
     "*PLASTIC": "`HARDENING=JOHNSON COOK` kept (ccx's native law) and given the `*RATE "
         "DEPENDENT, TYPE=JOHNSON COOK` card ccx needs to switch it on (C = 0 if the deck has "

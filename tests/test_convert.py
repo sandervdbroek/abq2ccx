@@ -2730,6 +2730,181 @@ def test_surface_interaction_hard_behavior_synthesized():
     assert "HARD" not in txt[i_full:]                       # FULL keeps only its LINEAR card
 
 
+# two stacked unit cubes of element type {el} pressed together through interaction SI (its
+# cards {si}), the pair's further parameters {pair}, in a step of procedure {proc}
+STACKED_CUBES = (
+    "*Node\n" + "".join(f"{1 + 4 * k + j}, {x}., {y}., {z}\n" for k, z in enumerate((0, 1, 1, 2))
+                        for j, (x, y) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1)))) +
+    "*Element, type={el}, elset=LOW\n1, 1, 2, 3, 4, 5, 6, 7, 8\n*Element, type={el}, elset=UP\n"
+    "2, 9, 10, 11, 12, 13, 14, 15, 16\n*Material, name=M\n*Elastic\n1e6, 0.\n*Conductivity\n1.\n"
+    "*Solid Section, elset=LOW, material=M\n*Solid Section, elset=UP, material=M\n"
+    "*Surface, name=LTOP\nLOW, S2\n*Surface, name=UBOT\nUP, S1\n*Surface Interaction, name=SI\n{si}"
+    "*Contact Pair, interaction=SI{pair}\nUBOT, LTOP\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+    "*Step, nlgeom\n{proc}\n0.05, 1.\n*Boundary\n13, 3, 3, -0.03\n*End Step\n")
+COUPLED_STEADY = "*Coupled Temperature-displacement, steady state"
+
+
+def cubes(si, pair="", proc="*Static", el="C3D8"):
+    return convert_str(STACKED_CUBES.format(si=si, pair=pair, proc=proc, el=el))
+
+
+def interaction_cards(body):
+    """The emitted cards of interaction SI, up to the *CONTACT PAIR."""
+    return body[body.index("*SURFACE INTERACTION, NAME=SI\n"):body.index("*CONTACT PAIR")]
+
+
+def test_tabular_overclosure_continues_on_its_last_slope():
+    # Abaqus continues a TABULAR pressure-overclosure curve on its last slope, ccx holds its last
+    # pressure (two pressed cubes: 100 for Abaqus' 294.1, validate_with_ccx contact_tabular_end):
+    # a point at 1000 model sizes on that slope
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n100., 0.01\n"
+                            "300., 0.03\n")
+    cards = interaction_cards(body).splitlines()
+    assert cards[1:5] == ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR", "0., 0.", "100., 0.01",
+                          "300., 0.03"]
+    p, h = (float(x) for x in cards[5].split(","))
+    assert math.isclose(h, 0.03 + 1e3 * conv._model_span(), rel_tol=1e-11)
+    assert math.isclose(p, 300. + 1e4 * (h - 0.03), rel_tol=1e-11)
+    assert len(cards) == 6 and conv.reduced_physics == [] and "far out on the last slope" in rep.text()
+    # a flat last segment: ccx's constant pressure is Abaqus' continuation
+    body, conv, _ = cubes("*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n100., 0.01\n"
+                          "100., 0.02\n")
+    assert interaction_cards(body).splitlines()[-1] == "100., 0.02"
+    # a thermal step without *GAP CONDUCTANCE: ccx reads a TABULAR interaction's conductance from
+    # that card (the empty user routine without one), Abaqus conducts no heat
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n100., 0.01\n",
+                            proc=COUPLED_STEADY, el="C3D8T")
+    assert interaction_cards(body).endswith("*GAP CONDUCTANCE\n0., 0.\n")
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n100., 0.01\n"
+                            "*Gap Conductance, pressure\n5., 0.\n", proc=COUPLED_STEADY, el="C3D8T")
+    assert interaction_cards(body).count("*GAP CONDUCTANCE") == 1
+
+
+def test_tabular_overclosure_on_a_face_to_face_pair():
+    # ccx 2.23's face-to-face contact reads no TABULAR table (no contact force: springforc_f2f
+    # reads the point count from plconloc(81)): a straight line through the origin is ccx's
+    # LINEAR law (validate_with_ccx contact_tabular_s2s), any other curve reduced physics
+    s2s = ", type=SURFACE TO SURFACE"
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n100., 0.01\n"
+                            "300., 0.03\n", s2s)
+    assert interaction_cards(body).splitlines()[1:] == [
+        "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=LINEAR", "10000."]
+    assert conv.reduced_physics == [] and "written as ccx's LINEAR law" in rep.text()
+    flagged = ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR on a face-to-face pair (no contact "
+               "pressure in ccx 2.23)"]
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n100., 0.01\n"
+                            "150., 0.02\n", s2s)
+    assert "PRESSURE-OVERCLOSURE=TABULAR\n0., 0.\n100., 0.01\n150., 0.02\n" in body
+    assert conv.reduced_physics == flagged and "reads no TABULAR table" in rep.text()
+    # the line on an interaction a node-to-surface pair uses too: ccx's LINEAR law is another
+    # there (its tension at clearances), so the table stays
+    body, conv, _ = cubes("*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n100., 0.01\n",
+                          s2s + "\nUBOT, LTOP\n*Contact Pair, interaction=SI")
+    assert "PRESSURE-OVERCLOSURE=TABULAR\n0., 0.\n100., 0.01\n" in body
+    assert conv.reduced_physics == flagged
+
+
+def test_exponential_overclosure_as_abaqus_curve():
+    # ccx reads c0 as the clearance where the pressure is 1 % of p0, Abaqus as where it is zero
+    # (pressed cubes: 466.2 for Abaqus' 431.4, validate_with_ccx contact_exponential): on a
+    # node-to-surface pair Abaqus' curve as a TABULAR one, its points on it
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=EXPONENTIAL\n2e-4, 100.\n")
+    cards = interaction_cards(body).splitlines()
+    assert cards[1] == "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR" and cards[2] == "0., -0.0002"
+    pts = [tuple(float(x) for x in ln.split(",")) for ln in cards[2:]]
+    assert len(pts) < 200 and all(b[1] > a[1] and b[0] > a[0] for a, b in zip(pts, pts[1:]))
+    for p, h in pts[1:-1]:
+        u = 1.0 + h / 2e-4
+        assert abs(p / (100.0 / (math.e - 1.0) * u * math.expm1(u)) - 1.0) < 1e-9
+    assert math.isclose(pts[-2][0], 1e10, rel_tol=1e-6) and pts[-1][1] > 1e3
+    assert conv.reduced_physics == [] and "Abaqus' curve is written as" in rep.text()
+    # Abaqus/Explicit's maximum stiffness (Abaqus/Standard ignores it): a line of that slope
+    for proc, slope in (("*Static", None), ("*Dynamic, explicit", 1e5)):
+        body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=EXPONENTIAL\n2e-4, 100., 1e5\n",
+                                proc=proc)
+        pts = [tuple(float(x) for x in ln.split(",")) for ln in interaction_cards(body).splitlines()[2:]]
+        far = (pts[-1][0] - pts[-2][0]) / (pts[-1][1] - pts[-2][1])
+        assert (math.isclose(far, slope, rel_tol=1e-6) if slope else far > 1e9)
+        assert ("then its maximum stiffness" in rep.text()) == bool(slope)
+    # c0 beyond the clearance up to which ccx makes node-to-surface springs (1e-3 sqrt(1 / 4))
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=EXPONENTIAL\n0.01, 100.\n")
+    assert conv.reduced_physics == ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL (no "
+                                    "pressure at clearances beyond ccx's node-to-surface springs)"]
+    assert "here at least 0.0005" in rep.text()
+    # on a face-to-face pair, which reads no TABULAR table: ccx's own law, reduced physics
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=EXPONENTIAL\n2e-4, 100.\n",
+                            ", type=SURFACE TO SURFACE")
+    assert "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL\n2e-4, 100.\n" in body
+    assert conv.reduced_physics == ["*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL on a "
+                                    "face-to-face pair (ccx's exponential law differs)"]
+
+
+def test_exponential_overclosure_points():
+    # within EXP_OVERCLOSURE_TOL of the pressure between the points, from 1e-3 p0 up
+    for c0, p0, kmax in ((2e-4, 100.0, None), (1.0, 1.0, None), (0.01, 100.0, 1e5)):
+        pts = A.exponential_overclosure(c0, p0, kmax)
+        assert pts[0] == (0.0, -c0) and len(pts) < 200
+        worst = 0.0
+        for (pa, ha), (pb, hb) in zip(pts, pts[1:]):
+            for k in range(1, 20):
+                h = ha + (hb - ha) * k / 20
+                u = 1.0 + h / c0
+                exact = p0 / (math.e - 1.0) * u * math.expm1(u)
+                if exact > 1e-3 * p0:
+                    worst = max(worst, abs((pa + (pb - pa) * k / 20) / exact - 1.0))
+        assert worst < A.EXP_OVERCLOSURE_TOL * 1.001
+        u = 1.0 + pts[-1][1] / c0
+        if kmax:              # Abaqus/Explicit's maximum stiffness: the curve ends at that slope
+            assert math.isclose(p0 / (math.e - 1.0) * (math.expm1(u) + u * math.exp(u)) / c0, kmax,
+                                rel_tol=1e-9)
+        else:
+            assert math.isclose(pts[-1][0], 1e8 * p0, rel_tol=1e-9)
+
+
+def test_gap_conductance_against_clearance():
+    # Abaqus tabulates k against the clearance (k(0) for every contact pressure), ccx against the
+    # pressure: (100, 0), (0, 0.01) conducted nothing above a pressure of 0.01 (validate_with_ccx
+    # gap_conductance_clearance); ccx conducts across closed gaps only, so k(0) alone
+    clearance = "*Surface Behavior, pressure-overclosure=HARD\n*Gap Conductance\n100., 0.\n0., 0.01\n"
+    open_gaps = "*GAP CONDUCTANCE across open gaps (ccx conducts across closed ones only)"
+    body, conv, rep = cubes(clearance, proc=COUPLED_STEADY, el="C3D8T")
+    assert interaction_cards(body).endswith("*GAP CONDUCTANCE\n100., 0.\n")
+    assert conv.reduced_physics == [open_gaps] and "up to a clearance of 0.01" in rep.text()
+    # per temperature; no thermal step: nothing lost
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=HARD\n*Gap Conductance\n"
+                            "100., 0., 20.\n0., 0.01, 20.\n200., 0., 100.\n0., 0.01, 100.\n")
+    assert interaction_cards(body).endswith("*GAP CONDUCTANCE\n100., 0., 20.\n200., 0., 100.\n")
+    assert conv.reduced_physics == [] and "no step conducts heat" in rep.text()
+    # field variables (or mass flow rates): ccx has none, Abaqus without them reads 0
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=HARD\n*Gap Conductance, "
+                            "dependencies=1\n300., 0., , , 1.\n0., 0.01, , , 1.\n100., 0., , , 0.\n"
+                            "0., 0.01, , , 0.\n", proc=COUPLED_STEADY, el="C3D8T")
+    assert interaction_cards(body).endswith("*GAP CONDUCTANCE\n100., 0.\n")
+    assert conv.reduced_physics == ["*GAP CONDUCTANCE mass-flow-rate / field-variable dependence",
+                                    open_gaps]
+    # beside a PRESSURE card (the closed-gap conductance): left out; ccx's later card would
+    # replace the earlier (validate_with_ccx gap_conductance_beside_pressure)
+    pressure = "*Gap Conductance, pressure\n50., 0.\n150., 1000.\n"
+    for si in (clearance + pressure, clearance.replace("*Gap", pressure + "*Gap")):
+        body, conv, rep = cubes(si, ", type=SURFACE TO SURFACE", COUPLED_STEADY, "C3D8T")
+        cards = interaction_cards(body)
+        assert "*GAP CONDUCTANCE, PRESSURE\n50., 0.\n150., 1000.\n" in cards
+        assert "\n** *GAP CONDUCTANCE\n** 100., 0.\n** 0., 0.01\n" in cards
+        assert cards.count("\n*GAP CONDUCTANCE") == 1 and conv.reduced_physics == [open_gaps]
+    # a user subroutine: as given
+    body, conv, _ = cubes("*Surface Behavior, pressure-overclosure=HARD\n*Gap Conductance, user\n"
+                          "*Gap Conductance\n100., 0.\n0., 0.01\n", proc=COUPLED_STEADY, el="C3D8T")
+    assert interaction_cards(body).endswith("*GAP CONDUCTANCE\n100., 0.\n0., 0.01\n")
+    # a PRESSURE table on a node-to-surface pair: ccx 2.23 reads it at a pressure of its own
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=HARD\n" + pressure,
+                            proc=COUPLED_STEADY, el="C3D8T")
+    assert conv.reduced_physics == ["*GAP CONDUCTANCE, PRESSURE on a node-to-surface pair (ccx reads "
+                                    "the conductance at another pressure)"]
+    body, conv, rep = cubes("*Surface Behavior, pressure-overclosure=HARD\n" + pressure,
+                            ", type=SURFACE TO SURFACE", COUPLED_STEADY, "C3D8T")
+    assert conv.reduced_physics == []
+
+
 def test_static_direct_with_contact_gets_automatic_increments():
     # ccx's penalty contact can need a cutback where Abaqus' converges at a fixed increment,
     # and under DIRECT ccx then stops (lcharleux_indentation_berko, at the start of

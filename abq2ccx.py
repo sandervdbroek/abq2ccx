@@ -2333,6 +2333,46 @@ def short_real(x: float, digits: int = 9) -> str:
     return s if any(c in s for c in ".eEnN") else s + "."
 
 
+# Abaqus' exponential pressure-overclosure law (Theory Guide, "Contact pressure definition"):
+# p = p0 / (e - 1) * u * (exp(u) - 1), u = 1 + h / c0 for an overclosure h above -c0, else 0.
+# As a TABULAR curve (handle_surface_behavior), each chord departs from it by at most
+# EXP_OVERCLOSURE_TOL of the pressure (step sqrt(8 tol / (p'' / p)) in u), from 1e-3 p0 to
+# 1e8 p0: under the 200 points ccx's node-to-surface contact reads (plcopy).
+EXP_OVERCLOSURE_TOL = 2e-3
+
+
+def exponential_overclosure(c0: float, p0: float, kmax: Optional[float] = None
+                            ) -> List[Tuple[float, float]]:
+    """(pressure, overclosure) points of Abaqus' exponential law for ``c0``, ``p0`` > 0, from
+    (0, -c0) to where p reaches 1e8 p0 or, given ``kmax`` (Abaqus/Explicit's maximum
+    stiffness, a straight line of that slope beyond), where dp/dh reaches it."""
+    a = p0 / (math.e - 1.0)
+
+    def p(u: float) -> float:
+        return a * u * math.expm1(u)
+
+    def dp(u: float) -> float:
+        return a * (math.expm1(u) + u * math.exp(u)) / c0
+
+    def root(f: Callable[[float], float], target: float) -> float:
+        lo, hi = 0.0, 64.0                        # both increase with u from 0
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            lo, hi = (mid, hi) if f(mid) < target else (lo, mid)
+        return lo
+    end = root(p, 1e8 * p0)
+    if kmax:
+        end = min(end, root(dp, kmax))
+    us = [0.0, min(end, root(p, 1e-3 * p0))]
+    while us[-1] < end:
+        u = us[-1]
+        step = math.sqrt(8.0 * EXP_OVERCLOSURE_TOL * u * math.expm1(u) / (math.exp(u) * (u + 2.0)))
+        # no sliver before the end: the last two steps share what is left
+        us.append(end if u + step >= end else u + step if end - u >= 1.5 * step else
+                  0.5 * (u + end))
+    return [(p(u), (u - 1.0) * c0) for u in us]
+
+
 def dotted_number(field: str) -> str:
     """Data field ``field`` with a decimal point where it is a number without one ('100' ->
     '100.', ' 1e-3' -> ' 1.e-3', '-2D1' -> '-2.D1'); anything else as it is.  ccx 2.23 reads a
@@ -9641,9 +9681,13 @@ class _Mesh:
     def _plan_surface_behavior(self, blocks: List[Block]) -> None:
         """The interactions with no *SURFACE BEHAVIOR (``_si_missing_behavior``): Abaqus'
         default is hard contact, ccx errors without the card, so handle_surface_interaction
-        writes HARD for them."""
+        writes HARD for them.  Also, for handle_surface_behavior and handle_gap_conductance,
+        each interaction's model-data *SURFACE BEHAVIOR and *GAP CONDUCTANCE cards
+        (``_si_cards``; ``_card_si`` the interaction of each) and the contact pairs on it
+        that are no ties (``_si_pairs``: "N2F" or "F2F", the slave surface)."""
         self._si_missing_behavior = set()
-        cur_si = None
+        self._si_cards, self._card_si, self._si_pairs = {}, {}, {}
+        cur_si, model = None, True
         for blk in blocks:
             if blk.keyword == "SURFACE INTERACTION":
                 cur_si = blk.uparam("NAME")
@@ -9651,6 +9695,241 @@ class _Mesh:
                     self._si_missing_behavior.add(cur_si)
             elif blk.keyword == "SURFACE BEHAVIOR" and cur_si:
                 self._si_missing_behavior.discard(cur_si)
+            if blk.keyword == "STEP":
+                model = False
+            elif blk.keyword in ("SURFACE BEHAVIOR", "GAP CONDUCTANCE") and cur_si and model:
+                self._si_cards.setdefault(cur_si, []).append(blk)
+                self._card_si[id(blk)] = cur_si
+            elif blk.keyword == "CONTACT PAIR" and not blk.has("TIED"):
+                kind = "F2F" if (blk.param("TYPE") or "").replace(" ", "").upper() == \
+                    "SURFACETOSURFACE" else "N2F"
+                for rec in merged_data_records(blk):
+                    if rec and rec[0]:
+                        self._si_pairs.setdefault(blk.uparam("INTERACTION"), []).append(
+                            (kind, rec[0]))
+
+    def _si_kinds(self, si: str) -> set:
+        """"N2F" / "F2F": how the contact pairs on interaction ``si`` are discretized."""
+        return {kind for kind, _ in self._si_pairs.get(si, [])}
+
+    def _tabular_lines(self, pts: Sequence[Tuple[float, float]], slope: float) -> List[str]:
+        """TABULAR (pressure, overclosure) data lines of ``pts``, with a point on ``slope`` past
+        the last one at an overclosure of 1000 model sizes: Abaqus continues the curve on its
+        last slope, where ccx holds the last pressure ("Outside the interval specified by the
+        user the pressure stays constant", 2.23 manual); exact for any overclosure reached."""
+        lines = [f"{short_real(p, 12)}, {short_real(h, 12)}" for p, h in pts]
+        if slope > 0.0:
+            p1, h1 = (pf(x) for x in lines[-1].split(","))
+            far = pf(short_real(h1 + 1e3 * max(self._model_span(), h1 - pts[0][1]), 12))
+            lines.append(f"{short_real(p1 + slope * (far - h1), 12)}, {short_real(far, 12)}")
+        return lines
+
+    def _n2f_reach(self, si: str) -> Optional[float]:
+        """The clearance up to which ccx 2.23 gives every slave node of the node-to-surface
+        pairs on interaction ``si`` a contact spring with a LINEAR or TABULAR law: 1e-3 sqrt(A),
+        A the node's share of its slave faces (gencontelem_n2f), at least a quarter (a third)
+        of the smallest quadrilateral (triangle); None where the faces are not linear 3-D faces
+        the converter can measure."""
+        amin = math.inf
+        for kind, slave in self._si_pairs.get(si, []):
+            if kind != "N2F":
+                continue
+            faces, why = self._surface_faces(slave)
+            if why or not faces:
+                return None
+            for nodes, shape, *_ in faces:
+                if shape != "area" or len(nodes) not in (3, 4) or \
+                        any(n not in self.geom.nodes for n in nodes):
+                    return None
+                amin = min(amin, _face_area([self.geom.nodes[n] for n in nodes]) / len(nodes))
+        return 1e-3 * math.sqrt(amin) if math.isfinite(amin) else None
+
+    def _gap_conductance_guard(self, si: str) -> List[str]:
+        """A zero *GAP CONDUCTANCE for interaction ``si`` with a TABULAR law in a deck with a
+        thermal step, when it has none: ccx's thermal contact reads every TABULAR interaction's
+        conductance from that card ("implies the use of a *GAP CONDUCTANCE card", 2.23 manual),
+        else from the empty user routine gapcon; Abaqus conducts no heat without one."""
+        if not self.steps.procs & CCX_THERMAL_PROCS or any(
+                c.keyword == "GAP CONDUCTANCE" for c in self._si_cards.get(si, [])):
+            return []
+        self.report.note(f"*SURFACE INTERACTION {si}: a zero *GAP CONDUCTANCE added after its "
+                         f"TABULAR pressure-overclosure (ccx's thermal contact reads its "
+                         f"conductance from that card; Abaqus conducts no heat without one).",
+                         once=True)
+        return ["*GAP CONDUCTANCE", "0., 0."]
+
+    def handle_surface_behavior(self, b: Block) -> List[str]:
+        """``*SURFACE BEHAVIOR`` of a *SURFACE INTERACTION.  ccx reads TABULAR and EXPONENTIAL
+        laws differently from Abaqus:
+        * TABULAR: Abaqus continues past the last point on the last slope, ccx holds the last
+          pressure, which lets the surfaces sink in without bound (probed on 2.23: two pressed
+          cubes carry 100 for Abaqus' 294.1): a point far out on the last slope is added
+          (_tabular_lines).  ccx 2.23's face-to-face contact reads no TABULAR table at all
+          (springforc_f2f takes the point count from plconloc(81), materialdata_sp stores it in
+          plconloc(801); probed: no contact force): a table p = K h becomes LINEAR K there,
+          exact on face-to-face pairs; any other is reduced physics there.
+        * EXPONENTIAL: Abaqus' pressure is zero at the clearance c0 and p0 at contact
+          (exponential_overclosure); ccx's is p0 100^(-d/c0) at a clearance d, never zero
+          (probed: 9865 for Abaqus' 4177).  On node-to-surface pairs Abaqus' curve becomes a
+          TABULAR one (within EXP_OVERCLOSURE_TOL), exact where ccx makes springs: to a clearance
+          of 1e-3 sqrt(A) (_n2f_reach) rather than c0; on face-to-face ones, which read no
+          TABULAR table, ccx's own law is kept, as reduced physics."""
+        si = self._card_si.get(id(b))
+        law = (b.param("PRESSURE-OVERCLOSURE") or "").replace(" ", "").upper()
+        recs = [r for r in merged_data_records(b) if r]
+        if si is None or law not in ("TABULAR", "EXPONENTIAL") or not recs or \
+                b.has("NO SEPARATION") or has_field_dependence(b):
+            return self.passthrough(b)
+        kinds = self._si_kinds(si)
+        params = OrderedDict((k, v) for k, v in b.params.items() if k != "DEPENDENCIES")
+        params["PRESSURE-OVERCLOSURE"] = "TABULAR"
+        head = emit_keyword("SURFACE BEHAVIOR", params)
+        try:
+            if law == "TABULAR":
+                pts = [tuple(fields_at(r, 2)) for r in recs]
+                if len(pts) < 2 or any(len(r) > 2 for r in recs) or \
+                        any(q[1] <= p[1] for p, q in zip(pts, pts[1:])):
+                    return self.passthrough(b)
+            else:
+                c0, p0, kmax = fields_at(recs[0], 3)
+                if c0 <= 0.0 or p0 <= 0.0:
+                    return self.passthrough(b)
+        except ValueError:
+            return self.passthrough(b)
+        if law == "EXPONENTIAL":
+            if "F2F" in kinds:
+                self.report.warn(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL of "
+                                 f"interaction {si} on a SURFACE TO SURFACE pair: ccx's "
+                                 f"exponential law is another curve (p0 100^(-d/c0) at a "
+                                 f"clearance d: 1 % of p0 at c0, never zero; Abaqus': zero at c0), "
+                                 f"and its face-to-face contact reads no TABULAR form of "
+                                 f"Abaqus' curve (ccx 2.23: no contact force); kept as ccx's law. "
+                                 f"A NODE TO SURFACE pair takes Abaqus' curve exactly.", once=True)
+                self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL on a face-to-"
+                              "face pair (ccx's exponential law differs)")
+                return self.passthrough(b)
+            explicit = kmax > 0.0 and self.steps.explicit
+            pts = exponential_overclosure(c0, p0, kmax if explicit else None)
+            u = 1.0 + pts[-1][1] / c0
+            slope = kmax if explicit else p0 / (math.e - 1.0) * (math.expm1(u) + u * math.exp(u)) / c0
+            reach = self._n2f_reach(si)
+            self.report.note(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL (c0, p0) -> "
+                             f"TABULAR: ccx reads c0 as the clearance where the pressure is 1 % of "
+                             f"p0 (never zero), Abaqus as the one where it is zero; Abaqus' curve "
+                             f"is written as {len(pts) + 1} points (within "
+                             f"{EXP_OVERCLOSURE_TOL:.1%} of its pressure up to 1e8 p0"
+                             f"{', then its maximum stiffness' if explicit else ''}).", once=True)
+            if "N2F" in kinds and (reach is None or c0 > reach):
+                self.report.warn(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL of "
+                                 f"interaction {si}: ccx's node-to-surface contact makes a spring "
+                                 f"with a TABULAR law only to a clearance of 1e-3 sqrt(A) (A: a "
+                                 f"slave node's area"
+                                 f"{f', here at least {short_real(reach, 3)}' if reach else ''}), "
+                                 f"so Abaqus' pressure at larger clearances up to c0 = "
+                                 f"{short_real(c0, 6)} is left out.", once=True)
+                self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL (no pressure "
+                              "at clearances beyond ccx's node-to-surface springs)")
+            return [head] + self._tabular_lines(pts, slope) + self._gap_conductance_guard(si)
+        (pa, ha), (pb, hb) = pts[-2], pts[-1]
+        slope = (pb - pa) / (hb - ha)
+        if "F2F" in kinds:
+            k = pts[-1][0] / pts[-1][1] if pts[0] == (0.0, 0.0) and pts[-1][1] > 0.0 else 0.0
+            if k > 0.0 and "N2F" not in kinds and all(
+                    abs(p - k * h) <= 1e-9 * abs(pts[-1][0]) for p, h in pts):
+                self.report.note(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR of interaction "
+                                 f"{si}: the straight line p = {short_real(k, 9)} h through the "
+                                 f"origin, written as ccx's LINEAR law (its face-to-face contact "
+                                 f"reads no TABULAR table).", once=True)
+                params["PRESSURE-OVERCLOSURE"] = "LINEAR"
+                return [emit_keyword("SURFACE BEHAVIOR", params), short_real(k, 12)]
+            self.report.warn(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR of interaction {si} "
+                             f"on a SURFACE TO SURFACE pair: ccx 2.23's face-to-face contact reads "
+                             f"no TABULAR table (probed: no contact force), so that pair transmits "
+                             f"no pressure. A NODE TO SURFACE pair reads it.", once=True)
+            self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR on a face-to-face pair "
+                          "(no contact pressure in ccx 2.23)")
+        if slope > 0.0:
+            self.report.note("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR: a point added far "
+                             "out on the last slope (Abaqus extrapolates the curve on it, ccx would "
+                             "hold the last pressure).", once=True)
+        return [head] + self._tabular_lines(pts, slope) + self._gap_conductance_guard(si)
+
+    def handle_gap_conductance(self, b: Block) -> List[str]:
+        """``*GAP CONDUCTANCE`` of a *SURFACE INTERACTION.  Abaqus tabulates k against the
+        clearance d unless PRESSURE is given, and keeps k(d = 0) for every contact pressure
+        when the interaction has no PRESSURE card ("Thermal contact properties"); ccx's table is
+        always against pressure, so a clearance table (k, 0), (0, 0.01) cuts the conductance
+        off at a pressure of 0.01 (probed on 2.23: no heat flow across pressed cubes), and a
+        later card replaces an earlier one.  ccx conducts only across closed gaps (face-to-face)
+        or up to a clearance of 1e-3 sqrt(A) (node-to-surface springs, _n2f_reach), so of a
+        clearance table only k(d = 0) has a ccx meaning: a pressure-independent conductance
+        (per temperature), exact in contact (probed: 49.75, Abaqus' flux), or nothing beside a
+        PRESSURE card, which gives the closed-gap conductance then.  Abaqus' conduction across
+        open gaps is reduced physics.  On node-to-surface pairs ccx 2.23 reads a PRESSURE table
+        at a pressure of its own (springforc_n2f_th: a LINEAR law's penalty slope, NaN for a
+        TABULAR one; probed: its last and first value), reduced physics too."""
+        si = self._card_si.get(id(b))
+        own = self._si_cards.get(si, []) if si else []
+        thermal = bool(self.steps.procs & CCX_THERMAL_PROCS)
+        if si is None or any(c.keyword == "GAP CONDUCTANCE" and c.has("USER") for c in own):
+            return self.passthrough(b)
+        rows = material_rows(b, 3)            # k, d or p, temperature, mass flow, fields
+        if rows is None:
+            return self.passthrough(b)
+        try:
+            vals = [fields_at(r, len(r)) for r in rows if any(r)]
+        except ValueError:
+            return self.passthrough(b)
+        if not vals:
+            return self.passthrough(b)
+        if b.has("PRESSURE"):
+            if thermal and "N2F" in self._si_kinds(si) and any(
+                    len({v[0] for v in vals if v[2] == t}) > 1 for t in {v[2] for v in vals}):
+                self.report.warn(f"*GAP CONDUCTANCE, PRESSURE of interaction {si} on a NODE TO "
+                                 f"SURFACE pair: ccx 2.23's node-to-surface thermal contact reads "
+                                 f"the conductance at a pressure of its own (probed: the table's "
+                                 f"last value with a LINEAR or HARD law, its first with TABULAR), "
+                                 f"not the contact pressure. A SURFACE TO SURFACE pair reads it.",
+                                 once=True)
+                self._reduces("*GAP CONDUCTANCE, PRESSURE on a node-to-surface pair (ccx reads "
+                              "the conductance at another pressure)")
+            return self.passthrough(b)
+        state = next((v[3:] for v in vals if not any(v[3:])), vals[0][3:])
+        if any(v[3:] != state for v in vals):
+            self.report.warn("*GAP CONDUCTANCE: ccx's conductance depends on no mass flow rate or "
+                             "field variable; the rows where they are 0 (else the first) kept.",
+                             once=True)
+            self._reduces("*GAP CONDUCTANCE mass-flow-rate / field-variable dependence")
+        lines: List[str] = []
+        temps = list(dict.fromkeys(v[2] for v in vals if v[3:] == state))
+        for t in temps:
+            curve = sorted((v[1], v[0]) for v in vals if v[3:] == state and v[2] == t)
+            k0 = curve[0][1] if curve[0][0] >= 0.0 else next(
+                (k1 + (k2 - k1) * -d1 / (d2 - d1) for (d1, k1), (d2, k2) in zip(curve, curve[1:])
+                 if d1 < 0.0 <= d2), curve[-1][1])
+            lines.append(f"{short_real(k0, 12)}, 0." + (f", {short_real(t, 12)}" if len(temps) > 1
+                                                       else ""))
+        dmax = max(v[1] for v in vals)
+        lost = thermal and any(v[0] != 0.0 for v in vals)
+        what = (f"Abaqus' conduction across open gaps, up to a clearance of {short_real(dmax, 6)}, "
+                f"is left out" if lost else "no step conducts heat" if not thermal else
+                "it conducts across no open gap either")
+        if any(c.keyword == "GAP CONDUCTANCE" and c.has("PRESSURE") for c in own):
+            msg = (f"*GAP CONDUCTANCE of interaction {si} (k against clearance) beside its "
+                   f"*GAP CONDUCTANCE, PRESSURE: Abaqus' conductance across open gaps, which ccx "
+                   f"does not conduct across; ccx would read it against pressure, the later card "
+                   f"replacing the earlier, so it is commented out; {what}.")
+            return self._comment_out(msg, [emit_keyword(b.keyword, b.params)] + list(b.data),
+                                     "*GAP CONDUCTANCE across open gaps (ccx conducts across "
+                                     "closed ones only)" if lost else False, warn=lost)
+        (self.report.warn if lost else self.report.note)(
+            f"*GAP CONDUCTANCE of interaction {si} (k against clearance) -> the closed-gap "
+            f"conductance k(d = 0) for every pressure, as Abaqus keeps it in contact (ccx reads "
+            f"the table against contact pressure and conducts across closed gaps only); {what}.",
+            once=True)
+        if lost:
+            self._reduces("*GAP CONDUCTANCE across open gaps (ccx conducts across closed ones only)")
+        return [emit_keyword("GAP CONDUCTANCE", OrderedDict())] + lines
 
     def _drop_surface_elements(self, raw: List[Block], blocks: List[Block]) -> None:
         """Leave Abaqus surface elements (SURFACE_ELEMENTS) out of the ccx mesh — ccx has no
@@ -35599,6 +35878,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._out_contact = {"abaqus": False, "pairs": 0, "nts": False, "flat": False, "axi": False}
         self._courant: Optional[Tuple[float, int]] = None   # (min h f / c, element), _courant_min
         self._si_missing_behavior: set = set()        # (_plan_surface_behavior)
+        self._si_cards: Dict[str, List[Block]] = {}     # interaction -> its *SURFACE BEHAVIOR /
+        self._card_si: Dict[int, str] = {}             # *GAP CONDUCTANCE cards; card -> it
+        self._si_pairs: Dict[str, List[Tuple[str, str]]] = {}   # -> (N2F / F2F, slave)
         # *BOUNDARY on rigid-coupling members (see _plan_coupled_bcs)
         self._bc_drop: Dict[int, set] = {}         # id(*BOUNDARY) -> (node, dof) taken off it
         self._bc_lines: Dict[int, List[List[str]]] = {}   # id(*BOUNDARY) -> its records after that
@@ -35940,6 +36222,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "SURFACE": "handle_surface",
         "CREEP": "handle_creep",
         "FRICTION": "handle_friction",
+        "SURFACE BEHAVIOR": "handle_surface_behavior",
+        "GAP CONDUCTANCE": "handle_gap_conductance",
         "CONTACT PAIR": "handle_contact_pair",
         "RIGID BODY": "handle_rigid_body",
         "ROTARY INERTIA": "handle_rotary_inertia",
