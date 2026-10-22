@@ -23764,6 +23764,293 @@ def test_unused_user_material_noted_as_never_called():
         assert ("ccx never calls it" in report.text()) != reduced
 
 
+
+IMP_STEP = "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n"
+
+
+def test_imperfection_data_lines_shift_the_nodes():
+    # *IMPERFECTION's data lines (node, shift) are the deck's own geometry: the *NODE
+    # coordinates move, the card becomes a comment, and nothing is reduced.  SYSTEM=C / S
+    # shifts change the node's cylindrical / spherical coordinates (angles in degrees, as
+    # *NODE reads them); an angle shift is one reading of two (reduced), as is a node shifted
+    # twice (the shifts added)
+    body, conv, report = convert_str(HEX_MODEL + "*Imperfection\n7, 0.1, -0.2, 0.3\n 8, , 0.5\n" + IMP_STEP)
+    assert conv.geom.nodes[7] == (1.1, 0.8, 1.3) and conv.geom.nodes[8] == (0.0, 1.5, 1.0)
+    assert "7, 1.1, 0.8, 1.3" in body and "** abq2ccx: *IMPERFECTION — applied to the *NODE " \
+        "coordinates above" in body and "** 7, 0.1" not in body
+    assert other_reduced(conv) == [] and report.n_commented == 0
+    assert "*IMPERFECTION: 2 node(s) shifted in the *NODE coordinates" in report.text()
+    deck = HEX_MODEL + ("*Imperfection, system=C\n2, 0.5\n6, , , 0.25\n*Imperfection, system=S\n"
+                        "7, 1.\n") + IMP_STEP
+    _, conv, _ = convert_str(deck)
+    assert conv.geom.nodes[2] == (1.5, 0.0, 0.0) and conv.geom.nodes[6] == (1.0, 0.0, 1.25)
+    k = 1 + 1 / math.sqrt(3)
+    assert max(abs(a - k) for a in conv.geom.nodes[7]) < 1e-12 and other_reduced(conv) == []
+    _, conv, report = convert_str(HEX_MODEL + "*Imperfection, system=C\n3, 0., 45.\n" + IMP_STEP)
+    assert max(abs(a - b) for a, b in zip(conv.geom.nodes[3], (0.0, math.sqrt(2), 0.0))) < 1e-12
+    assert other_reduced(conv) == ["*IMPERFECTION angle shifts (SYSTEM=C / S) read one of two ways"]
+    _, conv, report = convert_str(HEX_MODEL + "*Imperfection\n8, 0.1\n99, 1.\n*Imperfection\n8, 0.2\n"
+                                  + IMP_STEP)
+    assert abs(conv.geom.nodes[8][0] - 0.3) < 1e-12
+    assert other_reduced(conv) == ["*IMPERFECTION shifts of one node added up"]
+    assert "*IMPERFECTION names node 99, which the model does not have; skipped." in report.text()
+    _, conv, report = convert_str(HEX_MODEL + "*Imperfection, system=Q\n8, 0.1\n" + IMP_STEP)
+    assert conv.geom.nodes[8] == (0.0, 1.0, 1.0) and other_reduced(conv) == ["*IMPERFECTION"]
+    # a node-defined orientation reads the shifted nodes (the model's geometry)
+    _, conv, _ = convert_str(HEX_MODEL + "*Orientation, name=O, definition=nodes\n2, 4, 1\n"
+                             "*Imperfection\n2, 0., 1.\n" + IMP_STEP)
+    assert conv.orientations["O"][0] == (1.0, 1.0, 0.0)
+
+
+def test_imperfection_input_file_and_instance_nodes():
+    # INPUT= reads the data lines from a file (read_blocks inlines it); an assembly's
+    # imperfection names instance nodes (Instance.label) and shifts in global coordinates
+    d = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(d, "imp.dat"), "w", encoding="utf-8") as fh:
+            fh.write("7, 0., 0., -0.5\n")
+        path = os.path.join(d, "deck.inp")
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(HEX_MODEL + "*Imperfection, input=imp.dat\n" + IMP_STEP)
+        _, conv, _ = convert(path)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    assert conv.geom.nodes[7] == (1.0, 1.0, 0.5) and other_reduced(conv) == []
+    part = ("*Part, name=P\n" + HEX + "*Solid Section, elset=EALL, material=M\n*End Part\n"
+            "*Assembly, name=A\n*Instance, name=I1, part=P\n*End Instance\n"
+            "*Instance, name=I2, part=P\n10., 0., 0.\n*End Instance\n*End Assembly\n"
+            "*Material, name=M\n*Elastic\n1000., 0.3\n*Imperfection\nI2.7, 0.25\n"
+            "*Boundary\nI1.1, 1, 3\nI2.1, 1, 3\n*Step\n*Static\n*End Step\n")
+    _, conv, report = convert_str(part)
+    off = next(i["node_offset"] for i in report.instances if i["name"] == "I2")
+    assert conv.geom.nodes[7 + off] == (11.25, 1.0, 1.0) and conv.geom.nodes[7] == (1.0, 1.0, 1.0)
+
+
+def _imperfection_shapes(nodes, procedure="BUCKLE"):
+    """A first pass's result (Converter.imperfection_shapes) with modes 1 and 2 on ``nodes``."""
+    return {"modes": {1: {n: (0.0, 0.0, 1.0 if n == 7 else 0.5) for n in nodes},
+                      2: {n: (1.0, 0.0, 0.0) for n in nodes}},
+            "factors": {1: 2.5, 2: 4.0}, "deck": "/x/deck_ccx_imperfection.inp", "source": "/x/job.inp",
+            "procedure": procedure, "reduced": [], "repeated": []}
+
+
+def test_imperfection_file_form_takes_the_first_pass_modes():
+    # FILE= / STEP= modes come from another job's results, which ccx cannot read: commented out
+    # (reduced) and listed for --run's first pass; with that pass's modes, each line's mode
+    # times its scale moves the NSET's nodes (all of them without one)
+    deck = (HEX_MODEL + "*Nset, nset=TOPS\n5, 6, 7, 8\n*Imperfection, file=Job-1, step=1, nset=TOPS\n"
+            "1, 0.01\n2, -0.002\n" + IMP_STEP)
+    body, conv, report = convert_str(deck)
+    assert other_reduced(conv) == ["*IMPERFECTION"] and report.n_commented == 1
+    assert "** *IMPERFECTION, FILE=Job-1, STEP=1, NSET=TOPS" in body
+    assert "abq2ccx --run takes them from Job-1.inp, the Abaqus deck of job Job-1, next to this " \
+        "one: it runs that deck in ccx first and shifts the nodes by its results." in report.text()
+    [req] = conv.imperfection_files
+    assert req["key"] == ("JOB-1", 1) and req["modes"] == [1, 2] and req["inc"] is None
+    assert sorted(req["coords"]) == [5, 6, 7, 8] and req["coords"][7] == (1.0, 1.0, 1.0)
+    rep = A.Report()
+    conv = A.Converter(rep, Opt())
+    conv.imperfection_shapes = {("JOB-1", 1): _imperfection_shapes(range(1, 9))}
+    conv.convert(_blocks(deck, rep))
+    assert max(abs(a - b) for a, b in zip(conv.geom.nodes[7], (0.998, 1.0, 1.01))) < 1e-12
+    assert max(abs(a - b) for a, b in zip(conv.geom.nodes[5], (-0.002, 0.0, 1.005))) < 1e-12
+    assert conv.geom.nodes[1] == (0.0, 0.0, 0.0) and other_reduced(conv) == []
+    assert "4 node(s) shifted by modes 1 (factor 2.5), 2 (factor 4) of step 1 as ccx solves job.inp " \
+        "(deck_ccx_imperfection.inp, --run's first pass), each normalized" in rep.text()
+    # what the pass reports carries over: the job deck's reduced physics, a repeated mode, or why
+    # there are no modes
+    got = dict(_imperfection_shapes(range(1, 9)), reduced=["element S4R (x)"], repeated=[(1, 2)])
+    for shapes, want in ((got, ["*IMPERFECTION shifts from job.inp, whose ccx model reduces: element "
+                                "S4R (x)", "*IMPERFECTION mode 1 of a repeated eigenvalue"]),
+                         ("no job.inp here", ["*IMPERFECTION"])):
+        rep = A.Report()
+        conv = A.Converter(rep, Opt())
+        conv.imperfection_shapes = {("JOB-1", 1): shapes}
+        conv.convert(_blocks(deck, rep))
+        assert other_reduced(conv) == want, other_reduced(conv)
+    assert "geometry: --run could not take them from no job.inp here." in rep.text()
+
+
+def _blocks(text, report):
+    fd, path = tempfile.mkstemp(suffix=".inp")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        return A.read_blocks(path, report)
+    finally:
+        os.unlink(path)
+
+
+IMP_DAT = """
+                        S T E P       1
+
+
+ displacements (vx,vy,vz) for set ABQ2CCX_IMPERFECTION and time  0.0000000E+00
+
+         1  1.000000E-03  0.000000E+00 -2.000000E-03
+         2  0.000000E+00  0.000000E+00  0.000000E+00
+
+     B U C K L I N G   F A C T O R   O U T P U T
+
+
+ MODE NO       BUCKLING
+                FACTOR
+
+      1   0.2500000E+01
+      2   0.4000000E+01
+
+                    E I G E N V A L U E    N U M B E R     1
+
+
+ displacements (vx,vy,vz) for set ABQ2CCX_IMPERFECTION and time  0.0000000E+00
+
+         1  2.000000E-01  0.000000E+00 -4.000000E-01
+         2  1.000000E-01  0.000000E+00  0.000000E+00
+
+ displacements (vx,vy,vz) for set OTHER and time  0.0000000E+00
+
+         1  9.000000E+00  9.000000E+00  9.000000E+00
+
+                    E I G E N V A L U E    N U M B E R     2
+
+
+ displacements (vx,vy,vz) for set ABQ2CCX_IMPERFECTION and time  0.0000000E+00
+
+         1  0.000000E+00  3.000000E-01  0.000000E+00
+         2  0.000000E+00  0.000000E+00  0.000000E+00
+"""
+
+
+def test_imperfection_dat_reader_and_mode_normalization():
+    # the .dat tables of a *BUCKLE step: its base state first (no mode), then each mode's;
+    # Abaqus scales a mode to make its largest displacement component 1.0 (its sign with it)
+    fd, path = tempfile.mkstemp(suffix=".dat")
+    os.close(fd)
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(IMP_DAT)
+        got = A.dat_step_displacements(path, 1, "abq2ccx_imperfection")
+        assert A.dat_step_displacements(path, 2, "ABQ2CCX_IMPERFECTION") == []
+        other = A.dat_step_displacements(path, 1, "OTHER")
+    finally:
+        os.unlink(path)
+    assert [m for m, _v in got] == [None, 1, 2] and other == [(1, {1: (9.0, 9.0, 9.0)})]
+    assert got[1][1] == {1: (0.2, 0.0, -0.4), 2: (0.1, 0.0, 0.0)}
+    assert A.displacement_normalized(got[1][1]) == {1: (-0.5, -0.0, 1.0), 2: (-0.25, -0.0, -0.0)}
+    assert A.displacement_normalized(got[2][1])[1] == (0.0, 1.0, 0.0)
+    assert A.displacement_normalized({1: (0.0, 0.0, 0.0)}) == {1: (0.0, 0.0, 0.0)}
+
+
+def _imperfection_args(**kw):
+    return type("Args", (), dict(dict(quiet=True, ccx=None, timeout=None, no_log=True, check=False,
+                                      run=True, solid_dof=False), **kw))()
+
+
+def test_imperfection_two_pass_run():
+    # --run with an *IMPERFECTION, FILE=: the job's deck converted and run first (here a stand-in
+    # for ccx writes its .dat), its step's modes normalized, the deck converted again with the
+    # shifted nodes and run; where that cannot be done, the reason, and the perfect geometry
+    import contextlib
+    import json
+    d = tempfile.mkdtemp()
+    model = HEX_MODEL.replace("*Boundary\n", "*Nset, nset=TOPS\n5, 6, 7, 8\n*Boundary\n")
+    job = model + "*Step\n*Buckle\n2\n*Cload\n7, 3, -1.\n*End Step\n"
+    deck = (model + "*Imperfection, file=job, step=1, nset=TOPS\n1, 0.01\n2, 0.001\n"
+            + "*Step, nlgeom\n*Static\n*Cload\n7, 3, -1.\n*End Step\n")
+    runs = []
+
+    def fake_run(out_path, override, quiet, digest=True, instances=(), model=None, expanded=None,
+                 timeout=None, holds=None):
+        runs.append(os.path.basename(out_path))
+        if out_path.endswith("_imperfection.inp"):
+            text = open(out_path, encoding="utf-8").read()
+            assert "*NSET, NSET=ABQ2CCX_IMPERFECTION\n1, 2, 3, 4, 5, 6, 7, 8\n" in text
+            assert "*NODE PRINT, NSET=ABQ2CCX_IMPERFECTION, GLOBAL=YES\nU\n*END STEP" in text
+            rows = "".join(f"{n:10d}  0.000000E+00  0.000000E+00  0.000000E+00\n" for n in (2, 3, 4, 5, 6, 8))
+            with open(out_path[:-4] + ".dat", "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(dat.replace("         2 ", "         7 ").replace("E+00\n\n", "E+00\n" + rows + "\n"))
+        return {"code": 0, "ccx": "ccx", "ccx_version": "2.23", "status": "solved", "log": None,
+                "results": []}
+    real = A.run_ccx
+    A.run_ccx = fake_run
+    try:
+        for name, text in (("job.inp", job), ("deck.inp", deck)):
+            with open(os.path.join(d, name), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+        outs = {}
+        for case, dat in (("ok", IMP_DAT), ("low", IMP_DAT.replace("0.2500000E+01", "0.5000000E+00"))):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                assert A.main([os.path.join(d, "deck.inp"), "--outdir", os.path.join(d, case), "--run",
+                               "--json", "--quiet"]) == 0
+            outs[case] = json.loads(out.getvalue())
+        body = open(os.path.join(d, "ok", "deck_ccx.inp"), encoding="utf-8").read()
+        low = open(os.path.join(d, "low", "deck_ccx.inp"), encoding="utf-8").read()
+        os.unlink(os.path.join(d, "job.inp"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            A.main([os.path.join(d, "deck.inp"), "--outdir", os.path.join(d, "none"), "--run", "--json",
+                    "--quiet"])
+        outs["none"] = json.loads(out.getvalue())
+    finally:
+        A.run_ccx = real
+        shutil.rmtree(d, ignore_errors=True)
+    assert runs == ["deck_ccx_imperfection.inp", "deck_ccx.inp"] * 2 + ["deck_ccx.inp"]
+    # mode 1 (0.2, 0, -0.4) at node 1 and (0.1, 0, 0) at node 7 -> 1 at node 1 (scaled by -2.5);
+    # node 7: 0.01 * (-0.25, 0, 0) + 0.001 * mode 2 (0, 0, 0)
+    assert "\n7, 0.9975, 1, 1\n" in body and "\n5, 0, 0, 1\n" in body and "\n1, 0, 0, 0\n" in body
+    ok = outs["ok"]
+    assert ok["status"] == "converted" and ok["reduced_physics"] == []
+    assert [x["error"] for x in ok["run"]["imperfection"]] == [None]
+    assert ok["run"]["imperfection"][0]["deck"].endswith(os.path.join("ok", "deck_ccx_imperfection.inp"))
+    assert "\n7, 1, 1, 1\n" in low and outs["low"]["reduced_physics"] == ["*IMPERFECTION"]
+    assert "ccx's buckling factors of job.inp's step 1 (0.5, 4) may not be the lowest, so its mode " \
+        "numbers need not be Abaqus' — a factor lies below 1 (0.5)" in outs["low"]["run"]["imperfection"][0]["error"]
+    assert outs["none"]["run"]["imperfection"][0]["error"] == \
+        "there is no job.inp, the Abaqus deck of job job, next to the deck"
+
+
+def test_imperfection_first_pass_refusals():
+    # _imperfection_run's checks before ccx runs: the job's deck must have the step, as a
+    # *BUCKLE / *FREQUENCY (displacement-normalized) or general *STATIC step (one "1" line, no
+    # INC=), and the deck's nodes at the same places
+    d = tempfile.mkdtemp()
+    model = HEX_MODEL
+    say = []
+    try:
+        cases = (
+            ("*Step\n*Buckle\n2\n*Cload\n7, 3, -1.\n*End Step\n", 2, [1], None, model,
+             "job.inp has 1 step(s), no step 2"),
+            ("*Step\n*Frequency, normalization=mass\n2\n*End Step\n", 1, [1], None, model,
+             "job.inp's step 1 normalizes its modes by mass (NORMALIZATION=MASS)"),
+            ("*Step\n*Static\n*Cload\n7, 3, -1.\n*End Step\n", 1, [1, 2], None, model,
+             "job.inp's step 1 is a static step, whose one data line is '1, scale'"),
+            ("*Step\n*Static\n*Cload\n7, 3, -1.\n*End Step\n", 1, [1], "3", model,
+             "INC= names an Abaqus increment of job.inp's step 1"),
+            ("*Step\n*Dynamic\n0.1, 1.\n*End Step\n", 1, [1], None, model,
+             "job.inp's step 1 is a *DYNAMIC step: neither modes nor a general static solution"),
+            ("*Step\n*Buckle\n2\n*Cload\n7, 3, -1.\n*End Step\n", 1, [1], None,
+             model.replace("7, 1.,1.,1.", "7, 1.,1.,1.5"),
+             "job.inp's mesh is not this deck's: its node 7 is at 1, 1, 1.5, here at 1, 1, 1"))
+        for steps, step, modes, inc, mesh, want in cases:
+            with open(os.path.join(d, "job.inp"), "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(mesh + steps)
+            group = [{"file": "job", "step": step, "key": ("JOB", step), "inc": inc, "modes": modes,
+                      "coords": {n: p for n, p in convert_str(model)[1].geom.nodes.items()}}]
+            got = A._imperfection_run(os.path.join(d, "deck.inp"), _imperfection_args(), "job", step,
+                                      group, os.path.join(d, "p1.inp"), say.append)
+            assert isinstance(got, str) and got.startswith(want), (want, got)
+        assert not os.path.exists(os.path.join(d, "p1.inp")) and say == []
+        assert A.imperfection_source(os.path.join(d, "deck.inp"), "JOB") == os.path.join(d, "job.inp")
+        assert A.imperfection_source(os.path.join(d, "deck.inp"), "job.fil") == os.path.join(d, "job.inp")
+        assert A.imperfection_source(os.path.join(d, "deck.inp"), "other") is None
+        got = A._imperfection_run(os.path.join(d, "job.inp"), _imperfection_args(), "job", 1, [], "p1", say.append)
+        assert got == "job.inp is the deck itself: Abaqus reads an earlier run's results there"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import inspect
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

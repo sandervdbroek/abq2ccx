@@ -1522,6 +1522,152 @@ def matrix_generate_checks(ccx, env, tmp):
     return failures
 
 
+
+IMP_P_REF = 1.0              # imperfection_column's buckling load: 54-ish times this
+IMP_P_POST = 27.0            # about half the lowest buckling load
+
+
+def imperfection_column(steps, imperfection="", shift=None):
+    """A C3D8I column 0.5 x 1.0 x 10 along z (2 x 1 x 20 elements), clamped at its base and
+    pushed down at its top face: it buckles first sideways along x (I = 1.0 * 0.5^3 / 12, Euler
+    pi^2 E I / 4 L^2 = 54), its other modes well apart.  ``steps`` follow ``imperfection``
+    (model data); ``shift(node, (x, y, z))`` moves the nodes by hand.  Returns the deck and the
+    nodes (TIP: the middle of the top face)."""
+    nx, ny, nz, a, b, h = 2, 1, 20, 0.5, 1.0, 10.0
+    nid = {}
+    lines = ["*NODE"]
+    for k in range(nz + 1):
+        for j in range(ny + 1):
+            for i in range(nx + 1):
+                n = nid[i, j, k] = len(nid) + 1
+                p = (a * i / nx, b * j / ny, h * k / nz)
+                p = shift(n, p) if shift else p
+                lines.append(f"{n}, {p[0]!r}, {p[1]!r}, {p[2]!r}")
+    lines.append("*ELEMENT, TYPE=C3D8I, ELSET=COL")
+    e = 0
+    for k in range(nz):
+        for j in range(ny):
+            for i in range(nx):
+                e += 1
+                c = [nid[i, j, k], nid[i + 1, j, k], nid[i + 1, j + 1, k], nid[i, j + 1, k],
+                     nid[i, j, k + 1], nid[i + 1, j, k + 1], nid[i + 1, j + 1, k + 1], nid[i, j + 1, k + 1]]
+                lines.append(", ".join(map(str, [e] + c)))
+    top = [nid[i, j, nz] for j in range(ny + 1) for i in range(nx + 1)]
+    base = [nid[i, j, 0] for j in range(ny + 1) for i in range(nx + 1)]
+    lines += ["*NSET, NSET=TOP", ", ".join(map(str, top)), "*NSET, NSET=BASE", ", ".join(map(str, base)),
+              f"*NSET, NSET=TIP\n{nid[1, 0, nz]}", "*SOLID SECTION, ELSET=COL, MATERIAL=STEEL",
+              "*MATERIAL, NAME=STEEL", "*ELASTIC", "2.1e5, 0.3", "*BOUNDARY", "BASE, 1, 3"]
+    load = lambda p: "*CLOAD\n" + "".join(f"{n}, 3, {-p / len(top)!r}\n" for n in top)
+    text = "\n".join(lines) + "\n" + imperfection + steps.format(buckle=load(IMP_P_REF), post=load(IMP_P_POST))
+    return text, nid, nid[1, 0, nz]
+
+
+IMP_BUCKLE = "*STEP\n*BUCKLE\n3\n{buckle}*END STEP\n"
+IMP_POST = "*STEP, NLGEOM, INC=100\n*STATIC\n0.1, 1.\n{post}*NODE PRINT, NSET=TIP\nU\n*END STEP\n"
+
+
+def imperfection_checks(ccx, env, tmp):
+    """*IMPERFECTION on imperfection_column under half its buckling load (NLGEOM): the data-line
+    form against the same column with its nodes moved by hand (exact: the deck's own geometry,
+    the ccx decks alike), and the FILE= form's two-pass --run (the column's own *BUCKLE deck
+    first) against a manual two-run: that deck converted and run, its mode 1 read from the .frd
+    and scaled to a largest component 1.0 here, the nodes moved by hand.  Both must solve, and
+    the imperfect column bend sideways (the perfect one stays straight).  Returns the number
+    of failures."""
+    failures = 0
+
+    def solve(text, tag):
+        src, inp = os.path.join(tmp, f"imp_{tag}_src.inp"), os.path.join(tmp, f"imp_{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        return d, status, out, conv
+
+    # --- data lines: 0.02 (1 - cos(pi z / 2 L)) along x at every node -------------------------
+    bow = lambda z: 0.02 * (1 - math.cos(math.pi * z / 20.0))
+    _, nid, tip = imperfection_column(IMP_POST)
+    lines = "".join(f"{n}, {bow(10.0 * k / 20)!r}\n" for (_i, _j, k), n in nid.items())
+    tips = {}
+    for tag, text in (("lines", imperfection_column(IMP_POST, "*IMPERFECTION\n" + lines)[0]),
+                      ("hand", imperfection_column(IMP_POST, "", lambda n, p: (p[0] + bow(p[2]), p[1], p[2]))[0]),
+                      ("perfect", imperfection_column(IMP_POST)[0])):
+        d, status, out, conv = solve(text, tag)
+        tips[tag] = dat_displacement(os.path.join(d, "job.dat"), tip) if status == "solved" else None
+        if tag == "lines":
+            reduced = list(conv.reduced_physics)
+        shutil.rmtree(d, ignore_errors=True)
+        if tips[tag] is None:
+            print("\n".join(ln for ln in out.splitlines() if "ERROR" in ln)[:400])
+    got, hand, flat = tips["lines"], tips["hand"], tips["perfect"]
+    ok = got is not None and hand is not None and flat is not None and not reduced and \
+        max(abs(x - y) for x, y in zip(got, hand)) <= 1e-9 * abs(hand[0]) and \
+        abs(got[0]) > 0.25 * bow(10.0) and abs(flat[0]) < 1e-6 * abs(got[0])
+    fmt = lambda u: "none" if u is None else ", ".join(f"{x:+.6e}" for x in u)
+    print(f"{'PASS' if ok else 'FAIL'}  imperfection_data_lines (a C3D8I column at half its buckling "
+          f"load, NLGEOM, its nodes bowed 0.02 (1 - cos) along x by *IMPERFECTION data lines): tip u "
+          f"{fmt(got)}; moved by hand {fmt(hand)}; straight {fmt(flat)}"
+          + (f"; reduced: {reduced}" if reduced else ""))
+    failures += 0 if ok else 1
+
+    # --- FILE= / STEP=: --run's two passes against a manual two-run ---------------------------
+    import contextlib
+    import io
+    import json
+    work = os.path.join(tmp, "imp_two_pass")
+    os.makedirs(work, exist_ok=True)
+    with open(os.path.join(work, "colbuck.inp"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(imperfection_column(IMP_BUCKLE)[0])
+    with open(os.path.join(work, "colpost.inp"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(imperfection_column(IMP_POST, "*IMPERFECTION, FILE=colbuck, STEP=1\n1, 0.02\n")[0])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+        code = A.main([os.path.join(work, "colpost.inp"), "--outdir", os.path.join(work, "out"), "--run",
+                       "--ccx", ccx, "--quiet", "--json", "--timeout", str(CCX_TIMEOUT)])
+    try:
+        doc = json.loads(out.getvalue())
+    except ValueError:
+        doc = {}
+    run = doc.get("run") or {}
+    passes = run.get("imperfection") or [{}]
+    two = dat_displacement(os.path.join(work, "out", "colpost_ccx.dat"), tip)
+    placed = A.Converter(A.Report(), A.Options())
+    placed.build_geometry(A.read_blocks(os.path.join(work, "out", "colpost_ccx.inp"), A.Report()))
+    # the manual run: the buckle deck's mode 1 from the .frd (after its base state's block)
+    d, status, txt, _conv = solve(imperfection_column(IMP_BUCKLE)[0], "buckle")
+    modes = frd_blocks(os.path.join(d, "job.frd"), "DISP")[1:] if status == "solved" else []
+    factor = dat_eigen_table(os.path.join(d, "job.dat"), "B U C K L I N G") if status == "solved" else []
+    shutil.rmtree(d, ignore_errors=True)
+    mode = {n: v[:3] for n, v in modes[0][1].items()} if modes else {}
+    big = max((c for v in mode.values() for c in v), key=abs, default=0.0)
+    move = {n: tuple(0.02 * c / big for c in v) for n, v in mode.items()} if big else {}
+    hand = None
+    if move:
+        d, status, txt, _conv = solve(imperfection_column(
+            IMP_POST, "", lambda n, p: tuple(p[k] + move[n][k] for k in range(3)))[0], "manual")
+        hand = dat_displacement(os.path.join(d, "job.dat"), tip) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+    # (the .frd's mode has 6 digits, the .dat's the first pass reads 7)
+    off = max((abs(placed.geom.nodes[n][k] - (p[k] + move[n][k])) for (i, j, kk), n in nid.items()
+               for p in [(0.5 * i / 2, 1.0 * j, 0.5 * kk)] for k in range(3)), default=math.inf) \
+        if move and len(placed.geom.nodes) >= len(nid) else math.inf
+    ok = code == 0 and run.get("status") == "solved" and passes[0].get("error") is None and \
+        doc.get("reduced_physics") == [] and two is not None and hand is not None and \
+        off < 1e-5 * 0.02 and max(abs(x - y) for x, y in zip(two, hand)) <= 1e-4 * abs(hand[0]) and \
+        abs(two[0]) > 0.25 * 0.02
+    print(f"{'PASS' if ok else 'FAIL'}  imperfection_two_pass (the column's *IMPERFECTION, FILE=, STEP=1: "
+          f"mode 1 x 0.02 of its own *BUCKLE deck, factor {factor[0] if factor else 'none'}, through "
+          f"--run's two passes): ccx {run.get('status')}, tip u {fmt(two)}; manual two-run (the mode "
+          f"from the .frd) {fmt(hand)}; nodes {off:.1e} off the manual shift"
+          + (f"; first pass: {passes[0].get('error')}" if passes[0].get("error") else "")
+          + (f"; reduced: {doc.get('reduced_physics')}" if doc.get("reduced_physics") else ""))
+    if not ok and status != "solved":
+        print("\n".join(ln for ln in txt.splitlines() if "ERROR" in ln)[:400])
+    failures += 0 if ok else 1
+    shutil.rmtree(work, ignore_errors=True)
+    return failures
+
+
 def umat_build_checks(tmp):
     """The umat_build checks: --abaqus-umat decks in the ccx CCX_UMAT names, built with
     TEST_UMAT (see there).  Skipped without CCX_UMAT, and for a ccx whose UMAT is another one
@@ -11006,6 +11152,8 @@ def main():
     failures += umat_build_checks(tmp)
     # --- *MATRIX GENERATE: ccx's MATRIXSTORAGE files against the exact brick matrices ---------
     failures += matrix_generate_checks(ccx, env, tmp)
+    # --- task 147: *IMPERFECTION, data lines and FILE= (--run's two passes) ---------------------
+    failures += imperfection_checks(ccx, env, tmp)
 
     # --- the --run results digest (abq2ccx.ccx_results_digest) against the references above:
     # the planar beam's frequencies and buckling load (beam theory, Euler), the circular-section

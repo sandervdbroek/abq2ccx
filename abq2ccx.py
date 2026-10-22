@@ -7906,7 +7906,10 @@ class _Mesh:
     # ======================================================================
     # Pass A -- build geometry
     # ======================================================================
-    def build_geometry(self, blocks: List[Block]) -> None:
+    def build_geometry(self, blocks: List[Block], imperfect: bool = False) -> None:
+        """The mesh of ``blocks`` (nodes, elements, sets, orientations, surfaces); with
+        ``imperfect`` (the deck's own conversion) its *IMPERFECTION applied to the nodes
+        before node-defined orientations read them (_apply_imperfections)."""
         outer = self.report.card                # (what it reports is at the card's place)
         for b in blocks:
             self.report.card = b
@@ -7943,11 +7946,182 @@ class _Mesh:
                 self._register_orientation(b)
             elif kw == "SURFACE":
                 self._register_surface(b)
+        if imperfect:
+            if self.keep_deck_coords:
+                self.deck_coords = dict(self.geom.nodes)
+            self._apply_imperfections(blocks)
         for b in blocks:                        # DEFINITION=NODES: nodes may follow the card
             if b.keyword == "ORIENTATION" and b.uparam("DEFINITION").startswith("NODES"):
                 self.report.card = b
                 self._register_orientation(b)
         self.report.card = outer
+
+    def _apply_imperfections(self, blocks: List[Block]) -> None:
+        """*IMPERFECTION cards before the first *STEP (model data), as node shifts in global
+        coordinates (Abaqus 2017 "Introducing a geometric imperfection": "Only the translational
+        degrees of freedom are modified"), applied to the mesh before anything reads it, so
+        node-defined orientations, shell normals, couplings ... are the perturbed geometry's:
+        * data lines (an INPUT= file's too, which read_blocks inlines): node, then the shift
+          in SYSTEM's directions — R (default) x, y, z; C R, theta, Z; S R, theta, phi, angles
+          in degrees as *NODE reads them (system_point; checked against Abaqus' verification
+          decks ximpa / ximpf: a 0.2 radial shift written both ways).  The node's coordinates
+          in that system get the shift; with an angle shift that is one reading of the
+          undocumented form (a straight move along the arc's tangent is the other, which
+          differs at second order): reduced physics;
+        * FILE=, STEP=: modes (or a static solution) of another job's results, which ccx
+          cannot read: listed in ``imperfection_files`` for --run's first pass
+          (imperfection_pass), which runs that job's deck in ccx and hands its normalized
+          modes back in ``imperfection_shapes``; without them the card is commented out.
+        A node shifted twice (two lines or cards) gets the sum, which Abaqus does not
+        document: reduced physics.  What each card did is reported where it is written
+        (handle_imperfection)."""
+        first = next((i for i, b in enumerate(blocks) if b.keyword == "STEP"), len(blocks))
+        shifts: Dict[int, List[float]] = {}
+        twice: List[int] = []
+        for b in blocks[:first]:
+            if b.keyword != "IMPERFECTION":
+                continue
+            got = self._imperfection_modes(b) if b.param("FILE") is not None else \
+                self._imperfection_lines(b)
+            for n, d in got.items():
+                if n in shifts:
+                    twice.append(n)
+                acc = shifts.setdefault(n, [0.0, 0.0, 0.0])
+                for k in range(3):
+                    acc[k] += d[k]
+        if twice:
+            self.report.warn(f"*IMPERFECTION shifts node {twice[0]}"
+                             + (f" (and {len(twice) - 1} more)" if len(twice) > 1 else "")
+                             + " twice: Abaqus does not document whether they add up; added.",
+                             once=True)
+            self._reduces("*IMPERFECTION shifts of one node added up")
+        for n, d in shifts.items():
+            x = self.geom.nodes[n]
+            self.geom.nodes[n] = (x[0] + d[0], x[1] + d[1], x[2] + d[2])
+
+    def _imperfection_lines(self, b: Block) -> Dict[int, Vec]:
+        """The global shifts of an *IMPERFECTION card's data lines (_apply_imperfections)."""
+        system = (b.param("SYSTEM") or "R").strip().upper()[:1]
+        if system not in ("R", "C", "S"):
+            self._imperfection_notes[id(b)] = (
+                f"*IMPERFECTION, SYSTEM={b.param('SYSTEM')} is not an Abaqus coordinate system (R, "
+                f"C or S); commented out, so ccx solves the perfect geometry.", True)
+            return {}
+        out: Dict[int, Vec] = {}
+        missing: List[str] = []
+        angled = False
+        for rec in merged_data_records(b):
+            if not any(rec):
+                continue
+            try:
+                n, d = pint(rec[0]), fields_at(rec[1:], 3)
+            except ValueError:
+                _skip_unreadable(self.report, "*IMPERFECTION line", "a field that is not a number "
+                                 "(the first one a node number)")
+                continue
+            if n not in self.geom.nodes:
+                missing.append(rec[0])
+                continue
+            p = self.geom.nodes[n]
+            if system != "R":
+                angled = angled or bool(d[1]) or (system == "S" and bool(d[2]))
+                r = math.hypot(p[0], p[1])
+                th = math.degrees(math.atan2(p[1], p[0]))
+                own = (r, th, p[2]) if system == "C" else \
+                    (math.hypot(r, p[2]), th, math.degrees(math.atan2(p[2], r)))
+                q = system_point([own[k] + d[k] for k in range(3)], system)
+                d = [q[k] - p[k] for k in range(3)]
+            out[n] = (d[0], d[1], d[2]) if n not in out else \
+                tuple(out[n][k] + d[k] for k in range(3))     # (_apply_imperfections warns)
+        if missing:
+            self.report.warn(f"*IMPERFECTION names node {missing[0]}"
+                             + (f" (and {len(missing) - 1} more)" if len(missing) > 1 else "")
+                             + ", which the model does not have; skipped.", once=True)
+        if angled:
+            self.report.warn("*IMPERFECTION, SYSTEM=C / S with an angle shift: Abaqus does not say "
+                             "whether it adds the angle to the node's own angle or moves the node "
+                             "along the arc's tangent (the two differ at second order); the "
+                             "converter adds it to the angle.", once=True)
+            self._reduces("*IMPERFECTION angle shifts (SYSTEM=C / S) read one of two ways")
+        moved = sum(1 for v in out.values() if any(v))
+        self._imperfection_notes[id(b)] = (
+            f"*IMPERFECTION{'' if system == 'R' else ', SYSTEM=' + system}: {moved} node(s) shifted "
+            f"in the *NODE coordinates (ccx has no imperfection card; the deck's own geometry).",
+            None)
+        return out
+
+    def _imperfection_modes(self, b: Block) -> Dict[int, Vec]:
+        """The global shifts of an *IMPERFECTION, FILE= card: each data line's mode (a static
+        solution: "1") times its scale, at the NSET's nodes (all the model's without one),
+        from ``imperfection_shapes`` (--run's first pass); none without them, the card listed
+        in ``imperfection_files`` for that pass (_apply_imperfections)."""
+        job = (b.param("FILE") or "").strip().strip('"')
+        try:
+            step = pint(b.param("STEP") or "")
+            lines = [(pint(r[0]), fields_at(r[1:], 1)[0]) for r in merged_data_records(b) if any(r)]
+        except ValueError:
+            self._imperfection_notes[id(b)] = (
+                f"*IMPERFECTION, FILE={job}: its STEP= or a data line (mode, scale) is not a number; "
+                f"commented out, so ccx solves the perfect geometry.", True)
+            return {}
+        nset = (b.param("NSET") or "").strip()
+        nodes = [n for n in dedup(self.geom.nset(nset)) if n in self.geom.nodes] if nset else \
+            list(self.geom.nodes)
+        if not nodes:
+            self._imperfection_notes[id(b)] = (
+                f"*IMPERFECTION, FILE={job}: NSET={nset} has no node of the model; commented out, so "
+                f"ccx solves the perfect geometry.", True)
+            return {}
+        key = (job.upper(), step)
+        self.imperfection_files.append({
+            "file": job, "step": step, "key": key, "inc": (b.param("INC") or "").strip() or None,
+            "modes": dedup(k for k, _s in lines), "coords": {n: self.geom.nodes[n] for n in nodes}})
+        what = ", ".join(f"{k} x {s:g}" for k, s in lines)
+        got = self.imperfection_shapes.get(key)
+        if not isinstance(got, dict):
+            why = f": --run could not take them from {got}" if got else (
+                f"; abq2ccx --run takes them from {job}.inp, the Abaqus deck of job {job}, next to "
+                f"this one: it runs that deck in ccx first and shifts the nodes by its results")
+            self._imperfection_notes[id(b)] = (
+                f"*IMPERFECTION, FILE={job}, STEP={step}: the node shifts ({what}: mode x scale) come "
+                f"from step {step} of job {job}'s results, which ccx cannot read; commented out, so "
+                f"ccx solves the perfect geometry{why}.", True)
+            return {}
+        out: Dict[int, Vec] = {}
+        for n in nodes:
+            d = [sum(s * got["modes"][k].get(n, (0.0, 0.0, 0.0))[i] for k, s in lines) for i in range(3)]
+            out[n] = (d[0], d[1], d[2])
+        name = os.path.basename(got["deck"])
+        factors = [f"{k} ({'factor' if got['procedure'] == 'BUCKLE' else 'frequency'} "
+                   f"{got['factors'][k]:.7g})" for k, _s in lines if k in got["factors"]]
+        self._imperfection_notes[id(b)] = (
+            f"*IMPERFECTION, FILE={job}, STEP={step}: {len(out)} node(s) shifted by "
+            + (f"mode{'s' if len(factors) > 1 else ''} {', '.join(factors)}" if factors else
+               "the final displacements")
+            + f" of step {step} as ccx solves {os.path.basename(got['source'])} ({name}, --run's first "
+              f"pass)" + (", each normalized as Abaqus normalizes it (its largest displacement "
+                          "component 1.0)." if factors else "."), None)
+        for what in got["reduced"]:
+            self._reduces(f"*IMPERFECTION shifts from {os.path.basename(got['source'])}, whose ccx "
+                          f"model reduces: {what}")
+        for k, j in got["repeated"]:
+            self.report.warn(f"*IMPERFECTION, FILE={job}: mode {k}'s factor equals mode {j}'s (a "
+                             f"repeated eigenvalue), so any mix of the two is a mode: ccx's need not "
+                             f"be the one Abaqus finds.", once=True)
+            self._reduces(f"*IMPERFECTION mode {k} of a repeated eigenvalue")
+        return out
+
+    def handle_imperfection(self, b: Block) -> List[str]:
+        """An *IMPERFECTION card as written: a comment where its shifts are in the *NODE
+        coordinates (_apply_imperfections), else commented out with why."""
+        msg, reduces = self._imperfection_notes.get(id(b), (
+            "*IMPERFECTION after the first *STEP: Abaqus reads it as model data only; commented "
+            "out.", False))
+        if reduces is None:
+            self.report.note(msg)
+            return [f"** abq2ccx: {emit_keyword(b.keyword, b.params)} — applied to the *NODE "
+                    f"coordinates above"]
+        return self._comment_out(msg, [emit_keyword(b.keyword, b.params)] + list(b.data), reduces)
 
     def _types_where(self, test: Callable[[str], bool]) -> set:
         """The element types of the mesh (as it spells them) that pass ``test``."""
@@ -40911,6 +41085,13 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._abaqus_umat = bool(getattr(options, "abaqus_umat", False))
         self._umat_explicit = False      # an Abaqus/Explicit deck: user materials are VUMATs
         self.geom = Geometry()
+        # *IMPERFECTION, FILE= (_imperfection_modes): the cards, for --run's first pass
+        # (imperfection_pass), and what it found per (job, step): the modes, or why none
+        self.imperfection_files: List[dict] = []
+        self.imperfection_shapes: Dict[Tuple[str, int], Union[dict, str]] = {}
+        self._imperfection_notes: Dict[int, Tuple[str, Optional[bool]]] = {}
+        self.keep_deck_coords = False                # (that pass's own conversion of the job's deck:
+        self.deck_coords: Dict[int, Vec] = {}        # its nodes as the deck places them)
         self.orientations: Dict[str, Tuple[Vec, Vec, str]] = {}
         self._orient_rotation: Dict[str, Optional[Tuple[int, float]]] = {}
         self.surfaces: Dict[str, Tuple[str, List[Tuple[str, Optional[str]]]]] = {}
@@ -41622,6 +41803,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "MODEL CHANGE": "handle_model_change",
         "SUBMODEL": "handle_submodel",
         "PRE-TENSION SECTION": "handle_pretension_section",
+        "IMPERFECTION": "handle_imperfection",
         **dict.fromkeys(OUTPUT_CARDS, "handle_output"),
         **dict.fromkeys(ENERGY_CARDS, "handle_energy_output"),
         "KINEMATIC COUPLING": "handle_coupling",
@@ -41840,7 +42022,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
         blocks = self._plan_self_contact(blocks)      # before anything reads contact pairs
         self._plan_deck_facts(blocks)
-        self.build_geometry(blocks)
+        self.build_geometry(blocks, imperfect=True)
         blocks = self._split_coupling_refs(blocks)
         self._plan_embedded(blocks)             # before anything reads node coordinates
         self._warn_undefined_element_nodes()
@@ -44701,6 +44883,36 @@ def dat_blocks(path: str) -> Iterator[Tuple[int, str, str, Optional[float], List
             yield cur[0], cur[1], cur[2], cur[3], cur[4]
 
 
+_DAT_MODE_RE = re.compile(r"E I G E N V A L U E\s+N U M B E R\s+(\d+)$")
+
+
+def dat_step_displacements(path: str, step: int, nset: str) -> List[Tuple[Optional[int], Dict[int, Vec]]]:
+    """The displacement tables ccx step ``step`` prints for node set ``nset`` in the .dat file
+    ``path`` (*NODE PRINT, U), in order, each with the mode its "E I G E N V A L U E  N U M B E R"
+    heading gives in a *FREQUENCY or *BUCKLE step (None for one before any: a static table, as
+    a *BUCKLE step prints its base state first) and ``{node: (u1, u2, u3)}``."""
+    out: List[Tuple[Optional[int], Dict[int, Vec]]] = []
+    mode: Optional[int] = None
+    for st, title, name, _t, rows in dat_blocks(path):
+        if st != step:
+            continue
+        m = _DAT_MODE_RE.match(title)
+        if m:
+            mode = int(m.group(1))
+        elif title == "displacements" and name.upper() == nset.upper():
+            out.append((mode, {int(r[0]): (r[1], r[2], r[3]) for r in rows if len(r) >= 4}))
+    return out
+
+
+def displacement_normalized(mode: Dict[int, Vec]) -> Dict[int, Vec]:
+    """A mode shape scaled as Abaqus scales buckling modes and frequency modes of the default
+    NORMALIZATION=DISPLACEMENT: "the maximum displacement component is 1.0" (2017
+    "Eigenvalue buckling prediction") — the translation of largest size, the first such in node
+    order, made +1; a mode without translations stays as it is (its imperfection is zero)."""
+    big = max((c for v in mode.values() for c in v), key=abs, default=0.0)
+    return {n: (v[0] / big, v[1] / big, v[2] / big) for n, v in mode.items()} if big else dict(mode)
+
+
 def _deck_steps(path: str) -> Optional[dict]:
     """What the results digest reads from a ccx deck: per step its procedure and the DOFs
     1-3 that the *BOUNDARY cards in effect hold (bc_steps; not at a ROT NODE, whose DOFs are
@@ -45341,6 +45553,165 @@ def run_ccx(out_path: str, override: Optional[str], quiet: bool, digest: bool = 
     return run
 
 
+IMPERFECTION_NSET = "ABQ2CCX_IMPERFECTION"      # every node of the job's deck (imperfection_pass)
+
+
+def imperfection_source(deck: str, job: str) -> Optional[str]:
+    """The Abaqus deck of the job an *IMPERFECTION, FILE= names: <job>.inp next to ``deck`` (or
+    at the job's own path), its name matched regardless of case; None if there is none."""
+    job = re.sub(r"\.(fil|odb)$", "", job, flags=re.I)
+    base = job if os.path.isabs(job) else os.path.join(os.path.dirname(os.path.abspath(deck)), job)
+    folder, name = os.path.split(base if base.lower().endswith(".inp") else base + ".inp")
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return None
+    hit = [f for f in names if f == name] + [f for f in names if f != name and f.lower() == name.lower()]
+    return next((os.path.join(folder, f) for f in hit if os.path.isfile(os.path.join(folder, f))), None)
+
+
+def imperfection_pass(path: str, args, conv: "Converter", out_path: str) -> Dict[Tuple[str, int], Union[dict, str]]:
+    """--run's first pass for the *IMPERFECTION, FILE= cards of ``conv``, the deck ``path``
+    converted: per (job, step) what Converter.imperfection_shapes takes (_imperfection_run),
+    the job's deck converted and solved by ccx as <output>_imperfection.inp (its own report in
+    its .log), or why not."""
+    found: Dict[Tuple[str, int], Union[dict, str]] = {}
+    say = (lambda msg: None) if args.quiet else (lambda msg: sys.stderr.write(f"abq2ccx: {msg}\n"))
+    groups: Dict[Tuple[str, int], List[dict]] = {}
+    for req in conv.imperfection_files:
+        groups.setdefault(req["key"], []).append(req)
+    for i, (key, group) in enumerate(groups.items()):
+        job, step = group[0]["file"], group[0]["step"]
+        p1 = os.path.splitext(out_path)[0] + "_imperfection" + (str(i + 1) if i else "") + ".inp"
+        got = found[key] = _imperfection_run(path, args, job, step, group, p1, say)
+        say(f"*IMPERFECTION, FILE={job}, STEP={step}: "
+            + (f"read from {os.path.basename(p1)}'s .dat; converting the deck again with its nodes "
+               f"shifted." if isinstance(got, dict) else
+               f"no shifts ({got}); the deck runs on its perfect geometry."))
+    return found
+
+
+def _imperfection_run(path: str, args, job: str, step: int, group: List[dict], p1: str,
+                      say: Callable[[str], None]) -> Union[dict, str]:
+    """imperfection_pass for one (job, step): the job's deck (imperfection_source) converted,
+    a *NODE PRINT of U at all its nodes (IMPERFECTION_NSET) added to its step ``step``, written
+    to ``p1`` and run by run_ccx; then the step's modes (a *BUCKLE or *FREQUENCY step, each
+    displacement_normalized) or final displacements (a general *STATIC step, the "1" line)
+    from the .dat, as ``{"modes": {k: {node: u}}, "factors": {k: buckling factor or frequency},
+    "deck", "source", "procedure", "reduced": the job deck's reduced physics, "repeated":
+    [(mode, mode with the same factor)]}``; or why not, as a string.  Only where the converter
+    writes the job deck's steps one to one, and every node the cards ``group`` shift is a node
+    of the job's deck at the same place (the same mesh): Abaqus matches the nodes by label
+    and "does not check model compatibility".  ccx 2.23's *BUCKLE returns the factors nearest
+    1 (buckle_factor_warning): where that warns, its mode numbers need not be Abaqus'."""
+    src = imperfection_source(path, job)
+    if src is None:
+        return f"there is no {job}.inp, the Abaqus deck of job {job}, next to the deck"
+    name = os.path.basename(src)
+    if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(path)):
+        return f"{name} is the deck itself: Abaqus reads an earlier run's results there"
+    rep = Report()
+    try:
+        blocks = read_blocks(src, rep)
+        steps = sum(1 for b in blocks if b.keyword == "STEP")
+        conv = Converter(rep, args)
+        conv.keep_deck_coords = True
+        body = conv.convert(blocks)
+    except Exception as exc:                    # a bug: the deck still runs, unshifted
+        return f"converting {name} failed ({type(exc).__name__}: {exc}; a bug in abq2ccx: please report it)"
+    heads = [i for i, ln in enumerate(body) if ln[:5].upper() == "*STEP"]
+    ends = [i for i, ln in enumerate(body) if ln[:9].upper() == "*END STEP"]
+    if not 1 <= step <= steps:
+        return f"{name} has {steps} step(s), no step {step}"
+    if len(heads) != steps or len(ends) != steps or len(conv.steps.steps) != steps:
+        return f"the converter writes {name}'s {steps} step(s) as {len(heads)} ccx steps"
+    st = conv.steps.steps[step - 1]
+    modes = dedup(k for r in group for k in r["modes"])
+    if st.proc in ("BUCKLE", "FREQUENCY"):
+        if st.proc == "FREQUENCY" and st.procedure.uparam("NORMALIZATION") == "MASS":
+            return (f"{name}'s step {step} normalizes its modes by mass (NORMALIZATION=MASS), which "
+                    f"ccx's mass matrices need not match")
+    elif st.proc == "STATIC" and not st.perturbation and not st.procedure.has("RIKS"):
+        if modes != [1]:
+            return f"{name}'s step {step} is a static step, whose one data line is '1, scale'"
+        if any(r["inc"] for r in group):
+            return (f"INC= names an Abaqus increment of {name}'s step {step}, which ccx's increments "
+                    f"do not match (the final one, INC omitted, is the same state)")
+    else:
+        return (f"{name}'s step {step} is a *{st.proc or 'step without a procedure'}"
+                f"{' perturbation' if st.perturbation else ''}"
+                f"{', RIKS' if st.proc == 'STATIC' and st.procedure.has('RIKS') else ''} "
+                f"step: neither modes nor a general static solution")
+    own = conv.deck_coords
+    want = {n: p for r in group for n, p in r["coords"].items()}
+    tol = 1e-9 * max((abs(c) for p in own.values() for c in p), default=1.0)
+    off = [n for n, p in want.items() if n not in own or
+           max(abs(p[k] - own[n][k]) for k in range(3)) > tol]
+    if off:
+        n = off[0]
+        return (f"{name}'s mesh is not this deck's: "
+                + (f"it has no node {n}" if n not in own else
+                   f"its node {n} is at {', '.join(f'{c:.9g}' for c in own[n])}, here at "
+                   f"{', '.join(f'{c:.9g}' for c in want[n])}")
+                + (f" ({len(off)} such nodes)" if len(off) > 1 else ""))
+    at = ends[step - 1]
+    lines = (rep.header_comment_lines() + body[:heads[0]]
+             + [f"*NSET, NSET={IMPERFECTION_NSET}"] + reflow([str(n) for n in own], 16)
+             + body[heads[0]:at] + [f"*NODE PRINT, NSET={IMPERFECTION_NSET}, GLOBAL=YES", "U"]
+             + body[at:])
+    try:
+        with open(p1, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines) + "\n")
+        if not args.no_log:
+            with open(os.path.splitext(p1)[0] + ".log", "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(rep.text())
+    except OSError as exc:
+        return f"cannot write {p1}: {exc}"
+    say(f"*IMPERFECTION, FILE={job}, STEP={step}: converted {name}, the deck of job {job}, to "
+        f"{p1}; running it in ccx for its step {step}'s "
+        f"{'modes' if st.proc != 'STATIC' else 'displacements'}.")
+    run = run_ccx(p1, args.ccx, args.quiet, digest=False, timeout=args.timeout,
+                  holds=conv.rotation_holds)
+    if run["code"] != 0 or run["status"] != "solved":
+        free = run.get("free_rotations")
+        return ((f"ccx left {len(free)} rotation(s) the deck holds free in {os.path.basename(p1)}"
+                 if free else f"ccx did not solve {os.path.basename(p1)} ({run['status'] or 'not run'}")
+                + (f"; its output: {run['log']}" if run["log"] else "") + ("" if free else ")"))
+    dat = os.path.splitext(p1)[0] + ".dat"
+    tables = dat_step_displacements(dat, step, IMPERFECTION_NSET)
+    factors: Dict[int, float] = {}
+    for s, title, _n, _t, rows in dat_blocks(dat):
+        if s == step and title.startswith(("B U C K L I N G   F A C T O R", "E I G E N V A L U E   O U T")):
+            col = 1 if title[0] == "B" else 3       # a buckling factor, a frequency (cycles/time)
+            factors.update((int(r[0]), r[col]) for r in rows if len(r) > col)
+    if st.proc == "STATIC":
+        final = [v for m, v in tables if m is None]
+        if not final:
+            return f"ccx printed no displacements in step {step} of {os.path.basename(p1)}"
+        shapes, factors = {1: final[-1]}, {}
+    else:
+        shapes = {}
+        for m, v in tables:
+            if m is not None and m not in shapes:
+                shapes[m] = displacement_normalized(v)
+        lack = [k for k in modes if k not in shapes]
+        if lack:
+            return f"ccx gives {len(shapes)} mode(s) of {name}'s step {step}, not mode {lack[0]}"
+        warned = buckle_factor_warning(list(factors.values())) if st.proc == "BUCKLE" else None
+        if warned:
+            return (f"ccx's buckling factors of {name}'s step {step} "
+                    f"({', '.join(f'{x:.4g}' for x in list(factors.values())[:5])}"
+                    f"{', ...' if len(factors) > 5 else ''}) may not be the lowest, so its mode "
+                    f"numbers need not be Abaqus' — {warned}")
+    unread = sorted({n for r in group for n in r["coords"]} - {n for k in shapes for n in shapes[k]})
+    if unread:
+        return f"ccx printed no displacement at node {unread[0]} in {os.path.basename(p1)}'s step {step}"
+    repeated = [(k, j) for k in modes if k in factors for j in factors
+                if j != k and abs(factors[j] - factors[k]) <= 1e-5 * abs(factors[k])]
+    return {"modes": shapes, "factors": factors, "deck": p1, "source": src, "procedure": st.proc,
+            "reduced": list(conv.reduced_physics), "repeated": repeated}
+
+
 def _output_path(path: str, args) -> str:
     """Where the deck converted from ``path`` goes: -o, else <input>_ccx.inp (in --outdir)."""
     if args.output:
@@ -45436,6 +45807,16 @@ def _convert_one(path: str, args) -> Tuple[int, dict]:
             os.makedirs(args.outdir, exist_ok=True)
         except OSError as exc:
             return _failed(path, args, report, 1, f"cannot create --outdir {args.outdir}: {exc}")
+    shapes = None
+    if args.run and not args.check and conv.imperfection_files:
+        try:                                    # two passes: the job's modes, then the deck
+            shapes = imperfection_pass(path, args, conv, out_path)
+            report = Report()
+            conv = Converter(report, args)
+            conv.imperfection_shapes = shapes
+            body = conv.convert(read_blocks(path, report))
+        except Exception as exc:
+            return _crashed(path, args, report, exc)
     text = "\n".join(report.header_comment_lines() + body) + "\n"
 
     wrote = False
@@ -45470,6 +45851,12 @@ def _convert_one(path: str, args) -> Tuple[int, dict]:
         doc["run"] = {k: run.get(k) for k in ("ccx", "ccx_version", "status", "log")}
         if run.get("free_rotations"):
             doc["run"]["free_rotations"] = run["free_rotations"]
+        if shapes:
+            named = {r["key"]: r["file"] for r in conv.imperfection_files}
+            doc["run"]["imperfection"] = [
+                {"file": named.get(key, key[0]), "step": key[1],
+                 "deck": got["deck"] if isinstance(got, dict) else None,
+                 "error": None if isinstance(got, dict) else got} for key, got in shapes.items()]
         doc["results"] = run["results"]
     if strict:
         return 3, doc

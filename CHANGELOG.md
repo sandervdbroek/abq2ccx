@@ -29,6 +29,16 @@ physics.
   of step 1 included); warned as reduced physics where the nodes differ (their mean), a shell
   or beam section varies through its thickness, or a step changes the values (those at the
   end of step 1). User-set fields (USDFLD, `*FIELD, USER`, `FILE=`) keep the field-0 collapse.
+* **`*IMPERFECTION` converted** — it was commented out (reduced physics). Data lines and an
+  `INPUT=` file (node and shift, `SYSTEM=R`, `C` or `S`) now move the `*NODE` coordinates: the
+  deck's own geometry. `FILE=job, STEP=n` takes modes or a static solution from another job's
+  results, which ccx cannot read: `--run` first converts and runs that job's deck, `job.inp`
+  next to the deck, as `<output>_imperfection.inp`, then moves the nodes by its modes (each
+  scaled to a largest displacement component of 1.0, as Abaqus scales them) and runs the deck.
+  It does so only for the same mesh and a `*BUCKLE`, `*FREQUENCY` or general `*STATIC` step,
+  and not where ccx's buckling factors may not be the lowest; it says why otherwise, and the
+  deck runs on its perfect geometry. Without `--run` the card stays commented out and names the
+  deck to supply.
 * **Batch triage, crash reports, ccx install hint** — `--json` prints one object per deck per
   line (JSON Lines), now with the deck's `status` (`converted`, `reduced`, `commented` or
   `failed`) and `reduced_physics`, and a line with `error` for a deck that failed (none was

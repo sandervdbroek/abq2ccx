@@ -1079,7 +1079,9 @@ def gen_output():
              "went to). Values are at the step's last increment. `--run` also checks the job's "
              "`.12d` for a mean-rotation MPC per rotation a beam or shell node holds at step 1 "
              "(not at a knot): one it lacks, which ccx leaves free, is reported "
-             "(`run.free_rotations` in `--json`) and the exit code is 1.\n",
+             "(`run.free_rotations` in `--json`) and the exit code is 1. An `*IMPERFECTION, FILE=` "
+             "deck runs in two passes, its job's deck first (`run.imperfection`: per job and step, "
+             "that pass's deck, or the `error` why it took no modes).\n",
              md_table(["Key", "What"], [
                  ("`time`", "the total time reached, as ccx writes it"),
                  ("`max_u`, `max_mises`", "the largest \\|U\\| and von Mises stress and their node "

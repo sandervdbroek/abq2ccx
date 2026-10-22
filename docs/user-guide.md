@@ -59,6 +59,9 @@ top; `<output>.log`, the same report as text; and a one-line summary plus the re
 stderr. Run the deck with `ccx <output>` (no `.inp` extension). `--run` streams ccx's output
 to stderr as it comes and to `<output>.ccx.log` (its first 100 MB, then its last lines), and
 ends with ccx's own `*ERROR` and `*WARNING` lines.
+An `*IMPERFECTION, FILE=job` reads modes from another job's results: give that job's deck,
+`job.inp`, next to the deck, and `--run` runs it first (as `<output>_imperfection.inp`) and
+moves the nodes by its modes.
 
 ### Batch triage
 
