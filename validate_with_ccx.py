@@ -8237,7 +8237,7 @@ def main():
     # under a tilted one must match the plate in global components, the half panel with a
     # cylindrical *TRANSFORM on all nodes the whole panel without (before: 2.1 % / 1.3 % off).
     def corner_twin(label, text, twin, tol=1e-9, moved=0.0):
-        u, notes, why = [], [], []
+        u, notes, why, crashed = [], [], [], []
         for i, t in enumerate((text, twin)):
             src, inp = os.path.join(tmp, f"tc{i}_src.inp"), os.path.join(tmp, f"tc{i}.inp")
             with open(src, "w", encoding="utf-8", newline="\n") as fh:
@@ -8250,10 +8250,17 @@ def main():
                     break
                 shutil.rmtree(d, ignore_errors=True)
             u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
+            crashed.append(status == "failed" and "*ERROR" not in out and "Job finished" not in out)
             if status != "solved":                  # say how ccx ended (the last lines it printed)
                 tail = [ln.strip() for ln in out.splitlines() if ln.strip()][-3:]
                 why.append(f"{('the deck', 'its twin')[i]} {status}: {' | '.join(tail)}")
             shutil.rmtree(d, ignore_errors=True)
+        if u[0] and not u[1] and crashed[1]:
+            # the deck solved, but ccx crashed on its hand-written twin at every try (ccx 2.23's
+            # random tempload crash at a *DYNAMIC step's start; Windows' build in every try of
+            # some CI runs): nothing to compare against, which is ccx's fault, not the deck's
+            print(f"SKIP  {label}: ccx crashed on the twin at every try ({'; '.join(why)})")
+            return 0
         if not u[0] or u[0].keys() != u[1].keys():
             print(f"FAIL  {label}: no displacements to compare" + (f" ({'; '.join(why)})" if why else ""))
             return 1
