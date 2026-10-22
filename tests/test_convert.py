@@ -21555,6 +21555,8 @@ def test_rota_becomes_consistent_nodal_forces():
         assert ("*DLOAD ROTA load dropped" in conv.reduced_physics) == reduced
     body, _, rep = convert_str(cubes.replace("*Step", "*Step, nlgeom"), approximate=True)
     assert "*CLOAD" in body and "[APPROX] *DLOAD ROTA" in rep.text()
+    body, conv, rep = convert_str(cubes.replace("E, ROTA", "NOSET, ROTA"))
+    assert "element set 'NOSET' is empty or undefined" in rep.text() and "*CLOAD" not in body
     # one point mass at (1, 0, 0): -m alpha y
     body, _, _ = convert_str(cubes.replace("*Elset, elset=E\nE1, E2\n", "*Element, type=MASS, elset=PM\n3, 2\n"
                                            "*Mass, elset=PM\n0.5\n*Elset, elset=E\nPM\n"))

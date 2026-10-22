@@ -30744,7 +30744,10 @@ class _Loads:
         for (key, label), token in tokens.items():
             plan: dict = {"groups": [], "items": [], "why": "", "reduces": True}
             groups: "OrderedDict[float, List[int]]" = OrderedDict()
-            for e in dedup(self._load_elements(token)):
+            eids = dedup(self._load_elements(token))
+            if not eids:
+                plan["why"], plan["reduces"] = f"element set '{token}' is empty or undefined", False
+            for e in eids:
                 f = form(e, label) if e in self.geom.elements else None
                 if isinstance(f, str):
                     plan["why"] = f
