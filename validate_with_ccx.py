@@ -113,12 +113,20 @@ its system (abq2ccx.classify_ccx_run): a step that sets up none still ends in "J
 A ratio over a scale from ccx's output (ccx_ratio) fails its check when that scale is 0.
 
     python validate_with_ccx.py
+    python validate_with_ccx.py --list
+    python validate_with_ccx.py --only 'beam_*,t141'
+
+--list prints the checks' names and descriptions; --only runs the named checks (names or
+globs, comma-separated) and the checks whose results they read, in their usual order.
 
 Exits 0 if every available check passes (or ccx is not installed — then it skips with
 a clear message), 1 if a check fails.  Requires CalculiX 2.23:
 ``conda install -c conda-forge calculix=2.23``.
 """
 
+import argparse
+import collections
+import fnmatch
 import itertools
 import math
 import os
@@ -9190,19 +9198,304 @@ def knot_drilling_deck(modal=True, nx=30, ny=10):
     return out
 
 
-def main():
-    A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
-    ccx, env = find_ccx()
-    if not ccx:
-        print("CalculiX (ccx) not found — skipping end-to-end validation.")
-        print(f"Install CalculiX {A.CCX_VERSIONS[-1]} to enable it: {A.CCX_INSTALL}")
-        return 0
-    print(f"Using ccx: {ccx}\n")
+Check = collections.namedtuple("Check", "name doc func needs")
+CHECKS = []                 # the registered checks, in the order validate runs them
 
-    tmp = tempfile.mkdtemp(prefix="ccxconv_")
-    failures = 0
 
+def check(name, doc, needs=()):
+    """Register the decorated ``func(ccx, env, tmp, shared)`` as the check ``name`` (``doc``:
+    its line in --list), run after those registered before it.  It prints its PASS / FAIL /
+    SKIP lines and returns its failure count; ``shared`` holds shared_helpers() and what
+    checks store there for later ones, which name them in ``needs`` (run first under --only)."""
+    def register(func):
+        if any(c.name == name for c in CHECKS) or any(n not in [c.name for c in CHECKS]
+                                                      for n in needs):
+            raise ValueError(f"check {name!r}: a second one of that name, or needs a later one")
+        CHECKS.append(Check(name, doc, func, tuple(needs)))
+        return func
+    return register
+
+
+def select_checks(argv):
+    """The checks the command line ``argv`` asks for, in their order (None after --list)."""
+    ap = argparse.ArgumentParser(prog="validate_with_ccx.py",
+                                 description="Convert the examples, run them in CalculiX and "
+                                             "check the results against independent references.")
+    ap.add_argument("--list", action="store_true", help="print the checks' names and descriptions")
+    ap.add_argument("--only", action="append", default=[], metavar="NAME[,NAME...]",
+                    help="run only these checks (names or globs such as 'beam_*'), with the "
+                         "checks they need")
+    args = ap.parse_args(list(argv))
+    if args.list:
+        width = max(len(c.name) for c in CHECKS)
+        for c in CHECKS:
+            extra = f" (needs {', '.join(c.needs)})" if c.needs else ""
+            print(f"{c.name:<{width}}  {c.doc}{extra}")
+        return None
+    if not args.only:
+        return list(CHECKS)
+    chosen = set()
+    for pattern in filter(None, (p.strip() for p in ",".join(args.only).split(","))):
+        hits = {c.name for c in CHECKS if fnmatch.fnmatchcase(c.name, pattern)}
+        if not hits:
+            ap.error(f"no check is named or matches {pattern!r} (--list lists them)")
+        chosen |= hits
+    needs = {c.name: c.needs for c in CHECKS}
+    todo = list(chosen)
+    while todo:
+        for n in needs[todo.pop()]:
+            if n not in chosen:
+                chosen.add(n)
+                todo.append(n)
+    return [c for c in CHECKS if c.name in chosen]
+
+
+def shared_helpers(ccx, env, tmp):
+    """What several checks use, as closures over the run's ccx, env and scratch folder: the
+    start of every check's ``shared``."""
+    def solve(name, subs=(), nodes=()):
+        """Convert an example (optionally with text substitutions), run it and return the
+        last printed displacement of each node, or None."""
+        src = os.path.join(EXAMPLES, name + ".inp")
+        text = open(src, encoding="utf-8").read()
+        for a, b in subs:
+            text = text.replace(a, b)
+        tmp_src = os.path.join(tmp, f"{name}_{len(subs)}_src.inp")
+        with open(tmp_src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, f"{name}_{len(subs)}.inp")
+        convert(tmp_src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u = {n: dat_displacement(os.path.join(d, "job.dat"), n) for n in nodes} \
+            if status == "solved" else {}
+        shutil.rmtree(d, ignore_errors=True)
+        if status != "solved" or any(v is None for v in u.values()):
+            print(f"FAIL  {name}{' (variant)' if subs else ''}: did not solve ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return u
+
+    def rel(a, b):
+        return ccx_ratio(abs(a - b), abs(b))
+
+    ei = 1.0e5 * 4.0 / 3.0                                      # E I of the 2 x 2 section
+
+    bar = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n"
+           "8,0.,1.,1.\n9,2.,0.,0.\n10,2.,1.,0.\n11,2.,0.,1.\n12,2.,1.,1.\n13,3.,0.,0.\n14,3.,1.,0.\n"
+           "15,3.,0.,1.\n16,3.,1.,1.\n*Element, type=C3D8, elset=ALL\n1, 1,2,3,4,5,6,7,8\n"
+           "2, 2,9,10,3,6,11,12,7\n3, 9,13,14,10,11,15,16,12\n*Elset, elset=E1\n1\n*Nset, nset=TIP\n16\n"
+           "*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1.\n*Solid Section, elset=ALL, material=M\n"
+           "*Amplitude, name=A\n0., 1., 1., 1.\n*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n")
+
+    step = "*Step{}\n*Static\n{}*Node Print, nset=TIP\nU\n*End Step\n"
+
+    def local_axes(typ, a, b, x):
+        """Abaqus' local axes of a rectangular / cylindrical *TRANSFORM at point ``x``,
+        computed independently of abq2ccx."""
+        if typ == "R":
+            e1, e3 = _unit(a), _unit(_cross(a, b))
+            return e1, _cross(e3, e1), e3
+        e3 = _unit([q - p for p, q in zip(a, b)])
+        r = [xi - ai for xi, ai in zip(x, a)]
+        e1 = _unit([ri - _dot(r, e3) * e for ri, e in zip(r, e3)])
+        return e1, _cross(e3, e1), e3
+
+    def with_transform(deck, node, typ, a, b, x):
+        """``deck`` with a *TRANSFORM on ``node`` (at ``x``) and its *CLOAD lines (forces and
+        moments) given in the local axes."""
+        ax = local_axes(typ, a, b, x)
+        head, cload = deck.split("*Cload\n", 1)
+        lines, rest = cload.split("*", 1)
+        keep, own = [], {}
+        for ln in lines.strip().splitlines():
+            n, d, v = (f.strip() for f in ln.split(","))
+            if n == str(node):
+                own[int(d)] = float(v)
+            else:
+                keep.append(ln)
+        for base in (0, 3):
+            g = [own.get(base + k + 1, 0.0) for k in range(3)]
+            if any(g):
+                keep += [f"{node}, {base + j + 1}, {_dot(g, e):.14g}" for j, e in enumerate(ax)]
+        card = (f"*Nset, nset=LOCAL\n{node}\n*Transform, nset=LOCAL, type={typ}\n"
+                + ", ".join(repr(float(v)) for v in list(a) + list(b)) + "\n")
+        return head.replace("*Step", card + "*Step", 1) + "*Cload\n" + "\n".join(keep) + "\n*" + rest
+
+    def same_as(label, text, twin, turn=None, tol=1e-6):
+        """Run ``text`` and ``twin`` (the same model in global components) and compare every
+        printed displacement (the twin's turned by ``turn``: a rotated twin's back into the
+        model's axes); 1 on failure."""
+        u, bad = [], ""
+        for i, t in enumerate((text, twin)):
+            src, inp = os.path.join(tmp, f"ct{i}_src.inp"), os.path.join(tmp, f"ct{i}.inp")
+            with open(src, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(t)
+            convert(src, inp)
+            d, status, out = run_ccx(ccx, env, inp)
+            u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
+            if status != "solved" and not bad:
+                bad = " / ".join([status] + [l.strip() for l in out.splitlines() if "ERROR" in l])
+            shutil.rmtree(d, ignore_errors=True)
+        if not u[0] or u[0].keys() != u[1].keys():
+            print(f"FAIL  {label}: no displacements to compare ({bad or 'different nodes printed'})")
+            return 1
+        if turn:
+            u[1] = {n: turn(v) for n, v in u[1].items()}
+        scale = max(abs(x) for v in u[1].values() for x in v)
+        err = ccx_ratio(max(abs(p - q) for n in u[1] for p, q in zip(u[0][n], u[1][n])), scale)
+        ok = err <= tol
+        print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes differs from the "
+              f"{'rigidly rotated ' if turn else ''}model without the *TRANSFORM by {err:.1e} of "
+              f"max |u| ({scale:.4g})")
+        return 0 if ok else 1
+
+    untransformed = lambda t: re.sub(r"(?mi)^\*Transform.*\n.*\n", "", t)  # noqa: E731
+
+    rect, cyl = ("R", (1., 2., 0.5), (-1., 0.3, 1.)), ("C", (0.3, -0.2, -0.4), (1.1, 0.9, 1.6))
+
+    plastic = "*Plastic\n1e6, 0.\n"
+
+    def finite_drift(label, deck, lo, hi, moved):
+        u, flagged = [], []
+        for i, t in enumerate((deck, deck.replace(plastic, ""))):
+            src, inp = os.path.join(tmp, f"fr{i}_src.inp"), os.path.join(tmp, f"fr{i}.inp")
+            with open(src, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(t)
+            _, conv = convert(src, inp)
+            flagged.append(bool(other_reduced(conv)))
+            d, status, _ = run_ccx(ccx, env, inp)
+            u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
+            shutil.rmtree(d, ignore_errors=True)
+        if not u[0] or u[0].keys() != u[1].keys():
+            print(f"FAIL  {label}: no displacements to compare")
+            return 1
+        scale = max(math.hypot(*v) for v in u[1].values())
+        err = ccx_ratio(max(math.dist(u[0][n], u[1][n]) for n in u[1]), scale)
+        ok = lo <= err <= hi and scale >= moved and flagged == [lo > 0, False]
+        print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes {err:.2e} of max |u| "
+              f"({scale:.4g}) off the elastic twin's linear step (expected {lo:g}-{hi:g}); "
+              f"{'warned as' if flagged[0] else 'not'} reduced physics")
+        return 0 if ok else 1
+
+    def dist_run(tag, text):
+        src, inp = os.path.join(tmp, tag + "_src.inp"), os.path.join(tmp, tag + ".inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+        shutil.rmtree(d, ignore_errors=True)
+        return u, status, out
+
+    def composite_run(text, tag):
+        src = os.path.join(tmp, f"{tag}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, f"{tag}.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        res = (dat_displacements(dat), dat_totals(dat)) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if res is None:
+            print(f"FAIL  {tag}: did not solve ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+        return res
+
+    def faithful_run(text, tag, allow=()):
+        src = os.path.join(tmp, f"{tag}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        inp = os.path.join(tmp, f"{tag}.inp")
+        _rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        lost = [r for r in other_reduced(conv) if not r.startswith(allow)] if allow else other_reduced(conv)
+        if u is None or lost:
+            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if u is None else
+                                      "reduced physics: " + "; ".join(lost)))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return u
+
+    def review_run(text, tag, read, approximate=False):
+        """``read(.dat path)`` of ``text`` converted and solved, or None (FAIL printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        try:
+            convert(src, inp, approximate=approximate)
+        except Exception as exc:  # noqa: BLE001
+            print(f"FAIL  {tag}: the conversion failed ({exc!r})")
+            return None
+        d, status, out = run_ccx(ccx, env, inp)
+        res = read(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if not res:
+            print(f"FAIL  {tag}: no results ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+        return res
+
+    def same(runs, k=None):
+        """The largest difference between the NODE PRINT blocks of two runs (block ``k`` only,
+        or all), and the largest |u| of the second (the reference)."""
+        got, ref = runs
+        if k is None and len(got) != len(ref):
+            return math.inf, 0.0
+        pairs = [(got[k], ref[k])] if k is not None else list(zip(got, ref))
+        err = max(abs(a - b) for g, r in pairs for n, v in r.items()
+                  for a, b in zip(g.get(n, [math.inf] * 3), v))
+        return err, max(abs(x) for _, r in pairs for v in r.values() for x in v)
+
+    def t124_run(tag, kind, reduced=(), deck=None):
+        """(the .dat path's displacement blocks, buckling factor tables, frequency tables, the
+        report text) of avoidable_stops_deck(kind) (or ``deck``) converted and solved with
+        exactly the ``reduced`` physics, or None (FAIL printed).  ccx gets 120 s and files of at
+        most 50 MB (POSIX): some of these decks made it loop without end."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(avoidable_stops_deck(kind) if deck is None else deck)
+        rep, conv = convert(src, inp)
+        d = tempfile.mkdtemp(prefix="ccxval_")
+        shutil.copy(inp, os.path.join(d, "job.inp"))
+        r = ccx_job(ccx, env, d, 120, fsize=50 << 20)
+        rc, out = r.stopped or r.returncode, r.stdout + r.stderr
+        # (the checks below show the solve)
+        status = "solved" if rc == 0 and "Job finished" in out and "*ERROR" not in out and \
+            not A.ccx_nonfinite_result(os.path.join(d, "job")) else \
+            f"failed (rc {rc}, {os.path.getsize(r.log) >> 20} MB of output)"
+        dat = os.path.join(d, "job.dat")
+        res = None
+        if status == "solved":
+            res = (dat_node_blocks(dat), [[r[1] for r in t if len(r) == 2] for t in dat_tables(dat, "B U C K")],
+                   [[r[3] for r in t if len(r) == 5] for t in dat_tables(dat, "E I G E N V A L U E   O U")],
+                   rep.text())
+        shutil.rmtree(d, ignore_errors=True)
+        if res is None or sorted(conv.reduced_physics) != sorted(reduced):
+            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if res is None else
+                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return res
+
+    def t124_apart(a, b):
+        """The largest difference between two {node: values} blocks, and the largest |value|."""
+        err = max(abs(x - y) for n, v in b.items() for x, y in zip(a.get(n, [math.inf] * len(v)), v))
+        return err, max(abs(x) for v in b.values() for x in v)
+
+    return {"solve": solve, "rel": rel, "ei": ei, "bar": bar, "step": step,
+            "local_axes": local_axes, "with_transform": with_transform, "same_as": same_as,
+            "untransformed": untransformed, "cyl": cyl, "rect": rect, "plastic": plastic,
+            "finite_drift": finite_drift, "dist_run": dist_run, "composite_run": composite_run,
+            "faithful_run": faithful_run, "review_run": review_run, "same": same,
+            "t124_run": t124_run, "t124_apart": t124_apart}
+
+
+@check("nle10_thickplate", "NAFEMS LE10: run and check the benchmark stress")
+def check_nle10_thickplate(ccx, env, tmp, shared):
     # --- NAFEMS LE10: run and check the benchmark stress -----------------------
+    failures = 0
     inp = os.path.join(tmp, "le10.inp")
     convert(os.path.join(EXAMPLES, "nle10_thickplate.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -9224,12 +9517,20 @@ def main():
                   f"{syy:+.3f} MPa (reference {ref:+.2f} MPa, {abs(syy-ref)/abs(ref)*100:.1f}% diff)")
             failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+    shared["syy"] = syy
+    return failures
 
+
+@check("nle10_surface_elements", "the same plate, its pressure carried by SFM3D8 surface elements",
+       needs=("nle10_thickplate",))
+def check_nle10_surface_elements(ccx, env, tmp, shared):
     # --- the same plate, its pressure carried by SFM3D8 surface elements -------------
     # ccx has no surface element: the converter leaves the skin out and applies its load as
     # consistent nodal forces.  The skin's normal points out of the plate, so the pressure on
     # its SPOS side, an element-based P = -p (Abaqus: positive along the element normal) and
     # a TRVEC into the plate are all the face pressure above, which they must reproduce.
+    syy = shared["syy"]
+    failures = 0
     deck = open(os.path.join(EXAMPLES, "nle10_surface_elements.inp"), encoding="utf-8").read()
     face = syy
     for how, load in (("*DSLOAD P on SPOS", "*DSLOAD\n TOP,P,  1.0E6\n"),
@@ -9252,10 +9553,16 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  nle10_surface_elements (SFM3D8 skin, {how}): SYY at D = "
               f"{s[1] / 1e6:+.6f} MPa (face pressure {face:+.6f} MPa)")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("beam_circ_cantilever",
+       "circular-section cantilever on linear beams: tip deflection vs beam theory")
+def check_beam_circ_cantilever(ccx, env, tmp, shared):
     # --- circular-section cantilever on linear beams: tip deflection vs beam theory --
     # ccx 2.23 rejects linear beams with a circular section, so this checks the B31 -> B32R
     # upgrade (midside nodes, node order) and the radius -> diameter conversion together.
+    failures = 0
     inp = os.path.join(tmp, "beam.inp")
     convert(os.path.join(EXAMPLES, "beam_circ_cantilever.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -9271,12 +9578,17 @@ def main():
               f"{u[1]:+.4f} (beam theory {ref:+.4f}, {abs(u[1]-ref)/abs(ref)*100:.1f}% diff)")
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+    return failures
 
+
+@check("beam_pipe_box_cantilever", "pipe and box cantilevers: tip deflections vs beam theory")
+def check_beam_pipe_box_cantilever(ccx, env, tmp, shared):
     # --- pipe and box cantilevers: tip deflections vs beam theory ---------------------
     # ccx 2.23 runs PIPE and BOX sections only on B32R, so this checks the PIPE31 -> B32R
     # (midside nodes) and B32 -> B32R upgrades, and that both codes read the PIPE (outer
     # radius, wall) and BOX (a, b, t1..t4) data alike: the box has a != b and unequal wall
     # pairs and is loaded along y and z, so a swapped a/b or wall pair misses by >= 18 %.
+    failures = 0
     inp = os.path.join(tmp, "pipebox.inp")
     convert(os.path.join(EXAMPLES, "beam_pipe_box_cantilever.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -9299,13 +9611,18 @@ def main():
                           f"{abs(v - ref) / abs(ref) * 100:.1f}% diff)" for axis, v, ref in res))
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+    return failures
 
+
+@check("beam_u1_sections", "sections ccx's expanded beams cannot carry, as ccx's U1 beam element")
+def check_beam_u1_sections(ccx, env, tmp, shared):
     # --- sections ccx's expanded beams cannot carry, as ccx's U1 beam element -----------
     # A B33 cantilever with a general section (I12 nonzero, n1 not normal to the beam):
     # tip forces along y and z against unsymmetric bending theory, a torque against
     # T L / (G J) (U1's torsion G (I11 + I22) set to G J through a material copy's Poisson's
     # ratio) and the first bending frequencies against the Euler-Bernoulli cantilever about
     # the principal axes (U1 adds rotary inertia; its mass converges at O(h^2)).
+    failures = 0
     def f_cantilever(e_mod, inertia, rho_a, length, beta=1.875104069):
         return beta ** 2 / (2 * math.pi * length ** 2) * math.sqrt(e_mod * inertia / rho_a)
 
@@ -9525,11 +9842,17 @@ def main():
               f"{res[13][1]:.6g} ({sol[(13, 2)]:.6g}); largest difference {dev:.1e} of the largest "
               f"displacement, {rdev:.1e} of the largest rotation")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("coupling_shell_plate",
+       "rigid coupling on shell nodes vs the same plate as solids under *Rigid Body")
+def check_coupling_shell_plate(ccx, env, tmp, shared):
     # --- rigid coupling on shell nodes vs the same plate as solids under *Rigid Body --
     # ccx 2.23 rejects a rigid coupling on shell nodes that are not knots, so this checks the
     # knot beams and the rotation ties together (without the ties a moment about the edge
     # line finds the edge hinged) against a model ccx accepts unchanged.
+    failures = 0
     u = {}
     for name in ("coupling_shell_plate", "coupling_solid_plate"):
         inp = os.path.join(tmp, name + ".inp")
@@ -9549,13 +9872,18 @@ def main():
               f"displacement ({us[0]:+.4f}, {us[1]:+.4f}, {us[2]:+.4f}) vs the solid *Rigid Body "
               f"({ur[0]:+.4f}, {ur[1]:+.4f}, {ur[2]:+.4f}), {err * 100:.3f}% of |u|")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("coupling_bc_bars", "BCs on rigid-coupling members that the reference node's BCs impose")
+def check_coupling_bc_bars(ccx, env, tmp, shared):
     # --- BCs on rigid-coupling members that the reference node's BCs impose -----------
     # ccx stops on a DOF that is both a coupled DOF of a coupling member and under a
     # *BOUNDARY, so the converter takes such redundant BCs off. Bar A (coupling + redundant
     # member BCs) must match bar B (the same constraints as BCs and *EQUATIONs, no coupling)
     # exactly, and bar C's dropped u3 = 0 must still hold as its end face turns about z
     # (NLGEOM).
+    failures = 0
     inp = os.path.join(tmp, "coupling_bc_bars.inp")
     convert(os.path.join(EXAMPLES, "coupling_bc_bars.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -9578,12 +9906,18 @@ def main():
               f"same constraints without a coupling, max |du| = {err:.1e} of |u| {scale:.4f}; bar "
               f"C's end face |u3| <= {u3:.1e} as it moves {moved:.3f} (NLGEOM)")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("beam_circ_rotation_bcs",
+       "circular-section beams with rotational BCs: deflections vs beam theory")
+def check_beam_circ_rotation_bcs(ccx, env, tmp, shared):
     # --- circular-section beams with rotational BCs: deflections vs beam theory --------------
     # Under any rotational BC ccx 2.23 ties a B32/B32R end node's circular section to its corners,
     # locking the rotations the BC leaves free (beam A, twist held at its pinned ends, then
     # deflects 0.31 of beam theory; beam B, tip turned by a prescribed rotation, 0.76): this
     # checks the knot beams abq2ccx gives such nodes.
+    failures = 0
     inp = os.path.join(tmp, "circrot.inp")
     convert(os.path.join(EXAMPLES, "beam_circ_rotation_bcs.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -9601,13 +9935,19 @@ def main():
               f"{u[1]:+.4f} (beam theory {ref:+.4f}, {abs(u[1] - ref) / abs(ref) * 100:.1f}% diff)")
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+    return failures
 
+
+@check("beam_circ_explicit",
+       "circular-section beam in an explicit dynamic step: end deflection vs beam theory")
+def check_beam_circ_explicit(ccx, env, tmp, shared):
     # --- circular-section beam in an explicit dynamic step: end deflection vs beam theory ---
     # ccx 2.23 sizes a circular-section beam's explicit increment as if the section were the
     # box around the circle, about 1.3x its stable limit (the displacements turn NaN): this
     # checks the maximum increment abq2ccx caps the step with.  The load rises smoothly over
     # about three periods and is then held, so the beam ends near its static deflection;
     # L / d = 12, so the reference includes shear (Timoshenko).
+    failures = 0
     inp = os.path.join(tmp, "circexpl.inp")
     convert(os.path.join(EXAMPLES, "beam_circ_explicit.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -9628,11 +9968,20 @@ def main():
               f"{abs(u[1] - ref) / abs(ref) * 100:.1f}% diff)")
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+    shared["inp"] = inp
+    return failures
 
+
+@check("beam_circ_explicit_uncapped",
+       "the same beam without the cap: a diverged run, which the solve judge must catch",
+       needs=("beam_circ_explicit",))
+def check_beam_circ_explicit_uncapped(ccx, env, tmp, shared):
     # --- the same beam without the cap: a diverged run, which the solve judge must catch ---
     # ccx ends it with "Job finished" and exit 0.  The judge reads the NaN in the .dat
     # (Fortran's spelling) and must find it in the .frd on its own as well: C's printf spells
     # it as the C runtime does (NAN on Linux and macOS, -NAN(IND) with Windows' UCRT).
+    inp = shared["inp"]
+    failures = 0
     with open(inp, encoding="utf-8") as fh:
         deck = fh.read()
     uncapped = re.sub(r"(?m)^(\*DYNAMIC, EXPLICIT\n)[^\n]*\n", r"\1, 1.e-3\n", deck, count=1)
@@ -9658,13 +10007,19 @@ def main():
           f"{spelling(hits[1])}" + ("" if uncapped != deck else " (no *DYNAMIC, EXPLICIT to uncap)"))
     failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+    return failures
 
+
+@check("planar_pinned_beams",
+       "planar beams on pinned supports: frequencies and buckling vs beam theory")
+def check_planar_pinned_beams(ccx, env, tmp, shared):
     # --- planar beams on pinned supports: frequencies and buckling vs beam theory ---------
     # ccx runs B21 as a 3-D B31, so this checks the planar constraint: DOF 3 fixed on every
     # node (otherwise nothing holds the beam in its plane) and DOFs 4-5 at one node
     # (otherwise the free twist is a 0 Hz mode and the buckling factor meaningless): at the
     # pinned end, and on the circular section (a B32R in ccx) at the first element's middle
     # node — at the end node ccx 2.23 would lock the bending rotation as well (f1 1.46x).
+    failures = 0
     beam_refs = {}
     for name, label, ei, rho_a in (
             ("planar_pinned_beam", "B21", 210000.0 * 20.0 * 40.0 ** 3 / 12, 7.85e-9 * 20.0 * 40.0),
@@ -9692,11 +10047,18 @@ def main():
                   f"{got[2]:.0f} (Euler {refs[2]:.0f}); max {max(diffs) * 100:.1f}% diff")
             failures += 0 if ok else 1
         shutil.rmtree(d, ignore_errors=True)
+    shared["beam_refs"] = beam_refs
+    return failures
 
+
+@check("planar_b22_two_elements",
+       "two B22 elements: the mesh on which Abaqus' quadratic beam is exact")
+def check_planar_b22_two_elements(ccx, env, tmp, shared):
     # --- two B22 elements: the mesh on which Abaqus' quadratic beam is exact ----------------
     # Abaqus integrates its 3-node beams at 2 points along the beam, as ccx's B32R, which the
     # converter writes them as: Abaqus' mid-span deflection (Timoshenko, k = 0.85) to 0.15 %,
     # f1 and the Euler load to 1.3 % on two elements (ccx's B32, 3 points: 0.76, +11 %, +21 %).
+    failures = 0
     inp = os.path.join(tmp, "planar_b22_two_elements.inp")
     convert(os.path.join(EXAMPLES, "planar_b22_two_elements.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -9720,7 +10082,12 @@ def main():
               f"{refs[1]:.0f}); max {max(diffs) * 100:.1f}% diff")
         failures += 0 if ok else 1
     shutil.rmtree(d, ignore_errors=True)
+    return failures
 
+
+@check("distribution_orientations",
+       "per-element *DISTRIBUTION orientations vs one *ORIENTATION per element")
+def check_distribution_orientations(ccx, env, tmp, shared):
     # --- per-element *DISTRIBUTION orientations vs one *ORIENTATION per element ---------
     # ccx 2.23 gives each element its own distribution line only under a *SOLID SECTION
     # (and there turns only the first line by the rotation line), and gives every element
@@ -9728,6 +10095,7 @@ def main():
     # element and splits a shell section per direction: the C3D8 plate (two instances, one
     # rotated) and the composite S8R variable-angle-tow panel (a rotated instance) must move
     # exactly like the same models written with one orientation and section per element.
+    failures = 0
     for name, label in (("distribution_solid_plate", "C3D8 *SOLID SECTION"),
                         ("distribution_shell_plate", "composite S8R *SHELL SECTION")):
         res = {}
@@ -9754,36 +10122,20 @@ def main():
                   f"orientation): {len(ue)} node displacements vs one *ORIENTATION per element, "
                   f"max difference {err:.1e} of max |u|")
             failures += 0 if ok else 1
+    return failures
+
+
+@check("mpc_lever_joints_link",
+       "*MPC: a rigid lever (BEAM), joints (PIN / TIE) and a rigid link (LINK)")
+def check_mpc_lever_joints_link(ccx, env, tmp, shared):
     # --- *MPC: a rigid lever (BEAM), joints (PIN / TIE) and a rigid link (LINK) -------
     # BEAM -> *RIGID BODY on the beam's tip node (a knot whose ROT NODE follows its
     # rotation); PIN / TIE -> *EQUATION (a TIE between knots, so the rotations take part);
     # LINK -> its linearised *EQUATION, or ccx's *MPC BEAM under NLGEOM.
-    def solve(name, subs=(), nodes=()):
-        """Convert an example (optionally with text substitutions), run it and return the
-        last printed displacement of each node, or None."""
-        src = os.path.join(EXAMPLES, name + ".inp")
-        text = open(src, encoding="utf-8").read()
-        for a, b in subs:
-            text = text.replace(a, b)
-        tmp_src = os.path.join(tmp, f"{name}_{len(subs)}_src.inp")
-        with open(tmp_src, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-        inp = os.path.join(tmp, f"{name}_{len(subs)}.inp")
-        convert(tmp_src, inp)
-        d, status, out = run_ccx(ccx, env, inp)
-        u = {n: dat_displacement(os.path.join(d, "job.dat"), n) for n in nodes} \
-            if status == "solved" else {}
-        shutil.rmtree(d, ignore_errors=True)
-        if status != "solved" or any(v is None for v in u.values()):
-            print(f"FAIL  {name}{' (variant)' if subs else ''}: did not solve ({status})")
-            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
-            return None
-        return u
-
-    def rel(a, b):
-        return ccx_ratio(abs(a - b), abs(b))
-
-    ei = 1.0e5 * 4.0 / 3.0                                      # E I of the 2 x 2 section
+    ei = shared["ei"]
+    rel = shared["rel"]
+    solve = shared["solve"]
+    failures = 0
     u = solve("mpc_beam_lever", nodes=(21, 100, 221, 400))
     if u:
         tip = 1e6 / (3 * ei) + 20 * 1e4 / (2 * ei)              # P = 1, M = P e, L = 100
@@ -9878,10 +10230,19 @@ def main():
         failures += 0 if ok else 1
     else:
         failures += 1
+    return failures
+
+
+@check("connector_elements", "connector elements (CONN3D2)")
+def check_connector_elements(ccx, env, tmp, shared):
     # --- connector elements (CONN3D2): ccx has no connector element; abq2ccx writes each
     # connector's kinematic constraint as *EQUATION / *BOUNDARY / *RIGID BODY / *MPC -------
     # the same joints, lever and link as above, written as connectors, must give the same
     # answers: JOIN = PIN, WELD = TIE (a rigid body on knots), BEAM = *MPC BEAM, LINK = LINK
+    ei = shared["ei"]
+    rel = shared["rel"]
+    solve = shared["solve"]
+    failures = 0
     joints = [("*MPC\nPIN, 101, 21\nTIE, 301, 221\n",
                "*Element, type=CONN3D2, elset=J\n9001, 21, 101\n*Element, type=CONN3D2, elset=W\n"
                "9002, 221, 301\n*Connector Section, elset=J\nJoin,\n*Connector Section, elset=W\n"
@@ -9980,13 +10341,18 @@ def main():
         failures += 0 if ok else 1
     else:
         failures += 1
+    return failures
 
+
+@check("boundary_op_new", "*BOUNDARY, OP=NEW in a later step on a clamped beam and plate")
+def check_boundary_op_new(ccx, env, tmp, shared):
     # --- *BOUNDARY, OP=NEW in a later step on a clamped beam and plate --------------------
     # ccx 2.23 does not rebuild re-specified rotational BCs on shell/beam nodes after OP=NEW:
     # converted as they are, these decks' clamped roots become hinges in step 2 (tip
     # deflections of 1e5 to 1e9) and the plate's prescribed tip z comes out 0.  This checks
     # both repairs: an OP=NEW that removes nothing is dropped, and where it removes a BC (the
     # prop) the clamped nodes become knots, which stiffens the beam clamp by ~0.7 %.
+    failures = 0
     pl3_3ei = 10.0 * 1000.0 ** 3 / (3 * 210000.0 * 40.0 * 20.0 ** 3 / 12)      # P L^3 / (3 E I)
     for name in ("op_new_respecify", "op_new_remove"):
         inp = os.path.join(tmp, name + ".inp")
@@ -10011,13 +10377,18 @@ def main():
             f"{label} {v:+.4f} (expected {ref:+.4f}, {diff * 100:.2f}% diff)"
             for (label, v, ref), diff in zip(refs, diffs)))
         failures += 0 if ok else 1
+    return failures
 
+
+@check("dload_op_new", "*DSLOAD and *DLOAD, OP=NEW in one step")
+def check_dload_op_new(ccx, env, tmp, shared):
     # --- *DSLOAD and *DLOAD, OP=NEW in one step ---------------------------------------------
     # ccx 2.23 has one OP=NEW flag for *DLOAD and *DSLOAD and acts on it on a step's first
     # card only.  A 1 x 1 x 0.5 column on its base: step 1 under gravity and a top pressure;
     # step 2 adds a body force up and a pressure on the (held) base, OP=NEW on its second card:
     # Abaqus removes the gravity (*DLOAD, OP=NEW) or the top pressure (*DSLOAD, OP=NEW).  The
     # top's uz: -p L / E, -rho g L^2 / (2 E), +b L^2 / (2 E) (converted before: both loads kept)
+    failures = 0
     column = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 0.5\n"
               "6, 1., 0., 0.5\n7, 1., 1., 0.5\n8, 0., 1., 0.5\n*Element, type=C3D8, elset=EALL\n"
               "1, 1, 2, 3, 4, 5, 6, 7, 8\n*Nset, nset=TOP\n5, 6, 7, 8\n*Surface, name=ST\n"
@@ -10050,7 +10421,11 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  dload_op_new ({how}): top uz " + ", ".join(
             f"step {k} {v:+.6e} (expected {r:+.6e})" for k, (v, r) in enumerate(zip(uz, refs), 1)))
         failures += 0 if ok else 1
+    return failures
 
+
+@check("dload_op_new_body_force", "body forces after *DLOAD, OP=NEW")
+def check_dload_op_new_body_force(ccx, env, tmp, shared):
     # --- body forces after *DLOAD, OP=NEW ----------------------------------------------------
     # ccx 2.23's *DLOAD, OP=NEW keeps the BX / BY / BZ of earlier steps (Abaqus removes them),
     # so the converter writes zero lines for them.  A bar of three unit cubes along x (nu = 0)
@@ -10058,13 +10433,9 @@ def main():
     # OP=NEW and loads the bar by gravity along -x, or its first cube by BX = 2 on an amplitude;
     # or step 3 follows a perturbation step with BX on the bar under gravity (converted before:
     # the BX stayed on, 4.5e-3, 1.3e-2, 4.5e-3)
-    bar = ("*Node\n1,0.,0.,0.\n2,1.,0.,0.\n3,1.,1.,0.\n4,0.,1.,0.\n5,0.,0.,1.\n6,1.,0.,1.\n7,1.,1.,1.\n"
-           "8,0.,1.,1.\n9,2.,0.,0.\n10,2.,1.,0.\n11,2.,0.,1.\n12,2.,1.,1.\n13,3.,0.,0.\n14,3.,1.,0.\n"
-           "15,3.,0.,1.\n16,3.,1.,1.\n*Element, type=C3D8, elset=ALL\n1, 1,2,3,4,5,6,7,8\n"
-           "2, 2,9,10,3,6,11,12,7\n3, 9,13,14,10,11,15,16,12\n*Elset, elset=E1\n1\n*Nset, nset=TIP\n16\n"
-           "*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1.\n*Solid Section, elset=ALL, material=M\n"
-           "*Amplitude, name=A\n0., 1., 1., 1.\n*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n")
-    step = "*Step{}\n*Static\n{}*Node Print, nset=TIP\nU\n*End Step\n"
+    bar = shared["bar"]
+    step = shared["step"]
+    failures = 0
     bx, grav = 3.0 * 9.0 / 2000.0, -2.0 * 9.0 / 2000.0
     for how, deck, ref in (
             ("gravity after OP=NEW", step.format("", "*Dload\nALL, BX, 3.\n") +
@@ -10092,13 +10463,20 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  dload_op_new_body_force ({how}): tip ux " + ", ".join(
             f"step {k} {v:+.6e} (expected {r:+.6e})" for k, v, r in zip((1, len(ux)), got, ref)))
         failures += 0 if ok else 1
+    return failures
 
+
+@check("face_load_overlap", "face loads of different sources from different steps")
+def check_face_load_overlap(ccx, env, tmp, shared):
     # --- face loads of different sources from different steps --------------------------------
     # Abaqus adds two loads on one face that another surface, element set or card gives;
     # ccx 2.23 keeps one value per face, which a later step's line replaces, so the converter
     # gives the earlier load again there.  The bar above (nu = 0): a pressure p on its tip face
     # gives tip ux = -3 p / E; body forces b_j on its cubes, sum b_j (j - 0.5) / E.  Converted
     # before: -6e-3 / 0 for the tip (the later step's line alone), 1.7e-2 for the chain
+    bar = shared["bar"]
+    step = shared["step"]
+    failures = 0
     surfs = "*Surface, name=TIPA\n3, S4\n*Surface, name=TIPB\n3, S4\n*Elset, elset=E23\n2, 3\n" \
             "*Amplitude, name=T, time=total time\n0., 1., 10., 1.\n"
     tip_ux = lambda p: -3.0 * p / 1000.0
@@ -10134,7 +10512,11 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  face_load_overlap ({how}): tip ux " + ", ".join(
             f"{v:+.6e} (expected {r:+.6e})" for v, r in zip(ux, ref) if r is not None))
         failures += 0 if ok else 1
+    return failures
 
+
+@check("load_overlap", "concentrated and distributed loads of other sources, amplitudes")
+def check_load_overlap(ccx, env, tmp, shared):
     # --- concentrated and distributed loads of other sources, amplitudes ---------------------
     # Abaqus adds a node's *CLOAD through one node set to one through another set or its
     # number in a later step; ccx 2.23 keeps one value per node DOF, which the later line
@@ -10148,6 +10530,9 @@ def main():
     # 3.6e-2 (the later line alone), and ccx stopped on two amplitudes on one face ('*ERROR in
     # loadadd') in the next two; -6e-3, -6e-3, -9e-3, -6e-3 for -9e-3, -9e-3, -1.5e-2, -9e-3
     # in the last four (one line of the source given again, none after its zero line).
+    bar = shared["bar"]
+    step = shared["step"]
+    failures = 0
     tips ="*Nset, nset=TIPF\n13, 14, 15, 16\n*Nset, nset=TIPG\n13, 14, 15, 16\n*Surface, name=TIPA\n" \
            "3, S4\n*Surface, name=TIPB\n3, S4\n*Amplitude, name=R\n0., 0., 1., 2.\n"
     tip_f = lambda f: 12.0 * f / 1000.0
@@ -10197,7 +10582,12 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  load_overlap ({how}): tip ux " + ", ".join(
             f"{v:+.6e} (expected {r:+.6e})" for v, r in zip(ux, ref) if r is not None))
         failures += 0 if ok else 1
+    return failures
 
+
+@check("thermal_expansion_aniso",
+       "isotropic *Elastic beside an orthotropic / anisotropic *Expansion")
+def check_thermal_expansion_aniso(ccx, env, tmp, shared):
     # --- isotropic *Elastic beside an orthotropic / anisotropic *Expansion -----------------
     # ccx 2.23 uses a wrong stiffness for this combination in linear steps once the deck has
     # temperatures (a free heated cube shrinks), so the converter writes such *Elastic cards
@@ -10209,6 +10599,7 @@ def main():
     # 0.6 % / 1.4 % off there).
     # The same cubes with DEPENDENCIES=0 on every *Elastic and *Expansion: a plain table (it
     # was read as unparsable, and the ANISO shear coefficients were not halved).
+    failures = 0
     with open(os.path.join(EXAMPLES, "thermal_expansion_cubes.inp"), encoding="utf-8") as fh:
         cubes = fh.read()
     for tag, text in (("thermal_expansion_cubes", None),
@@ -10261,7 +10652,12 @@ def main():
                   f"(analytic {sxx_ref:+.5f})")
             failures += 0 if ok else 1
         shutil.rmtree(d, ignore_errors=True)
+    return failures
 
+
+@check("thermal_expansion_elastic_forms",
+       "orthotropic / anisotropic *Elastic forms beside an ANISO *Expansion")
+def check_thermal_expansion_elastic_forms(ccx, env, tmp, shared):
     # --- orthotropic / anisotropic *Elastic forms beside an ANISO *Expansion -----------------
     # Beside a TYPE=ANISO expansion, ccx 2.23 also misreads an orthotropic or engineering-
     # constants *Elastic in linear steps where no orientation applies (a free heated cube gets
@@ -10271,6 +10667,7 @@ def main():
     # (its strains against alpha dT) and a clamped one (its face reactions against -C alpha dT);
     # the linear deck has turned and unturned materials of every *Elastic form, the NLGEOM one
     # the unturned expansions without shear terms (second-order terms: 1e-2 there).
+    failures = 0
     res = []
     for cases, nlgeom, tol in ((EXP_FORMS_LINEAR, False, 1e-5), (EXP_FORMS_NLGEOM, True, 1e-2)):
         src = os.path.join(tmp, f"expansion_forms{'_nlgeom' if nlgeom else ''}_abq.inp")
@@ -10298,7 +10695,11 @@ def main():
               f"{n_nl} NLGEOM cases (ANISO without shear terms written as ORTHO) {nl[0] * 100:.3f}% / "
               f"{nl[1] * 100:.3f}% off")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("rigid_body_bc_bars", "BCs on *RIGID BODY nodes, moved to the reference node")
+def check_rigid_body_bc_bars(ccx, env, tmp, shared):
     # --- BCs on *RIGID BODY nodes, moved to the reference node -----------------------
     # Abaqus moves identical BCs on rigid-body nodes to the reference node, adding zero
     # rotations about the other axes; ccx stops on a BC on a rigid-body node, so the converter
@@ -10306,6 +10707,7 @@ def main():
     # cap: implied in step 1, moved in step 2 once the reference point is released) must match
     # bar B (the same BCs on its reference point by hand) exactly, and A's far face must keep
     # u1 = 0 while the cap twists about x (NLGEOM).
+    failures = 0
     inp = os.path.join(tmp, "rigid_body_bc_bars.inp")
     convert(os.path.join(EXAMPLES, "rigid_body_bc_bars.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -10329,10 +10731,16 @@ def main():
               f"|du| = {err:.1e} of |u| {scale:.4f}; A's far face |u1| <= {u1:.1e} as it moves "
               f"{moved:.3f} (NLGEOM)")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("nodal_force_loads",
+       "distributed loads ccx has no card for, applied as consistent nodal forces")
+def check_nodal_force_loads(ccx, env, tmp, shared):
     # --- distributed loads ccx has no card for, applied as consistent nodal forces ------
     # Cook's membrane: a shear traction (*DSLOAD TRVEC) on plane-stress CPS8 edges, against
     # the published displacement of the loaded edge's midpoint.
+    failures = 0
     inp = os.path.join(tmp, "cook.inp")
     convert(os.path.join(EXAMPLES, "cook_membrane_traction.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -10468,7 +10876,11 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  {name} with *TRANSFORM ({how}): u at {len(u[1])} nodes "
               f"differs from the model without it by {err:.1e} of max |u| ({scale:.4g})")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("dload_blank_fields", "body loads written with blank fields")
+def check_dload_blank_fields(ccx, env, tmp, shared):
     # --- body loads written with blank fields -----------------------------------------------
     # Abaqus (and ccx) read a blank *DLOAD field as zero; a dropped one moves the fields after
     # it up.  Gravity along -z on a clamped column ('COLUMN, GRAV, 9810., , , -1.' pulled along
@@ -10477,6 +10889,7 @@ def main():
     # The base must carry the column's weight rho g V along +z (less the load ccx applies at
     # the base nodes themselves, half the bottom element's weight), and the disc's radial
     # displacement must be the plane-stress rotating-disc solution (C3D20 mesh: 0.34 % off).
+    failures = 0
     weight = 7.85e-9 * 9810.0 * 10.0 * 10.0 * 100.0
 
     def spun(r, a=20.0, b=100.0, nu=0.3):                     # rho w^2 = 7.85e-3, E = 210000
@@ -10512,13 +10925,18 @@ def main():
               f"u_r = {u[1001][0]:.5e} / {u[1009][0]:.5e} at r = 20 / 100 (theory {spun(20.0):.5e} / "
               f"{spun(100.0):.5e}, {err_u * 100:.2f}% off)")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("thermal_no_initial_temperature", "*Temperature without initial temperatures")
+def check_thermal_no_initial_temperature(ccx, env, tmp, shared):
     # --- *Temperature without initial temperatures ------------------------------------------
     # Abaqus starts every node at 0 when a deck gives no initial temperatures; ccx stops on
     # *TEMPERATURE unless thermal *INITIAL CONDITIONS precede it, so the converter adds them
     # at 0 for every node — also the free node of the knot beam at the circular-section
     # beam's pinned end.  A free cube heated to T = 100 must strain alpha T, the beam's far
     # end move alpha T L.
+    failures = 0
     inp = os.path.join(tmp, "no_initial_temperature.inp")
     convert(os.path.join(EXAMPLES, "thermal_no_initial_temperature.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -10572,7 +10990,11 @@ def main():
               f"with a cylindrical one on its reference point): u at {len(u[1])} nodes differs from "
               f"the model in global components by {err:.1e} of max |u| ({scale:.4g})")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("connector_transform", "connector elements on nodes with a *TRANSFORM")
+def check_connector_transform(ccx, env, tmp, shared):
     # --- connector elements on nodes with a *TRANSFORM ------------------------------------
     # ccx, like Abaqus, reads *EQUATION terms and BCs on a transformed node in its local axes,
     # so abq2ccx writes the connector rows there — a rotation on its rotation node, which gets
@@ -10583,66 +11005,12 @@ def main():
     # with a transform on either reference point; the hinge to ground under NLGEOM with one on
     # its reference point.  Rows in global components (abq2ccx before this) miss by 7-76 % of
     # max |u| — with no warning on the JOINs and on reference point 1 — or ccx stops.
-    def local_axes(typ, a, b, x):
-        """Abaqus' local axes of a rectangular / cylindrical *TRANSFORM at point ``x``,
-        computed independently of abq2ccx."""
-        if typ == "R":
-            e1, e3 = _unit(a), _unit(_cross(a, b))
-            return e1, _cross(e3, e1), e3
-        e3 = _unit([q - p for p, q in zip(a, b)])
-        r = [xi - ai for xi, ai in zip(x, a)]
-        e1 = _unit([ri - _dot(r, e3) * e for ri, e in zip(r, e3)])
-        return e1, _cross(e3, e1), e3
-
-    def with_transform(deck, node, typ, a, b, x):
-        """``deck`` with a *TRANSFORM on ``node`` (at ``x``) and its *CLOAD lines (forces and
-        moments) given in the local axes."""
-        ax = local_axes(typ, a, b, x)
-        head, cload = deck.split("*Cload\n", 1)
-        lines, rest = cload.split("*", 1)
-        keep, own = [], {}
-        for ln in lines.strip().splitlines():
-            n, d, v = (f.strip() for f in ln.split(","))
-            if n == str(node):
-                own[int(d)] = float(v)
-            else:
-                keep.append(ln)
-        for base in (0, 3):
-            g = [own.get(base + k + 1, 0.0) for k in range(3)]
-            if any(g):
-                keep += [f"{node}, {base + j + 1}, {_dot(g, e):.14g}" for j, e in enumerate(ax)]
-        card = (f"*Nset, nset=LOCAL\n{node}\n*Transform, nset=LOCAL, type={typ}\n"
-                + ", ".join(repr(float(v)) for v in list(a) + list(b)) + "\n")
-        return head.replace("*Step", card + "*Step", 1) + "*Cload\n" + "\n".join(keep) + "\n*" + rest
-
-    def same_as(label, text, twin, turn=None, tol=1e-6):
-        """Run ``text`` and ``twin`` (the same model in global components) and compare every
-        printed displacement (the twin's turned by ``turn``: a rotated twin's back into the
-        model's axes); 1 on failure."""
-        u, bad = [], ""
-        for i, t in enumerate((text, twin)):
-            src, inp = os.path.join(tmp, f"ct{i}_src.inp"), os.path.join(tmp, f"ct{i}.inp")
-            with open(src, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(t)
-            convert(src, inp)
-            d, status, out = run_ccx(ccx, env, inp)
-            u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
-            if status != "solved" and not bad:
-                bad = " / ".join([status] + [l.strip() for l in out.splitlines() if "ERROR" in l])
-            shutil.rmtree(d, ignore_errors=True)
-        if not u[0] or u[0].keys() != u[1].keys():
-            print(f"FAIL  {label}: no displacements to compare ({bad or 'different nodes printed'})")
-            return 1
-        if turn:
-            u[1] = {n: turn(v) for n, v in u[1].items()}
-        scale = max(abs(x) for v in u[1].values() for x in v)
-        err = ccx_ratio(max(abs(p - q) for n in u[1] for p, q in zip(u[0][n], u[1][n])), scale)
-        ok = err <= tol
-        print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes differs from the "
-              f"{'rigidly rotated ' if turn else ''}model without the *TRANSFORM by {err:.1e} of "
-              f"max |u| ({scale:.4g})")
-        return 0 if ok else 1
-    untransformed = lambda t: re.sub(r"(?mi)^\*Transform.*\n.*\n", "", t)  # noqa: E731
+    cyl = shared["cyl"]
+    rect = shared["rect"]
+    same_as = shared["same_as"]
+    untransformed = shared["untransformed"]
+    with_transform = shared["with_transform"]
+    failures = 0
     plate = open(os.path.join(EXAMPLES, "connector_transform_plate.inp"), encoding="utf-8").read()
     failures += same_as("connector_transform_plate (JOIN to a rigid plate on a cylindrically "
                         "transformed face, LINK to a transformed node)", plate, untransformed(plate))
@@ -10667,7 +11035,6 @@ def main():
                         untransformed(nl_join))
     hinge = open(os.path.join(EXAMPLES, "connector_hinge_bodies.inp"), encoding="utf-8").read().replace(
         "*Node Print, nset=OUT", "*Node Print, nset=OUT, global=YES")
-    rect, cyl = ("R", (1., 2., 0.5), (-1., 0.3, 1.)), ("C", (0.3, -0.2, -0.4), (1.1, 0.9, 1.6))
     failures += same_as("connector_hinge_bodies with a rectangular *TRANSFORM on reference point 1",
                         with_transform(hinge, 1, *rect, (0., 0., 0.)), hinge)
     failures += same_as("connector_hinge_bodies with a cylindrical *TRANSFORM on reference point 3 "
@@ -10678,7 +11045,11 @@ def main():
     failures += same_as("connector_ground_hinge, NLGEOM, with a rectangular *TRANSFORM on its "
                         "reference point (moments in the local axes)",
                         with_transform(ground, 3, *rect, (0.2, 0.5, -0.1)), ground)
+    return failures
 
+
+@check("mpc_transform", "*MPC PIN / TIE / LINK on nodes with a *TRANSFORM")
+def check_mpc_transform(ccx, env, tmp, shared):
     # --- *MPC PIN / TIE / LINK on nodes with a *TRANSFORM ----------------------------------
     # Abaqus' PIN, TIE and LINK constrain the global displacements whatever the nodes'
     # transforms (its verification decks xmpcpinxt, xmpctiext and xmpclnk3t give the results
@@ -10693,6 +11064,14 @@ def main():
     # and under NLGEOM (the LINK as ccx's *MPC BEAM).  The equations in global components
     # (abq2ccx before) miss here by 103-111 % of max |u| (ccx only warns of a zero coefficient
     # in cascade), in the probes by 44-190 % without a message, or stop ccx.
+    cyl = shared["cyl"]
+    local_axes = shared["local_axes"]
+    plastic = shared["plastic"]
+    rect = shared["rect"]
+    same_as = shared["same_as"]
+    untransformed = shared["untransformed"]
+    with_transform = shared["with_transform"]
+    failures = 0
     mpc_tr = open(os.path.join(EXAMPLES, "mpc_transform.inp"), encoding="utf-8").read()
     rp_xyz = (2.6, 0.35, 0.2)
     failures += same_as("mpc_transform (PIN / TIE across faces with different *TRANSFORMs, a "
@@ -10818,13 +11197,16 @@ def main():
                 + "*Boundary\n1, 1, 6\n4, 1, 6\n" + step + "\n*Static\n*Boundary\n5, 4, 5\n*Cload\n6, 4, 0.1\n"
                 "*Node Print, nset=ALLN, global=yes\nU\n*End Step\n")
     back = lambda v: tuple(sum(strip_axes[k][i] * v[k] for k in range(3)) for i in range(3))  # noqa: E731
-    plastic = "*Plastic\n1e6, 0.\n"
     failures += same_as("transform_shell_rotations (local rotation BCs and moment on S4 nodes), a "
                         "*STATIC step with a *PLASTIC never reached", transformed_strip(False, plastic),
                         transformed_strip(True, plastic), back)
     failures += same_as("transform_shell_rotations, NLGEOM", transformed_strip(False, step="*Step, nlgeom"),
                         transformed_strip(True, step="*Step, nlgeom"), back, 1e-4)
+    return failures
 
+
+@check("shell_rotation_bcs", "two rotational BCs on a shell node, the free axis in the shell plane")
+def check_shell_rotation_bcs(ccx, env, tmp, shared):
     # --- two rotational BCs on a shell node, the free axis in the shell plane ---------------
     # ccx 2.23 holds both in-plane rotations for two rotational BCs on a shell node, so also
     # the free one where its axis is not the normal; abq2ccx writes one line (the in-plane
@@ -10833,6 +11215,7 @@ def main():
     # match the strip along x (where x is the drilling rotation, which ccx drops) turned back;
     # half a cylindrical panel with ZSYMM on its plane of symmetry must match the whole panel
     # (S8R and S4).  The two lines were 52-99 % off (probes).
+    failures = 0
     def pair_twin(label, text, twin, turn=None, tol=1e-6, moved=0.0):
         u, notes, flags = [], [], []
         for i, t in enumerate((text, twin)):
@@ -10873,13 +11256,18 @@ def main():
                               symmetric_panel_deck(typ, False), moved=0.01)
     failures += pair_twin("shell_rotation_pair_symmetry, S8R, NLGEOM", symmetric_panel_deck("S8R", True, 5.0, True),
                           symmetric_panel_deck("S8R", False, 5.0, True), tol=1e-4, moved=0.05)
+    return failures
 
+
+@check("s8r_corner_transform_bcs", "translational BCs on S8R corner nodes with a *TRANSFORM")
+def check_s8r_corner_transform_bcs(ccx, env, tmp, shared):
     # --- translational BCs on S8R corner nodes with a *TRANSFORM -----------------------------
     # ccx 2.23 ties such a BC (an MPC in global coordinates) to the node's middle expanded node
     # only; abq2ccx takes the node out of the *TRANSFORM, its BCs and loads in global components.
     # The plate with its loaded and moved corner under a turned *TRANSFORM and its held corner
     # under a tilted one must match the plate in global components, the half panel with a
     # cylindrical *TRANSFORM on all nodes the whole panel without (before: 2.1 % / 1.3 % off).
+    failures = 0
     def corner_twin(label, text, twin, tol=1e-9, moved=0.0):
         u, notes, why, excused, decks = [], [], [], [], []
         for i, t in enumerate((text, twin)):
@@ -10933,34 +11321,21 @@ def main():
     failures += corner_twin("transform_knot_dynamic (an S4 strip's fold node moved under a turned "
                             "*TRANSFORM, *STATIC then *DYNAMIC)", folded_strip_deck(True),
                             folded_strip_deck(False), moved=0.02)
+    return failures
 
+
+@check("rotations_nonlinear_solver",
+       "shell/beam rotations in a step ccx runs nonlinear without NLGEOM")
+def check_rotations_nonlinear_solver(ccx, env, tmp, shared):
     # --- shell/beam rotations in a step ccx runs nonlinear without NLGEOM -----------------
     # ccx turns the mean-rotation MPCs of rotational BCs and moments, and its knots' RIGID
     # MPCs, with the finite rotation there; abq2ccx warns (reduced physics, no linear form).
     # Each deck with a *PLASTIC never reached against its elastic twin (a linear step): the
     # drift the warning quotes (about theta^2 of max |u|; a knot 0.4-1 % at 0.01 rad), none
     # for held rotations
-    def finite_drift(label, deck, lo, hi, moved):
-        u, flagged = [], []
-        for i, t in enumerate((deck, deck.replace(plastic, ""))):
-            src, inp = os.path.join(tmp, f"fr{i}_src.inp"), os.path.join(tmp, f"fr{i}.inp")
-            with open(src, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(t)
-            _, conv = convert(src, inp)
-            flagged.append(bool(other_reduced(conv)))
-            d, status, _ = run_ccx(ccx, env, inp)
-            u.append(dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {})
-            shutil.rmtree(d, ignore_errors=True)
-        if not u[0] or u[0].keys() != u[1].keys():
-            print(f"FAIL  {label}: no displacements to compare")
-            return 1
-        scale = max(math.hypot(*v) for v in u[1].values())
-        err = ccx_ratio(max(math.dist(u[0][n], u[1][n]) for n in u[1]), scale)
-        ok = lo <= err <= hi and scale >= moved and flagged == [lo > 0, False]
-        print(f"{'PASS' if ok else 'FAIL'}  {label}: u at {len(u[1])} nodes {err:.2e} of max |u| "
-              f"({scale:.4g}) off the elastic twin's linear step (expected {lo:g}-{hi:g}); "
-              f"{'warned as' if flagged[0] else 'not'} reduced physics")
-        return 0 if ok else 1
+    finite_drift = shared["finite_drift"]
+    plastic = shared["plastic"]
+    failures = 0
     strip = ("*Node, nset=ALLN\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 2., 0., "
              "0.\n6, 2., 1., 0.\n*Element, type=S4, elset=E\n1, 1, 2, 3, 4\n2, 2, 5, 6, 3\n*Shell "
              "Section, elset=E, material=M\n0.1\n*Material, name=M\n*Elastic\n1000., 0.3\n" + plastic +
@@ -10981,11 +11356,16 @@ def main():
         "material=M, section=RECT\n0.2, 0.1\n0., 0., -1.\n*Material, name=M\n*Elastic\n1000., 0.3\n"
         + plastic + "*Boundary\n1, 1, 6\n*Step\n*Static\n*Cload\n5, 3, 4.56306e-05\n*Node Print, "
         "nset=ALLN\nU\n*End Step\n", 4e-3, 3e-2, 0.019)
+    return failures
 
+
+@check("velocity_bcs", "*BOUNDARY, TYPE=VELOCITY / ACCELERATION -> integrated displacement BCs")
+def check_velocity_bcs(ccx, env, tmp, shared):
     # --- *BOUNDARY, TYPE=VELOCITY / ACCELERATION -> integrated displacement BCs ----------
     # A column pulled through a rigid reference point: the velocity ramps in by a SMOOTH
     # STEP (the corpus' davidmorin pattern) and stays in force in a second step, where a ccx
     # BC would freeze; every increment must sit on the integral of the velocity.
+    failures = 0
     inp = os.path.join(tmp, "velocity_bc_column.inp")
     convert(os.path.join(EXAMPLES, "velocity_bc_column.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -11048,7 +11428,11 @@ def main():
               f"{u[1][2]:.6f} (0.005); wave stress behind the front {mean * 100:.1f}% off on "
               f"average ({worst * 100:.1f}% at worst), {ahead * 100:.2f}% ahead of it")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("default_amplitude_bars", "displacement BCs without AMPLITUDE: Abaqus' default amplitude")
+def check_default_amplitude_bars(ccx, env, tmp, shared):
     # --- displacement BCs without AMPLITUDE: Abaqus' default amplitude --------------------
     # Abaqus/Standard ramps a displacement BC without an amplitude in every procedure, where
     # ccx steps it in dynamics, *VISCO and transient coupled steps; loads keep the
@@ -11062,6 +11446,7 @@ def main():
     # Abaqus/Explicit ignores the value of such a BC and holds the DOF (zero velocity): the
     # driven top stays at 0, and the loaded top, held by one in the second step, stays where
     # the first step left it.
+    failures = 0
     src = open(os.path.join(EXAMPLES, "default_amplitude_bars.inp"), encoding="utf-8").read()
     dyn = "*Dynamic, direct\n 0.005, 1."
     visco = src.replace(dyn, "*Visco, cetol=0.001\n 0.1, 1.").replace(
@@ -11116,7 +11501,12 @@ def main():
               f"{dev:.1e} of {'0' if label.endswith('EXPLICIT') else 'the ramps 0 -> 0.01 -> 0.03'} "
               f"at {len(driven)} increments; {what}")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("coupled_quasistatic_bars",
+       "transient coupled temperature-displacement steps without inertia")
+def check_coupled_quasistatic_bars(ccx, env, tmp, shared):
     # --- transient coupled temperature-displacement steps without inertia -----------------
     # ccx 2.23 solves a transient *COUPLED TEMPERATURE-DISPLACEMENT step as a dynamic one with
     # the mass of every *DENSITY and *MASS, where Abaqus/Standard neglects inertia; abq2ccx
@@ -11132,6 +11522,7 @@ def main():
     # second (abq2ccx warns about this).  With the masses as given, the heated top misses its
     # static position by up to 30 % of the expansion and the loaded top swings between -66 %
     # and +63 % of its extension about its static position.
+    failures = 0
     src = open(os.path.join(EXAMPLES, "coupled_quasistatic_bars.inp"), encoding="utf-8").read()
     heat = src.replace("type=C3D8T", "type=DC3D8").replace("*Coupled Temperature-displacement",
                                                            "*Heat Transfer")
@@ -11188,13 +11579,19 @@ def main():
               f"{jump[2] * 100:+.3f} % of the jump (HHT alpha / (1 + alpha) = {-hht * 100:.2f} %: "
               f"within {dev_j:.1e})")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("beam_output_requests",
+       "output requests at beam nodes: field output for a node set, history at a node")
+def check_beam_output_requests(ccx, env, tmp, shared):
     # --- output requests at beam nodes: field output for a node set, history at a node ----
     # ccx 2.23 writes a model with beams to the .frd expanded to 3-D, without the original
     # beam nodes, so a *NODE FILE for a set of them writes empty blocks (shown below without
     # OUTPUT=2D).  This checks the tip displacements the .frd gets with the OUTPUT=2D abq2ccx
     # adds, the mid-span history in the .dat (*NODE PRINT), and that both follow the
     # *TIME POINTS the deck's NUMBER INTERVAL = 4 became.
+    failures = 0
     inp = os.path.join(tmp, "beam_output.inp")
     convert(os.path.join(EXAMPLES, "beam_output_requests.inp"), inp)
     e, nu, p, length = 210000.0, 0.3, 1000.0, 240.0
@@ -11272,12 +11669,17 @@ def main():
               f"{disp[-1][1][16][0]:.7f} at t = 1 ({bar_ux(1.0):.7f}); ux within {dev_u:.1e}, "
               f"S11 within {dev_s:.1e} of P t / A")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("preselected_output", "Abaqus' preselected and default field output")
+def check_preselected_output(ccx, env, tmp, shared):
     # --- Abaqus' preselected and default field output ---------------------------------
     # A bar in tension with only the two requests Abaqus/CAE writes (*Output, field / history,
     # variable=PRESELECT): ccx has no preselected output and wrote the mesh only; abq2ccx
     # writes *NODE FILE U, RF and *EL FILE S, E.  Uniform stress: u_x = P L / (E A), S11 =
     # P / A, E11 = S11 / E, and the reactions at x = 0 sum to -P.
+    failures = 0
     inp = os.path.join(tmp, "preselect_output_bar.inp")
     convert(os.path.join(EXAMPLES, "preselect_output_bar.inp"), inp)
     d, status, out = run_ccx(ccx, env, inp)
@@ -11360,7 +11762,11 @@ def main():
               f"nodes {min(cpress[0]):.4f}...{max(cpress[0]):.4f} (10), then {min(cpress[1]):.4f}..."
               f"{max(cpress[1]):.4f} (20) in the carried step; worst {worst * 100:.3f}% off")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("cps4i_slab", "CPS4I / CPE4I as C3D8I slabs: pure bending, exactly")
+def check_cps4i_slab(ccx, env, tmp, shared):
     # --- CPS4I / CPE4I as C3D8I slabs: pure bending, exactly -----------------------
     # ccx has no incompatible-mode plane element; abq2ccx writes each as a one-element-thick
     # C3D8I slab (top nodes tied in plane, thickness DOF held; plane stress through an ORTHO
@@ -11368,6 +11774,7 @@ def main():
     # on rectangles exactly, so the 5 x 2 cantilever under an end couple must give beam
     # theory: tip u_y = M L^2 / (2 E' I) (E' = E plane stress, E / (1 - nu^2) plane strain),
     # sigma_xx = -M y / I at every integration point, sigma_zz = 0 / nu sigma_xx.
+    failures = 0
     for kind, ep in (("CPS4I", 1000.0), ("CPE4I", 1000.0 / (1 - 0.3 ** 2))):
         src = os.path.join(tmp, f"slab_{kind}_src.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
@@ -11394,12 +11801,19 @@ def main():
               f"sigma_zz {s10[2]:.5f}; max deviation {err:.1e}"
               + (" (a plain CPS4 gives 39 % of the deflection)" if kind == "CPS4I" else ""))
         failures += 0 if ok else 1
+    return failures
 
+
+@check("shell_pressure_sides",
+       "shell pressure on SPOS / SNEG faces and element-based P, against Navier")
+def check_shell_pressure_sides(ccx, env, tmp, shared):
     # --- shell pressure on SPOS / SNEG faces and element-based P, against Navier --------
     # Abaqus pushes a surface pressure against the surface normal (SPOS along -n, SNEG along
     # +n) and an element-based *DLOAD P along +n (Abaqus 2017 shell element library); ccx's
     # *DLOAD P on a shell pushes along +n, so abq2ccx flips the sign on SPOS.  Simply
     # supported square S8R plate, a = 1, t = 0.01, p = 1: centre deflection 0.00406 p a^4 / D.
+    solve = shared["solve"]
+    failures = 0
     dee = 1.0e7 * 0.01 ** 3 / (12 * (1 - 0.3 ** 2))
     ref = 0.00406235 / dee
     for variant, subs, sign in (("*DSLOAD on SPOS", (), -1.0),
@@ -11414,12 +11828,17 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  shell_pressure_sides ({variant}): centre w {w:+.5e} "
               f"(Navier {sign * ref:+.5e}, {abs(w / (sign * ref) - 1) * 100:.1f}% off)")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("kinematic_all_dofs", "*KINEMATIC without DOF lines: all DOFs, like a rigid body")
+def check_kinematic_all_dofs(ccx, env, tmp, shared):
     # --- *KINEMATIC without DOF lines: all DOFs, like a rigid body ---------------------------
     # Abaqus couples every DOF when *KINEMATIC has no data lines; ccx would couple none, so
     # abq2ccx writes '1, 3', which carries the reference node's rotations too: the coupled end
     # face of a C3D8 cantilever under a reference-node force and two moments must move exactly
     # as with *RIGID BODY on the same face.
+    failures = 0
     res = {}
     for kind, subs in (("kinematic", ()), ("rigid", (("*COUPLING, CONSTRAINT NAME=CAP, REF NODE=REF, "
                                                       "SURFACE=END\n*KINEMATIC\n",
@@ -11447,13 +11866,19 @@ def main():
     else:
         print(f"FAIL  kinematic_all_dofs: did not solve ({len(nodes)} nodes compared)")
         failures += 1
+    return failures
 
+
+@check("assembly_rotated_instances",
+       "assembly flattening: a turned instance against the same model written flat")
+def check_assembly_rotated_instances(ccx, env, tmp, shared):
     # --- assembly flattening: a turned instance against the same model written flat -------
     # Two instances of one part, the second translated and turned 90 degrees about z, with an
     # orthotropic material at 45 degrees (turned with the instance: an unturned orientation
     # moves the nodes by 9 % of max |u|), instance-qualified loads and a surface pressure.
     # The flat twin numbers the instances 1-20 / 21-40 as the converter does and gives the
     # second one's coordinates and orientation turned by hand.
+    failures = 0
     res, xyz = {}, {}
     for deck in ("assembly_rotated_instances", "assembly_rotated_instances_flat"):
         inp = os.path.join(tmp, deck + ".inp")
@@ -11502,8 +11927,15 @@ def main():
         else:
             print(f"FAIL  {tag}: the two models printed different nodes ({len(un)} / {len(uf)})")
             failures += 1
+    return failures
+
+
+@check("pretension_one_member_set",
+       "*PRE-TENSION SECTION, NODE= / ELEMENT= a one-member set (as Abaqus allows)")
+def check_pretension_one_member_set(ccx, env, tmp, shared):
     # --- *PRE-TENSION SECTION, NODE= / ELEMENT= a one-member set (as Abaqus allows): ccx 2.23
     # reads only a number there and stops on a set name ('*ERROR reading *PRE-TENSION SECTION')
+    failures = 0
     def pretension_closures(text, tag, nodes):
         """The pre-tension nodes' DOF 1 (the cut's closure) of ``text`` converted and solved."""
         src, inp = os.path.join(tmp, tag + "_src.inp"), os.path.join(tmp, tag + ".inp")
@@ -11543,10 +11975,16 @@ def main():
               f"with ELEMENT=1, NODE=99 and F L / E A = {want:.7g} (the set names stop ccx; ccx's own "
               f"cut drops the cut element: F L / 2 E A)")
     failures += 0 if got and ref and ok else 1
+    return failures
+
+
+@check("pretension_cut", "a truss / beam cut (ELEMENT=)")
+def check_pretension_cut(ccx, env, tmp, shared):
     # --- a truss / beam cut (ELEMENT=): Abaqus puts the cut at the element's last node and keeps
     # the element; ccx 2.23 deletes it (no compliance, only the axial force across) and stops on
     # a truss or U1.  Bolt and member in parallel: closure F / kb + F / km, then held while P
     # pulls: the bolt takes kb P / (kb + km) of it
+    failures = 0
     kb, km, f, p = 210000.0 / 2.0, 210000.0, 1000.0, 3000.0
     want = [(f / kb + f / km, -f / km, f), (f / kb + f / km, -f / km + p / (kb + km), f + kb * p / (kb + km))]
     for tag, kw, what in (("pretension_cut_beam", {}, "a B31 bolt"),
@@ -11604,10 +12042,16 @@ def main():
               f"the uncut beam {err:.1e} of max |u| apart "
               f"(ccx's own cut: no moment across, the tip ran off to 1e10)")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("coupling_ref_node_forms", "a coupling's REF NODE= at the assembly level")
+def check_coupling_ref_node_forms(ccx, env, tmp, shared):
     # --- a coupling's REF NODE= at the assembly level: an instance set, an instance node, an
     # assembly set, CAE's assembly reference point (numbered 1, like the instance's first
     # node), REFNODE=, a legacy *KINEMATIC COUPLING and a distributing coupling, each against
     # the model written flat (ccx needs a node number there and stops on a set name)
+    failures = 0
     tops = {}
     for form in ("flat", "flat_dist", "set", "node", "asm_set", "asm_point", "refnode", "legacy", "dist_node"):
         src, inp = os.path.join(tmp, f"cref_{form}_src.inp"), os.path.join(tmp, f"cref_{form}.inp")
@@ -11633,20 +12077,17 @@ def main():
               f"displacements {err:.1e} of max |u| from the model written flat (top u1 "
               f"{tops['flat'][0][0]:.6g}, distributing {tops['flat_dist'][0][0]:.6g})")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("distributing_coupling", "*COUPLING + *DISTRIBUTING")
+def check_distributing_coupling(ccx, env, tmp, shared):
     # --- *COUPLING + *DISTRIBUTING: Abaqus moves the reference node with the coupling nodes'
     # weighted mean motion and turns it with their weighted least-squares rotation (and spreads
     # its loads by the same relations, distributing_relations); ccx's own card only spreads the
     # loads: a BC on the node moved nothing, the node printed U = 0, a beam on it hung free
-
-    def dist_run(tag, text):
-        src, inp = os.path.join(tmp, tag + "_src.inp"), os.path.join(tmp, tag + ".inp")
-        with open(src, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-        convert(src, inp)
-        d, status, out = run_ccx(ccx, env, inp)
-        u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
-        shutil.rmtree(d, ignore_errors=True)
-        return u, status, out
+    dist_run = shared["dist_run"]
+    failures = 0
     xyz, _, top, _, _ = distributing_block()
     area = {n: 0.25 * (2 if 0 < xyz[n][0] < 3 else 1) * (2 if xyz[n][1] == 1 else 1) for n in top}
     motion, spread = distributing_relations(xyz, area, DIST_REF)
@@ -11763,10 +12204,22 @@ def main():
               f"the node; the tip {', '.join(f'{x:.6g}' for x in a[101])} vs the face's motion and rotation plus "
               f"the root-clamped beam's deflection {err_tip:.1e} apart (ccx's card: the beam hung free)")
         failures += 0 if ok else 1
+    shared["cpl"] = cpl
+    shared["f"] = f
+    shared["loads"] = loads
+    shared["m"] = m
+    shared["xyz"] = xyz
+    return failures
+
+
+@check("truss_below_beams", "a truss numbered below the beams at a node they share")
+def check_truss_below_beams(ccx, env, tmp, shared):
     # --- a truss numbered below the beams at a node they share: ccx 2.23 gives a node its
     # lowest-numbered beam / truss element's expansion, so the node had no rotations — it held the
     # beams' rotation there (93 % off under a tip load) and stopped on a rotational BC or moment;
     # Abaqus' answer does not depend on the numbering
+    dist_run = shared["dist_run"]
+    failures = 0
     for tag, step in (("truss_below_beams_tip_load", ["*CLOAD", "3, 2, 1.", "3, 3, 0.5"]),
                       ("truss_below_beams_moment", ["*CLOAD", "2, 6, 0.3", "2, 5, 0.2", "3, 3, 0.5"]),
                       ("truss_below_beams_rotation_bc", ["*BOUNDARY", "2, 4, 6", "*CLOAD", "3, 2, 1."])):
@@ -11785,11 +12238,18 @@ def main():
               f"beams): tip {', '.join(f'{x:.6g}' for x in lo[3])}, {err:.1e} of max |u| from the truss "
               f"numbered after them (ccx: 93 % stiffer under the tip load, stopped on the moment / BC)")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("truss_shell_node", "a truss at a shell node without a beam")
+def check_truss_shell_node(ccx, env, tmp, shared):
     # --- a truss at a shell node without a beam: ccx 2.23 makes the node a knot whose turn about
     # the shell normal it holds along the truss's section axis only, normal to the shell normal in
     # the first case, where spooles crashed (exit 255, no message); in the second the knot ran,
     # 1e-3 off.  The truss ends at a copy tied through a hub of two knot beams to the node; the
     # reference has the truss as an axial spring of its stiffness, which ccx does not expand
+    dist_run = shared["dist_run"]
+    failures = 0
     for tag, kw, base in (("shell_truss_node_s4", dict(typ="S4", plane="xy", d=(0.0, -0.5, -1.0), first=True),
                            "crashed in spooles, exit 255"),
                           ("shell_truss_node_s8r", dict(typ="S8R", plane="xz", d=(1.0, 0.0, 0.0), first=False),
@@ -11809,6 +12269,12 @@ def main():
               f"T3D2 at an inner node): every node {err:.1e} of max |u| ({big:.4g}, tip node {tip}) from the truss "
               f"as an axial spring (ccx's own knot: {base})")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("truss_spc_index",
+       "ccx 2.23 overwrites one entry of its BC index per truss node (gen3dtruss.f)")
+def check_truss_spc_index(ccx, env, tmp, shared):
     # --- ccx 2.23 overwrites one entry of its BC index per truss node (gen3dtruss.f): a beam or
     # shell rotation held there went free without a message (a cantilever beside a held truss that
     # carries nothing: tip 3.2e11 for -1.145; the shell strip twisted), a later step's BC went to
@@ -11816,7 +12282,7 @@ def main():
     # move every overwritten entry past the BCs; the reference is the deck without its trusses.
     # The cantilever's emitted deck without the equations shows what ccx did, which --run's .12d
     # check (free_rotations) finds
-
+    failures = 0
     def tbi_run(tag, text, strip=False):
         src, inp = os.path.join(tmp, tag + "_src.inp"), os.path.join(tmp, tag + ".inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
@@ -11863,9 +12329,16 @@ def main():
               f"clamped beside held T3D2s that carry nothing): {shown}, {err:.1e} from the deck without the "
               f"trusses; every held rotation has its mean-rotation MPC{before}")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("dcoup3d_verification", "the legacy *DISTRIBUTING COUPLING (DCOUP3D) vs Abaqus' own results")
+def check_dcoup3d_verification(ccx, env, tmp, shared):
     # --- the legacy *DISTRIBUTING COUPLING (DCOUP3D) vs Abaqus' own results: the Verification
     # Guide's linear problem, whose tables the equations of the distributing constraint give back
     # to 3 digits, offset moments and rotations included (ccx's card: (3.89e-3, 0, 0) in step 1)
+    dist_run = shared["dist_run"]
+    failures = 0
     motion3, _ = distributing_relations(DCOUP3D_XYZ, {1: 1.0, 2: 2.0, 3: 3.0}, DCOUP3D_REF)
     worst, exact, shown = 0.0, 0.0, []
     for step in range(3):
@@ -11888,10 +12361,20 @@ def main():
           f"node 1's within {worst:.1e} of Abaqus' tables (3 digits); node 10 {exact:.1e} from the coupling "
           f"nodes' weighted motion ({'; '.join(shown)})")
     failures += 0 if ok else 1
+    return failures
+
+
+@check("distributing_plane_two_thicknesses",
+       "*COUPLING + *DISTRIBUTING on plane-element edges of two section thicknesses",
+       needs=("distributing_coupling",))
+def check_distributing_plane_two_thicknesses(ccx, env, tmp, shared):
     # --- *COUPLING + *DISTRIBUTING on plane-element edges of two section thicknesses: the weights
     # are the edges' tributary lengths times the thickness (planned before the thicknesses were
     # read, they took 1 for both: 39 % off), vs the force and moment as Abaqus' nodal forces
     # (in the plane: one rotation, T = sum w r . r; the edge nodes lie on a line)
+    cpl = shared["cpl"]
+    dist_run = shared["dist_run"]
+    failures = 0
     xy2 = {1 + i + 5 * j: (float(i), float(j)) for j in range(3) for i in range(5)}
     w2 = {n: v / 8.0 for n, v in {11: 0.5, 12: 1.0, 13: 2.0, 14: 3.0, 15: 1.5}.items()}
     c2 = [sum(w2[n] * xy2[n][k] for n in w2) for k in (0, 1)]
@@ -11922,9 +12405,23 @@ def main():
               f"|u| ({big:.3g}) from Abaqus' nodal forces with edge length x thickness weights, the node's "
               f"displacement included (thickness 1 for both: 39 % off)")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("distributing_membrane_skin",
+       "*COUPLING + *DISTRIBUTING on an M3D4 / M3D3 skin on the block's top",
+       needs=("distributing_coupling",))
+def check_distributing_membrane_skin(ccx, env, tmp, shared):
     # --- *COUPLING + *DISTRIBUTING on an M3D4 / M3D3 skin on the block's top: equations on the
     # membrane nodes (ccx's card spread the load over the faces its hinge holds: 20 % off on M3D4,
     # nothing on M3D3), vs Abaqus' distribution of the force and moment as nodal forces
+    cpl = shared["cpl"]
+    dist_run = shared["dist_run"]
+    f = shared["f"]
+    loads = shared["loads"]
+    m = shared["m"]
+    xyz = shared["xyz"]
+    failures = 0
     _, els, _, topel, _ = distributing_block()
     for typ in ("M3D4", "M3D3"):
         tag = f"distributing_membrane_skin_{typ.lower()}"
@@ -11958,10 +12455,17 @@ def main():
               f"nodal forces, the reference node's displacement included (u3 {got[100][2]:.6g}; ccx's card: "
               + ("the face 20 % off, the node not moved" if typ == "M3D4" else "transmitted nothing") + ")")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("damage_johnson_cook",
+       "Johnson-Cook damage initiation: ccx's indicator, the model unchanged")
+def check_damage_johnson_cook(ccx, env, tmp, shared):
     # --- Johnson-Cook damage initiation: ccx's indicator, the model unchanged -------
     # ccx 2.23 evaluates the criterion once it has its second data line (the damage at which
     # it deletes an element, out of reach so that it only reports): in uniaxial tension the
     # indicator is PEEQ / (d1 + d2 exp(-d3 / 3)), and the run is the same as without the card.
+    failures = 0
     src = open(os.path.join(EXAMPLES, "damage_johnson_cook_cubes.inp"), encoding="utf-8").read()
     card = "*DAMAGE INITIATION, CRITERION=JOHNSON COOK\n0.2, 0.3, 1.5, 0., 0., 1878., 293., 1.\n"
     runs = {}
@@ -11992,6 +12496,11 @@ def main():
               f"criterion, results {'identical to' if same else 'DIFFERENT from'} the run "
               f"without the card")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("rigid_elements", "rigid elements and analytical rigid surfaces")
+def check_rigid_elements(ccx, env, tmp, shared):
     # --- rigid elements and analytical rigid surfaces ---------------------------------
     # ccx has neither: the converter gives each facet a force-free skin element that the rigid
     # body carries.  Against frictionless HARD contact (ccx: a linear law of slope K = 50 x the
@@ -11999,6 +12508,7 @@ def main():
     # F = A d / (L / E' + 1 / K) — E' = E / (1 - nu^2) in plane strain — exactly, and the same
     # punch written as an analytical surface, or as a solid punch whose every node is given
     # the motion, must give the same block.
+    failures = 0
     def rigid_run(text, name, approximate=False):
         src = os.path.join(tmp, name + "_src.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
@@ -12149,13 +12659,18 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  rigid_pressure ({kind}): P = 2 on a rigid {what} against a "
               f"spring k = 4: u = {u if u is not None else r['status']} (p / k = 0.5)")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("umat", "user materials on a stock ccx: the name guard and --abaqus-umat")
+def check_umat(ccx, env, tmp, shared):
     # --- user materials on a stock ccx: the name guard and --abaqus-umat --------------
     # ccx hands a *USER MATERIAL to the routine its name starts with: USER... to an empty stub
     # in a stock ccx, JOHNSONCOOK... to its own Johnson-Cook law.  Renamed, the material stops
     # ccx instead.  --abaqus-umat writes it for ccx's Abaqus-UMAT interface, where a stock ccx
     # has a linear-elastic example: the stretched cube gives S33 = E eps through ABAQUS (small
     # strain) and E ln(1 + eps) through ABAQUSNL (NLGEOM, logarithmic strain).
+    failures = 0
     src = os.path.join(tmp, "umat_src.inp")
     for name in ("UserMat", "JohnsonCook_Steel"):
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
@@ -12183,22 +12698,64 @@ def main():
               f"UMAT, S33 = {f'{s[2]:.4f}' if s else status} (reference {ref:.4f})")
         failures += 0 if ok else 1
     failures += umat_build_checks(tmp)
-    # --- *MATRIX GENERATE: ccx's MATRIXSTORAGE files against the exact brick matrices ---------
-    failures += matrix_generate_checks(ccx, env, tmp)
-    # --- task 147: *IMPERFECTION, data lines and FILE= (--run's two passes) ---------------------
-    failures += imperfection_checks(ccx, env, tmp)
-    # --- code check G1-1: 2-point / 2 x 2 loads whose nodal forces would clash keep their line ----
-    failures += nodal_clash_checks(ccx, env, tmp)
-    # --- code check D1-1: ... and a static perturbation step's change of a TIME=TOTAL TIME load -
-    failures += nodal_clash_sp_checks(ccx, env, tmp)
-    # --- code checks G1-2, D1-5, D1-6: steady-state dynamics BC values (ignored), DIRECT (stops) --
-    failures += ssd_load_case_checks(ccx, env, tmp)
+    return failures
 
+
+@check("matrix_generate",
+       "*MATRIX GENERATE: ccx's MATRIXSTORAGE files against the exact brick matrices")
+def check_matrix_generate(ccx, env, tmp, shared):
+    # --- *MATRIX GENERATE: ccx's MATRIXSTORAGE files against the exact brick matrices ---------
+    failures = 0
+    failures += matrix_generate_checks(ccx, env, tmp)
+    return failures
+
+
+@check("t147", "task 147: *IMPERFECTION, data lines and FILE= (--run's two passes)")
+def check_t147(ccx, env, tmp, shared):
+    # --- task 147: *IMPERFECTION, data lines and FILE= (--run's two passes) ---------------------
+    failures = 0
+    failures += imperfection_checks(ccx, env, tmp)
+    return failures
+
+
+@check("nodal_clash",
+       "code check G1-1: 2-point / 2 x 2 loads whose nodal forces would clash keep their line")
+def check_nodal_clash(ccx, env, tmp, shared):
+    # --- code check G1-1: 2-point / 2 x 2 loads whose nodal forces would clash keep their line ----
+    failures = 0
+    failures += nodal_clash_checks(ccx, env, tmp)
+    return failures
+
+
+@check("nodal_clash_sp",
+       "code check D1-1: ... and a static perturbation step's change of a TIME=TOTAL TIME load")
+def check_nodal_clash_sp(ccx, env, tmp, shared):
+    # --- code check D1-1: ... and a static perturbation step's change of a TIME=TOTAL TIME load -
+    failures = 0
+    failures += nodal_clash_sp_checks(ccx, env, tmp)
+    return failures
+
+
+@check("ssd_load_case",
+       "code checks G1-2, D1-5, D1-6: steady-state dynamics BC values (ignored), DIRECT (stops)")
+def check_ssd_load_case(ccx, env, tmp, shared):
+    # --- code checks G1-2, D1-5, D1-6: steady-state dynamics BC values (ignored), DIRECT (stops) --
+    failures = 0
+    failures += ssd_load_case_checks(ccx, env, tmp)
+    return failures
+
+
+@check("results_digest",
+       "the --run results digest (abq2ccx.ccx_results_digest) against the references above",
+       needs=("planar_pinned_beams",))
+def check_results_digest(ccx, env, tmp, shared):
     # --- the --run results digest (abq2ccx.ccx_results_digest) against the references above:
     # the planar beam's frequencies and buckling load (beam theory, Euler), the circular-section
     # cantilever's tip deflection (P L^3 / 3 E I; ccx writes the beam expanded, so its largest
     # |U| is at a node next to the tip node 21), and the two-block assembly's reactions, which
     # statics makes the applied load (-100 in z on I2.7), at the names Abaqus gives them.
+    beam_refs = shared["beam_refs"]
+    failures = 0
     for name in ("planar_pinned_beam", "beam_circ_cantilever", "assembly_two_blocks"):
         inp = os.path.join(tmp, name + ".inp")
         rep, conv = convert(os.path.join(EXAMPLES, name + ".inp"), inp)
@@ -12232,6 +12789,11 @@ def main():
                     f"the loaded corner")
         print(f"{'PASS' if ok else 'FAIL'}  results digest ({name}): {what}")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("composite_shells", "composite shells: S4R -> S8R, SC8R / SC6R -> one solid per ply")
+def check_composite_shells(ccx, env, tmp, shared):
     # --- composite shells: S4R -> S8R, SC8R / SC6R -> one solid per ply ---------------------
     # ccx runs *SHELL SECTION, COMPOSITE on S8R / S6 only and has no layered solid section, so
     # abq2ccx upgrades composite S4R to S8R (a node at the middle of every edge) and writes a
@@ -12240,21 +12802,8 @@ def main():
     # solution (a/h = 100 and 10), the plate stacked along its elements' direction 1, and the
     # in-plane stiffness A of a [30/-60/45]s laminate in the x-y and the x-z plane (exact: the
     # strain is uniform).
-    def composite_run(text, tag):
-        src = os.path.join(tmp, f"{tag}_src.inp")
-        with open(src, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-        inp = os.path.join(tmp, f"{tag}.inp")
-        convert(src, inp)
-        d, status, out = run_ccx(ccx, env, inp)
-        dat = os.path.join(d, "job.dat")
-        res = (dat_displacements(dat), dat_totals(dat)) if status == "solved" else None
-        shutil.rmtree(d, ignore_errors=True)
-        if res is None:
-            print(f"FAIL  {tag}: did not solve ({status})")
-            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
-        return res
-
+    composite_run = shared["composite_run"]
+    failures = 0
     plies = lambda h: [(h / 3, ang, PAGANO_PLY) for ang in (0, 90, 0)]     # noqa: E731
     centre_b, centre_t = 81, 162                    # the SC8R plate's centre, bottom and top
     stacked = {}
@@ -12375,11 +12924,18 @@ def main():
                   f"edge reactions of three uniform strains vs classical lamination theory's A11 ... "
                   f"A66, max difference {err:.1e} of the largest")
             failures += 0 if ok else 1
+    return failures
 
+
+@check("shell_material_axes",
+       "material axes of plain shell and membrane sections, and *DISTRIBUTION ones")
+def check_shell_material_axes(ccx, env, tmp, shared):
     # --- material axes of plain shell and membrane sections, and *DISTRIBUTION ones -----
     # ccx 2.23 projects a shell orientation's turned axis 1 onto the shell (Abaqus: the axis
     # after the rotation axis) and gives a membrane its orientation's axes unprojected (or
     # the global ones); abq2ccx gives such sections Abaqus' directions element by element.
+    composite_run = shared["composite_run"]
+    failures = 0
     for kind, plane, orient in (("s4r", "XY", True), ("s4r", "XZ", True), ("s4r", "YZ", True),
                                 ("m3d4", "XZ", True), ("m3d4", "YZ", True), ("m3d4", "YZ", False),
                                 ("s4r", "XY", PLATE_AXES), ("m3d4", "XZ", PLATE_AXES),
@@ -12515,7 +13071,12 @@ def main():
               + (" (ccx loads the inner face of its expanded shells: 1 % less load at this t/R)"
                  if kind.startswith("s4r") else ""))
         failures += 0 if ok else 1
+    return failures
 
+
+@check("orientation_initial_states",
+       "initial stresses and plastic strains given in an orientation's axes")
+def check_orientation_initial_states(ccx, env, tmp, shared):
     # --- initial stresses and plastic strains given in an orientation's axes -----------------
     # Abaqus reads them in the axes of the element's orientation, ccx 2.23 in global ones, and a
     # plastic strain's shear as tensor components (Abaqus: engineering); abq2ccx turns them into
@@ -12523,23 +13084,8 @@ def main():
     # initial stress to eps = -C^-1 sigma and takes its plastic strain stress-free; a quarter
     # annulus with a uniform hoop stress has a closed-form radial displacement; a CPS4 square's
     # initial shear (Abaqus' third component on plane stress, ccx's fourth) relaxes by tau / G
-    def faithful_run(text, tag, allow=()):
-        src = os.path.join(tmp, f"{tag}_src.inp")
-        with open(src, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-        inp = os.path.join(tmp, f"{tag}.inp")
-        _rep, conv = convert(src, inp)
-        d, status, out = run_ccx(ccx, env, inp)
-        u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None
-        shutil.rmtree(d, ignore_errors=True)
-        lost = [r for r in other_reduced(conv) if not r.startswith(allow)] if allow else other_reduced(conv)
-        if u is None or lost:
-            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if u is None else
-                                      "reduced physics: " + "; ".join(lost)))
-            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
-            return None
-        return u
-
+    faithful_run = shared["faithful_run"]
+    failures = 0
     for kind in ("stress", "plastic", "blank"):
         tag = f"initial_{kind}_turned"
         # "blank": blank fields in the *Orientation line and the stress record (Abaqus: 0)
@@ -12752,11 +13298,17 @@ def main():
               f"Abaqus' shell axes" + (", a projected *ORIENTATION" if orient else "") + f"): strains "
               f"{err:.1e} of the largest off {ref}")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("deformation_plasticity", "*Deformation Plasticity on an orientation")
+def check_deformation_plasticity(ccx, env, tmp, shared):
     # --- *Deformation Plasticity on an orientation ------------------------------------------
     # an isotropic law, so Abaqus' results do not depend on the axes, but ccx 2.23's do (CalculiX
     # issue #160: up to 84 % off on turned axes, a hang on zero ones): abq2ccx writes its sections
     # without the orientation, and a bar on any must move as the one without
+    faithful_run = shared["faithful_run"]
+    failures = 0
     for typ in ("C3D8", "C3D20R"):
         ref = faithful_run(dp_bar_deck(typ, "none"), f"deformation_plasticity_{typ.lower()}")
         if ref is None:
@@ -12797,9 +13349,16 @@ def main():
               f"{(eps / small - 1) * 100:+.1f} % past Abaqus' small-strain {small:.6g}; "
               + ("reduced physics" if flagged else f"reduced physics: {conv.reduced_physics}"))
         failures += 0 if ok else 1
+    return failures
+
+
+@check("quad_membranes", "quadratic membranes")
+def check_quad_membranes(ccx, env, tmp, shared):
     # --- quadratic membranes: ccx 2.23 expands each element on nodes of its own and leaves the
     # mid-thickness node of its corners free (M3D8R singular, M3D6 / M3D8 too soft); abq2ccx
     # writes the solids itself, held at the membrane nodes by *EQUATION
+    composite_run = shared["composite_run"]
+    failures = 0
     for typ in ("M3D8R", "M3D8", "M3D6", "M3D9R"):
         for stretch in (None, 1.2):
             tag = f"quad_membrane_{typ.lower()}" + ("_nlgeom" if stretch else "")
@@ -12833,6 +13392,11 @@ def main():
               f"t/R {t:g}, internal pressure): radial displacement {min(ur):.5g} .. {max(ur):.5g} vs "
               f"thin-wall theory {want:.5g}, max difference {err * 100:.2f}%")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("shell_reference_pressure", "shell / membrane pressure on the reference surface")
+def check_shell_reference_pressure(ccx, env, tmp, shared):
     # --- shell / membrane pressure on the reference surface: ccx 2.23 loads one face of its
     # expanded element (a shell's P, P1 and P2 alike the bottom one, whose area is off by
     # O(t/R)) and that leaves a mean stress -p/2 through the thickness of its 3-D solid; abq2ccx
@@ -12840,6 +13404,8 @@ def main():
     # 0.3: the symmetry-plane reaction against p times the reference surface's projected area
     # (on a sphere times 1 + (1 - 4 o^2) (t/2R)^2, the split's residual for OFFSET o; NLGEOM:
     # the deformed sphere's), the mean radial displacement against thin-wall theory
+    composite_run = shared["composite_run"]
+    failures = 0
     t, e_mod = 0.1, 1e5
     for typ, kw, tag in (("S8R", {}, "s8r"), ("S8R", {"load": "SNEG"}, "s8r_sneg"),
                          ("S8R", {"load": "SPOS"}, "s8r_spos"), ("S8R", {"sets": 2}, "s8r_two_sets"),
@@ -12888,9 +13454,16 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what}): pressure force {force:.6g} vs {want_f:.6g} "
               f"({err_f * 100:.3f}% off){disp}")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("membrane_ties", "a *TIE / tied pair / kinematic coupling on membrane faces")
+def check_membrane_ties(ccx, env, tmp, shared):
     # --- a *TIE / tied pair / kinematic coupling on membrane faces: ccx would take its expanded
     # membrane's face, whose bottom nodes its hinge eliminates (SNEG ties nothing, SPOS ties a
     # face that shears through the thickness); abq2ccx takes the membrane nodes, as Abaqus does
+    composite_run = shared["composite_run"]
+    failures = 0
     for typ, flip, pair in (("M3D4", False, False), ("M3D4", True, False), ("M3D4R", False, False),
                             ("M3D3", True, False), ("M3D4", False, True)):
         face = "SPOS" if flip else "SNEG"
@@ -12974,8 +13547,13 @@ def main():
               f"{len(u)} node displacements in plate axes vs the x-y strip with b in the plate, max "
               f"difference {err:.1e} of max |u|")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("t150", "task 150: OFFSET TO NODES orientations, value distributions, integrated output")
+def check_t150(ccx, env, tmp, shared):
     # --- task 150: OFFSET TO NODES orientations, value distributions, integrated output ------
+    failures = 0
     def t150_run(text, tag):
         """The .dat path of ``text`` converted and solved without reduced physics, or None (FAIL
         printed); the directory goes at the end of the block."""
@@ -13041,26 +13619,15 @@ def main():
         failures += 0 if ok else 1
     for d in t150_dirs:
         shutil.rmtree(d, ignore_errors=True)
+    return failures
 
+
+@check("review1", "decks the converter got wrong before the 19 Oct 2026 code review")
+def check_review1(ccx, env, tmp, shared):
     # --- decks the converter got wrong before the 19 Oct 2026 code review ------------------
-    def review_run(text, tag, read, approximate=False):
-        """``read(.dat path)`` of ``text`` converted and solved, or None (FAIL printed)."""
-        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
-        with open(src, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-        try:
-            convert(src, inp, approximate=approximate)
-        except Exception as exc:  # noqa: BLE001
-            print(f"FAIL  {tag}: the conversion failed ({exc!r})")
-            return None
-        d, status, out = run_ccx(ccx, env, inp)
-        res = read(os.path.join(d, "job.dat")) if status == "solved" else None
-        shutil.rmtree(d, ignore_errors=True)
-        if not res:
-            print(f"FAIL  {tag}: no results ({status})")
-            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
-        return res
-
+    review_run = shared["review_run"]
+    same = shared["same"]
+    failures = 0
     # a planar beam's tip node coupled to a reference node (the converter stopped on it)
     tips = [review_run(planar_coupled_tip_deck(c), "planar_coupled_tip" + ("" if c else "_ref"),
                        dat_displacements) for c in (True, False)]
@@ -14003,16 +14570,6 @@ def main():
               f"{runs[0][0][0]:.7g})")
     failures += 0 if ok else 1
     # the planners' BC and moment states after a linear perturbation step: the base state again
-    def same(runs, k=None):
-        """The largest difference between the NODE PRINT blocks of two runs (block ``k`` only,
-        or all), and the largest |u| of the second (the reference)."""
-        got, ref = runs
-        if k is None and len(got) != len(ref):
-            return math.inf, 0.0
-        pairs = [(got[k], ref[k])] if k is not None else list(zip(got, ref))
-        err = max(abs(a - b) for g, r in pairs for n, v in r.items()
-                  for a, b in zip(g.get(n, [math.inf] * 3), v))
-        return err, max(abs(x) for _, r in pairs for v in r.values() for x in v)
 
     # a rotation a *FREQUENCY step holds on a transformed joint (global components: it came back
     # in the next general step, held at the frequency step's zero)
@@ -16234,10 +16791,17 @@ def main():
               f"force-free dummy beam): the turned tip moves R u of the unturned one's ({err:.1e} apart; "
               f"max |u| {max(abs(x) for x in u[a]):.4f})")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("abbreviated_indented",
+       "indented keyword lines and abbreviations, read as Abaqus reads them")
+def check_abbreviated_indented(ccx, env, tmp, shared):
     # --- indented keyword lines and abbreviations, read as Abaqus reads them: a free cube
     # heated from the initial 20 to 120 strains alpha dT = 1e-3 (the initial temperature lost,
     # it strained 1.2e-3; the indented mesh lost, nothing solved)
+    review_run = shared["review_run"]
+    failures = 0
     nodes = "".join(f"{n + 1}, {x}., {y}., {z}.\n" for n, (x, y, z) in enumerate(
         ((0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1))))
     deck = ("  *NODE, NSET=ALL\n" + nodes + "   *ELEMENT, TYPE=C3D8, ELSET=E\n1, 1,2,3,4,5,6,7,8\n"
@@ -16256,11 +16820,17 @@ def main():
               f"cube heated 20 -> 120 strains alpha dT, u = 1e-3 x ({err:.1e} apart, corner u_x "
               f"{u[7][0]:.6e})")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("self_contact_approx", "self-contact under --approximate")
+def check_self_contact_approx(ccx, env, tmp, shared):
     # --- self-contact under --approximate: ccx's 'S, S' with TYPE=SURFACE TO SURFACE, on a strip
     # folding shut (tip 0.25 down over a gap 0.2), against the symmetric pairs Abaqus' two-way
     # self-contact acts like (the deck's node-to-surface ones); commented out without
     # --approximate, only the strip's bending carries (base: commented out either way)
+    review_run = shared["review_run"]
+    failures = 0
     def tip_force(dat):
         h = dat_history(dat, "total force", "TIP")
         return (h[-1][0], *h[-1][1][0]) if h and h[-1][1] else None
@@ -16278,11 +16848,17 @@ def main():
               f"{want[2]:.6g} with symmetric node-to-surface pairs ({err:.1e} apart; out of plane "
               f"{got[3]:.2g}), {plain[2]:.3g} with it commented out (no --approximate)")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("clearance_main_secondary", "Abaqus 2022+ MAIN / SECONDARY read as MASTER / SLAVE")
+def check_clearance_main_secondary(ccx, env, tmp, shared):
     # --- Abaqus 2022+ MAIN / SECONDARY read as MASTER / SLAVE: a *CLEARANCE of 0 between two
     # cubes 0.01 apart, one pushed 0.005 toward the other, closes the gap from the start (ccx
     # applies a clearance on its MASTER / SLAVE pair; base: 'parameter not recognized', ccx
     # stopped).  Closed form: the two cubes (EA/L 1000) and the contact (1e4) in series
+    review_run = shared["review_run"]
+    failures = 0
     def clearance_run(dat):
         tot = dat_totals(dat)
         u = [r for _, _t, s, _tm, rows in A.dat_blocks(dat) if s == "LTOP" for r in rows]
@@ -16303,11 +16879,17 @@ def main():
               f"{-f_main[2]:.7g} = the series closed form {want:.7g} ({err:.1e}), the struck cube's top "
               f"{u_main[0][3]:.4g}; as SLAVE= / MASTER= ({apart:.1e} apart); without it {f_none[2]:.1e}")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("general_contact_approx", "general contact under --approximate")
+def check_general_contact_approx(ccx, env, tmp, shared):
     # --- general contact under --approximate: Abaqus' *CONTACT, ALL EXTERIOR written as a
     # node-to-surface pair of the two blocks' exterior faces (the struck lower block the slave);
     # it carries what a hand-written pair of the touching faces carries (without --approximate
     # the pushed block meets nothing)
+    review_run = shared["review_run"]
+    failures = 0
     runs = {tag: review_run(general_contact_deck(form), f"general_contact_{tag}",
                             lambda dat: dat_totals(dat)[-1:], approximate=ap)
             for tag, form, ap in (("approx", "general", True), ("pair", "pair", False),
@@ -16345,10 +16927,16 @@ def main():
                   f"hand-written pair{' without the tie slave faces' if tie else ''} ({err:.1e} apart); {none:.4g} "
                   f"without contact")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("shell_tie_fallback", "shell ties with no exact ccx form")
+def check_shell_tie_fallback(ccx, env, tmp, shared):
     # --- shell ties with no exact ccx form: the deck's surfaces with Abaqus' tolerance plus
     # the shells' half thickness, which ccx's expanded faces need (with ccx's default it tied
     # nothing: the T joint's stiffener hung free, 1.84e11); off the merged twins as warned
+    review_run = shared["review_run"]
+    failures = 0
     for tag, node, dof, limit in (("tee", 105, 2, 0.30), ("solid", 205, 2, 0.05)):
         got, want = (review_run(shell_tie_fallback_deck(k), f"shell_tie_fallback_{k}", dat_displacements)
                      for k in (tag, tag + "_merged"))
@@ -16389,12 +16977,18 @@ def main():
               f"loaded while its rigid component and a BC fix it): node 2 uy {got[2][1]:.7g} = 0.01 tan 30 "
               f"{exact:.7g}, as without the load")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("explicit_coupled_approx", "Abaqus/Explicit's coupled step under --approximate")
+def check_explicit_coupled_approx(ccx, env, tmp, shared):
     # --- Abaqus/Explicit's coupled step under --approximate: ccx's *COUPLED TEMPERATURE-
     # DISPLACEMENT with the model's mass (the bar keeps moving at 1: u = 0.01 at t = 0.01; with
     # the masses scaled away, as for Abaqus/Standard's coupled step, it would not move), its
     # temperatures those of *HEAT TRANSFER in the same increments, the z = 0 nodes held at 0
     # (the BC's 0.5 ignored, as Abaqus/Explicit does); without --approximate *NO ANALYSIS
+    review_run = shared["review_run"]
+    failures = 0
     def temps(dat):
         return {int(r[0]): r[1] for r in (dat_tables(dat, "temperatures") or [[]])[-1] if len(r) == 2}
 
@@ -16428,8 +17022,14 @@ def main():
         print("FAIL  explicit_coupled_approx: without --approximate the step is not *NO ANALYSIS "
               "with a warning naming --approximate")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("review2_r20",
+       "cards ccx 2.23 stopped or crashed on as they were written (code review 2, R20)")
+def check_review2_r20(ccx, env, tmp, shared):
     # --- cards ccx 2.23 stopped or crashed on as they were written (code review 2, R20) ---
+    failures = 0
     def r20_run(tag, kind):
         """The .dat path of ccx_rejects_deck(kind) converted and solved, with no reduced
         physics (the directory is removed at the end of the block), or None (FAIL printed)."""
@@ -16545,8 +17145,13 @@ def main():
         failures += 0 if ok else 1
     for d in r20_dirs:
         shutil.rmtree(d, ignore_errors=True)
+    return failures
 
+
+@check("t91", "task 91: cards ccx 2.23 stopped on, or solved wrong, as they were written")
+def check_t91(ccx, env, tmp, shared):
     # --- task 91: cards ccx 2.23 stopped on, or solved wrong, as they were written ---
+    failures = 0
     def t91_run(tag, kind, reduced=()):
         """The .dat path of ccx_leftovers_deck(kind) converted and solved with exactly the
         ``reduced`` physics (the directory is removed at the end of the block), or None (FAIL
@@ -16664,8 +17269,14 @@ def main():
     failures += 0 if ok else 1
     for d in t91_dirs:
         shutil.rmtree(d, ignore_errors=True)
+    return failures
 
+
+@check("t95", "task 95: task 91's follow-ups")
+def check_t95(ccx, env, tmp, shared):
     # --- task 95: task 91's follow-ups ---
+    review_run = shared["review_run"]
+    failures = 0
     def t95_run(tag, kind, reduced=()):
         """The .dat path of ccx_leftovers2_deck(kind) converted and solved with exactly the
         ``reduced`` physics, or None (FAIL printed)."""
@@ -16816,10 +17427,18 @@ def main():
                   f" body, its mass on a member node in no other element): f = {f[0]:.7g} "
                   f"(sqrt(k/m)/2pi = {want:.7g})")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("step_rules", "one rule per step question (the walkers of the deck's steps agree)")
+def check_step_rules(ccx, env, tmp, shared):
     # --- one rule per step question (the walkers of the deck's steps agree) ----------
     # a *BUCKLE step's LOAD CASE=2 BCs, left out (ccx has one set of BCs per step: the modes
     # get the LOAD CASE=1 ones, warned), counted as BCs by the planners: the OP=NEW of
     # LOAD CASE=1 went, as if the step re-specified the BCs in force, so ccx kept the top's
+    review_run = shared["review_run"]
+    same = shared["same"]
+    failures = 0
     fac = review_run(lc2_column_deck(), "lc2_column",
                      lambda dat: dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T"))
     ok = bool(fac) and len(fac) == 2
@@ -16941,12 +17560,18 @@ def main():
               f"sub/mesh.inp): the pulled face moves {u.get(2, [math.nan])[0]:.7g} (4 / 1000; "
               f"{dev:.1e} apart)")
     failures += 0 if u and ok else 1
+    return failures
 
 
+@check("step_rule_leftovers", "step-rule leftovers (task 103)")
+def check_step_rule_leftovers(ccx, env, tmp, shared):
     # --- step-rule leftovers (task 103) ----------------------------------------------------
     # a circular-section beam node whose rotations a step gives 0.001 and its next line 0: held
     # at 0 (the value in force), a full zero clamp, exact without a knot beam (one was added:
     # every node given a nonzero rotation by any card read so far counted as moving)
+    review_run = shared["review_run"]
+    same = shared["same"]
+    failures = 0
     runs = [review_run(circ_override_deck(ov), "circ_override" + ("" if ov else "_ref"),
                        dat_node_blocks) for ov in (True, False)]
     ok = all(runs) and len(runs[0]) == len(runs[1]) == 1
@@ -16978,13 +17603,18 @@ def main():
     elif all(runs):
         print(f"FAIL  lc2_planar: {len(runs[0])}, {len(runs[1])} factors")
     failures += 0 if ok else 1
+    return failures
 
 
+@check("shell_body_forces", "*DLOAD BX / BY / BZ on shells")
+def check_shell_body_forces(ccx, env, tmp, shared):
     # --- *DLOAD BX / BY / BZ on shells: a body force per unit volume in Abaqus, a pressure on
     # face 1 in ccx 2.23 (the strip's tip moved 48.08 out of its plane under BX), written as GRAV
     # of B / rho on a set of the shells (rho 7.5) or, without a density, as consistent nodal
     # forces of B t per area.  The strip under BX against q L^2 / (2 E A) (0.004) and its C3D8
     # twin; under BY against the deck written with that GRAV; under BZ against the pressure B t
+    review_run = shared["review_run"]
+    failures = 0
     twin = review_run(shell_body_plate_deck("C3D8", ["*DLOAD\nE, BX, 2.\n"]), "shell_body_twin",
                       dat_node_blocks)
     for typ, rho in (("S4", 7.5), ("S4", None), ("S8R", 7.5)):
@@ -17057,7 +17687,11 @@ def main():
                   f"tip ux per step {', '.join(f'{x:.6g}' for x in ux)} vs {', '.join(f'{x:g}' for x in want)}"
                   + (f"; uz {p_uz:.6g} vs the pressure's 0.02404" if name == "amplitude" and p_uz else ""))
             failures += 0 if ok else 1
+    return failures
 
+
+@check("rotary_body_loads", "*DLOAD CENT and ROTA, which ccx 2.23 lacks")
+def check_rotary_body_loads(ccx, env, tmp, shared):
     # --- *DLOAD CENT and ROTA, which ccx 2.23 lacks: CENT (rho w^2) -> CENTRIF of w^2 = CENT /
     # rho on a set per density, or consistent nodal forces where there is no density; ROTA (alpha)
     # -> consistent nodal forces of the d'Alembert force -rho alpha n x r.  An annulus held at its
@@ -17067,6 +17701,8 @@ def main():
     # unlike consistent loads (corner and midside nodes 0.996 / 1.002 of u_r; any nodal force).
     # CPS8R takes CENT as nodal forces too: ccx integrates CENTRIF at 2 x 2 points there, which
     # moves the shares on its curved elements (Abaqus integrates fully)
+    review_run = shared["review_run"]
+    failures = 0
     ur_b, ut_b = rotary_disc_refs(100.0)
     for typ in ("C3D20", "CPS8", "CPS8R", "S8R"):
         for rho in (7.85e-9, None):
@@ -17143,13 +17779,20 @@ def main():
         failures += 0 if ok else 1
     else:
         failures += 1
+    return failures
 
+
+@check("rigid_ref_nodes", "rigid-body reference nodes (task 115)")
+def check_rigid_ref_nodes(ccx, env, tmp, shared):
     # --- rigid-body reference nodes (task 115) -------------------------------------------
     # a shell REF NODE with a *TRANSFORM in its PIN NSET, *DYNAMIC: the free reference node
     # takes the *TRANSFORM, the shell node's rotation is tied to the ROT NODE (in its axes).
     # With the axes kept on the shell node its drilling rotation stayed free and massless, and
     # ccx stopped ('increment size smaller than minimum'); against the deck without the
     # *TRANSFORM, which names only DOFs it leaves as they are
+    review_run = shared["review_run"]
+    same = shared["same"]
+    failures = 0
     runs = [review_run(free_ref_transform_deck(tr), "free_ref_transform_dynamic" + ("" if tr else "_ref"),
                        dat_node_blocks) for tr in (True, False)]
     ok = all(runs) and len(runs[0]) == len(runs[1])
@@ -17273,12 +17916,18 @@ def main():
               f"ranges): every node {err:.1e} of max |u| ({scale:.4g}) from RIGHT, 1, 3 (before: ccx "
               f"exited 255)")
     failures += 0 if all(legacy.values()) and ok else 1
+    return failures
 
+
+@check("eigen_modal_knots", "eigenvalue and modal steps with knots (code review 3, B08 / B17)")
+def check_eigen_modal_knots(ccx, env, tmp, shared):
     # --- eigenvalue and modal steps with knots (code review 3, B08 / B17) ----------
     # shell/beam nodes with rotational BCs or a *CLOAD in a deck with modal steps get knot
     # beams: ccx 2.23 segfaulted on those BCs and applied the force wrongly; the response is
     # checked against ccx's own modes superposed (a C3D8I twin's *MODAL DYNAMIC matches that
     # superposition to 7 digits)
+    review_run = shared["review_run"]
+    failures = 0
     for kind, proc in (("strip", "modal"), ("column", "modal"), ("strip", "ssd")):
         tag = f"modal_knots_{kind}_{proc}"
         node, dof = (21, 1) if kind == "column" else (11, 3)
@@ -17326,8 +17975,13 @@ def main():
         if status != "solved":
             print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
         failures += 0 if ok else 1
+    return failures
 
+
+@check("t116", "task 116: cards ccx stopped on without a warning")
+def check_t116(ccx, env, tmp, shared):
     # --- task 116: cards ccx stopped on without a warning ---
+    failures = 0
     def t116_run(tag, kind, reduced=(), approximate=False):
         """The .dat blocks [(step, title, set, time, rows)] of ccx_stops_deck(kind) converted and
         solved with exactly the ``reduced`` physics, or None (FAIL printed)."""
@@ -17446,11 +18100,18 @@ def main():
                   f"{kind[5:].upper()} beside a plain one; ccx stopped in gen3dnor): the twin with it "
                   f"written as a triangle ({err:.1e} apart, max |u| {scale:.4g})")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("input_side", "input side (task 119)")
+def check_input_side(ccx, env, tmp, shared):
     # --- input side (task 119) -----------------------------------------------------------
     # a blank *BEAM SECTION n1 line before the integration-point line (Abaqus: the default):
     # read without it, the line 5, 5 was n1 (as ccx reads it: it skips a blank line), the
     # section turned 90 deg (0.498); against the explicit (0, 0, -1) and P L^3 / 3 E I
+    review_run = shared["review_run"]
+    same = shared["same"]
+    failures = 0
     runs = [review_run(beam_n1_deck(n1), f"beam_n1_{tag}", dat_displacements)
             for tag, n1 in (("blank", "\n5, 5\n"), ("explicit", "0., 0., -1.\n5, 5\n"))]
     ok = all(runs)
@@ -17685,8 +18346,15 @@ def main():
           f"period, then a transient step): as with the period written out (times {', '.join(times[:2])}; "
           f"before: '*ERROR ... step size is negative', step time NaN)")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("t135", "task 135: output frequency, absolute amplitudes, flags")
+def check_t135(ccx, env, tmp, shared):
     # --- task 135: output frequency, absolute amplitudes, flags ------------------------------
+    finite_drift = shared["finite_drift"]
+    plastic = shared["plastic"]
+    failures = 0
     def scb_run(text, tag, read, convert_it=True):
         """(the converter or None, ``read(.dat path)``) of ``text`` solved by ccx, converted first
         unless ``convert_it`` is False (a hand-written ccx twin); the result None where ccx did
@@ -17820,8 +18488,13 @@ def main():
               f"long, {errs[1]:.3%} for one 141 long (ccx damps along the current line); "
               f"{'both flagged' if all(r[0].reduced_physics for r in runs) else 'NOT flagged'}")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("explicit_mass_scaling", "explicit mass scaling")
+def check_explicit_mass_scaling(ccx, env, tmp, shared):
     # --- explicit mass scaling ------------------------------------------------------------
+    failures = 0
     def explicit_run(text, tag, approximate=False):
         """(tip displacements printed, the increment ccx selected, its output) of ``text``
         converted and solved, or None (FAIL printed)."""
@@ -17894,44 +18567,15 @@ def main():
               f"mass): {len(got)} printed increments as the twin scaled by hand ({err:.1e} of the tip's "
               f"{tip:.4g} apart), increment {inc:.6g} = {grow:.6g} x the true mass's {inc_true:.6g}")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("t124", "task 124: conversions ccx 2.23 stopped or looped on: exact forms")
+def check_t124(ccx, env, tmp, shared):
     # --- task 124: conversions ccx 2.23 stopped or looped on: exact forms ---
-    def t124_run(tag, kind, reduced=(), deck=None):
-        """(the .dat path's displacement blocks, buckling factor tables, frequency tables, the
-        report text) of avoidable_stops_deck(kind) (or ``deck``) converted and solved with
-        exactly the ``reduced`` physics, or None (FAIL printed).  ccx gets 120 s and files of at
-        most 50 MB (POSIX): some of these decks made it loop without end."""
-        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
-        with open(src, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(avoidable_stops_deck(kind) if deck is None else deck)
-        rep, conv = convert(src, inp)
-        d = tempfile.mkdtemp(prefix="ccxval_")
-        shutil.copy(inp, os.path.join(d, "job.inp"))
-        r = ccx_job(ccx, env, d, 120, fsize=50 << 20)
-        rc, out = r.stopped or r.returncode, r.stdout + r.stderr
-        # (the checks below show the solve)
-        status = "solved" if rc == 0 and "Job finished" in out and "*ERROR" not in out and \
-            not A.ccx_nonfinite_result(os.path.join(d, "job")) else \
-            f"failed (rc {rc}, {os.path.getsize(r.log) >> 20} MB of output)"
-        dat = os.path.join(d, "job.dat")
-        res = None
-        if status == "solved":
-            res = (dat_node_blocks(dat), [[r[1] for r in t if len(r) == 2] for t in dat_tables(dat, "B U C K")],
-                   [[r[3] for r in t if len(r) == 5] for t in dat_tables(dat, "E I G E N V A L U E   O U")],
-                   rep.text())
-        shutil.rmtree(d, ignore_errors=True)
-        if res is None or sorted(conv.reduced_physics) != sorted(reduced):
-            print(f"FAIL  {tag}: " + (f"did not solve ({status})" if res is None else
-                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
-            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
-            return None
-        return res
-
-    def t124_apart(a, b):
-        """The largest difference between two {node: values} blocks, and the largest |value|."""
-        err = max(abs(x - y) for n, v in b.items() for x, y in zip(a.get(n, [math.inf] * len(v)), v))
-        return err, max(abs(x) for v in b.values() for x in v)
-
+    t124_apart = shared["t124_apart"]
+    t124_run = shared["t124_run"]
+    failures = 0
     # an unread node surface on a *RIGID BODY's plane-element members: left out
     runs = [t124_run("t124_rb_surface", "rb_surf"), t124_run("t124_rb_surface_ref", "rb_ref")]
     ok = all(runs)
@@ -18006,9 +18650,14 @@ def main():
               f"one of density 1, initial temperatures, *DYNAMIC): {len(runs[0][0])} increments as with "
               f"*DENSITY 0 ({err:.1e} apart; top u_z {moved:.6g}; before: the other cube's density)")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("t133", "task 133: *BOUNDARY, FIXED on *TRANSFORM translations")
+def check_t133(ccx, env, tmp, shared):
     # --- task 133: *BOUNDARY, FIXED on *TRANSFORM translations (ccx 2.23 holds the global
     # component, read as the local value) and in a static perturbation step: the values ---
+    failures = 0
     def t133_run(tag, kind, reduced=()):
         """(the displacement blocks, the report text) of fixed_transform_deck(kind) converted and
         solved with exactly the ``reduced`` physics, or None (FAIL printed)."""
@@ -18079,10 +18728,16 @@ def main():
                   f"base BC holding it ({err:.1e} apart; the step moves the model {moved:.4g}; before: "
                   f"{'the global component' if kind == 'sp_tr' else 'twice the base value'})")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("contact_property_tables", "contact property tables ccx reads otherwise than Abaqus")
+def check_contact_property_tables(ccx, env, tmp, shared):
     # --- contact property tables ccx reads otherwise than Abaqus -------------------------------
     # two pressed unit cubes: the force (unit area: the pressure) against Abaqus' law, the heat
     # flux against 100 / (2 + 1 / k) with Abaqus' conductance k
+    review_run = shared["review_run"]
+    failures = 0
     def cubes_totals(dat):
         f, q = dat_history(dat, "total force", "TOP"), dat_history(dat, "total heat", "TOP")
         return f and (-f[-1][1][0][2], q[-1][1][0][0] if q else None)
@@ -18148,9 +18803,16 @@ def main():
           f"{got[1]:.6g} for Abaqus' 970 / 800 (ccx's springs end at a clearance of 5e-4), flagged "
           f"{flagged} (before: no warning)")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("t129", "task 129: *TIE of conventional shells on solid faces: Abaqus ties the shell nodes")
+def check_t129(ccx, env, tmp, shared):
     # --- task 129: *TIE of conventional shells on solid faces: Abaqus ties the shell nodes ---
     # (the untied nodes compared: ccx prints a tied shell node at another point than a merged one)
+    t124_apart = shared["t124_apart"]
+    t124_run = shared["t124_run"]
+    failures = 0
     for kind, typ, ref, what, before in (
             ("skin", "S4", "skin_merged", "an S4 strip's end on a C3D8 block, tied by a faceless "
              "(double-sided) slave line", "the line left out, ccx looped"),
@@ -18173,10 +18835,16 @@ def main():
                   f"{'knotted nodes tied' if kind == 'offset' else 'merged mesh'} ({err:.1e} apart; |u| "
                   f"{moved:.6g}; before: {before})")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("midside_bc", "a card that moves one end of an edge the converter put a node on")
+def check_midside_bc(ccx, env, tmp, shared):
     # --- a card that moves one end of an edge the converter put a node on: the node takes the
     # interpolation with the other end's BC in force (before: only a card giving both ends
     # reached it, so it kept step 1's value, or stayed free where two cards held the ends)
+    review_run = shared["review_run"]
+    failures = 0
     for kind, what, before in (("steps", "node 3 lifted by 0.2 in step 1, node 6 lowered by 0.1 "
                                 "in step 2 on a card of its own", "0.1, step 1's, the nodes 0.05 off"),
                                ("cards", "nodes 3 and 6 held and moved by 0.2 and -0.1 on a card "
@@ -18194,8 +18862,13 @@ def main():
                   f"mean; before: {before}), every node as the twin's whose card gives both ends "
                   f"({err:.1e} apart; free nodes moved up to {moved:.4g})")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("t141", "task 141: *EMBEDDED ELEMENT as host-interpolation *EQUATIONs")
+def check_t141(ccx, env, tmp, shared):
     # --- task 141: *EMBEDDED ELEMENT as host-interpolation *EQUATIONs ------------------------
+    failures = 0
     def t141_run(tag, deck):
         """(the .dat's displacement blocks, its last stress table, the converted deck's node
         coordinates, the report text, the eigenfrequencies) of ``deck`` converted (no reduced
@@ -18335,8 +19008,14 @@ def main():
             print(f"{'PASS' if ok else 'FAIL'}  t141_rule_{kind} ({what}): as its twin ({err:.1e} apart at "
                   f"{len(common)} nodes; |u| {moved:.6g})")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("t139", "task 139: *SYSTEM frames, *CONTROLS ANALYSIS=DISCONTINUOUS, *MODEL CHANGE w/o TYPE")
+def check_t139(ccx, env, tmp, shared):
     # --- task 139: *SYSTEM frames, *CONTROLS ANALYSIS=DISCONTINUOUS, *MODEL CHANGE w/o TYPE ---
+    t124_apart = shared["t124_apart"]
+    failures = 0
     def t139_run(tag, deck):
         """(displacement blocks of the .dat, ccx's output, the report) of ``deck`` converted and
         solved without reduced physics, or None (FAIL printed)."""
@@ -18444,8 +19123,14 @@ def main():
               f"second of two clamped C3D8 left out in step 2): the first element alone ({err:.1e} "
               f"apart; |u| {moved:.6g}, {both:.6g} with both; before: ccx stopped)")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("t145", "task 145: Norton creep past ccx's singular-matrix stop (an increment cap)")
+def check_t145(ccx, env, tmp, shared):
     # --- task 145: Norton creep past ccx's singular-matrix stop (an increment cap) ---
+    review_run = shared["review_run"]
+    failures = 0
     u = review_run(norton_creep_deck(), "norton_creep_cap", dat_displacements)
     if u:
         got = [u.get(n, [math.inf])[0] for n in (2, 3, 6, 7)]
@@ -18469,12 +19154,19 @@ def main():
               f"{', '.join(f'{x:.7g}' for x in got)} past the elastic {200 / 200e3:g} (before: the "
               f"conversion failed, OverflowError)")
     failures += 0 if u and ok else 1
+    return failures
 
+
+@check("t155", "task 155: unprobed suspects")
+def check_t155(ccx, env, tmp, shared):
     # --- task 155: unprobed suspects ---
     # a kinematic coupling whose reference node has a *TRANSFORM, and a BC on a coupled beam
     # node's rotation the reference node does not impose: warned as without the *TRANSFORM, and
     # under --approximate taken off as Abaqus does (it eliminates the coupled DOFs), the twin's
     # answer (before: kept silently, the body followed it: 0.13 of 0.155 off)
+    review_run = shared["review_run"]
+    same = shared["same"]
+    failures = 0
     runs = [review_run(t155_coupling_deck(tr), "t155_coupling_transform" + ("" if tr else "_ref"),
                        dat_node_blocks, approximate=True) for tr in (True, False)]
     rep, _ = convert(os.path.join(tmp, "t155_coupling_transform_src.inp"),
@@ -18541,8 +19233,15 @@ def main():
               f"{'warned' if flags[0] else 'NOT warned'}; two wide {d2:.1e} apart, "
               f"{'warned' if flags[1] else 'not warned'}")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("norton_creep_floor",
+       "Norton creep below ccx's 1e-20 floor on A t^m: warned, reduced physics")
+def check_norton_creep_floor(ccx, env, tmp, shared):
     # --- Norton creep below ccx's 1e-20 floor on A t^m: warned, reduced physics ---
+    review_run = shared["review_run"]
+    failures = 0
     u = review_run(norton_creep_floor_deck(), "norton_creep_floor", dat_displacements)
     rep, conv = convert(os.path.join(tmp, "norton_creep_floor_src.inp"),
                         os.path.join(tmp, "norton_creep_floor_flag.inp"))
@@ -18560,8 +19259,14 @@ def main():
         print(f"FAIL  norton_creep_floor: {'solved' if u else 'no results'}, "
               f"{'warned' if warned else 'NOT warned'}, reduced physics {conv.reduced_physics}")
     failures += 0 if ok else 1
+    return failures
 
+
+@check("t123", "silently wrong answers (task 123)")
+def check_t123(ccx, env, tmp, shared):
     # --- silently wrong answers (task 123) ---------------------------------------------------
+    review_run = shared["review_run"]
+    failures = 0
     def same_u(runs, nodes=None):
         """Largest difference between two runs' displacement tables, and the largest |u|."""
         got, ref = runs
@@ -18773,9 +19478,14 @@ def main():
                   f"({u[3][0]:+.6f}, {u[3][1]:+.6f}, {u[3][2]:+.6f}) (beam theory (-0.02, -0.05, "
                   f"0.01), {err:.1e} off; before (0, 0, 0.01))")
         failures += 0 if ok else 1
+    return failures
 
+
+@check("other_decks", "other decks: confirm they are accepted and solve")
+def check_other_decks(ccx, env, tmp, shared):
     # --- other decks: confirm they are accepted and solve ----------------------
     # (loaded, every BC zero: any displacement is the solve's)
+    failures = 0
     for name in ("composite_shell", "assembly_two_blocks"):
         inp = os.path.join(tmp, name + ".inp")
         convert(os.path.join(EXAMPLES, name + ".inp"), inp)
@@ -18793,10 +19503,34 @@ def main():
             print("      " + " / ".join(l.strip() for l in out.splitlines()
                                         if "ERROR" in l or "convergence" in l.lower())[:200])
             failures += 1
+    return failures
+
+
+def main(argv=()):
+    """Run the checks ``argv`` selects (none: all of them) against ccx; 1 if one fails."""
+    A._tolerant_stdio()                 # ccx's error lines may hold what cp1252 cannot show
+    checks = select_checks(argv)
+    if checks is None:
+        return 0
+    ccx, env = find_ccx()
+    if not ccx:
+        print("CalculiX (ccx) not found — skipping end-to-end validation.")
+        print(f"Install CalculiX {A.CCX_VERSIONS[-1]} to enable it: {A.CCX_INSTALL}")
+        return 0
+    print(f"Using ccx: {ccx}\n")
+    if len(checks) < len(CHECKS):
+        print(f"Running {len(checks)} of {len(CHECKS)} checks: "
+              f"{', '.join(c.name for c in checks)}\n")
+
+    tmp = tempfile.mkdtemp(prefix="ccxconv_")
+    failures = 0
+    shared = shared_helpers(ccx, env, tmp)
+    for c in checks:
+        failures += c.func(ccx, env, tmp, shared)
 
     shutil.rmtree(tmp, ignore_errors=True)
     return closing_lines(failures)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
