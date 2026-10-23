@@ -30858,7 +30858,7 @@ class _Constraints:
         a = fmt_num(self._knot_a)
         thermal = [] if self._knot_k is None else \
             ["*CONDUCTIVITY", fmt_num(self._knot_k), "*SPECIFIC HEAT", "0."]
-        return [f"*MATERIAL, NAME={KNOT_SET}", "*ELASTIC", f"{fmt_num(self._knot_e)}, 0.",
+        return [f"*MATERIAL, NAME={KNOT_SET}", "*ELASTIC", f"{short_real(self._knot_e, 12)}, 0.",
                 "*DENSITY", "0."] + thermal + [
                 f"*BEAM SECTION, ELSET={KNOT_SET}, MATERIAL={KNOT_SET}, SECTION=RECT",
                 f"{a}, {a}", "1., -1., 0."]
@@ -42611,10 +42611,15 @@ class _PostPasses:
         stiffness: ccx's solution then depends on round-off (probed: a fixed-fixed S4 beam
         with knot beams on its loaded nodes deflected 0.0056 or 0.105 for 0.292, by the knot
         beams' modulus; the plain shells, and the knotted ones with that rotation held, 0.292
-        for any).  An *EQUATION n . theta = 0 holds it (n: the node's normal as ccx computes
-        it, _ccx_shell_normal), eliminating a rotation no other equation eliminates: nothing
-        acts on that rotation, in Abaqus' shell as in ccx's (no drilling stiffness), so it
-        changes nothing else."""
+        for any).  It is held (n: the node's normal as ccx computes it, _ccx_shell_normal) —
+        nothing acts on that rotation, in Abaqus' shell as in ccx's (no drilling stiffness), so
+        it changes nothing else: along a global axis by a *BOUNDARY on that rotation (model
+        data, given again after a *BOUNDARY, OP=NEW ccx acts on), else by an *EQUATION
+        n . theta = 0 eliminating a rotation no other equation eliminates.  Not by an equation
+        in a deck with a *MODAL DYNAMIC step: ccx 2.23 crashes there at random on any equation
+        that eliminates a knot's rotation (probed: 9-12 of 50 runs, exit -11 / -10 / -6, as
+        the step starts; a *BOUNDARY there: none of 50), so such a knot stays as it was,
+        warned."""
         knots = set(self._knots)
         if not knots or getattr(self.opt, "solid_dof", False):
             return deck
@@ -42644,6 +42649,8 @@ class _PostPasses:
                         held.update(sets.members("NSET", rec[0]) or ([int(rec[0])] if rec and
                                                                       rec[0].isdigit() else []))
         rows: List[List[Tuple[int, int, float]]] = []
+        bcs: List[str] = []                     # (holds along a global axis)
+        loose: List[int] = []                   # (no form: an equation in a *MODAL DYNAMIC deck)
         for n in sorted(knots - held - set(self._transformed)):
             own = [e for e in at.get(n, ()) if e not in beams]
             if not own or any(ccx_type(self.geom.elements[e][0]) not in SHEET_SHELLS for e in own) or \
@@ -42660,19 +42667,40 @@ class _PostPasses:
                 continue                        # (an equation holds a part of the turn about n)
             terms = sorted(((n, k + 4, c) for k, c in enumerate(nrm) if abs(c) > 1e-12),
                            key=lambda t: ((n, t[1]) in dependent, -abs(t[2])))
-            if terms and (n, terms[0][1]) not in dependent:
+            if not terms or (n, terms[0][1]) in dependent:
+                continue
+            if self._along_axis(nrm):
+                bcs.append(f"{n}, {terms[0][1]}, {terms[0][1]}")
+            elif "MODAL DYNAMIC" in self.steps.procs:
+                loose.append(n)
+            else:
                 rows.append(terms)
-        if not rows:
+        if loose:
+            self.report.warn(f"{len(loose)} knot(s) of the converter's knot beams on shell nodes whose "
+                             f"normal is off the global axes (e.g. node {loose[0]}), in a deck with a "
+                             f"*MODAL DYNAMIC step: their rotation about the normal has no stiffness, so "
+                             f"ccx 2.23's solution may depend on round-off (probed: a knotted S4 beam 2 % "
+                             f"to 50x too stiff), and the *EQUATION that holds it elsewhere crashes ccx's "
+                             f"*MODAL DYNAMIC step at random (probed) — verify.", once=True)
+            self._reduces("knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)")
+        if not rows and not bcs:
             return deck
         at = next((c.line for c in deck.cards if c.keyword == "STEP"), len(deck.lines))
+        hold = ["*BOUNDARY"] + bcs if bcs else []
         deck.insert_at(at, ["** abq2ccx: the drilling rotation of knot beams' knots on shell nodes "
-                            "held (no stiffness acts on it)"] + self._equation_lines(rows))
-        self.report.note(f"{len(rows)} knot(s) of the converter's knot beams on shell nodes (e.g. node "
-                         f"{rows[0][0][0]}): their rotation about the shell normal held by an *EQUATION "
-                         f"— nothing stiffens it (the shell's expanded nodes lie on the normal, the knot "
-                         f"beam is force-free), and ccx 2.23's solution then depends on round-off "
-                         f"(probed: a knotted S4 beam 2 % to 50x too stiff, by the knot beam's "
-                         f"modulus).", once=True)
+                            "held (no stiffness acts on it)"] + hold + self._equation_lines(rows))
+        for st in deck.steps if bcs else ():
+            card = st.acting("BOUNDARY")            # (OP=NEW removes the model data's BCs too)
+            if card is not None:
+                deck.insert_after(card, ["** abq2ccx: the knots' drilling rotations held again"] + hold)
+        first = (bcs[0].split(",")[0] if bcs else str(rows[0][0][0]))
+        self.report.note(f"{len(rows) + len(bcs)} knot(s) of the converter's knot beams on shell nodes "
+                         f"(e.g. node {first}): their rotation about the shell normal held "
+                         f"({'by a *BOUNDARY' if bcs else ''}{' / ' if bcs and rows else ''}"
+                         f"{'by an *EQUATION' if rows else ''}) — nothing stiffens it (the shell's "
+                         f"expanded nodes lie on the normal, the knot beam is force-free), and ccx "
+                         f"2.23's solution then depends on round-off (probed: a knotted S4 beam 2 % to "
+                         f"50x too stiff, by the knot beam's modulus).", once=True)
         return deck.edited()
 
     def _initial_gradients_back(self, deck: EmittedDeck) -> EmittedDeck:

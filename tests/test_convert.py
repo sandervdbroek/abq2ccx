@@ -26033,25 +26033,46 @@ def test_frequency_range_feeding_a_modal_step_warned():
 def test_knot_drilling_rotation_held_on_shell_nodes():
     # a knot beam's knot on a smooth shell node: its rotation about the normal has no stiffness
     # (the shell's expanded nodes lie on the normal, the knot beam is force-free), so ccx's
-    # answer hung on round-off (probed: a knotted S4 plate 1.5x-16x too stiff): n . theta = 0
-    strip = ("*Node\n" + "".join(f"{1 + i + 5 * j}, {float(i)}, {float(j)}, 0.\n" for j in range(2) for i in range(5)) +
-             "*Element, type=S4, elset=E\n" + "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 7}, {i + 6}\n" for i in range(4)) +
-             "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Shell Section, elset=E, material=M\n0.1\n"
-             "*Boundary\n1, 1, 6\n6, 1, 6\n5, 1, 6\n10, 1, 6\n*Step\n*Frequency\n3\n*End Step\n"
-             "*Step\n*Steady State Dynamics\n1., 10., 3\n*Cload\n3, 3, 1.\n{}*End Step\n")
-    body, conv, rep = convert_str(strip.format(""))
-    assert 3 in conv._knots and "*EQUATION\n1\n3, 6, 1\n" in body
-    assert "rotation about the shell normal held by an *EQUATION" in rep.text()
+    # answer hung on round-off (probed: a knotted S4 plate 1.5x-16x too stiff): held, by a
+    # *BOUNDARY where the normal is a global axis, else by n . theta = 0
+    def strip(extra="", turn=0.0, last="*Steady State Dynamics\n1., 10., 3"):
+        c, s = math.cos(math.radians(turn)), math.sin(math.radians(turn))
+        return ("*Node\n" + "".join(f"{1 + i + 5 * j}, {float(i)}, {c * j:.15g}, {s * j:.15g}\n"
+                                    for j in range(2) for i in range(5)) +
+                "*Element, type=S4, elset=E\n" + "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 7}, {i + 6}\n"
+                                                        for i in range(4)) +
+                "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n*Shell Section, elset=E, "
+                "material=M\n0.1\n*Boundary\n1, 1, 6\n6, 1, 6\n5, 1, 6\n10, 1, 6\n*Step\n*Frequency\n3\n"
+                f"*End Step\n*Step\n{last}\n*Cload\n3, 3, 1.\n{extra}*End Step\n")
+    hold = "held (no stiffness acts on it)\n"
+    body, conv, rep = convert_str(strip())
+    assert 3 in conv._knots and hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body
+    assert "rotation about the shell normal held (by a *BOUNDARY)" in rep.text()
+    # given again after a *BOUNDARY, OP=NEW ccx acts on (it removes the model data's BCs too;
+    # this one releases node 10's clamp)
+    body, _, _ = convert_str(strip() + "*Step\n*Static\n*Boundary, op=NEW\n1, 1, 6\n6, 1, 6\n"
+                                       "5, 1, 6\n*End Step\n")
+    assert "*BOUNDARY, OP=NEW" in _step(body, 3)
+    assert "drilling rotations held again\n*BOUNDARY\n3, 6, 6\n" in _step(body, 3)
+    # a normal off the global axes: an *EQUATION; in a deck with a *MODAL DYNAMIC step, where
+    # ccx crashes at random on equations that eliminate a knot's rotation, none: warned
+    body, conv, _ = convert_str(strip(turn=30.0))
+    rows = [r for r in _equation_terms(body) if len(r) == 2 and r[0][0] == 3]
+    assert len(rows) == 1 and {d for _, d, _ in rows[0]} == {5, 6} and not conv.reduced_physics
+    body, conv, rep = convert_str(strip(turn=30.0, last="*Modal Dynamic\n1e-4, 0.01"))
+    assert hold not in body and "crashes ccx's *MODAL DYNAMIC step at random" in rep.text()
+    assert "knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)" in \
+        conv.reduced_physics
     # a rotational BC on the node: left as it is
-    body, conv, _ = convert_str(strip.format("*Boundary\n3, 4, 4\n"))
-    assert "*EQUATION\n1\n3, 6, 1\n" not in body
+    body, conv, _ = convert_str(strip("*Boundary\n3, 4, 4\n"))
+    assert hold not in body
     # a rigid coupling that ties all the member's rotations needs none; one of DOFs 1-3 only does
     s4 = (S4 + "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, surface=RS\n"
           "*Kinematic\n")
     body, _, _ = convert_str(s4)
-    assert "*EQUATION\n1\n" not in body
+    assert hold not in body
     body, _, _ = convert_str(s4 + "1, 3\n")
-    assert "*EQUATION\n1\n5, 6, 1\n*EQUATION\n1\n6, 6, 1" in body
+    assert hold + "*BOUNDARY\n5, 6, 6\n6, 6, 6" in body
 
 
 if __name__ == "__main__":

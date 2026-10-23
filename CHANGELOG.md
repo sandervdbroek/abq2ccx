@@ -482,8 +482,11 @@ physics.
     onto quadratic membranes' solid nodes were turned as if local.
   - Knot beams on smooth shell nodes left the knot's rotation about the normal without
     stiffness, so ccx's answer hung on round-off (a knotted S4 plate 1.5-16x too stiff); that
-    rotation is now held. Knot beams also leaked their section stiffness into the knot (a
-    slender beam tip 1.3 % short); their modulus is now 1e-6 of the deck's.
+    rotation is now held: by a `*BOUNDARY` where the normal is a global axis, else by an
+    `*EQUATION`, except in decks with a `*MODAL DYNAMIC` step, which ccx 2.23 crashes on at
+    random when an equation eliminates a knot's rotation (warned there). Knot beams also leaked
+    their section stiffness into the knot (a slender beam tip 1.3 % short); their modulus is
+    now 1e-6 of the deck's.
   - Two kinematic couplings of the same DOFs on one reference node turned apart (1-2 %); they
     become one coupling. A plane-edge coupling on a beam node drifted out of plane. A moment or
     rotation BC about a deck `*TRANSFORM` axis that is no beam section axis was 4x off; such
