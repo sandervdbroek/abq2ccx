@@ -8834,9 +8834,17 @@ def test_section_temperature_points_written_as_gradients():
            "and gradients" in conv.reduced_physics
     # an OFFSET: the temperature at the reference surface (100), in the form an offset S8R
     # reads right in ccx, T - 2/3 g e t (_plan_offset_gradients)
-    lines, conv, _ = run("*Shell Section, elset=E, material=M, temperature=2, offset=SPOS\n0.1\n",
-                         "PLATE, 0., 100.")
-    assert lines == ["PLATE, 66.6666666667, 1000."] and not conv.reduced_physics
+    offset = "*Shell Section, elset=E, material=M, temperature=2, offset=SPOS\n0.1\n"
+    body, conv, _ = convert_str(POINT_PLATE.format(sec=offset, ic="PLATE, 0.", temp="PLATE, 0., 100.").replace(
+        "9, 2, 20, 21, 3,", "9, 22, 20, 21, 23,").replace("21, 2., 1., 0.\n", "21, 2., 1., 0.\n22, 1., 0., 0.\n"
+                                                           "23, 1., 1., 0.\n"))
+    assert _card_at(_step(body, 1), "*TEMPERATURE") == ["PLATE, 66.6666666667, 1000."]
+    assert not conv.reduced_physics
+    # (here the C3D8 shares nodes 2 and 3, which keep the line its solid reads: warned)
+    lines, conv, _ = run(offset, "PLATE, 0., 100.")
+    assert lines == ["PLATE_T, 66.6666666667, 1000.", "PLATE_T~1, 100., 1000."]
+    assert conv.geom.nset("PLATE_T~1") == [2, 3]
+    assert conv.reduced_physics == ["temperature gradients on offset shells / beams not exact in ccx"]
     # composite layers: n points per layer, shared at the interfaces; one per layer for n = 1
     plies = "0.05, 3, M, 0.\n0.05, 3, M, 90.\n"
     lines, conv, _ = run("*Shell Section, elset=E, composite, temperature=2\n" + plies, "PLATE, 0., 50., 100.")
@@ -8950,7 +8958,8 @@ def test_midside_bcs_follow_a_card_that_moves_one_end():
     assert f"\n{m}, " not in _step(body, 1) and "whose other end" not in rep.text()
     body, conv, rep, m = run(held + "*Step\n*Static\n*Boundary, op=NEW\n1, 1, 6\n4, 1, 6\n6, 3, 3, -0.1\n"
                              "*End Step\n")
-    assert f"\n{m}, " not in _step(body, 2)
+    # (no interpolated line; the knot the OP=NEW leaves there gets its drilling rotation held)
+    assert [ln for ln in _step(body, 2).splitlines() if ln.startswith(f"{m}, ")] == [f"{m}, 6, 6"]
     # the other end on another amplitude (or held under one) and the card's: approximate, warned;
     # a zero value there, the same amplitude, or the same total-time amplitude: exact
     for steps, mean, bad in (
@@ -26166,9 +26175,14 @@ def test_knot_drilling_rotation_held_on_shell_nodes():
     assert hold not in body and "crashes ccx's *MODAL DYNAMIC step at random" in rep.text()
     assert "knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)" in \
         conv.reduced_physics
-    # a rotational BC on the node: left as it is
-    body, conv, _ = convert_str(strip("*Boundary\n3, 4, 4\n"))
+    # a BC on the node's rotation about the normal in every step: left as it is; one in the
+    # last step only leaves the steps before to the hold (and replaces it there), one about
+    # another axis leaves that rotation free, so it is held all the same
+    body, conv, _ = convert_str(strip().replace("*Boundary\n1, 1, 6\n", "*Boundary\n3, 4, 6\n1, 1, 6\n"))
     assert hold not in body
+    for bc in ("3, 4, 6", "3, 4, 4"):
+        body, conv, _ = convert_str(strip(f"*Boundary\n{bc}\n"))
+        assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body
     # a rigid coupling that ties all the member's rotations needs none; one of DOFs 1-3 only does
     s4 = (S4 + "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, surface=RS\n"
           "*Kinematic\n")
@@ -26176,6 +26190,112 @@ def test_knot_drilling_rotation_held_on_shell_nodes():
     assert hold not in body
     body, _, _ = convert_str(s4 + "1, 3\n")
     assert hold + "*BOUNDARY\n5, 6, 6\n6, 6, 6" in body
+
+
+def test_offset_shell_gradient_kept_where_other_elements_read_the_node():
+    # (delta review R1-1) a node an offset S8R shares with a beam, truss or solid: that element
+    # reads the line's temperature as given (Abaqus gives it T), so the line stays there,
+    # warned (probed: the edge beam stretched alpha (-2/3 g e t) L with the shifted line)
+    deck = ("*Node, nset=ALL\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 2., 1., 0.\n"
+            "6, 0., 2., 0.\n7, 1., 2., 0.\n8, 2., 2., 0.\n*Element, type=S8R, elset=E\n"
+            "1, 1, 3, 8, 6, 2, 5, 7, 4\n{other}*Material, name=M\n*Elastic\n1000., 0.3\n*Expansion\n1e-3\n"
+            "*Shell Section, elset=E, material=M, offset=SPOS\n0.1\n*Boundary\n1, 1, 6\n"
+            "*Step\n*Static\n*Temperature\nALL, 0., 10.\n*End Step\n")
+    beam = ("*Element, type=B32, elset=BM\n2, 1, 2, 3\n*Beam Section, elset=BM, material=M, section=RECT\n"
+            "0.1, 0.1\n0., 0., -1.\n")
+    body, conv, rep = convert_str(deck.format(other=beam))
+    assert _card_at(_step(body, 1), "*TEMPERATURE") == ["ALL_T, 0., 10.", "ALL_T~1, -0.333333333333, 10."]
+    assert conv.geom.nset("ALL_T") == [1, 2, 3]
+    assert "beams, trusses or solids on the node, which read its temperature as given" in rep.text()
+    assert "temperature gradients on offset shells / beams not exact in ccx" in conv.reduced_physics
+    # a truss likewise; a point mass reads no temperature, nor does a node of the shell alone
+    body, conv, _ = convert_str(deck.format(other="*Element, type=T3D2, elset=TR\n2, 1, 3\n"
+                                                  "*Solid Section, elset=TR, material=M\n0.01\n"))
+    assert conv.geom.nset("ALL_T") == [1, 3]
+    for other in ("*Element, type=MASS, elset=PM\n2, 3\n*Mass, elset=PM\n1.\n", ""):
+        body, conv, rep = convert_str(deck.format(other=other))
+        assert _card_at(_step(body, 1), "*TEMPERATURE") == ["ALL, -0.333333333333, 10."]
+        assert "read its temperature as given" not in rep.text() and not other_reduced(conv)
+
+
+def test_plane_node_cload_of_a_general_step_not_warned_in_modal_steps():
+    # (delta review R1-2) a *CLOAD that only a general step gives reaches no modal step: a
+    # *MODAL DYNAMIC step starts with *CLOAD, OP=NEW, ccx's steady-state dynamics step drops the
+    # earlier loads (probed: the same response without it).  One the modal step gives, or that
+    # a *MODAL DYNAMIC step right after the general step holds (_modal_held), still warns
+    head = ("*Node\n1, 0., 0.\n2, 0., 0.1\n3, 0.1, 0.\n4, 0.1, 0.1\n*Element, type=CPS4, elset=P\n"
+            "1, 1, 3, 4, 2\n*Surface, name=TOP\nP, S2\n*Material, name=M\n*Elastic\n2e5, 0.3\n*Density\n"
+            "1e-3\n*Solid Section, elset=P, material=M\n0.01\n*Boundary\n1, 1, 2\n2, 1, 2\n")
+    static = "*Step\n*Static\n*Cload\n4, 2, 1.\n*End Step\n"
+    freq = "*Step\n*Frequency\n3\n*End Step\n"
+    why = "concentrated loads on plane-element nodes in modal steps (ccx misapplies them)"
+    for modal in ("*Steady State Dynamics\n1., 10., 3", "*Modal Dynamic\n0.0001, 0.01"):
+        last = f"*Step\n{modal}\n*Dsload\nTOP, P, 1.\n*End Step\n"
+        _, conv, rep = convert_str(head + static + freq + last)
+        assert "plane / axisymmetric elements (e.g." not in rep.text() and why not in conv.reduced_physics
+        _, conv, rep = convert_str(head + static + freq + last.replace("*End Step", "*Cload\n3, 1, 1.\n*End Step"))
+        assert "*CLOAD on 1 node(s) of plane / axisymmetric elements (e.g. node 3)" in rep.text()
+        assert why in conv.reduced_physics
+    _, conv, rep = convert_str(head + freq + static + "*Step\n*Modal Dynamic\n0.0001, 0.01\n*End Step\n")
+    assert "(e.g. node 4) in a deck with a modal step" in rep.text() and why in conv.reduced_physics
+
+
+def test_dashpot_bc_that_jumps_warned():
+    # (delta review R1-4) a displacement whose amplitude starts elsewhere than the DOF stands,
+    # or jumps in the step: the dashpot passes the impulse c du, which no load on an amplitude
+    # carries (ccx x 0.0475 with the ramp's force alone, 0.0975 with the impulse): warned, no
+    # force written (an inner jump stopped the conversion on a division by zero)
+    amps = ("*Amplitude, name=JUMP\n0., 0.5, 2., 1.\n*Amplitude, name=FLAT\n0., 1., 2., 1.\n"
+            "*Amplitude, name=MID\n0., 0., 1., 0.5, 1., 1., 2., 1.\n*Amplitude, name=RAMP\n0., 0., 2., 1.\n"
+            "*Amplitude, name=MORE\n0., 1., 2., 2.\n")
+    step = "*Step\n*Dynamic\n0.01, 2.\n*Boundary, amplitude={}\n2, 1, 1, 0.1\n*End Step\n"
+    why = "dashpots on nodes moved by BCs in *DYNAMIC (ccx ignores their velocity)"
+    for card in (step.format("JUMP"), step.format("FLAT"), step.format("MID"),
+                 step.format("MID").replace("amplitude=", "type=VELOCITY, amplitude=")):
+        body, conv, rep = convert_str(DRAGGED_MASS.format("1., 0.") + amps + card)
+        assert "ABQ2CCX_DASH" not in body and why in conv.reduced_physics, card
+        assert "a displacement jump's impulse" in rep.text()
+    # a step that takes the DOF on from where the step before left it: its force, exact; one
+    # that starts the amplitude over at 0 jumps back: warned there
+    body, conv, rep = convert_str(DRAGGED_MASS.format("1., 0.") + amps + step.format("RAMP") +
+                                  step.format("MORE"))
+    assert _card_at(_step(body, 2), "*CLOAD, AMPLITUDE=ABQ2CCX_DASH1") == ["1, 1, 1."]
+    assert "Dashpot(s) on" not in rep.text() and not conv.reduced_physics
+    body, conv, rep = convert_str(DRAGGED_MASS.format("1., 0.") + amps + step.format("RAMP") * 2)
+    assert "ABQ2CCX_DASH1" in _step(body, 1) and "ABQ2CCX_DASH" not in _step(body, 2)
+    assert why in conv.reduced_physics
+    # a TIME=TOTAL TIME amplitude picked up in step 2: at 0.1 there (exact), at 0.05 (a jump)
+    for points, jumps in (("0., 0., 4., 2.", False), ("0., 0., 4., 1.", True)):
+        body, conv, _ = convert_str(DRAGGED_MASS.format("1., 0.") + amps + "*Amplitude, name=TT, time=TOTAL TIME\n"
+                                    + points + "\n" + step.format("RAMP") + step.format("TT"))
+        assert ("ABQ2CCX_DASH" in _step(body, 2)) != jumps and (why in conv.reduced_physics) == jumps
+
+
+def test_knot_drilling_held_where_op_new_releases_a_clamp():
+    # (delta review R1-5) a knot the converter makes where a later *BOUNDARY, OP=NEW releases a
+    # clamp is free about the normal in that step (ccx stopped under NLGEOM, exit 201; with the
+    # hold it solves as the twin without the first step): held after the OP=NEW
+    def strip(turn=0.0):
+        c, s = math.cos(math.radians(turn)), math.sin(math.radians(turn))
+        return ("*Node\n" + "".join(f"{1 + i + 9 * j}, {0.1 * i:.15g}, {0.1 * c * j:.15g}, {0.1 * s * j:.15g}\n"
+                                    for j in range(2) for i in range(9)) +
+                "*Element, type=S4, elset=E\n" + "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 11}, {i + 10}\n"
+                                                        for i in range(8)) +
+                "*Material, name=M\n*Elastic\n6e6, 0.3\n*Shell Section, elset=E, material=M\n0.01\n"
+                "*Boundary\n1, 1, 6\n10, 1, 6\n9, 1, 6\n18, 1, 6\n*Step\n*Static\n*End Step\n"
+                "*Step, nlgeom\n*Static\n0.1, 1.\n*Boundary, op=NEW\n1, 1, 6\n10, 1, 6\n*Cload\n"
+                "9, 3, 0.05\n18, 3, 0.05\n*End Step\n")
+    body, conv, rep = convert_str(strip())
+    assert {9, 18} <= set(conv._knots) and "held (no stiffness acts on it)" not in body
+    assert ("*BOUNDARY, OP=NEW\n1, 1, 6\n10, 1, 6\n** abq2ccx: the knots' drilling rotations held again\n"
+            "*BOUNDARY\n9, 6, 6\n18, 6, 6\n") in _step(body, 2)
+    assert "rotation about the shell normal held (by a *BOUNDARY) where no BC holds it" in rep.text()
+    assert not other_reduced(conv)
+    # a normal off the global axes: the *EQUATION would act in step 1 too, where the clamp
+    # holds its dependent rotation (ccx stops on that): warned
+    body, conv, rep = convert_str(strip(30.0))
+    assert "drilling rotations held" not in body and "with rotational BCs in some steps only" in rep.text()
+    assert "knot drilling rotations without stiffness (rotational BCs in some steps only)" in conv.reduced_physics
 
 
 if __name__ == "__main__":

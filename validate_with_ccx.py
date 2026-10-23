@@ -9134,16 +9134,20 @@ def dragged_mass_deck(bc):
     """A unit point mass on node 1 dragged along x by a DASHPOTA (c = 10) from node 2 at (1, 0, 0),
     which a BC moves over a *DYNAMIC step of 2 (fixed increments of 0.005): ``bc`` "ramp" (a
     displacement of 0.1 on a ramp amplitude), "plain" (the same without one: ramped from rest),
-    "kink" (0.1 on the points (0, 0), (1, 0.25), (2, 1): 0.025 then 0.075 per unit time), or
-    "velocity" (TYPE=VELOCITY 0.1 on that ramp amplitude: 0.05 t)."""
+    "kink" (0.1 on the points (0, 0), (1, 0.25), (2, 1): 0.025 then 0.075 per unit time),
+    "velocity" (TYPE=VELOCITY 0.1 on that ramp amplitude: 0.05 t), or "continued" (0.1 on the
+    points (0, 0), (1, 1), (2, 1): 0.1 per unit time, then still; then a second step of 2 that
+    gives it again on the points (0, 1), (2, 2), from where the first left it: 0.05)."""
     card = {"ramp": "*BOUNDARY, AMPLITUDE=RAMP\n2, 1, 1, 0.1", "plain": "*BOUNDARY\n2, 1, 1, 0.1",
             "kink": "*BOUNDARY, AMPLITUDE=KINK\n2, 1, 1, 0.1",
-            "velocity": "*BOUNDARY, TYPE=VELOCITY, AMPLITUDE=RAMP\n2, 1, 1, 0.1"}[bc]
+            "velocity": "*BOUNDARY, TYPE=VELOCITY, AMPLITUDE=RAMP\n2, 1, 1, 0.1",
+            "continued": "*BOUNDARY, AMPLITUDE=HOLD\n2, 1, 1, 0.1"}[bc]
+    step = "*STEP, INC=100000\n*DYNAMIC, DIRECT\n0.005, 2.\n{}\n*NODE PRINT, NSET=P\nU\n*END STEP\n"
     return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n*NSET, NSET=P\n1\n*ELEMENT, TYPE=MASS, ELSET=EM\n11, 1\n"
             "*MASS, ELSET=EM\n1.\n*ELEMENT, TYPE=DASHPOTA, ELSET=D\n21, 1, 2\n*DASHPOT, ELSET=D\n\n10.\n"
             "*AMPLITUDE, NAME=RAMP\n0., 0., 2., 1.\n*AMPLITUDE, NAME=KINK\n0., 0., 1., 0.25, 2., 1.\n"
-            "*BOUNDARY\n1, 2, 3\n2, 2, 3\n*STEP, INC=100000\n*DYNAMIC, DIRECT\n0.005, 2.\n"
-            f"{card}\n*NODE PRINT, NSET=P\nU\n*END STEP\n")
+            "*AMPLITUDE, NAME=HOLD\n0., 0., 1., 1., 2., 1.\n*AMPLITUDE, NAME=MORE\n0., 1., 2., 2.\n*BOUNDARY\n1, 2, 3\n2, 2, 3\n" + step.format(card) +
+            (step.format("*BOUNDARY, AMPLITUDE=MORE\n2, 1, 1, 0.1") if bc == "continued" else ""))
 
 
 def dragged_mass_reference(bc, m=1.0, c=10.0, t_end=2.0):
@@ -9154,6 +9158,10 @@ def dragged_mass_reference(bc, m=1.0, c=10.0, t_end=2.0):
         return v * t + (v0 - v) * tau * (1.0 - math.exp(-t / tau)), v + (v0 - v) * math.exp(-t / tau)
     if bc in ("ramp", "plain"):
         return const(0.05, t_end)[0]
+    if bc == "continued":
+        x1, v1 = const(0.1, 1.0)
+        x2, v2 = const(0.0, 1.0, v1)
+        return x1 + x2 + const(0.05, t_end, v2)[0]
     if bc == "kink":
         x1, v1 = const(0.025, 1.0)
         return x1 + const(0.075, 1.0, v1)[0]
@@ -9174,6 +9182,51 @@ def b31_gradient_deck(typ, values=False):
             f"{', TEMPERATURE=VALUES' if values else ''}\n0.1, 0.1\n1., 0., 0.\n*BOUNDARY\n1, 1, 6\n"
             "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nNALL, 0.\n*STEP\n*STATIC\n*TEMPERATURE\n"
             f"NALL, {pts if values else '10., 100., 40.'}\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+
+
+def offset_beam_gradient_deck():
+    """An S8R square 2 x 2 (OFFSET=SPOS, thickness 0.1, E 1e-3) with a B32 RECT beam (0.1 x 0.1,
+    E 1000, alpha 1e-3 for both) along its edge nodes 1-2-3, node 1 clamped, heated to (0, 10):
+    the beam's axis stays at 0, so its far end does not move along it (code review R1-1)."""
+    return ("*NODE, NSET=ALL\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 2., 1., 0.\n"
+            "6, 0., 2., 0.\n7, 1., 2., 0.\n8, 2., 2., 0.\n*ELEMENT, TYPE=S8R, ELSET=E\n1, 1, 3, 8, 6, 2, 5, 7, 4\n"
+            "*ELEMENT, TYPE=B32, ELSET=BM\n2, 1, 2, 3\n*BEAM SECTION, ELSET=BM, MATERIAL=M, SECTION=RECT\n"
+            "0.1, 0.1\n0., 0., -1.\n*NSET, NSET=C\n3, 8\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            "*EXPANSION\n1e-3\n*MATERIAL, NAME=SOFT\n*ELASTIC\n1e-3, 0.3\n*EXPANSION\n1e-3\n"
+            "*SHELL SECTION, ELSET=E, MATERIAL=SOFT, OFFSET=SPOS\n0.1\n*BOUNDARY\n1, 1, 6\n*STEP\n*STATIC\n"
+            "*TEMPERATURE\nALL, 0., 10., 0.\n*NODE PRINT, NSET=C\nU\n*END STEP\n")
+
+
+def general_cload_modal_deck(modal, cload=True):
+    """A CPS4 strip 4 x 1 (thickness 0.1, one end held) that a static step loads at its free
+    corner by a *CLOAD (``cload``), then a *FREQUENCY step and ``modal`` ("ssd": *STEADY STATE
+    DYNAMICS 1-10 Hz, "md": *MODAL DYNAMIC over 0.01) with a pressure on its top edge only, its
+    free end printed (code review R1-2)."""
+    last = "*STEADY STATE DYNAMICS\n1., 10., 3" if modal == "ssd" else "*MODAL DYNAMIC\n1e-3, 0.01"
+    return ("*NODE\n" + "".join(f"{1 + i + 5 * j}, {float(i)}, {float(j)}, 0.\n" for j in range(2) for i in range(5)) +
+            "*ELEMENT, TYPE=CPS4, ELSET=E\n" + "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 7}, {i + 6}\n"
+                                                      for i in range(4)) +
+            "*SURFACE, NAME=TOP\nE, S3\n*NSET, NSET=NP\n5, 10\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n"
+            "*DENSITY\n1e-3\n*SOLID SECTION, ELSET=E, MATERIAL=M\n0.1\n*BOUNDARY\n1, 1, 2\n6, 1, 2\n"
+            "*STEP\n*STATIC\n" + ("*CLOAD\n5, 2, 1.\n" if cload else "") + "*END STEP\n"
+            "*STEP\n*FREQUENCY\n3\n*END STEP\n"
+            f"*STEP\n{last}\n*DSLOAD\nTOP, P, 1.\n*NODE PRINT, NSET=NP\nU\n*END STEP\n")
+
+
+def released_knot_deck(twin=False):
+    """An S4 strip 0.8 x 0.1 (thickness 0.01, E 6e6) clamped at both ends in a first step; a
+    second, NLGEOM step releases the far end by *BOUNDARY, OP=NEW and pulls it up by 0.1, its
+    tip printed.  The converter puts knot beams on the clamped nodes (OP=NEW would break their
+    rotational BCs in ccx).  ``twin``: the second step alone, its clamp the near end's
+    (code review R1-5)."""
+    nodes = "".join(f"{1 + i + 9 * j}, {0.1 * i:.15g}, {0.1 * j:.15g}, 0.\n" for j in range(2) for i in range(9))
+    els = "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 11}, {i + 10}\n" for i in range(8))
+    clamp = "1, 1, 6\n10, 1, 6\n"
+    return ("*NODE\n" + nodes + "*ELEMENT, TYPE=S4, ELSET=E\n" + els + "*NSET, NSET=TIP\n9, 18\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n6e6, 0.3\n*SHELL SECTION, ELSET=E, MATERIAL=M\n0.01\n"
+            "*BOUNDARY\n" + clamp + ("" if twin else "9, 1, 6\n18, 1, 6\n*STEP\n*STATIC\n*END STEP\n") +
+            "*STEP, NLGEOM\n*STATIC\n0.1, 1.\n" + ("" if twin else "*BOUNDARY, OP=NEW\n" + clamp) +
+            "*CLOAD\n9, 3, 0.05\n18, 3, 0.05\n*NODE PRINT, NSET=TIP\nU\n*END STEP\n")
 
 
 def knot_drilling_deck(modal=True, nx=30, ny=10):
@@ -19267,7 +19320,7 @@ def check_norton_creep_floor(ccx, env, tmp, shared):
 @check("t123", "silently wrong answers (task 123)")
 def check_t123(ccx, env, tmp, shared):
     # --- silently wrong answers (task 123) ---------------------------------------------------
-    review_run = shared["review_run"]
+    review_run, same = shared["review_run"], shared["same"]
     failures = 0
     def same_u(runs, nodes=None):
         """Largest difference between two runs' displacement tables, and the largest |u|."""
@@ -19454,7 +19507,7 @@ def check_t123(ccx, env, tmp, shared):
     # a dashpot whose other end a BC moves in *DYNAMIC: ccx damped as if that end stood still
     # (the dragged mass did not move); now the missing force on the free end.  Against the
     # exact motion m x'' = c (v_b - x')
-    for bc in ("ramp", "plain", "kink", "velocity"):
+    for bc in ("ramp", "plain", "kink", "velocity", "continued"):
         u = review_run(dragged_mass_deck(bc), f"dragged_mass_{bc}", dat_displacements)
         ok = bool(u) and 1 in u
         if ok:
@@ -19480,6 +19533,48 @@ def check_t123(ccx, env, tmp, shared):
                   f"({u[3][0]:+.6f}, {u[3][1]:+.6f}, {u[3][2]:+.6f}) (beam theory (-0.02, -0.05, "
                   f"0.01), {err:.1e} off; before (0, 0, 0.01))")
         failures += 0 if ok else 1
+
+    # --- delta review R1 (1.6.0) ---
+    # an offset S8R's edge beam: the shell's T - 2/3 g e t also went to the beam on its nodes
+    # (it stretched alpha (-1/3) L = -6.667e-4); those nodes now keep the line (warned)
+    u = review_run(offset_beam_gradient_deck(), "offset_gradient_beam", dat_displacements)
+    ok = bool(u) and 3 in u
+    if ok:
+        ok = abs(u[3][0]) < 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  offset_gradient_beam (an offset S8R heated (0, 10), a B32 on "
+              f"its edge): the beam's end u1 {u[3][0]:.2e} (its axis at T 0: 0; before -6.667e-4)")
+    else:
+        print("FAIL  offset_gradient_beam: no end displacement")
+    failures += 0 if ok else 1
+
+    # a static step's *CLOAD on a CPS4 node reaches no later modal step (a *MODAL DYNAMIC step
+    # starts with *CLOAD, OP=NEW, ccx's steady-state dynamics step drops it), so it is not
+    # flagged there: the modal step as without it
+    for modal in ("ssd", "md"):
+        runs = [review_run(general_cload_modal_deck(modal, c), f"general_cload_{modal}" + ("" if c else "_ref"),
+                           dat_node_blocks) for c in (True, False)]
+        ok = all(runs) and len(runs[0]) == len(runs[1])
+        if ok:
+            err, moved = same(runs)
+            ok = err <= 1e-12 * moved and moved > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  general_cload_{modal} (a CPS4 strip: a static step's *CLOAD, "
+                  f"then *FREQUENCY and {'steady-state' if modal == 'ssd' else 'modal'} dynamics under a "
+                  f"pressure): {len(runs[0])} printed blocks as without the *CLOAD ({err:.1e} apart; |u| "
+                  f"{moved:.4g})")
+        failures += 0 if ok else 1
+
+    # knots whose clamp a later *BOUNDARY, OP=NEW releases: free about the normal there, so the
+    # NLGEOM step stopped (exit 201); now held after the OP=NEW.  Against the step alone
+    runs = [review_run(released_knot_deck(t), "released_knot" + ("_ref" if t else ""), dat_displacements)
+            for t in (False, True)]
+    ok = all(runs)
+    if ok:
+        err = abs(runs[0][9][2] / runs[1][9][2] - 1.0)
+        ok = err < 1e-4 and runs[1][9][2] > 0.1
+        print(f"{'PASS' if ok else 'FAIL'}  released_knot (an S4 strip, both ends clamped, the far one "
+              f"released by OP=NEW in an NLGEOM step and pulled): tip u3 {runs[0][9][2]:.6g} (the step alone "
+              f"{runs[1][9][2]:.6g}, {err:.1e} off; the knots differ; before: ccx stopped)")
+    failures += 0 if ok else 1
     return failures
 
 

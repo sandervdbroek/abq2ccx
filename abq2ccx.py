@@ -10620,13 +10620,19 @@ class _Mesh:
         steps = self.steps.steps
         hit: List[int] = []
         fixes: Dict[int, Dict[Tuple[int, int], list]] = {}
+        prev: Optional[Tuple[Step, dict]] = None     # the step before and its BCs
         for st, state in zip(steps, self.steps.states(lambda b: given[id(b)], skip=self.steps.lc2,
                                                       blocks=cards)):
+            before, prev = prev, (st, dict(state))
             if st.proc != "DYNAMIC" or st.perturbation:
                 continue
             moving: Dict[Tuple[int, int], Optional[list]] = {}
             for k, (b, mag) in state.items():
-                v = self._bc_velocity(b, mag, st, step_of.get(id(b)), defs, k in rest[st.no][0])
+                # (where the DOF is as the step starts: 0 at rest, else where the step before's
+                # BC left it, if it had one the converter can evaluate)
+                start = 0.0 if k in rest[st.no][0] else None if before is None or k not in before[1] \
+                    else self._bc_end_value(*before[1][k], before[0], step_of.get(id(before[1][k][0])))
+                v = self._bc_velocity(b, mag, st, step_of.get(id(b)), defs, k in rest[st.no][0], start)
                 if v != "still":
                     moving[k] = v
             pert = any(0 <= i < len(steps) and steps[i].perturbation for i in (st.no - 2, st.no))
@@ -10679,7 +10685,9 @@ class _Mesh:
                          f"force misses its velocity. The converter adds the missing force only in "
                          f"small-strain implicit steps, on dashpots outside constraints and "
                          f"*TRANSFORMs, of one constant coefficient, for displacement BCs on TABULAR "
-                         f"amplitudes or ramped from rest and velocity BCs.", once=True)
+                         f"amplitudes or ramped from rest and velocity BCs, where the motion does not "
+                         f"jump (a displacement jump's impulse, c times the jump, has no such form).",
+                         once=True)
         self._reduces("dashpots on nodes moved by BCs in *DYNAMIC (ccx ignores their velocity)")
 
     def _dashpot_coefficients(self, blocks: List[Block], ends: Dict[int, tuple]) -> Dict[int, float]:
@@ -10705,7 +10713,8 @@ class _Mesh:
         return out
 
     def _bc_velocity(self, b: Block, mag: float, st: Step, given: Optional[int],
-                     defs: Dict[str, str], at_rest: bool) -> Union[str, None, list]:
+                     defs: Dict[str, str], at_rest: bool,
+                     start: Optional[float] = None) -> Union[str, None, list]:
         """The velocity a *BOUNDARY line (``b``, its magnitude ``mag``; given in step
         ``given``, None for model data) prescribes over step ``st``, as Abaqus applies it:
         "still" (zero), the points (step time, velocity) of a piecewise-linear history (two at
@@ -10716,7 +10725,12 @@ class _Mesh:
         velocity on such an amplitude: magnitude x the amplitude; one without: the magnitude,
         in its step where Abaqus steps it (Step.defaults) and after; a step-time amplitude's
         end value after its step.  An acceleration, a FIXED / USER / SUBMODEL BC, a TIME DELAY:
-        FIXED holds still, the others are not known."""
+        FIXED holds still, the others are not known.  Nor is a displacement whose history
+        jumps: an amplitude given in the step that starts elsewhere than the DOF (0 at rest,
+        else ``start``, where the step before left it; None: not known), as a constant one
+        on a moved DOF does, or an amplitude with two points at one time in the step (its
+        velocity a pulse: the impulse c du a dashpot passes on; the same for a velocity's
+        jump, which the slopes here would smear)."""
         T, t0 = st.period, st.t_start
         q = self._bc_type(b)
         if b.has("FIXED"):
@@ -10748,6 +10762,13 @@ class _Mesh:
         if curve.total and t0 is None:
             return None
         off = t0 if curve.total else 0.0
+        inside = [t for t in curve.breaks if off <= t <= off + T]
+        if len(set(inside)) < len(inside):
+            return None                         # (a jump in the step)
+        if q == "DISPLACEMENT" and here:
+            u0, s0 = k * curve.value(off), 0.0 if at_rest else start
+            if s0 is None or not math.isclose(u0, s0, rel_tol=1e-9):
+                return None                     # (a jump as the step starts)
         ts = [off] + [t for t in curve.breaks if off < t < off + T] + [off + T]
         if q == "VELOCITY":
             pts = [(t - off, k * curve.value(t)) for t in ts]
@@ -10756,6 +10777,26 @@ class _Mesh:
                    for s in [k * (curve.value(t2) - curve.value(t1)) / (t2 - t1)]
                    for p in ((t1 - off, s), (t2 - off, s))]
         return "still" if all(v == 0.0 for _, v in pts) else pts
+
+    def _bc_end_value(self, b: Block, mag: float, st: Step, given: Optional[int]) -> Optional[float]:
+        """Where a displacement *BOUNDARY line (``b``, ``mag``; given in step ``given``, None
+        for model data) holds its DOF at the end of step ``st``, as Abaqus applies it: its
+        magnitude without an amplitude (ramped to it), x the amplitude's end value with one (a
+        step-time amplitude's at the end of its step, a TIME=TOTAL TIME one's at the end of
+        ``st``); None where the converter does not know it (_bc_velocity)."""
+        if self._bc_type(b) != "DISPLACEMENT" or b.has("FIXED") or b.has("USER") or \
+                b.has("SUBMODEL") or b.param("TIME DELAY") or math.isnan(mag):
+            return None
+        name = b.uparam("AMPLITUDE")
+        if not name:
+            return mag
+        curve = self._amp_curves.get(name)
+        src = st if curve is not None and curve.total else self.steps.steps[given - 1] if given else None
+        if curve is None or src is None:
+            return None
+        end = held_factor(curve, None, src.period, None if src.t_start is None or src.period is None
+                          else src.t_start + src.period)
+        return None if end is None else (1.0 if curve.absolute else mag) * end
 
     def _dashpot_cloads(self) -> List[str]:
         """The missing dashpot forces of this step (_plan_driven_dashpots): a *CLOAD of
@@ -32759,7 +32800,7 @@ class _Constraints:
         _modal_held).  Not in a deck with an explicit step (the massless knot beams stop ccx's
         explicit solver) or U1 beams (ccx stops on any B31 there): warned.  A force on a node of
         plane / axisymmetric elements is just as wrong there (probed on CPS4), and no knot fits
-        them: warned, reduced physics."""
+        them: warned, reduced physics, where a modal step applies it (_modal_plane_loads)."""
         procs = {step.proc for step in self.steps}
         modal = procs & {"MODAL DYNAMIC", "STEADY STATE DYNAMICS"}
         if not modal:
@@ -32772,8 +32813,7 @@ class _Constraints:
                 expanded.update(conn)
         plane = {n for typ, conn in self.geom.elements.values()
                  if ccx_type(typ).startswith(PLANE_ELEM_PREFIXES) for n in conn}
-        loaded = sorted({n for b in blocks if b.keyword == "CLOAD" and plane
-                         for n, _src, _d, v in self._rot_moments(b, plane, (1, 3)) if v})
+        loaded = self._modal_plane_loads(plane) if plane else []
         if loaded:
             self.report.warn(f"*CLOAD on {len(loaded)} node(s) of plane / axisymmetric elements (e.g. "
                              f"node {loaded[0]}) in a deck with a modal step: ccx 2.23 applies a force on "
@@ -32814,6 +32854,35 @@ class _Constraints:
                          f"no density) — ccx 2.23 {why} (probed); on a knot the response equals ccx's "
                          f"own modes superposed. A knot holds a beam section rigid at the node, as beam "
                          f"theory does.", once=True)
+
+    def _modal_plane_loads(self, plane: set) -> List[int]:
+        """The nodes of ``plane`` that a *CLOAD force loads in a modal step (_plan_modal_knots):
+        one given in a *MODAL DYNAMIC or *STEADY STATE DYNAMICS step, or held into a *MODAL
+        DYNAMIC step from the step before it (_modal_held: the general steps' *CLOADs in force
+        there, Abaqus' reading, and that step's own).  Another step's does not reach a modal
+        step: a *MODAL DYNAMIC step starts with *CLOAD, OP=NEW (_modal_own_loads), ccx's
+        steady-state dynamics step drops the earlier *CLOADs (probed: the same response
+        without them)."""
+        acts = op_new_cards([b for st in self.steps for b in st.cards], ("CLOAD",))
+        state: Dict[Tuple[int, int], bool] = {}     # the general steps' forces in force
+        before: set = set()                          # the nodes the step before loads itself
+        out: set = set()
+        for st in self.steps:
+            own: Dict[Tuple[int, int], bool] = {}
+            for b in st.cards:
+                if b.keyword == "CLOAD":
+                    if id(b) in acts and not st.perturbation:
+                        state = {}
+                    own.update(((n, d), bool(v)) for n, _src, d, v in self._rot_moments(b, plane, (1, 3)))
+            mine = {n for (n, _d), on in own.items() if on}
+            if st.proc in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS"):
+                out |= mine
+                if st.no in self._modal_held:
+                    out |= before | {n for (n, _d), on in state.items() if on}
+            elif not st.perturbation:
+                state.update(own)
+            before = mine
+        return sorted(out)
 
 
 class _Loads:
@@ -39572,9 +39641,13 @@ class _Loads:
         e t / 3, and composites read the layers otherwise: warned).  S3 (a C3D6 of the bottom
         and top nodes) is exact as it is, S4 / S4R ignore gradients (_plan_shell_gradients).
         Warned without a rewrite: a nodal thickness, an offset distribution, a node whose
-        shells read the line otherwise, a beam with OFFSET1 / OFFSET2.  Lines of a step and
-        of *INITIAL CONDITIONS alike, split per node group (_point_set)."""
+        shells read the line otherwise, a beam with OFFSET1 / OFFSET2, and a node of another
+        element that reads node temperatures (a beam, truss, solid, membrane, continuum
+        shell: Abaqus gives it T, so the line stays as given; probed: an offset S8R's edge
+        beam stretched by alpha (-2/3 g e t) L with the rewrite).  Lines of a step and of
+        *INITIAL CONDITIONS alike, split per node group (_point_set)."""
         kinds: Dict[int, set] = {}              # node -> how its elements read a line (T, g)
+        read: set = set()                       # the elements of those sections
         for b in blocks:
             if b.keyword == "SHELL SECTION":
                 elset = b.param("ELSET") or ""
@@ -39587,6 +39660,7 @@ class _Loads:
                 except (ValueError, IndexError):
                     layers = []
                 for e in self._existing(elset):
+                    read.add(e)
                     typ = ccx_type(self.geom.elements[e][0])
                     if typ not in ("S6", "S8", "S8R") or off == 0.0:
                         kind: tuple = ("plain",)
@@ -39602,10 +39676,23 @@ class _Loads:
             elif b.keyword == "BEAM SECTION" and any(
                     (b.param(k) or "0").strip() not in ("0", "0.", "") for k in ("OFFSET1", "OFFSET2")):
                 for e in self._existing(b.param("ELSET") or ""):
+                    read.add(e)
                     for n in self.geom.elements[e][1]:
                         kinds.setdefault(n, set()).add(("?", "a beam OFFSET1 / OFFSET2"))
         if not any(k[0] != "plain" for ks in kinds.values() for k in ks):
             return
+        # the other elements on those nodes that read node temperatures: not the converter's
+        # knot beams, skins and free-mass springs, nor point, spring, dashpot or connector
+        # elements; a node the converter added (a truss's copy of a node, a midside node)
+        # takes the lines of the nodes it lies between (_midside_records)
+        skip = read | set(self.geom.elsets.get(KNOT_SET, ())) | set(self.geom.elsets.get(RIGID_SET, ())) | \
+            set(self.geom.elsets.get(FREE_MASS_SET, ()))
+        other = {n for e, (typ, conn) in self.geom.elements.items() if e not in skip and not
+                 typ.upper().startswith(("MASS", "ROTARYI", "SPRING", "DASHPOT", "GAPUNI", "CONN", "JOINT",
+                                         "DCOUP")) for n in conn}
+        other.update(x for a, c, m, _s in self._between() + self._tied_nodes if m in other for x in (a, c))
+        for n in other & set(kinds):
+            kinds[n].add(("other",))
         shift: Dict[int, float] = {}
         loose: Dict[int, str] = {}
         for n, ks in kinds.items():
@@ -39613,6 +39700,8 @@ class _Loads:
             odd = [k[1] for k in ks if k[0] == "?"]
             if odd:
                 loose[n] = odd[0]
+            elif qs and ("other",) in ks:
+                loose[n] = "beams, trusses or solids on the node, which read its temperature as given"
             elif len(qs) > 1 or (qs and any(k[0] == "plain" for k in ks)):
                 loose[n] = "shells beside it that read the line otherwise"
             elif qs:
@@ -42725,23 +42814,28 @@ class _PostPasses:
     def _hold_knot_drilling(self, blocks: List[Block], deck: EmittedDeck) -> EmittedDeck:
         """The drilling rotation of a converter knot beam's knot on a smooth shell node — one
         that ccx 2.23 would make no knot by itself (one group of shells, _ccx_knot's test),
-        with no rotational *BOUNDARY and no other element, where no *EQUATION holds a part of
-        its turn about the normal (none names its rotations, or each that does holds a
-        direction normal to it: a coupling of some rotations about axes in the shell's plane).
+        with no other element, where no *EQUATION holds a part of its turn about the normal
+        (none names its rotations, or each that does holds a direction normal to it: a
+        coupling of some rotations about axes in the shell's plane) — in the steps where no
+        *BOUNDARY holds a part of that turn either.
         The knot's rotation about the shell normal moves neither the shell's expanded nodes
         (they lie on the normal) nor anything the force-free knot beam holds, so it has no
         stiffness: ccx's solution then depends on round-off (probed: a fixed-fixed S4 beam
         with knot beams on its loaded nodes deflected 0.0056 or 0.105 for 0.292, by the knot
         beams' modulus; the plain shells, and the knotted ones with that rotation held, 0.292
-        for any).  It is held (n: the node's normal as ccx computes it, _ccx_shell_normal) —
+        for any; a clamp that a later *BOUNDARY, OP=NEW releases, NLGEOM: ccx stopped, held it
+        solves).  It is held (n: the node's normal as ccx computes it, _ccx_shell_normal) —
         nothing acts on that rotation, in Abaqus' shell as in ccx's (no drilling stiffness), so
-        it changes nothing else: along a global axis by a *BOUNDARY on that rotation (model
-        data, given again after a *BOUNDARY, OP=NEW ccx acts on), else by an *EQUATION
-        n . theta = 0 eliminating a rotation no other equation eliminates.  Not by an equation
-        in a deck with a *MODAL DYNAMIC step: ccx 2.23 crashes there at random on any equation
-        that eliminates a knot's rotation (probed: 9-12 of 50 runs, exit -11 / -10 / -6, as
-        the step starts; a *BOUNDARY there: none of 50), so such a knot stays as it was,
-        warned."""
+        it changes nothing else: along a global axis by a *BOUNDARY on that rotation, in model
+        data unless a deck BC holds it there, and again after each *BOUNDARY, OP=NEW ccx acts
+        on that leaves it free in its step (ccx's BC state, the emitted deck's); else by an
+        *EQUATION n . theta = 0 eliminating a rotation no other equation eliminates, where no
+        *BOUNDARY holds one of its rotations in any step (the equation acts in all of them; one
+        that is held needs none, and ccx stops on a BC on its dependent DOF): elsewhere warned.
+        Not by an equation in a deck with a *MODAL DYNAMIC step: ccx 2.23 crashes there at
+        random on any equation that eliminates a knot's rotation (probed: 9-12 of 50 runs, exit
+        -11 / -10 / -6, as the step starts; a *BOUNDARY there: none of 50), so such a knot
+        stays as it was, warned."""
         knots = set(self._knots)
         if not knots or getattr(self.opt, "solid_dof", False):
             return deck
@@ -42761,19 +42855,37 @@ class _PostPasses:
                         rot.setdefault(n, [1.0, 1.0, 1.0])
             for n, a in rot.items():
                 tie.setdefault(n, []).append((a[0], a[1], a[2]))
-        held: set = set()                       # nodes with a rotational BC
         sets = self._mesh_sets.read(deck)
-        for c in deck.cards:
-            if c.keyword == "BOUNDARY":
-                for rec in c.records():
-                    rng = bc_dof_range(rec) if rec and rec[0] else None
-                    if rng is None or rng[1] >= 4 and rng[0] <= 6:
-                        held.update(sets.members("NSET", rec[0]) or ([int(rec[0])] if rec and
-                                                                      rec[0].isdigit() else []))
+
+        def rotations(c: EmittedCard) -> set:
+            """(node, DOF) of the rotations a *BOUNDARY card holds (all three on a line whose
+            DOFs do not read)."""
+            out: set = set()
+            for rec in c.records():
+                if rec and rec[0]:
+                    lo, hi = bc_dof_range(rec) or (4, 6)
+                    ds = [d for d in (4, 5, 6) if lo <= d <= hi]
+                    nodes = (sets.members("NSET", rec[0]) or ([int(rec[0])] if rec[0].isdigit() else [])) \
+                        if ds else []
+                    out.update((n, d) for n in nodes for d in ds)
+            return out
+        state = set().union(*(rotations(c) for c in deck.model if c.keyword == "BOUNDARY"))
+        model = set(state)                      # the rotations held in model data
+        states: List[set] = []                  # per step, those held while it runs
+        for st in deck.steps:
+            for c in st.cards:
+                if c.keyword == "BOUNDARY":
+                    if c is st.acting("BOUNDARY"):
+                        state = set()
+                    state |= rotations(c)
+            states.append(set(state))
+        phases = states or [model]              # (a deck without steps: its model data)
+        anywhere = set(model).union(*phases)
         rows: List[List[Tuple[int, int, float]]] = []
-        bcs: List[str] = []                     # (holds along a global axis)
+        bcs: List[Tuple[int, int]] = []         # (holds along a global axis)
         loose: List[int] = []                   # (no form: an equation in a *MODAL DYNAMIC deck)
-        for n in sorted(knots - held - set(self._transformed)):
+        mixed: List[int] = []                   # (no form: held by a BC in some steps only)
+        for n in sorted(knots - set(self._transformed)):
             own = [e for e in at.get(n, ()) if e not in beams]
             if not own or any(ccx_type(self.geom.elements[e][0]) not in SHEET_SHELLS for e in own) or \
                     len({sections.get(e) for e in own}) > 1 or None in {sections.get(e) for e in own}:
@@ -42792,7 +42904,13 @@ class _PostPasses:
             if not terms or (n, terms[0][1]) in dependent:
                 continue
             if self._along_axis(nrm):
-                bcs.append(f"{n}, {terms[0][1]}, {terms[0][1]}")
+                if any((n, terms[0][1]) not in s for s in phases):
+                    bcs.append((n, terms[0][1]))
+                continue
+            if all(any((n, d) in s for _n, d, _c in terms) for s in phases):
+                continue                        # (a BC holds a part of the turn in every step)
+            if any((n, d) in anywhere for _n, d, _c in terms):
+                mixed.append(n)
             elif "MODAL DYNAMIC" in self.steps.procs:
                 loose.append(n)
             else:
@@ -42805,21 +42923,35 @@ class _PostPasses:
                              f"to 50x too stiff), and the *EQUATION that holds it elsewhere crashes ccx's "
                              f"*MODAL DYNAMIC step at random (probed) — verify.", once=True)
             self._reduces("knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)")
+        if mixed:
+            self.report.warn(f"{len(mixed)} knot(s) of the converter's knot beams on shell nodes whose "
+                             f"normal is off the global axes (e.g. node {mixed[0]}), with rotational BCs "
+                             f"in some steps only: in the others their rotation about the normal has no "
+                             f"stiffness, so ccx 2.23's solution may depend on round-off (probed: a "
+                             f"knotted S4 beam 2 % to 50x too stiff), and the *EQUATION that holds it "
+                             f"elsewhere would act in every step (ccx stops on a BC on its dependent "
+                             f"DOF) — verify.", once=True)
+            self._reduces("knot drilling rotations without stiffness (rotational BCs in some steps only)")
         if not rows and not bcs:
             return deck
         at = next((c.line for c in deck.cards if c.keyword == "STEP"), len(deck.lines))
-        hold = ["*BOUNDARY"] + bcs if bcs else []
-        deck.insert_at(at, ["** abq2ccx: the drilling rotation of knot beams' knots on shell nodes "
-                            "held (no stiffness acts on it)"] + hold + self._equation_lines(rows))
-        for st in deck.steps if bcs else ():
+        first = [f"{n}, {d}, {d}" for n, d in bcs if (n, d) not in model]
+        if first or rows:
+            deck.insert_at(at, ["** abq2ccx: the drilling rotation of knot beams' knots on shell nodes "
+                                "held (no stiffness acts on it)"] + (["*BOUNDARY"] + first if first else []) +
+                           self._equation_lines(rows))
+        for st, s in zip(deck.steps, states) if bcs else ():
             card = st.acting("BOUNDARY")            # (OP=NEW removes the model data's BCs too)
-            if card is not None:
-                deck.insert_after(card, ["** abq2ccx: the knots' drilling rotations held again"] + hold)
-        first = (bcs[0].split(",")[0] if bcs else str(rows[0][0][0]))
+            again = [f"{n}, {d}, {d}" for n, d in bcs if (n, d) not in s]
+            if card is not None and again:
+                deck.insert_after(card, ["** abq2ccx: the knots' drilling rotations held again",
+                                         "*BOUNDARY"] + again)
+        first = (str(bcs[0][0]) if bcs else str(rows[0][0][0]))
         self.report.note(f"{len(rows) + len(bcs)} knot(s) of the converter's knot beams on shell nodes "
                          f"(e.g. node {first}): their rotation about the shell normal held "
                          f"({'by a *BOUNDARY' if bcs else ''}{' / ' if bcs and rows else ''}"
-                         f"{'by an *EQUATION' if rows else ''}) — nothing stiffens it (the shell's "
+                         f"{'by an *EQUATION' if rows else ''}) where no BC holds it — nothing "
+                         f"stiffens it (the shell's "
                          f"expanded nodes lie on the normal, the knot beam is force-free), and ccx "
                          f"2.23's solution then depends on round-off (probed: a knotted S4 beam 2 % to "
                          f"50x too stiff, by the knot beam's modulus).", once=True)

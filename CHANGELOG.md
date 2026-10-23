@@ -522,15 +522,18 @@ entries. The GitHub release notes use the same section.
     gave the expanded nodes ccx's "undefined" marker (spurious strain), and `*TEMPERATURE,
     OP=NEW` kept the last gradient; both now get the initial temperatures again. Gradients on
     `OFFSET` S6 / S8 / S8R shells are written as `T - 2/3 g e t` (the mean was off by
-    `2/3 g e t`). Gradients across B31 / B31R beams, which ccx ignores, are warned.
+    `2/3 g e t`), except on nodes a beam, truss or solid shares, which reads the temperature as
+    given (warned). Gradients across B31 / B31R beams, which ccx ignores, are warned.
   - A point mass on a node of no other element never moved in `*DYNAMIC`; it gets a
     zero-stiffness spring (warned where the deck has other steps). Initial velocities copied
     onto quadratic membranes' solid nodes were turned as if local.
   - Knot beams on smooth shell nodes left the knot's rotation about the normal without
     stiffness, so ccx's answer hung on round-off (a knotted S4 plate 1.5-16x too stiff); that
-    rotation is now held: by a `*BOUNDARY` where the normal is a global axis, else by an
-    `*EQUATION`, except in decks with a `*MODAL DYNAMIC` step, which ccx 2.23 crashes on at
-    random when an equation eliminates a knot's rotation (warned there). Knot beams also leaked
+    rotation is now held in the steps where no BC holds it, also after a `*BOUNDARY, OP=NEW`
+    releases a clamp: by a `*BOUNDARY` where the normal is a global axis, else by an
+    `*EQUATION`. Warned instead: such a knot off the axes with BCs in some steps only (the
+    equation would act in all), and in decks with a `*MODAL DYNAMIC` step, which ccx 2.23
+    crashes on at random when an equation eliminates a knot's rotation. Knot beams also leaked
     their section stiffness into the knot (a slender beam tip 1.3 % short); their modulus is
     now 1e-6 of the deck's.
   - Two kinematic couplings of the same DOFs on one reference node turned apart (1-2 %); they
@@ -549,7 +552,9 @@ entries. The GitHub release notes use the same section.
   - A dashpot whose other end a BC moves in a small-strain implicit `*DYNAMIC` step: ccx damps
     as if that end stood still (a mass dragged through a dashpot did not move). The missing
     force, c (v . n) n, now goes on the free end as a `*CLOAD` on an amplitude of the BC's
-    velocity history (displacements on TABULAR amplitudes or ramped from rest, velocities).
+    velocity history (displacements on TABULAR amplitudes or ramped from rest, velocities). A
+    displacement that jumps (an amplitude that starts elsewhere than the node stands, or has two
+    points at one time) passes an impulse c du that no load amplitude carries: warned.
   - `--approximate`: B31 / B31R beams of a RECT section whose temperature gradients change run
     as B32R, which reads the gradients (the B31 stays straight).
 
