@@ -20471,6 +20471,17 @@ def test_plastic_c3d8_flagged_c3d8i_under_approximate():
     _, conv, _ = convert_str(plastic.replace("*Plastic\n10., 0.\n", ""))
     assert conv.reduced_physics == []
     assert not A.brick_locks("COH3D8") and not A.brick_locks("C3D8R") and A.brick_locks("C3D8HT")
+    # no step that can yield (*FREQUENCY, *BUCKLE, a perturbation *STATIC): no flag, and
+    # --approximate leaves the C3D8 (C3D8I lowered such a deck's first frequency by 19 %: R2-1)
+    for step in ("*Step\n*Frequency\n3\n*End Step\n", "*Step\n*Buckle\n2\n*Cload\n7, 1, 1.\n*End Step\n",
+                 "*Step, perturbation\n*Static\n*Cload\n7, 1, 1.\n*End Step\n"):
+        deck = plastic[:plastic.index("*Step")] + step
+        for approx in (False, True):
+            body, conv, _ = convert_str(deck, approximate=approx)
+            assert not any("locks" in r for r in conv.reduced_physics), (step, approx)
+            assert "TYPE=C3D8\n" in body and "C3D8I" not in body, (step, approx)
+    assert not A.Converter._steps_can_yield(A.blocks_from_lines(plastic.replace("*Static", "*Frequency").splitlines()))
+    assert A.Converter._steps_can_yield(A.blocks_from_lines(plastic.splitlines()))
 
 
 def test_creep_and_near_incompressibility_lock_cpe4_cax4_c3d8():
@@ -20528,6 +20539,10 @@ def test_s3_shells_flagged_s6_under_approximate():
     assert S3_FLAG in conv.reduced_physics and len(conv.reduced_physics) == 2
     assert convert_str(deck.replace("type={t}, elset=T\n1, 1, 2, 3\n2, 1, 3, 4\n",
                                     "type=S4, elset=T\n1, 1, 2, 3, 4\n"))[1].reduced_physics == []
+    # the S3 of a *RIGID BODY, ELSET= are not flagged: their bending plays no part (R2-1)
+    rigid = deck.format(t="S3").replace("*Boundary\n", "*Node\n9, 0.5, 0.5, 0.\n*Rigid Body, elset=T, "
+                                        "ref node=9\n*Boundary\n", 1)
+    assert S3_FLAG not in convert_str(rigid)[1].reduced_physics
 
 
 def test_plastic_shell_sections_flagged_and_layered():
@@ -20542,6 +20557,10 @@ def test_plastic_shell_sections_flagged_and_layered():
     assert "*SHELL SECTION of a plastic material (1 section(s): ELSET=E; 2 elements, S4): ccx 2.23 " \
            "integrates an expanded shell's section through the thickness at its brick's Gauss points (2 on " \
            "S4), Abaqus at the section's 5 Simpson points" in rep.text()
+    # no step that can yield: nothing to flag or layer (R2-1)
+    freq = deck[:deck.index("*Step")] + "*Step\n*Frequency\n2\n*End Step\n"
+    assert convert_str(freq)[1].reduced_physics == []
+    assert "COMPOSITE" not in convert_str(freq, approximate=True)[0]
     body, conv, rep = convert_str(deck, approximate=True)
     assert "*SHELL SECTION, ELSET=E, COMPOSITE\n0.05, , M\n0.05, , M\n*" in body
     assert {t for t, _ in conv.geom.elements.values()} == {"S8R"}

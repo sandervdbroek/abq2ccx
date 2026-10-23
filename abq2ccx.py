@@ -13469,7 +13469,8 @@ class _Mesh:
         100: 26 % in bending, a buckling load 37 % high; 7 % / 15 % off at 8.3 / 10
         thicknesses), S8R is within 2 % from 4 x 4 elements at a/t 100 (8 x 8 at 1000), and
         within 1.3 % on a Scordelis-Lo roof of 4 x 4 elements per quarter (S4 46 %)."""
-        s4r = [e for e, (typ, _c) in self.geom.elements.items() if ccx_type(typ) == "S4R"]
+        rigid = self._rigid_body_elements(blocks)
+        s4r = [e for e, (typ, _c) in self.geom.elements.items() if ccx_type(typ) == "S4R" and e not in rigid]
         if not s4r:
             return
         hits: Dict[str, int] = {}
@@ -13560,7 +13561,8 @@ class _Mesh:
         linear shells joined to them by an edge upgraded too, the new nodes on the curved
         surface): 0.71 / 0.95 / 0.998 / 1.006 on the a/t 100 plate, 0.81 / 0.98 / 0.996 /
         0.998 on the roof."""
-        s3 = [e for e, (typ, _c) in self.geom.elements.items() if ccx_type(typ) == "S3"]
+        rigid = self._rigid_body_elements(blocks)
+        s3 = [e for e, (typ, _c) in self.geom.elements.items() if ccx_type(typ) == "S3" and e not in rigid]
         if not s3:
             return
         hits: Dict[str, int] = {}
@@ -14011,7 +14013,7 @@ class _Mesh:
         become S8R / S6 with a node at the middle of every edge (_upgrade_linear_shells, the
         linear shells joined to them by an edge too); a section with S8 or without a constant
         thickness is left as it is (and flagged)."""
-        plastic = self._plastic_materials(blocks)
+        plastic = self._plastic_materials(blocks) if self._steps_can_yield(blocks) else set()
         found: List[Tuple[Block, List[int], Dict[str, int], int, bool]] = []
         for b in blocks:
             mat = b.uparam("MATERIAL")
@@ -22045,6 +22047,38 @@ class _Materials:
             out[g[0].uparam("NAME")] = opts
         return out
 
+    # the procedures of a general step in which a material can yield (_steps_can_yield)
+    _YIELD_PROCS = ("STATIC", "DYNAMIC", "VISCO", "COUPLED TEMPERATURE-DISPLACEMENT",
+                    "UNCOUPLED TEMPERATURE-DISPLACEMENT", "DYNAMIC TEMPERATURE-DISPLACEMENT",
+                    "SOILS", "GEOSTATIC")
+
+    @staticmethod
+    def _steps_can_yield(blocks: List[Block]) -> bool:
+        """Whether a step of the deck can make a material yield: one whose procedure (the
+        first of STEP_PROCS after its *STEP, as step_procedure reads it) is mechanical and that
+        is no linear perturbation step.  A deck of *FREQUENCY / *BUCKLE steps never yields, so
+        its plastic materials neither lock (_volume_keeping_materials) nor bend plastically
+        (_plan_plastic_shells), and --approximate leaves their elements as written (code check
+        R2-1: C3D8I lowered such a deck's first frequency by 19 %)."""
+        step = None
+        for b in blocks:
+            if b.keyword == "STEP":
+                step = b
+            elif step is not None and b.keyword in STEP_PROCS:
+                if b.keyword in Converter._YIELD_PROCS and not step.has("PERTURBATION"):
+                    return True
+                step = None
+        return False
+
+    def _rigid_body_elements(self, blocks: List[Block]) -> set:
+        """The elements of the *RIGID BODY, ELSET= sets, whose stiffness plays no part: no flag
+        for how ccx bends them (_plan_s4r_shells, _plan_s3_shells; code check R2-1)."""
+        out: set = set()
+        for b in blocks:
+            if b.keyword == "RIGID BODY" and (b.param("ELSET") or "").strip():
+                out.update(self.geom.elset(b.param("ELSET").strip()))
+        return out
+
     def _plastic_materials(self, blocks: List[Block]) -> set:
         """The materials (upper case) with a *PLASTIC option: Mises or Hill flow, which keeps
         the volume."""
@@ -22054,7 +22088,8 @@ class _Materials:
     def _volume_keeping_materials(self, blocks: List[Block]) -> Dict[str, str]:
         """The materials (upper case) whose deformation keeps the volume, on which ccx 2.23's
         fully integrated CPE4 / CAX4 / C3D8 lock (_plan_volume_locking) -> "plastic" (a
-        *PLASTIC option), "creeping" (*CREEP, not of a Drucker-Prager or cap material, in a
+        *PLASTIC option, in a deck with a step that can yield: _steps_can_yield), "creeping"
+        (*CREEP, not of a Drucker-Prager or cap material, in a
         deck with a step that creeps: *VISCO, or *COUPLED TEMPERATURE-DISPLACEMENT / *SOILS
         without CREEP=NONE) or "nearly incompressible" (an isotropic *ELASTIC row with a
         Poisson's ratio from LOCKING_NU, or a *HYPERELASTIC row whose small-strain one reaches
@@ -22062,10 +22097,11 @@ class _Materials:
         flags that)."""
         creeps = any(b.keyword == "VISCO" or (b.keyword in ("COUPLED TEMPERATURE-DISPLACEMENT", "SOILS")
                                               and b.uparam("CREEP") != "NONE") for b in blocks)
+        yields = self._steps_can_yield(blocks)
         out: Dict[str, str] = {}
         for m, opts in self._material_options(blocks).items():
             kws = {c.keyword for c in opts[1:]}
-            if "PLASTIC" in kws:
+            if "PLASTIC" in kws and yields:
                 out[m] = "plastic"
             elif creeps and "CREEP" in kws and not kws & {"DRUCKER PRAGER", "CAP PLASTICITY"}:
                 out[m] = "creeping"
