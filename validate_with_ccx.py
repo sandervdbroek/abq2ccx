@@ -159,7 +159,7 @@ def convert(path, out_inp, approximate=False, abaqus_umat=False, setup=None):
 CCX_TIMEOUT = 600      # seconds of wall-clock time a ccx run gets
 SKIPPED = []           # the checks that printed SKIP
 # The SKIPs that hide no regression: umat_build without CCX_UMAT, and corner_twin's checks when
-# ccx failed on the twin at every try for no fault of the decks (ccx_fault: ccx 2.23's random
+# ccx failed at every try for no fault of the decks (twin_excuse, ccx_fault: ccx 2.23's random
 # crash at a *DYNAMIC step's start on Windows, 5f03246; ccx could not start).  Any other SKIP
 # fails validate: a SKIP can hide a regression.
 EXPECTED_SKIPS = ("umat_build", "transform_shell_corner_plate", "transform_shell_corner_panel",
@@ -225,6 +225,27 @@ def ccx_fault(status, out, windows=os.name == "nt"):
     last = [ln.strip() for ln in out.splitlines() if ln.strip()][-2:]
     if windows and last == ["Dynamic analysis was selected", "Newton-Raphson iterative procedure is active"]:
         return "ccx crashed at the *DYNAMIC step's start"
+    return None
+
+
+def ccx_lines(text):
+    """A ccx deck's lines without its comment and blank lines: what ccx reads."""
+    return [ln.rstrip() for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("**")]
+
+
+def twin_excuse(excused, solved, same_input):
+    """Why corner_twin may SKIP instead of comparing the deck with its twin, or None.
+    ``excused``: ccx_fault of the deck's and of the twin's last try; ``solved``: whether each
+    solved; ``same_input``: the deck's ccx input is the twin's but for comments (ccx_lines), with
+    the deck's node taken out of the *TRANSFORM and the same reduced physics.  ccx failing alike
+    on both, or on the twin while the deck solved, is ccx's fault; on the deck alone it is only
+    when ccx solved the very same input as the twin (Windows' build crashed on one of two such
+    files at every try in CI run 39904709873).  Any other failure is the deck's (code check G4-5)."""
+    if excused[1] and (solved[0] or excused[0]):
+        return f"{excused[1]} on the twin{' and the deck' if excused[0] else ''} at every try"
+    if excused[0] and solved[1] and same_input:
+        return (f"{excused[0]} on the deck at every try; ccx solved the same input, but for "
+                f"comments, as the twin")
     return None
 
 
@@ -10860,13 +10881,15 @@ def main():
     # under a tilted one must match the plate in global components, the half panel with a
     # cylindrical *TRANSFORM on all nodes the whole panel without (before: 2.1 % / 1.3 % off).
     def corner_twin(label, text, twin, tol=1e-9, moved=0.0):
-        u, notes, why, excused = [], [], [], []
+        u, notes, why, excused, decks = [], [], [], [], []
         for i, t in enumerate((text, twin)):
             src, inp = os.path.join(tmp, f"tc{i}_src.inp"), os.path.join(tmp, f"tc{i}.inp")
             with open(src, "w", encoding="utf-8", newline="\n") as fh:
                 fh.write(t)
             rep, conv = convert(src, inp)
             notes.append(("taken out of the *TRANSFORM" in rep.text(), list(conv.reduced_physics)))
+            with open(inp, encoding="utf-8") as fh:
+                decks.append(ccx_lines(fh.read()))
             for _ in range(5):       # ccx 2.23 crashes at random at a *DYNAMIC step's start after
                 d, status, out = run_ccx(ccx, env, inp)     # a *STATIC one (tempload): rerun it
                 if status != "failed" or "*ERROR" in out or "Job finished" in out:
@@ -10878,14 +10901,14 @@ def main():
                 tail = [ln.strip() for ln in out.splitlines() if ln.strip()][-3:]
                 why.append(f"{('the deck', 'its twin')[i]} {status}: {' | '.join(tail)}")
             shutil.rmtree(d, ignore_errors=True)
-        if excused[1] and (u[0] or excused[0]):
-            # ccx failed on the hand-written twin at every try for no fault of it (ccx_fault:
-            # ccx 2.23's random tempload crash at a *DYNAMIC step's start, Windows' build in
-            # every try of some CI runs), and the deck solved or failed alike: nothing to
-            # compare, which is ccx's fault, not the deck's (a failure on the deck alone, any
-            # other crash, a time limit or an *ERROR still FAIL)
-            print(f"SKIP  {label}: {excused[1]} on the twin"
-                  f"{' and the deck' if excused[0] else ''} at every try ({'; '.join(why)})")
+        same = decks[0] == decks[1] and notes[0][0] and not notes[1][0] and notes[0][1] == notes[1][1]
+        excuse = twin_excuse(excused, (bool(u[0]), bool(u[1])), same)
+        if excuse:
+            # ccx failed at every try for no fault of the decks (ccx_fault: ccx 2.23's random
+            # tempload crash at a *DYNAMIC step's start, Windows' build in every try of some CI
+            # runs): nothing to compare, which is ccx's fault (twin_excuse; any other crash, a
+            # time limit or an *ERROR still FAIL)
+            print(f"SKIP  {label}: {excuse} ({'; '.join(why)})")
             SKIPPED.append(label)
             return 0
         if not u[0] or u[0].keys() != u[1].keys():

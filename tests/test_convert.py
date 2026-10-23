@@ -19892,6 +19892,21 @@ def test_validate_excuses_only_ccx_s_own_crash_and_a_ccx_that_cannot_start():
                                  ("timeout", crash, True),
                                  ("failed", "ccx run failed in validate_with_ccx: ValueError: x", True)):
         assert not V.ccx_fault(status, out, windows=windows), (status, out[-80:], windows)
+    # corner_twin's SKIP: ccx's fault on the twin (deck solved or faulted alike), or on the deck
+    # alone only when ccx solved the very same input as the twin (CI run 39904709873: Windows'
+    # build crashed on transform_knot_dynamic's deck at every try, not on its twin)
+    fault = "ccx crashed at the *DYNAMIC step's start"
+    assert V.twin_excuse((None, fault), (True, False), False) == fault + " on the twin at every try"
+    assert V.twin_excuse((fault, fault), (False, False), False).endswith("on the twin and the deck at every try")
+    assert V.twin_excuse((fault, None), (False, True), True).endswith("solved the same input, but for comments, as the twin")
+    for excused, solved, same in (((fault, None), (False, True), False),   # its own input: FAIL
+                                  ((None, None), (False, True), True),     # not ccx's fault
+                                  ((None, fault), (False, False), True),   # the deck's own failure
+                                  ((fault, None), (False, False), True),   # the twin failed too
+                                  ((None, None), (True, True), True)):     # compared as usual
+        assert V.twin_excuse(excused, solved, same) is None, (excused, solved, same)
+    deck = "** a comment\n*NODE\n1, 0., 0., 0.\n\n**\n  ** indented\n*STEP  \n"
+    assert V.ccx_lines(deck) == ["*NODE", "1, 0., 0., 0.", "*STEP"]
 
 
 def test_file_names_that_are_not_utf8_convert():
