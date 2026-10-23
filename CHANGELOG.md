@@ -227,8 +227,11 @@ physics.
   meets the master surface, also where the master is wider than what it joins. Self-contact,
   edge-to-edge contact and pairs of two rigid bodies are left out (warned). Two blocks pressed
   together carry what a hand-written pair carries, to all digits, also with an embedded sheet
-  or bar, or partly tied (to a master over the whole top as well). Without the option the
-  cards stay commented out, and the warning names `--approximate`.
+  or bar, or partly tied (to a master over the whole top as well). Not yet where two bodies'
+  faces end flush (a lid on a block of the same footprint, stacked blocks): ccx pairs a slave
+  node on the master's edge with its side face and misses most of the contact (22 % of a
+  hand-written pair's force in a probe). Without the option the cards stay commented out,
+  and the warning names `--approximate`.
 * **Linear connector behaviour and JOINTC** — a connector with a `*CONNECTOR BEHAVIOR` was
   commented out, and a JOINTC element stopped ccx. Linear `*CONNECTOR ELASTICITY` / `DAMPING`
   (uncoupled or coupled) on the components of `CARTESIAN`, `BUSHING`, `CARDAN`, `ROTATION` and
@@ -430,6 +433,9 @@ physics.
   solves under its own loads and matches the same model with Abaqus' built-in material (8
   decks, within 2e-10), or the repository's Abaqus stress–strain curve (a polycrystal
   crystal-plasticity deck, within 0.25 %, 1.1 % at the yield knee).
+* **`corpus/fetch.py` refuses options it does not know** — any argument but `--companions`
+  or `--umat` (`--help` too) started the full corpus download over `corpus/files/`; it now
+  prints the usage and downloads nothing.
 
 * **ccx stops the conversion now avoids** — a `*TIE` line naming one surface as slave and master
   is left out (Abaqus ties nothing there; ccx 2.23 looped without end), and a solid or node slave

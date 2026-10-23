@@ -6,7 +6,7 @@
     python corpus/fetch.py --umat        # only the UMAT tier's sources (manifest.UMAT_SOURCES)
 
 Files land in ``corpus/files/`` (gitignored). Re-run any time; existing files are
-overwritten. Requires network access (uses urllib from the standard library).
+overwritten. Any other argument (``--help`` too) prints this usage and downloads nothing. Requires network access (uses urllib from the standard library).
 
 A deck's companions, the files its cards read with ``INPUT=`` (``*INCLUDE`` and data cards
 such as ``*NODE`` or ``*DISTRIBUTION``, nested ones too), are fetched from next to it and
@@ -140,8 +140,12 @@ def umat_files(repo, src, dest):
     return fetched, failed
 
 
-def main():
-    if "--umat" in sys.argv[1:]:
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else argv
+    if args not in ([], ["--companions"], ["--umat"]):  # --help or a typo: no full download
+        print("usage:\n" + __doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    if args == ["--umat"]:
         fail = 0
         for repo, src in sorted(UMAT_SOURCES.items()):
             got, failed = umat_files(repo, src, UMAT_DEST)
@@ -153,7 +157,7 @@ def main():
             fail += bool(failed)
         print(f"\n{len(UMAT_SOURCES) - fail} repositories ok, {fail} failed -> {UMAT_DEST}")
         return 1 if fail else 0
-    only = "--companions" in sys.argv[1:]
+    only = args == ["--companions"]
     os.makedirs(DEST, exist_ok=True)
     ok = fail = 0
     written, conflicts = {}, set()

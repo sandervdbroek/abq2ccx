@@ -2,8 +2,8 @@
 """End-to-end validation: convert the example decks and actually run them in CalculiX.
 
 This is the proof that the converter produces *runnable, correct* CalculiX input — not
-just structurally-valid text.  It auto-detects a ``ccx`` binary (including the one
-bundled with FreeCAD) and checks results against reference values: the NAFEMS LE10
+just structurally-valid text.  It auto-detects a ``ccx`` binary (on the PATH or in
+a known install) and checks results against reference values: the NAFEMS LE10
 stress (also with the pressure carried by surface elements, which ccx does not have),
 the tip deflections of circular-, pipe- and box-section cantilevers against beam
 theory, beams under a general or an I section run as ccx's U1 element (cantilevers about

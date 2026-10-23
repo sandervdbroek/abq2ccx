@@ -38,7 +38,9 @@ If ``corpus/files/`` is empty the corpus checks skip cleanly, so this file is sa
 run without network. The bundled ``examples/`` are exercised by ``test_convert.py``.
 """
 
+import contextlib
 import hashlib
+import io
 import os
 import shutil
 import sys
@@ -771,6 +773,22 @@ def test_umat_manifest():
             assert u["reference"]["curve"] in files, e["name"]
         used.add(u["repo"])
     assert used == set(UMAT_SOURCES), f"sources no recipe uses: {set(UMAT_SOURCES) - used}"
+
+
+def test_fetch_unknown_option():
+    """corpus/fetch.py prints its usage and downloads nothing for an argument it does not
+    know (``--help`` once started the full download over corpus/files/)."""
+    import fetch as F
+    calls = []
+    real, F.download = F.download, calls.append
+    try:
+        for argv in (["--help"], ["-h"], ["--companion"], ["--umat", "--companions"]):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                assert F.main(argv) == 2, argv
+            assert "--companions" in err.getvalue() and not calls, argv
+    finally:
+        F.download = real
 
 
 def test_fetch_umat():

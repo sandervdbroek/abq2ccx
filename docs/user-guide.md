@@ -150,6 +150,9 @@ a different model without saying so. With it, these reframings are made, each wi
 * general contact (`*CONTACT`, `ALL EXTERIOR` or named surfaces) → node-to-surface contact
   pairs between the bodies that can meet (their exterior faces; the struck, yielding or finer
   body the slave, one line per slave body), without self-contact and edge-to-edge contact.
+  Not yet where two bodies' faces end flush (a lid on a block of the same footprint, stacked
+  blocks): ccx pairs a slave node on the master's edge with its side face and misses most of
+  the contact (22 % of a hand-written pair's force in a probe); write that pair by hand.
 
 ## `--abaqus-umat`
 

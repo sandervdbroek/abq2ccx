@@ -172,7 +172,7 @@ The [architecture guide](https://github.com/sandervdbroek/abq2ccx/blob/main/docs
 * The converter checks structure, and physics on its benchmarks — not on your model. Run ccx
   and sanity-check the results.
 
-Validated on CalculiX 2.23 (the FreeCAD 1.1.4 build); written for 2.22–2.23.
+Validated on CalculiX 2.23 (conda-forge's `calculix` 2.23 build 2); written for 2.22–2.23.
 
 ## Examples
 

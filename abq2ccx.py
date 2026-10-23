@@ -4440,7 +4440,7 @@ PASS_WITH_NOTE = {
     "USER ELEMENT": USER_ELEMENT_MSG,
 }
 # ccx hands a mechanical *USER MATERIAL to the routine its name starts with (umat_main.f, the
-# same in FreeCAD's 2.23 build): ABAQUS / ABAQUSNL -> the Abaqus-UMAT interface (a stock ccx has
+# same in the 2.23 builds): ABAQUS / ABAQUSNL -> the Abaqus-UMAT interface (a stock ccx has
 # a linear-elastic example there), USER -> umat_user and @ -> a shared library (empty in a stock
 # ccx: no stress, no stiffness), the rest -> ccx's own laws; any other name stops with "no user
 # material subroutine".  ccx reads names upper-cased and without blanks, quotes kept (so a
@@ -26376,9 +26376,9 @@ class _Constraints:
         coupled, or in a legacy *KINEMATIC COUPLING card."""
         self.report.warn("Rigid coupling (*KINEMATIC) whose reference node is a shell/beam node, "
                          "with only some translations coupled (or in a *KINEMATIC COUPLING card): "
-                         "ccx implements it with RIGID MPCs, which ccx 2.23 (e.g. the FreeCAD 1.1 "
-                         "build) rejects ('*ERROR in gen3dmpc: nodes belonging to shell elements "
-                         "must not be subject to a RIGID MPC'), and the converter can only repair "
+                         "ccx implements it with RIGID MPCs, which ccx 2.23 rejects ('*ERROR in gen3dmpc: "
+                         "nodes belonging to shell elements must not be subject to a RIGID MPC'), "
+                         "and the converter can only repair "
                          "full-translation couplings of such a node. Couple DOFs 1-3, or use a "
                          "separate reference point tied to the node.", once=True)
 
@@ -30634,8 +30634,8 @@ class _Constraints:
     # -- rigid couplings on shell / beam nodes ---------------------------------
     def _plan_rigid_couplings(self, blocks: List[Block]) -> None:
         """ccx builds *RIGID BODY and *KINEMATIC couplings from RIGID MPCs, which ccx 2.23
-        (the FreeCAD 1.1 build) rejects on a shell, membrane, beam or truss node unless ccx
-        has made the node a *knot* ('*ERROR in gen3dmpc: nodes belonging to shell elements must not
+        rejects on a shell, membrane, beam or truss node unless ccx has made the node a *knot*
+        ('*ERROR in gen3dmpc: nodes belonging to shell elements must not
         be subject to a RIGID MPC'; 2.22 accepted it, current sources warn).  A beam element
         attached to a node makes it a knot, so every such node of a rigid constraint gets a
         *knot beam*: a B31 from the node to a new free end node, in a material without
@@ -30784,7 +30784,7 @@ class _Constraints:
         self._add_knot_beams(knots, blocks)
         if len(knots) > len(conn):
             self.report.note(f"Rigid coupling on shell/beam nodes: ccx builds *KINEMATIC / *RIGID "
-                             f"BODY from RIGID MPCs, which ccx 2.23 (FreeCAD 1.1 build) rejects on a "
+                             f"BODY from RIGID MPCs, which ccx 2.23 rejects on a "
                              f"shell/beam node unless ccx made it a knot ('*ERROR in gen3dmpc: ... "
                              f"RIGID MPC'). Each of the {len(knots) - len(conn)} such node(s) got a "
                              f"force-free knot beam (a B31 to a new free node, elset/material "

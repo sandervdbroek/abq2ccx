@@ -2,7 +2,7 @@
 
 The facts about Abaqus and CalculiX that the converter relies on, and where each comes from.
 Each was taken from a primary source — the CalculiX manual or sources, the Abaqus manuals —
-and the behavioural ones were **probed** on ccx 2.23 (the FreeCAD 1.1.4 build): small decks
+and the behavioural ones were **probed** on ccx 2.23 (conda-forge's build 2): small decks
 run against a hand calculation or an equivalent model. `validate_with_ccx.py` repeats many
 of the probes on the bundled examples ([testing](testing.md#2-end-to-end--validate_with_ccxpy)).
 
@@ -189,7 +189,7 @@ of the probes on the bundled examples ([testing](testing.md#2-end-to-end--valida
 
 ## Version notes
 
-* Written for CalculiX 2.22–2.23 and validated on **2.23**, the build in FreeCAD 1.1.4. There
+* Written for CalculiX 2.22–2.23 and validated on **2.23** (conda-forge's `calculix` 2.23 build 2). There
   is no 2.24 as of October 2026.
 * ccx 2.23 segfaults where a card it rejects (step data outside a `*STEP`, a section naming
   an undefined material) is the deck's last card and has a data line (CalculiX PR #190), and

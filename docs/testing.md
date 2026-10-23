@@ -18,10 +18,10 @@ that a runaway job cannot fill the disk.
 request: the unit tests, the generated-reference check and a `pip install .` on Ubuntu, macOS
 and Windows with Python 3.9 (the oldest supported) and the newest; and `validate_with_ccx.py`
 and an `abq2ccx --run` on Ubuntu and on Windows (there on Python 3.9, whose `open()` defaults
-to the code page) with conda-forge's `calculix` 2.23 build 2, the build FreeCAD 1.1.4 bundles
-(`conda-meta/calculix-2.23-pl5321h484372f_2.json` in its macOS app; on Windows built by MinGW
-GCC against the UCRT), so CI solves with the ccx the checks were written on (Ubuntu packages
-2.21; later conda-forge builds of 2.23 add fixes made after its release). The two runs agree
+to the code page) with conda-forge's `calculix` 2.23 build 2 (`calculix-2.23-pl5321h484372f_2`;
+on Windows built by MinGW GCC against the UCRT), so CI solves with the ccx the checks were
+written on (Ubuntu packages 2.21; later conda-forge builds of 2.23 add fixes made after its
+release). The two runs agree
 to every printed digit except how NaN is spelled (`-NAN` on Linux, `-NAN(IND)` on Windows)
 and the sixth digit of one buckling factor. ARPACK converges it only to `*BUCKLE`'s default
 accuracy of 1 %, so each platform's BLAS lands on its own value: 223458 on Linux, 223460 on
@@ -273,7 +273,7 @@ The tests:
   together; `fetch.py --umat` saves only files with the pinned sha256. Always run.
 * `test_corpus_umat` — [the UMAT tier](#the-umat-tier), with `ABQ2CCX_CCX_SRC` set.
 
-**Results on ccx 2.23** (the FreeCAD 1.1.4 build): all 1052 decks convert with no dangling
+**Results on ccx 2.23** (conda-forge's build 2): all 1052 decks convert with no dangling
 reference. 246 are gated `expect_solve`: **181 solve the deck's own physics**; 14 are
 `source_unloaded`, two are `solver_differs` (a snap-fit insert that only contact holds drifts
 out of its buckle; a plate pushed about 1240 times past its buckling load, whose lowest factors
