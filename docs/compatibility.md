@@ -208,14 +208,14 @@ for any non-trivial deck. The converter classifies every keyword — translated,
 organisational, or commented with guidance — and the [keyword reference](keyword-reference.md)
 gives the full split.
 
-Of the 1052 corpus decks, 596 do not solve; most need what stock ccx does not have: user
-materials (354 decks), user elements (66), and other user subroutines, Riks, explicit coupled
+Of the 1052 corpus decks, 585 do not solve; most need what stock ccx does not have: user
+materials (349 decks), user elements (66), and other user subroutines, Riks, explicit coupled
 temperature–displacement steps, cohesive and acoustic models, Abaqus general contact. Others are
-incomplete source decks (47). Another 50 solve only a model with reduced physics — the
+incomplete source decks (45). Another 58 solve only a model with reduced physics — the
 conversion had to drop or replace part of it (concrete damaged plasticity, user hardening,
 Chaboche back-stresses, field-dependent properties, hybrid / modified / thin-shell elements,
 Euler–Bernoulli `U1` beams for Timoshenko ones, general contact, an imperfection, `S4R` and
-one-point elements that only hourglass stiffness bends, plastic `CPE4` / `CAX4`, which lock), and two converge to solutions that are not the deck's (a
+one-point elements that only hourglass stiffness bends, `CPE4` / `CAX4` / `C3D8` of a plastic or nearly incompressible material, which lock, `S3R` shells, plastic shell sections, a modal step superposing more modes than its frequency range), and two converge to solutions that are not the deck's (a
 body that only contact holds drifts away before the contact closes; a buckling deck loaded far above
 its buckling load, whose lowest factors ccx's `*BUCKLE` does not return) — all kept out of the
 count of faithful solves. The

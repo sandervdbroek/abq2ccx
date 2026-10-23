@@ -118,13 +118,13 @@ prints one `PASS` line per check, about 600 in all; [testing](https://github.com
 A **corpus of 1052 genuine Abaqus decks** — 1022 from about 180 public repositories (CAE
 exports, UMAT and UEL decks, explicit and coupled models, …) and 30 NAFEMS benchmark decks of
 the Abaqus 2017 documentation — is fetched on demand and run through convert → integrity check
-→ ccx. On ccx 2.23 all 1052 convert with no dangling reference; **177 solve the deck's own
-physics**; 58 more solve but stay out of that count — 14 load nothing in the source deck, 50
-(7 of them also unloaded) solve a model with reduced physics, and two (one also reduced) converge to solutions
+→ ccx. On ccx 2.23 all 1052 convert with no dangling reference; **181 solve the deck's own
+physics**; 65 more solve but stay out of that count — 14 load nothing in the source deck, 58
+(8 of them also unloaded) solve a model with reduced physics, and two (one also reduced) converge to solutions
 that are not the deck's (a part that only contact holds drifts away in ccx; a plate pushed far past
 its buckling load, whose lowest factors ccx's `*BUCKLE` does not return) — and 221 mesh-only
-decks are accepted. The other 596 need what ccx cannot run — mostly user materials (354) and
-user elements (66). **27 benchmark decks are checked against their published answer**: 20
+decks are accepted. The other 585 need what ccx cannot run — mostly user materials (349) and
+user elements (66). **30 benchmark decks are checked against their published answer**: 23
 match Abaqus' result for the same mesh (within 0.5 % for temperatures and frequencies, 1 % for
 stresses and displacements), 7 differ for reasons traced to ccx (its nodal extrapolation,
 plane-stress slab, film integration, mass matrices, a coarse shell mesh, beam clamps, a coarse beam mesh). See
