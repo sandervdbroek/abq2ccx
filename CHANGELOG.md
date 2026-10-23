@@ -64,7 +64,10 @@ entries. The GitHub release notes use the same section.
   wedge, which locks in bending on flat and curved shells (the Scordelis-Lo roof: 0.12 of its
   deflection on 8 × 8 squares): `--approximate` writes `S6`. A plastic `*SHELL SECTION` is
   integrated at 2 Gauss points through the thickness (Abaqus: 5 Simpson points), so it carries
-  1.155 times the fully plastic moment: `--approximate` writes a composite of 2 equal layers.
+  1.155 times the fully plastic moment: `--approximate` writes a composite of 2 equal layers. A
+  composite section's plastic layer that the section's middle crosses is flagged too (one layer:
+  1.155 against Abaqus' 0.667 times that moment), and C3D8 / CPE4 / CAX4 of a user material
+  get a note. Plasticity counts only in a deck with a step that can yield.
 * **Geostatic initial stresses and steps** — `*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC` was
   commented out. It is now written at each of ccx's integration points: the vertical stress
   linear in the elevation (z in 3-D, y in plane and axisymmetric models) through the card's two

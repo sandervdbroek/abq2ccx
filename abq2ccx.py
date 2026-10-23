@@ -13846,6 +13846,19 @@ class _Mesh:
             self._lock_plane_quads(blocks, plane)
         if brick:
             self._lock_bricks(brick)
+        # a user material's flow is the UMAT's: the converter cannot tell whether it keeps the
+        # volume, so a note, not a flag (code check R2-2: the UMAT tier's C3D8 decks)
+        user = {m for m, opts in self._material_options(blocks).items()
+                if any(c.keyword == "USER MATERIAL" for c in opts[1:])}
+        umat = sorted({ccx_type(typ) for e, (typ, _c) in self.geom.elements.items()
+                       if sec.get(e, (None, ""))[1] in user and (plane_locks(typ) or brick_locks(typ))})
+        if umat and self._steps_can_yield(blocks):
+            self.report.note(f"Element {' / '.join(umat)} of a user material: ccx 2.23 lacks Abaqus' "
+                             f"selectively reduced volume terms on these elements, so they lock "
+                             f"where the UMAT's deformation keeps the volume (plastic flow, creep, a "
+                             f"nearly incompressible material), which the converter cannot tell; "
+                             f"there, mesh with C3D8I / CPE8R / CAX8R (what --approximate writes for "
+                             f"a *PLASTIC or *CREEP material).", once=True)
 
     def _lock_why(self, cts: List[str], kinds: List[str], what: str) -> str:
         """Why ccx's ``cts`` lock on materials of ``kinds`` (_plan_volume_locking)."""
@@ -13913,7 +13926,8 @@ class _Mesh:
 
     def _lock_bricks(self, lock: Dict[int, str]) -> None:
         """_plan_volume_locking's C3D8 (``lock``: element -> its material's kind): reduced
-        physics, or under --approximate C3D8I (the deck's suffixes kept: C3D8H -> C3D8IH)."""
+        physics, or under --approximate C3D8I (a coupled temperature-displacement T kept, a
+        hybrid H dropped: C3D8HT -> C3D8IT)."""
         hits: Dict[str, int] = {}
         for e in lock:
             typ = self.geom.elements[e][0].upper()
@@ -14014,6 +14028,7 @@ class _Mesh:
         linear shells joined to them by an edge too); a section with S8 or without a constant
         thickness is left as it is (and flagged)."""
         plastic = self._plastic_materials(blocks) if self._steps_can_yield(blocks) else set()
+        self._flag_plastic_composites(blocks, plastic)
         found: List[Tuple[Block, List[int], Dict[str, int], int, bool]] = []
         for b in blocks:
             mat = b.uparam("MATERIAL")
@@ -14066,6 +14081,11 @@ class _Mesh:
                    "Gauss points each, the fully plastic moment exactly (the strip reaches 1.0004 of "
                    "its limit load on S8R, 1.002 on S6, first yield at 1.27 times the first-yield "
                    "moment)").format(n=PLASTIC_SHELL_LAYERS)
+        if any(r != "5 Simpson" for r in rules):
+            # the cure aims at the continuous section, not at the deck's own rule (Simpson 3:
+            # 0.667 of the fully plastic moment, Gauss 3: 0.861; code check R2-4)
+            layered += (f"; that is the continuous section's answer, not what the deck's "
+                        f"{' / '.join(r for r in rules if r != '5 Simpson')} points give Abaqus")
         cure: List[Tuple[Block, List[int]]] = []
         if self._approx:
             for b, els, ks, _n, _g in found:
@@ -14109,6 +14129,56 @@ class _Mesh:
                  + ". BCs, temperatures and initial conditions on both ends of an edge reach its "
                    "midside node, and so do the node sets of BCs, couplings, ties and output.")
         self.report.warn(f"[APPROX] {what} written as {layered}: {why}.{added}")
+
+    def _flag_plastic_composites(self, blocks: List[Block], plastic: set) -> None:
+        """Composite *SHELL SECTIONs (_plan_plastic_shells' plastic materials, ``plastic``)
+        with a plastic layer the middle of the section crosses.  ccx 2.23 integrates every layer
+        at 2 Gauss points through its thickness, Abaqus at the layer's Simpson points (3 by
+        default).  Fully plastic, a layer's stress moment is |z| times the yield stress, which
+        both rules integrate exactly where |z| has no kink, so they agree on every layer but the
+        one the middle crosses (the plastic neutral surface of a layup of one yield stress):
+        one layer, 0.667 (Abaqus) against 1.155 (ccx) times the fully plastic moment; the middle
+        of 3 equal layers, 0.963 against 1.017 for the section (code check R2-4, by hand
+        integration).  So such a section is reduced physics, unless the deck asks for 2 Gauss
+        points in that layer; an even layup whose middle lies between two layers is not."""
+        hits: List[str] = []
+        for b in blocks:
+            elset = (b.param("ELSET") or "").strip()
+            if b.keyword != "SHELL SECTION" or not b.has("COMPOSITE") or \
+                    self._continuum_shell_elset(elset) or \
+                    not any(e in self.geom.elements and ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS
+                            for e in self.geom.elset(elset)):
+                continue
+            rows = [g for g in (trimmed_fields(r) for r in merged_data_records(b)) if g]
+            try:
+                layers = [(pf(g[0]), pint(g[1]) if len(g) > 1 and g[1] else 3, g[2].upper())
+                          for g in rows if len(g) >= 3 and g[0] and g[2]]
+            except ValueError:
+                continue
+            if b.has("SYMMETRIC"):
+                layers += layers[::-1]
+            total = sum(th for th, _n, _m in layers)
+            if not layers or not total > 0:
+                continue
+            gauss = b.uparam("SECTION INTEGRATION") == "GAUSS"
+            z, mid, tol = 0.0, 0.5 * total, 1e-9 * total
+            for th, npts, mat in layers:
+                lo, z = z, z + th
+                if lo + tol < mid < z - tol:
+                    if mat in plastic and not (gauss and npts == 2):
+                        hits.append(elset)
+                    break
+        if not hits:
+            return
+        self.report.warn(f"Composite *SHELL SECTION with a plastic layer the middle of the section "
+                         f"crosses (ELSET={', '.join(hits[:3])}{', ...' if len(hits) > 3 else ''}): "
+                         f"ccx 2.23 integrates every layer at 2 Gauss points through its thickness, "
+                         f"Abaqus at the layer's Simpson points (3 by default); fully plastic they "
+                         f"agree on the other layers but part on that one (a one-layer section "
+                         f"carries 1.155 times the fully plastic moment in ccx, 0.667 in Abaqus). A "
+                         f"layup whose middle lies between two layers avoids it.")
+        self._reduces("plastic composite *SHELL SECTION with a layer through the middle (ccx 2.23 "
+                      "integrates it at 2 Gauss points, Abaqus at its Simpson points)")
 
     def _plan_quadratic_shells(self, blocks: List[Block]) -> None:
         """Composite shells ccx cannot run -> the quadratic shells it can.  ccx 2.23 reads

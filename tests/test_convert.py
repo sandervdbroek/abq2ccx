@@ -20480,6 +20480,12 @@ def test_plastic_c3d8_flagged_c3d8i_under_approximate():
             body, conv, _ = convert_str(deck, approximate=approx)
             assert not any("locks" in r for r in conv.reduced_physics), (step, approx)
             assert "TYPE=C3D8\n" in body and "C3D8I" not in body, (step, approx)
+    # a user material: whether its flow keeps the volume is the UMAT's, so a note, not a flag (R2-2)
+    umat = plastic.replace("*Elastic\n1000., 0.3\n*Plastic\n10., 0.\n", "*User Material, constants=2\n1000., 0.3\n")
+    _, conv, rep = convert_str(umat)
+    assert "Element C3D8 of a user material: ccx 2.23 lacks Abaqus' selectively reduced volume" in rep.text()
+    assert not any("locks" in r for r in conv.reduced_physics), conv.reduced_physics
+    assert "of a user material" not in convert_str(umat.replace("*Static", "*Frequency"))[2].text()
     assert not A.Converter._steps_can_yield(A.blocks_from_lines(plastic.replace("*Static", "*Frequency").splitlines()))
     assert A.Converter._steps_can_yield(A.blocks_from_lines(plastic.splitlines()))
 
@@ -20545,6 +20551,31 @@ def test_s3_shells_flagged_s6_under_approximate():
     assert S3_FLAG not in convert_str(rigid)[1].reduced_physics
 
 
+def test_plastic_composite_layer_through_the_middle_flagged():
+    # ccx 2.23 integrates every composite layer at 2 Gauss points, Abaqus at 3 Simpson points:
+    # fully plastic they agree on a layer without a kink of |z| and part on the one the middle
+    # crosses (one layer: 1.155 against 0.667 times the fully plastic moment): R2-4
+    deck = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,.5,0,0\n6,1,.5,0\n7,.5,1,0\n8,0,.5,0\n"
+            "*Element, type=S8R, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Material, name=P\n*Elastic\n1000., 0.3\n*Plastic\n1., 0.\n*Material, name=L\n*Elastic\n1000., 0.3\n"
+            "*Shell Section, elset=E, composite{rule}\n{plies}*Boundary\n1, 1, 6\n4, 1, 6\n"
+            "*Step\n*{proc}\n*End Step\n")
+    flag = ("plastic composite *SHELL SECTION with a layer through the middle (ccx 2.23 integrates it at "
+            "2 Gauss points, Abaqus at its Simpson points)")
+    for plies, rule, proc, flagged in (("0.1, 3, P\n", "", "Static", True),
+                                       ("0.05, 3, P\n0.05, 3, P\n", "", "Static", False),
+                                       ("0.03, 3, L\n0.04, 3, P\n0.03, 3, L\n", "", "Static", True),
+                                       ("0.03, 3, P\n0.04, 3, L\n0.03, 3, P\n", "", "Static", False),
+                                       ("0.05, 3, P\n", ", symmetric", "Static", False),
+                                       # mirrored: the middle lies between the two halves
+                                       ("0.04, 3, L\n0.02, 3, P\n", ", symmetric", "Static", False),
+                                       ("0.1, 2, P\n", ", section integration=gauss", "Static", False),
+                                       ("0.1, 3, P\n", "", "Frequency\n2", False)):
+        _, conv, rep = convert_str(deck.format(rule=rule, plies=plies, proc=proc))
+        assert (flag in conv.reduced_physics) == flagged, (plies, rule, proc, conv.reduced_physics)
+        assert ("a plastic layer the middle of the section crosses" in rep.text()) == flagged, plies
+
+
 def test_plastic_shell_sections_flagged_and_layered():
     # ccx 2.23 integrates an expanded shell's section through the thickness at 2 Gauss points
     # (S6 / S8: 3), Abaqus a plastic one at 5 Simpson points: in plastic bending ccx's carries
@@ -20566,6 +20597,11 @@ def test_plastic_shell_sections_flagged_and_layered():
     assert {t for t, _ in conv.geom.elements.values()} == {"S8R"}
     # (an S8R strip one element wide is flagged for itself: _warn_s8r_strips)
     assert conv.reduced_physics[0] == "--approximate: *SHELL SECTION of a plastic material"
+    # a deck's own rule (Simpson 3): the cure gives the continuous section's answer, which it says
+    own = deck.replace("*Shell Section,elset=E,material=M\n0.1\n", "*Shell Section,elset=E,material=M\n0.1, 3\n")
+    assert own != deck
+    _, _, rep = convert_str(own, approximate=True)
+    assert "that is the continuous section's answer, not what the deck's 3 Simpson points give" in rep.text()
     # Gauss points as many as ccx's (S4: 2): the deck's own rule; elastic: nothing to flag
     gauss = deck.replace("*Shell Section,elset=E,material=M\n0.1\n",
                          "*Shell Section,elset=E,material=M, section integration=GAUSS\n0.1, 2\n")

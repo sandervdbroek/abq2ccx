@@ -333,6 +333,9 @@ displacements and stresses within 1e-6) or the source repository's published cur
 
 The tier takes about six minutes. A twin catches an interface error: the shear deck built
 without `--stretch` is 37 % off its twin.
+A twin runs on the same elements, so it shares ccx's element behaviour: where a UMAT's
+deformation keeps the volume on `C3D8` / `CPE4` / `CAX4`, both lock alike (the conversion
+notes it), and the tier checks the interface, not that locking.
 
 The decks' own expectations stay as they are: a stock ccx stops on the UMAT (or runs its example).
 
