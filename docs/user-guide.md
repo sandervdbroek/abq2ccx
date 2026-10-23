@@ -97,8 +97,11 @@ a different model without saying so. With it, these reframings are made, each wi
   `SECTION=I` where `U1` cannot run (a deck with shells, NLGEOM, plasticity, …) → the
   rectangle with the same area and strong-axis inertia;
 * surface tractions under NLGEOM that follow the surface or act per current area (but a
-  follower `TRVEC` normal to flat faces, a pressure), and beam line loads under NLGEOM →
-  fixed nodal forces;
+  follower `TRVEC` normal to flat faces, a pressure), beam line loads, `*DLOAD ROTA`, and
+  `CENT` where it becomes nodal forces, under NLGEOM → fixed nodal forces from the undeformed
+  geometry;
+* B31 / B31R beams whose temperatures change the gradients across them (ccx ignores the
+  gradients on 2-node beams) → 3-node beams with a midside node, which read them;
 * surface elements that carry mass or rebar → left out of the mesh;
 * curved analytical rigid surfaces (`CIRCL` and `PARAB` profiles, `TYPE=REVOLUTION`,
   `FILLET RADIUS`) → flat facets about the slave faces' size (the warning gives their chord
@@ -111,7 +114,8 @@ a different model without saying so. With it, these reframings are made, each wi
   Abaqus/Standard ignores it; identical BCs on `*RIGID BODY` nodes → moved to the reference
   node even where that holds the body more than the BCs did;
 * a connector under NLGEOM whose linear form is not exact (a hinge between two moving
-  bodies) → written in its linear form;
+  bodies), and connector springs, dashpots, motions and loads on rotation components or turning
+  local directions under NLGEOM → written in their linear form;
 * an `*MPC LINK` → ccx's distance MPC in a deck whose first step is linear and a later one
   NLGEOM;
 * `S4R` shells (ccx 2.23 bends them only through their `C3D8R`'s hourglass stiffness) → `S4`,
@@ -300,7 +304,9 @@ that card. Messages are de-duplicated. A clean conversion says *"No conversion i
 
 ### Names the converter adds
 
-Everything the converter creates starts with `ABQ2CCX_`:
+Sets, surfaces, amplitudes and elements the converter creates start with `ABQ2CCX_`; copies of
+the deck's materials and sections keep its name with a suffix (`_PLANE_STRESS`, `_FIELD<k>`,
+`_MASS_SCALED`):
 
 | Name | What it is |
 | --- | --- |
@@ -318,6 +324,15 @@ Everything the converter creates starts with `ABQ2CCX_`:
 | `ABQ2CCX_VEL*`, `ABQ2CCX_ACC*` | amplitudes that integrate velocity and acceleration BCs |
 | `ABQ2CCX_TP*`, `ABQ2CCX_OUTPUT*` | generated `*TIME POINTS` and output node sets |
 | `ABQ2CCX_<material>` | a `*USER MATERIAL` whose name would make ccx run one of its own routines, renamed so ccx stops instead |
+| `ABQ2CCX_FREE_MASS` | the zero-stiffness springs that let ccx move point masses on nodes of no other element |
+| `ABQ2CCX_REF<n>_COUPLED` | the one surface of kinematic couplings that share reference node `n` |
+| `ABQ2CCX_CONN_*` | the springs and dashpots of connectors with linear elasticity or damping, a set per type and value |
+| `ABQ2CCX_GC*` | general contact under `--approximate`: the bodies' surfaces, their masters' unions and the hard frictionless interaction |
+| `ABQ2CCX_CENT*`, `ABQ2CCX_QUAD_REST_*` | the elements of each density a `*DLOAD CENT` reaches as ccx's `CENTRIF`, and the elements of a set that keep a load line where the others' load became nodal forces |
+| `ABQ2CCX_CONST`, `ABQ2CCX_DASH*` | amplitudes: a constant one, and the velocity histories that drive dashpot forces |
+| `ABQ2CCX_IMPERFECTION` | every node of the job deck whose modes or results `*IMPERFECTION, FILE=` reads (`--run`) |
+| `<material>_FIELD<k>`, `<elset>_FIELD<k>` | a material's copy at its elements' `k`-th set of field-variable values, and the section's elements that use it |
+| `<material>_MASS_SCALED` | a material's copy for the sections that explicit mass scaling scales |
 
 Two names are ccx's own: `AMPLITUDE=RAMP12357111317` on a `*BOUNDARY` is ccx's step ramp, which
 the converter uses where Abaqus/Standard ramps a displacement BC that ccx would apply at once,
@@ -355,8 +370,9 @@ transfer and coupled temperature–displacement analyses of solids, shells and b
 covered, with the common materials, orientations and composite layups (linear composite
 shells run as `S8R`/`S6`, composite continuum shells as one `C3D8I`/`C3D6` per ply), sets,
 surfaces, BCs, loads, ties, equations, couplings, rigid bodies, rigid elements and analytical
-rigid surfaces, and connectors without a behaviour. Contact is translated card by card, but ccx's
-penalty contact behaves differently — check it. User subroutines, connector behaviours,
+rigid surfaces, and connectors without a behaviour or with linear springs and dampers. Contact is
+translated card by card, but ccx's penalty contact behaves differently — check it. User
+subroutines, nonlinear connector behaviours,
 gaskets, inertia relief, Riks and some specialised materials and procedures have no
 equivalent and are flagged for manual work.
 

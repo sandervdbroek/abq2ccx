@@ -4500,8 +4500,11 @@ SPECIAL_UNSUPPORTED = {
                     "material); drop, or approximate with *DAMPING.",
     "INERTIA RELIEF": "ccx has no inertia relief; constrain with a soft spring-to-ground / 3-2-1 "
                       "set, or balance with the equilibrating load.",
-    "CONNECTOR BEHAVIOR": "connector behaviour has no ccx equivalent (a section that uses it is "
-                          "commented out); remodel as *SPRING / *DASHPOT / *MPC per the behaviour.",
+    "CONNECTOR BEHAVIOR": "a connector behaviour the converter cannot write (it writes linear "
+                          "*CONNECTOR ELASTICITY and DAMPING on CARTESIAN, BUSHING, CARDAN, ROTATION, "
+                          "REVOLUTE / HINGE and AXIAL components as springs and dashpots); a section "
+                          "that uses it is commented out; remodel as *SPRING / *DASHPOT / *MPC per "
+                          "the behaviour.",
     "CONNECTOR MOTION": "prescribes connector components; the converter writes it on the "
                         "components of CONN3D2 / CONN2D2 elements (a *BOUNDARY on a helper node "
                         "tied to the component), and this card names none it can write (or is an "
@@ -4518,9 +4521,14 @@ SPECIAL_UNSUPPORTED = {
     "REBAR": "rebar/reinforcement layers have no ccx equivalent; mesh reinforcements explicitly.",
     "CONCRETE": "concrete plasticity models are unsupported by ccx; substitute *PLASTIC or remodel.",
     "CONCRETE DAMAGED PLASTICITY": "unsupported by ccx; substitute *PLASTIC or remodel.",
+    **{f"CONNECTOR {k}": "connector elasticity or damping the converter cannot write (it writes "
+                         "the linear form on CARTESIAN, BUSHING, CARDAN, ROTATION, REVOLUTE / HINGE "
+                         "and AXIAL components as springs and dashpots); a *CONNECTOR SECTION that "
+                         "uses it is commented out."
+       for k in ("ELASTICITY", "DAMPING")},
     **{f"CONNECTOR {k}": "connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that "
                          "uses it is commented out)."
-       for k in ("ELASTICITY", "DAMPING", "STOP", "LOCK", "FRICTION", "PLASTICITY", "HARDENING",
+       for k in ("STOP", "LOCK", "FRICTION", "PLASTICITY", "HARDENING",
                  "DAMAGE INITIATION", "DAMAGE EVOLUTION", "CONSTITUTIVE REFERENCE",
                  "DERIVED COMPONENT", "POTENTIAL", "UNIAXIAL BEHAVIOR", "FAILURE")},
     "CONTACT": "Abaqus general contact has no ccx equivalent; --approximate writes it as "

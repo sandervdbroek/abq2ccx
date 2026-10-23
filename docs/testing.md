@@ -17,8 +17,8 @@ that a runaway job cannot fill the disk.
 **CI.** GitHub Actions ([`ci.yml`](../.github/workflows/ci.yml)) run on every push and pull
 request: the unit tests, the generated-reference check and a `pip install .` on Ubuntu, macOS
 and Windows with Python 3.9 (the oldest supported) and the newest; and `validate_with_ccx.py`
-and an `abq2ccx --run` on Ubuntu and on Windows (there on Python 3.9, whose `open()` defaults
-to the code page) with conda-forge's `calculix` 2.23 build 2 (`calculix-2.23-pl5321h484372f_2`;
+and an `abq2ccx --run` on Ubuntu and on Windows (there on Python 3.13, whose `open()` still
+defaults to the code page) with conda-forge's `calculix` 2.23 build 2 (`calculix-2.23-pl5321h484372f_2`;
 on Windows built by MinGW GCC against the UCRT), so CI solves with the ccx the checks were
 written on (Ubuntu packages 2.21; later conda-forge builds of 2.23 add fixes made after its
 release). The two runs agree

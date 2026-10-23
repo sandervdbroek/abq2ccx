@@ -197,8 +197,9 @@ converter comments `*TEMPERATURE` out there.
 
 The converter keeps these as `**` comments with guidance:
 
-* **Connectors with a behaviour**, fasteners and joints → `*RIGID BODY`, `*MPC`, `*SPRING`,
-  `*DASHPOT`. (Connectors without a behaviour are converted.)
+* **Connectors with a nonlinear behaviour** (plasticity, damage, friction, stops, locks),
+  fasteners and joints → `*RIGID BODY`, `*MPC`, `*SPRING`, `*DASHPOT`. (Connectors without a
+  behaviour, and linear connector elasticity and damping, are converted.)
 * **Gaskets** → a thin soft solid or a `*SPRING`; **cohesive elements and debonding** →
   contact or a nonlinear `*SPRING` (by default they run as a bonded thin continuum, warned).
 * **Abaqus general contact** (`*CONTACT`) → `*CONTACT PAIR`s between the surfaces that can

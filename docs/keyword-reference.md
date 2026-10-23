@@ -143,7 +143,7 @@ Any other keyword not in the CalculiX set and without a translator is emitted as
 | --- | --- |
 | `*VISCOELASTIC` | time-domain viscoelasticity is unsupported (ccx *VISCO is a creep STEP, not a material); drop, or approximate with *DAMPING. |
 | `*INERTIA RELIEF` | ccx has no inertia relief; constrain with a soft spring-to-ground / 3-2-1 set, or balance with the equilibrating load. |
-| `*CONNECTOR BEHAVIOR` | connector behaviour has no ccx equivalent (a section that uses it is commented out); remodel as *SPRING / *DASHPOT / *MPC per the behaviour. |
+| `*CONNECTOR BEHAVIOR` | a connector behaviour the converter cannot write (it writes linear *CONNECTOR ELASTICITY and DAMPING on CARTESIAN, BUSHING, CARDAN, ROTATION, REVOLUTE / HINGE and AXIAL components as springs and dashpots); a section that uses it is commented out; remodel as *SPRING / *DASHPOT / *MPC per the behaviour. |
 | `*CONNECTOR MOTION` | prescribes connector components; the converter writes it on the components of CONN3D2 / CONN2D2 elements (a *BOUNDARY on a helper node tied to the component), and this card names none it can write (or is an OP=NEW after an earlier one); the prescribed motion is missing. |
 | `*CONNECTOR LOAD` | loads connector components; the converter writes it on the components of CONN3D2 / CONN2D2 elements (a *CLOAD on a helper node tied to the component), and this card names none it can write (or is an OP=NEW after an earlier one); the load is missing. |
 | `*GASKET BEHAVIOR` | gasket behaviour has no ccx equivalent. |
@@ -152,8 +152,8 @@ Any other keyword not in the CalculiX set and without a translator is emitted as
 | `*REBAR` | rebar/reinforcement layers have no ccx equivalent; mesh reinforcements explicitly. |
 | `*CONCRETE` | concrete plasticity models are unsupported by ccx; substitute *PLASTIC or remodel. |
 | `*CONCRETE DAMAGED PLASTICITY` | unsupported by ccx; substitute *PLASTIC or remodel. |
-| `*CONNECTOR ELASTICITY` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
-| `*CONNECTOR DAMPING` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
+| `*CONNECTOR ELASTICITY` | connector elasticity or damping the converter cannot write (it writes the linear form on CARTESIAN, BUSHING, CARDAN, ROTATION, REVOLUTE / HINGE and AXIAL components as springs and dashpots); a *CONNECTOR SECTION that uses it is commented out. |
+| `*CONNECTOR DAMPING` | connector elasticity or damping the converter cannot write (it writes the linear form on CARTESIAN, BUSHING, CARDAN, ROTATION, REVOLUTE / HINGE and AXIAL components as springs and dashpots); a *CONNECTOR SECTION that uses it is commented out. |
 | `*CONNECTOR STOP` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
 | `*CONNECTOR LOCK` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |
 | `*CONNECTOR FRICTION` | connector behaviour has no ccx equivalent (a *CONNECTOR SECTION that uses it is commented out). |

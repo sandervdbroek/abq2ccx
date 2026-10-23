@@ -95,7 +95,8 @@ with the reason, so ccx never silently runs a different model.
 
 `python validate_with_ccx.py` converts the bundled examples, runs them in CalculiX (it finds
 `ccx`, including FreeCAD's copy) and compares each result with an independent reference. It
-prints one `PASS` line per check, about 600 in all; [testing](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/testing.md) lists them.
+prints one `PASS` line per result, about 830 from 99 checks: `--list` names the checks,
+`--only` runs some of them, and [testing](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/testing.md) describes them.
 
 | Check | Reference | Agreement |
 | --- | --- | --- |
@@ -144,7 +145,7 @@ read (+ *INCLUDE, *PARAMETER)  →  flatten *PART/*INSTANCE/*ASSEMBLY
 | Translated | a handler adjusts the keyword, parameters or data | `*ELASTIC`, `*SHELL SECTION`, `*STEP`, `*DSLOAD`, output cards |
 | Equivalent | mapped to the CalculiX construct that does the same | `*MPC BEAM` → `*RIGID BODY`, connectors → `*EQUATION`s, tractions → `*CLOAD` |
 | Dropped | organisational, no CalculiX meaning | `*PART`/`*INSTANCE`/`*ASSEMBLY` (flattened), `*PREPRINT` |
-| Commented | no equivalent: kept as `**` comments with a warning | `*VISCOELASTIC`, `*CONNECTOR BEHAVIOR`, `*INERTIA RELIEF` |
+| Commented | no equivalent: kept as `**` comments with a warning | `*VISCOELASTIC`, `*CONNECTOR PLASTICITY`, `*INERTIA RELIEF` |
 
 The [architecture guide](https://github.com/sandervdbroek/abq2ccx/blob/main/docs/architecture.md) describes the pipeline and how to extend it.
 
@@ -155,7 +156,7 @@ The [architecture guide](https://github.com/sandervdbroek/abq2ccx/blob/main/docs
   (`--abaqus-umat`), a VUMAT has no ccx interface.
 * Cohesive and gasket elements run as thin continua (their traction-separation law is lost;
   warned). Abaqus general contact (`*CONTACT`; `--approximate`: contact pairs between the
-  bodies), connector behaviours, inertia relief and materials such as viscoelasticity and
+  bodies), nonlinear connector behaviours, inertia relief and materials such as viscoelasticity and
   concrete damaged plasticity have no equivalent and are flagged for remodelling; a deck that
   runs without them is flagged as reduced physics.
 * ccx's own first-order elements are not Abaqus': its `CPE4`/`C3D8`/`CAX4` are plain 2×2(×2)
