@@ -9135,19 +9135,22 @@ def dragged_mass_deck(bc):
     which a BC moves over a *DYNAMIC step of 2 (fixed increments of 0.005): ``bc`` "ramp" (a
     displacement of 0.1 on a ramp amplitude), "plain" (the same without one: ramped from rest),
     "kink" (0.1 on the points (0, 0), (1, 0.25), (2, 1): 0.025 then 0.075 per unit time),
-    "velocity" (TYPE=VELOCITY 0.1 on that ramp amplitude: 0.05 t), or "continued" (0.1 on the
+    "velocity" (TYPE=VELOCITY 0.1 on that ramp amplitude: 0.05 t), "continued" (0.1 on the
     points (0, 0), (1, 1), (2, 1): 0.1 per unit time, then still; then a second step of 2 that
-    gives it again on the points (0, 1), (2, 2), from where the first left it: 0.05)."""
+    gives it again on the points (0, 1), (2, 2), from where the first left it: 0.05), or
+    "moving" (the ramp, then that second step: 0.05 throughout, the end moving as the second
+    step starts)."""
     card = {"ramp": "*BOUNDARY, AMPLITUDE=RAMP\n2, 1, 1, 0.1", "plain": "*BOUNDARY\n2, 1, 1, 0.1",
             "kink": "*BOUNDARY, AMPLITUDE=KINK\n2, 1, 1, 0.1",
             "velocity": "*BOUNDARY, TYPE=VELOCITY, AMPLITUDE=RAMP\n2, 1, 1, 0.1",
-            "continued": "*BOUNDARY, AMPLITUDE=HOLD\n2, 1, 1, 0.1"}[bc]
+            "continued": "*BOUNDARY, AMPLITUDE=HOLD\n2, 1, 1, 0.1",
+            "moving": "*BOUNDARY, AMPLITUDE=RAMP\n2, 1, 1, 0.1"}[bc]
     step = "*STEP, INC=100000\n*DYNAMIC, DIRECT\n0.005, 2.\n{}\n*NODE PRINT, NSET=P\nU\n*END STEP\n"
     return ("*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n*NSET, NSET=P\n1\n*ELEMENT, TYPE=MASS, ELSET=EM\n11, 1\n"
             "*MASS, ELSET=EM\n1.\n*ELEMENT, TYPE=DASHPOTA, ELSET=D\n21, 1, 2\n*DASHPOT, ELSET=D\n\n10.\n"
             "*AMPLITUDE, NAME=RAMP\n0., 0., 2., 1.\n*AMPLITUDE, NAME=KINK\n0., 0., 1., 0.25, 2., 1.\n"
             "*AMPLITUDE, NAME=HOLD\n0., 0., 1., 1., 2., 1.\n*AMPLITUDE, NAME=MORE\n0., 1., 2., 2.\n*BOUNDARY\n1, 2, 3\n2, 2, 3\n" + step.format(card) +
-            (step.format("*BOUNDARY, AMPLITUDE=MORE\n2, 1, 1, 0.1") if bc == "continued" else ""))
+            (step.format("*BOUNDARY, AMPLITUDE=MORE\n2, 1, 1, 0.1") if bc in ("continued", "moving") else ""))
 
 
 def dragged_mass_reference(bc, m=1.0, c=10.0, t_end=2.0):
@@ -9158,6 +9161,8 @@ def dragged_mass_reference(bc, m=1.0, c=10.0, t_end=2.0):
         return v * t + (v0 - v) * tau * (1.0 - math.exp(-t / tau)), v + (v0 - v) * math.exp(-t / tau)
     if bc in ("ramp", "plain"):
         return const(0.05, t_end)[0]
+    if bc == "moving":
+        return const(0.05, 2.0 * t_end)[0]
     if bc == "continued":
         x1, v1 = const(0.1, 1.0)
         x2, v2 = const(0.0, 1.0, v1)
@@ -19507,16 +19512,18 @@ def check_t123(ccx, env, tmp, shared):
     # a dashpot whose other end a BC moves in *DYNAMIC: ccx damped as if that end stood still
     # (the dragged mass did not move); now the missing force on the free end.  Against the
     # exact motion m x'' = c (v_b - x')
-    for bc in ("ramp", "plain", "kink", "velocity", "continued"):
+    # ("moving": ccx sets the second step's accelerations up with the velocity the first left
+    # the end, so the force starts there on its change: exact to the printed digits)
+    for bc in ("ramp", "plain", "kink", "velocity", "continued", "moving"):
         u = review_run(dragged_mass_deck(bc), f"dragged_mass_{bc}", dat_displacements)
         ok = bool(u) and 1 in u
         if ok:
             want = dragged_mass_reference(bc)
             err = abs(u[1][0] / want - 1.0)
-            ok = err < 1e-4
+            ok = err < (1e-6 if bc == "moving" else 1e-4)
             print(f"{'PASS' if ok else 'FAIL'}  dragged_mass ({bc}: a unit mass dragged through a "
                   f"DASHPOTA by its BC-driven other end): x = {u[1][0]:.7g} (exact {want:.7g}, "
-                  f"{err:.1e} off; before 0)")
+                  f"{err:.1e} off; before {'0.195125' if bc == 'moving' else '0'})")
         failures += 0 if ok else 1
 
     # --approximate: B31 / B31R beams whose temperature gradients change run as B32R, which

@@ -552,9 +552,11 @@ entries. The GitHub release notes use the same section.
   - A dashpot whose other end a BC moves in a small-strain implicit `*DYNAMIC` step: ccx damps
     as if that end stood still (a mass dragged through a dashpot did not move). The missing
     force, c (v . n) n, now goes on the free end as a `*CLOAD` on an amplitude of the BC's
-    velocity history (displacements on TABULAR amplitudes or ramped from rest, velocities). A
-    displacement that jumps (an amplitude that starts elsewhere than the node stands, or has two
-    points at one time) passes an impulse c du that no load amplitude carries: warned.
+    velocity history (displacements on TABULAR amplitudes or ramped from rest, velocities); at a
+    later step's start, where ccx sets the accelerations up with the velocity the step before
+    left the end, on the change of that velocity. A displacement that jumps (an amplitude that
+    starts elsewhere than the node stands, or has two points at one time) passes an impulse
+    c du that no load amplitude carries: warned.
   - `--approximate`: B31 / B31R beams of a RECT section whose temperature gradients change run
     as B32R, which reads the gradients (the B31 stays straight).
 

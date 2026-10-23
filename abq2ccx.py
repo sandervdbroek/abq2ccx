@@ -10590,12 +10590,17 @@ class _Mesh:
         strain implicit step that force goes on the free DOF as a *CLOAD on an amplitude of its
         own (_dashpot_cloads), which the next step takes off: exact where the prescribed
         velocity is a known function of time that a ccx amplitude carries (_bc_velocity;
-        probed: the dragged mass moves 0.09502 for the exact 0.095).  Warned, reduced physics,
-        elsewhere: under NLGEOM (the axis turns), in an explicit step, an end with a *TRANSFORM,
-        in a constraint (an *EQUATION, MPC, coupling, rigid body; the converter's DASHPOT1 /
-        DASHPOT2 form), a coefficient that is not one constant, a velocity history it does not
-        know, a deck *CLOAD or a converted load on the DOF, a linear perturbation step next to
-        the step."""
+        probed: the dragged mass moves 0.09502 for the exact 0.095).  As a step starts, ccx
+        sets up the accelerations with the velocity the step before left a prescribed node
+        (probed: a mass dragged on through two *DYNAMIC steps moved 0.195125 for 0.195), so
+        there the force is the one on the change of that velocity, then the step's (a jump at
+        step time 0: 0.1950000), also where the node now stands still; where that velocity is
+        not known (a node free in the step before, a step other than *DYNAMIC since one that
+        moved it): warned.  Warned, reduced physics, elsewhere: under NLGEOM (the axis turns),
+        in an explicit step, an end with a *TRANSFORM, in a constraint (an *EQUATION, MPC,
+        coupling, rigid body; the converter's DASHPOT1 / DASHPOT2 form), a coefficient that is
+        not one constant, a velocity history it does not know, a deck *CLOAD or a converted
+        load on the DOF, a linear perturbation step next to the step."""
         self._dash_cloads, self._dash_amps, self._dash_zero, self._dash_amp_points = {}, {}, {}, {}
         if not self.steps.dynamic:
             return
@@ -10620,12 +10625,16 @@ class _Mesh:
         steps = self.steps.steps
         hit: List[int] = []
         fixes: Dict[int, Dict[Tuple[int, int], list]] = {}
+        kicks: Dict[int, Dict[Tuple[int, int], float]] = {}     # step -> DOF -> the force ccx counts at its start
         prev: Optional[Tuple[Step, dict]] = None     # the step before and its BCs
+        carried: Dict[Tuple[int, int], Optional[float]] = {}    # the velocity ccx holds as a step starts
         for st, state in zip(steps, self.steps.states(lambda b: given[id(b)], skip=self.steps.lc2,
                                                       blocks=cards)):
             before, prev = prev, (st, dict(state))
             if st.proc != "DYNAMIC" or st.perturbation:
+                carried = {k: None if v != 0.0 else 0.0 for k, v in carried.items()}
                 continue
+            v0, carried = carried, {}
             moving: Dict[Tuple[int, int], Optional[list]] = {}
             for k, (b, mag) in state.items():
                 # (where the DOF is as the step starts: 0 at rest, else where the step before's
@@ -10635,10 +10644,13 @@ class _Mesh:
                 v = self._bc_velocity(b, mag, st, step_of.get(id(b)), defs, k in rest[st.no][0], start)
                 if v != "still":
                     moving[k] = v
+            carried = {k: (moving[k][-1][1] if moving[k] else None) if k in moving else 0.0 if k in state
+                       else None for k in query}
             pert = any(0 <= i < len(steps) and steps[i].perturbation for i in (st.no - 2, st.no))
             for e, (a, z) in ends.items():
                 p = [k for k in moving if k[0] in (a, z)]
-                if not p:
+                held = {k: v0.get(k, 0.0) for k in state if k[0] in (a, z) and v0.get(k, 0.0) != 0.0}
+                if not p and not held:
                     continue
                 axis = vsub(self.geom.nodes[z], self.geom.nodes[a]) \
                     if a in self.geom.nodes and z in self.geom.nodes else (0.0, 0.0, 0.0)
@@ -10648,19 +10660,27 @@ class _Mesh:
                                  moving[(y, j)]) for y, j in p]
                        for x in (a, z) for i in (1, 2, 3) if (x, i) not in state}
                 own = {k: [t for t in ts if t[0]] for k, ts in own.items()}
+                # (the share ccx counts as the step starts: the velocities the step before left)
+                kick = {(x, i): sum(coef.get(e, 0.0) * n[i - 1] * n[j - 1] * (-1.0 if y == x else 1.0) * v
+                                    for (y, j), v in held.items() if v is not None)
+                        for x, i in own}
                 if st.explicit or st.nlgeom or pert or not own or coef.get(e) is None or \
                         vnorm(axis) == 0.0 or any(x in tied or x in self._transformed for x in (a, z)) or \
-                        any(moving[k] is None for k in p) or \
-                        any(k in self._deck_cloads for k, ts in own.items() if ts):
-                    hit.append(a if any(k[0] == a for k in p) else z)
+                        any(moving[k] is None for k in p) or None in held.values() or \
+                        any(k in self._deck_cloads for k, ts in own.items() if ts or kick[k]):
+                    hit.append(a if any(k[0] == a for k in list(p) + list(held)) else z)
                     continue
                 for k, ts in own.items():
-                    if ts:
+                    if ts or kick[k]:
                         fixes.setdefault(st.no, {}).setdefault(k, []).extend(ts)
+                    if kick[k]:
+                        kicks.setdefault(st.no, {})[k] = kicks.get(st.no, {}).get(k, 0.0) + kick[k]
         names: Dict[tuple, str] = {}
         for s, dofs in sorted(fixes.items()):
             for nd, funcs in dofs.items():
                 pts = tuple(piecewise_sum(funcs, steps[s - 1].period))
+                if kicks.get(s, {}).get(nd):          # (a jump at step time 0: _dashpot_cloads)
+                    pts = ((0.0, pts[0][1] - kicks[s][nd]),) + pts
                 big = max(abs(v) for _, v in pts)
                 if big == 0.0:
                     continue
@@ -10686,8 +10706,9 @@ class _Mesh:
                          f"small-strain implicit steps, on dashpots outside constraints and "
                          f"*TRANSFORMs, of one constant coefficient, for displacement BCs on TABULAR "
                          f"amplitudes or ramped from rest and velocity BCs, where the motion does not "
-                         f"jump (a displacement jump's impulse, c times the jump, has no such form).",
-                         once=True)
+                         f"jump (a displacement jump's impulse, c times the jump, has no such form) "
+                         f"and the end's velocity as the step starts is known (none after another "
+                         f"step since a *DYNAMIC step moved it).", once=True)
         self._reduces("dashpots on nodes moved by BCs in *DYNAMIC (ccx ignores their velocity)")
 
     def _dashpot_coefficients(self, blocks: List[Block], ends: Dict[int, tuple]) -> Dict[int, float]:
@@ -10805,8 +10826,9 @@ class _Mesh:
         constant amplitude CONST_AMP (ccx holds a step-time load at its end value).  A jump goes
         from 1e-6 of the step before it to 1e-6 after: the mean at its time, which ccx's
         integration takes there (probed: exact, where the jump's two values at that time are
-        1.4e-3 / 2.7e-3 off).  A DOF a converted load (nodal forces) shares is left to it,
-        warned in its step."""
+        1.4e-3 / 2.7e-3 off); one at step time 0 from 0 to 1e-6 of the step (the value at 0 is
+        the one ccx sets the step's accelerations up with: _plan_driven_dashpots).  A DOF a
+        converted load (nodal forces) shares is left to it, warned in its step."""
         s = self.emit.no
         taken = {nd for f, _a in self.emit.nodal_loads.values() for nd in f}
         fix = [(nd, name) for nd, name in self._dash_cloads.get(s, ()) if nd not in taken]
@@ -10823,7 +10845,7 @@ class _Mesh:
                 for i in range(len(pts) - 1):
                     if pts[i][0] == pts[i + 1][0]:
                         t = pts[i][0]
-                        pts[i], pts[i + 1] = (t - 1e-6 * span, pts[i][1]), (t + 1e-6 * span, pts[i + 1][1])
+                        pts[i], pts[i + 1] = (max(t - 1e-6 * span, 0.0), pts[i][1]), (t + 1e-6 * span, pts[i + 1][1])
                 out += [f"*AMPLITUDE, NAME={name}"] + amplitude_lines(pts)
             groups: "OrderedDict[str, List[str]]" = OrderedDict()
             for nd, name in fix:

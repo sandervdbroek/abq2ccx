@@ -26002,11 +26002,16 @@ def test_dashpot_on_a_bc_driven_node_gets_its_missing_force():
     s1 = _step(body, 1)
     assert _card_at(s1, "*AMPLITUDE, NAME=ABQ2CCX_DASH1") == ["0, 0, 1, 0.25, 2, 1"]   # 5 x 0.2 x KINK
     assert _card_at(s1, "*CLOAD, AMPLITUDE=ABQ2CCX_DASH1") == ["1, 1, 1.", "1, 2, 1."]
-    # the next step takes it off at once
-    body, conv, _ = convert_str(DRAGGED_MASS.format("1., 0.") + step.format("", "", "", "", "0.1") +
+    # the next step takes it off at once (where the end stands still as it ends; else from
+    # the force ccx counts as the step starts: test_dashpot_force_where_a_step_starts_with_...)
+    body, conv, _ = convert_str(DRAGGED_MASS.format("1., 0.") + "*Amplitude, name=STOP\n0., 0., 1., 1., 2., 1.\n" +
+                                step.format("", "", "", ", amplitude=STOP", "0.1") +
                                 "*Step\n*Dynamic\n0.01, 1.\n*End Step\n")
     assert _card_at(_step(body, 2), "*CLOAD, AMPLITUDE=ABQ2CCX_CONST") == ["1, 1, 0."]
     assert "*AMPLITUDE, NAME=ABQ2CCX_CONST" in _step(body, 2)
+    body, conv, _ = convert_str(DRAGGED_MASS.format("1., 0.") + step.format("", "", "", "", "0.1") +
+                                "*Step\n*Dynamic\n0.01, 1.\n*End Step\n")
+    assert _card_at(_step(body, 2), "*AMPLITUDE, NAME=ABQ2CCX_DASH2") == ["0, -0.5, 1e-06, 0, 1, 0"]
     # a BC that holds the node: nothing; warned where the converter has no form
     body, conv, rep = convert_str(DRAGGED_MASS.format("1., 0.") + step.format("", "", "", "", "0."))
     assert "ABQ2CCX_DASH" not in body and "Dashpot(s) on" not in rep.text()
@@ -26259,7 +26264,7 @@ def test_dashpot_bc_that_jumps_warned():
     # that starts the amplitude over at 0 jumps back: warned there
     body, conv, rep = convert_str(DRAGGED_MASS.format("1., 0.") + amps + step.format("RAMP") +
                                   step.format("MORE"))
-    assert _card_at(_step(body, 2), "*CLOAD, AMPLITUDE=ABQ2CCX_DASH1") == ["1, 1, 1."]
+    assert _card_at(_step(body, 2), "*CLOAD, AMPLITUDE=ABQ2CCX_DASH2") == ["1, 1, 1."]
     assert "Dashpot(s) on" not in rep.text() and not conv.reduced_physics
     body, conv, rep = convert_str(DRAGGED_MASS.format("1., 0.") + amps + step.format("RAMP") * 2)
     assert "ABQ2CCX_DASH1" in _step(body, 1) and "ABQ2CCX_DASH" not in _step(body, 2)
@@ -26269,6 +26274,38 @@ def test_dashpot_bc_that_jumps_warned():
         body, conv, _ = convert_str(DRAGGED_MASS.format("1., 0.") + amps + "*Amplitude, name=TT, time=TOTAL TIME\n"
                                     + points + "\n" + step.format("RAMP") + step.format("TT"))
         assert ("ABQ2CCX_DASH" in _step(body, 2)) != jumps and (why in conv.reduced_physics) == jumps
+
+
+def test_dashpot_force_where_a_step_starts_with_the_end_moving():
+    # ccx sets a step's accelerations up with the velocity the step before left the prescribed
+    # end (probed: dragged on through two *DYNAMIC steps, 0.195125 for 0.195): at step time 0
+    # the force on the change of that velocity, then the step's (0.1950000; also with another
+    # increment size, a TIME=TOTAL TIME amplitude, the end then standing still)
+    amps = ("*Amplitude, name=RAMP\n0., 0., 2., 1.\n*Amplitude, name=MORE\n0., 1., 2., 2.\n"
+            "*Amplitude, name=FAST\n0., 1., 2., 3.\n*Amplitude, name=TT, time=TOTAL TIME\n0., 0., 4., 2.\n")
+    step = "*Step\n*{}\n0.01, 2.\n{}*End Step\n"
+    bc = "*Boundary, amplitude={}\n2, 1, 1, 0.1\n"
+    why = "dashpots on nodes moved by BCs in *DYNAMIC (ccx ignores their velocity)"
+    for second, points in ((bc.format("MORE"), "0, 0, 2e-06, 0.5, 2, 0.5"),       # (c v = 0.5 on)
+                           (bc.format("FAST"), "0, 0.5, 2e-06, 1, 2, 1"),         # (0.05 -> 0.1)
+                           ("", "0, -0.5, 2e-06, 0, 2, 0")):                      # (standing still)
+        body, conv, rep = convert_str(DRAGGED_MASS.format("1., 0.") + amps + step.format("Dynamic", bc.format("RAMP")) +
+                                      step.format("Dynamic", second))
+        assert _card_at(_step(body, 2), "*AMPLITUDE, NAME=ABQ2CCX_DASH2") == [points], second
+        assert _card_at(_step(body, 2), "*CLOAD, AMPLITUDE=ABQ2CCX_DASH2") == ["1, 1, 1."]
+        assert not conv.reduced_physics
+    body, conv, _ = convert_str(DRAGGED_MASS.format("1., 0.") + amps + step.format("Dynamic", bc.format("TT")) +
+                                step.format("Dynamic", ""))
+    assert _card_at(_step(body, 2), "*AMPLITUDE, NAME=ABQ2CCX_DASH2") == ["0, 0, 2e-06, 0.5, 2, 0.5"]
+    # a static step before the first *DYNAMIC step leaves no velocity (probed: exact); one
+    # after a *DYNAMIC step that moved the end: ccx's velocity there not known, warned
+    body, conv, _ = convert_str(DRAGGED_MASS.format("1., 0.") + amps + step.format("Static", bc.format("RAMP")) +
+                                step.format("Dynamic", bc.format("MORE")))
+    assert _card_at(_step(body, 2), "*AMPLITUDE, NAME=ABQ2CCX_DASH1") == ["0, 0.5, 2, 0.5"]
+    assert not conv.reduced_physics
+    body, conv, _ = convert_str(DRAGGED_MASS.format("1., 0.") + amps + step.format("Dynamic", bc.format("RAMP")) +
+                                step.format("Static", "") + step.format("Dynamic", bc.format("MORE")))
+    assert "ABQ2CCX_DASH" not in _step(body, 3) and why in conv.reduced_physics
 
 
 def test_knot_drilling_held_where_op_new_releases_a_clamp():
