@@ -15185,7 +15185,7 @@ def main():
     # (S4, S8R) or 3 (S6) Gauss points, Abaqus a plastic one at 5 Simpson points, which carry
     # exactly the fully plastic moment: a strip in 4-point bending under displacement control
     # levels off at 1.155 (ccx then stops: the section has no tangent left) / 0.866 times its
-    # limit load; --approximate writes a composite of 4 equal layers (S4 -> S8R): 1.000
+    # limit load; --approximate writes a composite of 2 equal layers (S4 -> S8R): 1.000
     def strip_rf(dat):
         tot = dat_tables(dat, "total force")
         return [-tot[-1][0][2]] if tot and tot[-1] else None
@@ -15206,12 +15206,12 @@ def main():
             flagged = any(r.startswith("plastic *SHELL SECTION") for r in conv.reduced_physics)
             with open(os.path.join(tmp, f"{tag}_approximate.inp"), encoding="utf-8") as fh:
                 body = fh.read()
-            written = body.count(", , M\n") == 4 and ("*ELEMENT, TYPE=S8R\n" in body) == (typ == "S4")
+            written = body.count(", , M\n") == 2 and ("*ELEMENT, TYPE=S8R\n" in body) == (typ == "S4")
             err = abs(app[0] / ref - 1)
             ok = flagged and written and err < 0.01
             print(f"{'PASS' if ok else 'FAIL'}  {tag} (a plastic {typ} strip in 4-point bending pushed to 6 "
                   f"times its elastic deflection at the limit load, its reaction / the limit load): "
-                  f"{app[0] / ref:.4f} as {'4 equal layers' if written else 'NOT 4 layers'}"
+                  f"{app[0] / ref:.4f} as {'2 equal layers' if written else 'NOT 2 layers'}"
                   f"{' of S8R' if typ == 'S4' else ''} (--approximate); as written {raw[0] / ref:.4f}"
                   f"{'' if status == 'solved' else ' when ccx stopped'}, {'flagged' if flagged else 'NOT flagged'} "
                   f"reduced physics")

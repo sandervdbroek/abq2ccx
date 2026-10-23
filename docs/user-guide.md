@@ -127,7 +127,7 @@ a different model without saying so. With it, these reframings are made, each wi
 * `S3` / `S3R` shells (one `C3D6` wedge in ccx 2.23, which locks in bending) → `S6` with
   midside nodes;
 * a plastic `*SHELL SECTION` (ccx integrates it at 2 Gauss points through the thickness) → a
-  composite of 4 equal layers, its linear shells `S8R` / `S6`;
+  composite of 2 equal layers, its linear shells `S8R` / `S6`;
 * `S4`, `S4R5`, `S4T` and `S4RT` shells collapsed to a triangle → `S3`, `S3R`, `S3T`, `S3RT`
   (a collapsed `S4R` is `S3R` without the option: exact);
 * a `*DAMPING` value the materials share but Abaqus does not apply to point masses, springs or

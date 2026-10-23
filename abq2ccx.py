@@ -449,10 +449,11 @@ S4_MAX_WIDTH = 6.0
 # The Gauss points through the thickness of the brick ccx 2.23 expands a shell into (C3D6,
 # C3D8I, C3D8R, C3D15, C3D20, C3D20R), where Abaqus integrates a shell section at 5 Simpson
 # points by default; --approximate writes a plastic section as a composite of
-# PLASTIC_SHELL_LAYERS equal layers of its material, each at 2 Gauss points
+# PLASTIC_SHELL_LAYERS equal layers of its material, each at 2 Gauss points: two, as ccx 2.23
+# stops on 3 or more on a mesh of knots ('*ERROR in knotmpc: increase nk_')
 # (Converter._plan_plastic_shells)
 SHELL_SECTION_POINTS = {"S3": 2, "S4": 2, "S4R": 1, "S6": 3, "S8": 3, "S8R": 2}
-PLASTIC_SHELL_LAYERS = 4
+PLASTIC_SHELL_LAYERS = 2
 # Elements ccx 2.23 also expands into one C3D8R brick integrated at a single point
 # (gen3delem.f; the S4R is _plan_s4r_shells') -> the fully integrated element --approximate
 # writes them as (Converter._plan_one_point_bricks)
@@ -13985,9 +13986,12 @@ class _Mesh:
         end, S6 0.869.  So reduced physics — unless the deck asks for Gauss points as many as
         every element's brick has (SECTION INTEGRATION=GAUSS) —, or under --approximate the
         section written as a composite of PLASTIC_SHELL_LAYERS equal layers of its material
-        (ccx: 2 Gauss points per layer, 8 through the thickness): the strip then reaches 1.0004
-        of its limit load on S8R and 1.003 on S6, first yield at 1.12 times the first-yield
-        moment.  ccx runs composite shells on S8R / S6 only, so the section's linear shells
+        (ccx: 2 Gauss points per layer, 4 through the thickness, which give the fully plastic
+        moment exactly as the 5 Simpson points do): the strip then reaches 1.0004 of its limit
+        load on S8R and 1.002 on S6, first yield at 1.27 times the first-yield moment (4 layers:
+        1.12, but ccx 2.23 stops on 3 or more layers where the shells' nodes are knots: '*ERROR
+        in knotmpc: increase nk_', juliafem_shell_box).  ccx runs composite shells on S8R / S6
+        only, so the section's linear shells
         become S8R / S6 with a node at the middle of every edge (_upgrade_linear_shells, the
         linear shells joined to them by an edge too); a section with S8 or without a constant
         thickness is left as it is (and flagged)."""
@@ -14041,8 +14045,9 @@ class _Mesh:
                f"plastic one (probed: a strip in 4-point bending reaches 1.155 times its limit load "
                f"on S4 and S8R, elastic to the end, 0.869 on S6); stretched, they agree")
         layered = ("a composite of {n} equal layers of its material, which ccx integrates at 2 "
-                   "Gauss points each (the strip reaches 1.0004 of its limit load on S8R, 1.003 on "
-                   "S6, first yield at 1.12 times the first-yield moment)").format(n=PLASTIC_SHELL_LAYERS)
+                   "Gauss points each, the fully plastic moment exactly (the strip reaches 1.0004 of "
+                   "its limit load on S8R, 1.002 on S6, first yield at 1.27 times the first-yield "
+                   "moment)").format(n=PLASTIC_SHELL_LAYERS)
         cure: List[Tuple[Block, List[int]]] = []
         if self._approx:
             for b, els, ks, _n, _g in found:

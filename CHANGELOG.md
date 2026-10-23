@@ -27,7 +27,7 @@ physics.
   wedge, which locks in bending on flat and curved shells (the Scordelis-Lo roof: 0.12 of its
   deflection on 8 × 8 squares): `--approximate` writes `S6`. A plastic `*SHELL SECTION` is
   integrated at 2 Gauss points through the thickness (Abaqus: 5 Simpson points), so it carries
-  1.155 times the fully plastic moment: `--approximate` writes a composite of 4 equal layers.
+  1.155 times the fully plastic moment: `--approximate` writes a composite of 2 equal layers.
 * **Geostatic initial stresses and steps** — `*INITIAL CONDITIONS, TYPE=STRESS, GEOSTATIC` was
   commented out. It is now written at each of ccx's integration points: the vertical stress
   linear in the elevation (z in 3-D, y in plane and axisymmetric models) through the card's two

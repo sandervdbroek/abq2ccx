@@ -20514,8 +20514,8 @@ def test_s3_shells_flagged_s6_under_approximate():
 def test_plastic_shell_sections_flagged_and_layered():
     # ccx 2.23 integrates an expanded shell's section through the thickness at 2 Gauss points
     # (S6 / S8: 3), Abaqus a plastic one at 5 Simpson points: in plastic bending ccx's carries
-    # 1.155 (0.86) times the fully plastic moment; --approximate writes a composite of 4 equal
-    # layers (8 Gauss points, the fully plastic moment exact), its S4 as S8R
+    # 1.155 (0.86) times the fully plastic moment; --approximate writes a composite of 2 equal
+    # layers (4 Gauss points, the fully plastic moment exact), its S4 as S8R
     deck = S4 + "*Plastic\n1., 0.\n*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Static\n*Cload\n5, 3, 1.\n*End Step\n"
     deck = deck.replace("*Elastic\n1000.,0.3\n*Plastic", "*Elastic\n1000.,0.3\n*Plastic")
     _, conv, rep = convert_str(deck)
@@ -20524,7 +20524,7 @@ def test_plastic_shell_sections_flagged_and_layered():
            "integrates an expanded shell's section through the thickness at its brick's Gauss points (2 on " \
            "S4), Abaqus at the section's 5 Simpson points" in rep.text()
     body, conv, rep = convert_str(deck, approximate=True)
-    assert "*SHELL SECTION, ELSET=E, COMPOSITE\n0.025, , M\n0.025, , M\n0.025, , M\n0.025, , M\n" in body
+    assert "*SHELL SECTION, ELSET=E, COMPOSITE\n0.05, , M\n0.05, , M\n*" in body
     assert {t for t, _ in conv.geom.elements.values()} == {"S8R"}
     # (an S8R strip one element wide is flagged for itself: _warn_s8r_strips)
     assert conv.reduced_physics[0] == "--approximate: *SHELL SECTION of a plastic material"
