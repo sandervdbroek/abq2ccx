@@ -4,7 +4,44 @@ Corpus counts are on the CalculiX version current at the time; from October 2026
 counts only decks that solve their own problem: under their own loads, without reduced
 physics.
 
+From 1.6.0 on, each version opens with an overview in plain language (what now converts, what
+gives more correct answers, what changed in using the converter), followed by the detailed
+entries. The GitHub release notes use the same section.
+
 ## Unreleased
+
+### Overview
+
+* **More of a deck converts.** Features that were left out now convert: initial soil
+  (geostatic) stresses, geometric imperfections, embedded reinforcement such as rebar and fibres,
+  springs and dampers in connectors, material data that depends on field variables,
+  element-by-element orientations and property values, integrated section forces, stiffness and
+  mass matrix export, centrifugal and rotary-acceleration loads, and mass scaling. With
+  `--approximate`, Abaqus general contact and explicit coupled thermal-structural steps now run
+  as approximations.
+* **More correct answers.** Many models that ccx ran without a message but with a wrong answer
+  now give the right one, or are clearly flagged. The fixes cover temperatures in shells and
+  beams, point masses, shell nodes joined to beams or rigid parts, trusses next to clamped beams
+  and shells, ties between shells and solids, contact pressure and heat-conductance tables,
+  damping, boundary conditions in local axes, several load cases in one step, and loads on
+  quadratic plane and axisymmetric elements. Shells the converter upgrades to quadratic elements
+  now follow the curved surface instead of forming flat facets.
+* **Clearer labels.** Elements that ccx runs stiffer than Abaqus (bricks with creeping or nearly
+  incompressible material, triangular shells, plastic shell sections) are now marked as reduced
+  physics, each with an `--approximate` alternative. So are creep laws that ccx quietly speeds
+  up when the deck's units make the creep constant very small.
+* **Fewer ccx failures.** More inputs on which ccx stopped, crashed or printed without end are
+  now written in a form it runs, or warned about. Creep analyses with high stress exponents run
+  to the end instead of stopping.
+* **Easier to use.** Warnings give the file and line of the card they are about. `--run` shows
+  ccx's output as it runs, keeps a log file and takes a time limit (`--timeout`). Batch runs
+  write one JSON line or one spreadsheet row per deck (`--json`, `--summary`). Assembly decks
+  convert about 17 % faster, in up to a third less memory. A new script builds ccx with a deck's
+  Abaqus UMAT in one command.
+* **Tested on real decks.** Of the 1052 public Abaqus decks the tests use, 181 now solve their
+  own problem in ccx 2.23 (177 in 1.5.0).
+
+### Details
 
 * **Steady-state dynamics: BC values and `DIRECT`** — Abaqus' mode-based (and subspace-based)
   `*STEADY STATE DYNAMICS` ignores a nonzero `*BOUNDARY` value: nodes move there only through
