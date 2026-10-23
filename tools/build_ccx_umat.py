@@ -29,6 +29,7 @@ flags (--fflags=-ffree-form for free-form source in a .f file).
 """
 
 import argparse
+import glob
 import hashlib
 import os
 import re
@@ -388,6 +389,8 @@ def run(cmd, cwd, log):
 
 def _ccx_sources(src):
     """The relative paths of the ccx source tree's sources and Makefiles, sorted."""
+    if not os.path.isdir(src):
+        raise BuildError(f"{src} is not ccx's source folder (CalculiX/ccx_2.23/src)")
     names = sorted(f for f in os.listdir(src) if os.path.isfile(os.path.join(src, f)) and
                    (f.endswith((".c", ".h", ".f", ".inc")) or f.startswith("Makefile")))
     if "umat_abaqusnl.f" not in names or "Makefile" not in names:
@@ -435,9 +438,13 @@ def build_base(src, prefix, cache=None, jobs=4, echo=print):
                 raise BuildError(f"{src}/umat_abaqusnl.f is not ccx 2.23's: no place for the U0 fix")
             with open(p, "w", newline="") as fh:
                 fh.write(s.replace(U0_ANCHOR, U0_ANCHOR + U0_FIX, 1))
-        cflags = CCX_CFLAGS + " -I" + os.path.join(prefix, "include", "spooles")
+        # make splits CFLAGS on blanks (ccx's recipes write $(CFLAGS) unquoted), so SPOOLES'
+        # headers come through a link beside the sources: a path with a blank cannot break it
+        os.symlink(os.path.join(os.path.abspath(prefix), "include", "spooles"),
+                   os.path.join(tmp, "spooles"))
         run(["make", f"-j{jobs}", "CalculiX.o", "CalculiX.a", "CC=" + cc, "FC=" + fc,
-             "FFLAGS=" + CCX_FFLAGS, "CFLAGS=" + cflags], work, log)
+             "FFLAGS=" + CCX_FFLAGS, "CFLAGS=" + CCX_CFLAGS + " -I../spooles"], work, log)
+        os.remove(os.path.join(tmp, "spooles"))
         for f in ("CalculiX.o", "CalculiX.a"):
             shutil.move(os.path.join(work, f), os.path.join(tmp, f))
         run([ar, "d", "CalculiX.a", "umat.o"], tmp, log)      # ccx's example UMAT
@@ -477,12 +484,15 @@ def build_base(src, prefix, cache=None, jobs=4, echo=print):
             if not os.path.exists(os.path.join(base, "CalculiX.a")):
                 raise
             shutil.rmtree(tmp, ignore_errors=True)
-    except BaseException:
+    except BaseException as exc:
         if os.path.exists(tmp):
             kept = tmp + ".failed"
-            shutil.rmtree(kept, ignore_errors=True)
+            for old in glob.glob(os.path.join(glob.escape(cache), "ccx-build-*.failed")):
+                shutil.rmtree(old, ignore_errors=True)          # only the latest failed build
             os.rename(tmp, kept)
             echo(f"the failed build is kept in {kept}")
+            if isinstance(exc, BuildError):                  # its log is in the kept folder now
+                raise BuildError(str(exc).replace(tmp, kept)) from None
         raise
     return base
 
@@ -493,6 +503,11 @@ def build(files, out, src, prefix, cache=None, fflags=(), patches=(), uexternald
     ``out``.  ``patches``: (regex, replacement) pairs applied to a copy of each file."""
     if not files:
         raise BuildError("no UMAT source files")
+    for a, _b in patches:               # before the base build, which takes minutes
+        try:
+            re.compile(a)
+        except re.error as exc:
+            raise BuildError(f"--patch {a!r}: {exc}") from None
     for f in files:
         if not os.path.isfile(f):
             raise BuildError(f"{f}: no such file")
@@ -539,6 +554,9 @@ def build(files, out, src, prefix, cache=None, fflags=(), patches=(), uexternald
                 _libs(prefix), w, log)
         except BuildError as exc:
             raise BuildError(str(exc).replace(log, "the build log")) from None
+        if not os.path.exists(tmp) and os.path.exists(tmp + ".exe"):      # Windows' linker
+            tmp += ".exe"
+            out += "" if out.lower().endswith(".exe") else ".exe"
         os.makedirs(os.path.dirname(out), exist_ok=True)
         shutil.move(tmp, out + ".tmp")
         os.replace(out + ".tmp", out)

@@ -818,6 +818,32 @@ def test_fetch_umat():
         F.download = real
 
 
+def test_build_ccx_umat_errors():
+    """tools/build_ccx_umat.py names a --src that is no folder, and checks every --patch regex
+    before the base build that takes minutes (both raised tracebacks: code check R2-6)."""
+    sys.path.insert(0, os.path.join(ROOT, "tools"))
+    import build_ccx_umat as B
+    with tempfile.TemporaryDirectory() as d:
+        umat = os.path.join(d, "u.f")
+        with open(umat, "w") as fh:
+            fh.write("      SUBROUTINE UMAT\n      END\n")
+        for src in (os.path.join(d, "none"), umat):
+            try:
+                B.build([umat], os.path.join(d, "ccx"), src, d, cache=d)
+            except B.BuildError as exc:
+                assert "is not ccx's source folder" in str(exc), exc
+            else:
+                raise AssertionError(src)
+        try:
+            B.build([umat], os.path.join(d, "ccx"), os.path.join(d, "none"), d, cache=d,
+                    patches=[("([", "x")])
+        except B.BuildError as exc:
+            assert str(exc).startswith("--patch '(['"), exc
+        else:
+            raise AssertionError("bad regex")
+        assert os.listdir(d) == ["u.f"], os.listdir(d)       # nothing built or cached
+
+
 def test_corpus_umat():
     """The UMAT tier (umat_tier): with ABQ2CCX_CCX_SRC set, each deck with a ``umat`` recipe
     solves in a ccx built with its own UMAT and matches its twin or reference."""

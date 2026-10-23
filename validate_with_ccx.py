@@ -9240,6 +9240,8 @@ def select_checks(argv):
         if not hits:
             ap.error(f"no check is named or matches {pattern!r} (--list lists them)")
         chosen |= hits
+    if not chosen:          # --only '' (an empty CI variable) would run nothing and pass
+        ap.error("--only names no check (--list lists them)")
     needs = {c.name: c.needs for c in CHECKS}
     todo = list(chosen)
     while todo:

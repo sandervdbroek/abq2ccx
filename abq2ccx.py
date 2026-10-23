@@ -13929,15 +13929,23 @@ class _Mesh:
                           f"selectively reduced volume terms: it locks where the material keeps "
                           f"its volume)")
             return
+        hybrid = set()
         for e in lock:
             typ, conn = self.geom.elements[e]
-            base, sfx = split_suffixes(typ)
-            new = base.upper().replace("C3D8", "C3D8I", 1) + sfx
+            sfx = typ.upper()[4:] if typ.upper().startswith("C3D8") else ""
+            if "H" in sfx:                  # C3D8H / C3D8HT: ccx has no hybrid C3D8I either
+                hybrid.add(typ.upper())
+            new = "C3D8I" + sfx.replace("H", "")
             if ccx_type(new) != "C3D8I":
                 new = "C3D8I"
             self.geom.elements[e] = (new, conn)
             self._elem_types.add(new)
-        self.report.warn(f"[APPROX] Element {what} written as C3D8I: {why}. ccx's {good}.")
+        for t in sorted(hybrid):
+            self._reduces(f"element {t} -> C3D8I")
+        self.report.warn(f"[APPROX] Element {what} written as C3D8I: {why}. ccx's {good}."
+                         + (f" CalculiX has no hybrid (mixed displacement-pressure) formulation, so "
+                            f"{' / '.join(sorted(hybrid))} run as that displacement element."
+                            if hybrid else ""))
 
     def _note_curved_membranes(self) -> None:
         """A note where linear membranes (M3D3, M3D4, M3D4R) on a curved surface run in a

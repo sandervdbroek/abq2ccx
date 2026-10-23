@@ -20460,10 +20460,14 @@ def test_plastic_c3d8_flagged_c3d8i_under_approximate():
     body, conv, rep = convert_str(plastic, approximate=True)
     assert "*ELEMENT, TYPE=C3D8I\n1, 1, 2, 3, 4, 5, 6, 7, 8\n" in body
     assert conv.reduced_physics == ["--approximate: Element C3D8 (1 elements, of a plastic material) written as C3D8I"]
-    # suffixes kept (hybrid, coupled temperature-displacement); elastic or cohesive: not flagged
-    for typ, new in (("C3D8H", "C3D8IH"), ("C3D8T", "C3D8IT")):
-        _, conv, _ = convert_str(plastic.replace("TYPE=C3D8", "TYPE=" + typ), approximate=True)
+    # the coupled temperature-displacement suffix kept; the hybrid one dropped and named in the
+    # deck's own type (it was written C3D8IH and reported as "element C3D8IH -> C3D8I", an element
+    # the deck does not have: code check R2-3); elastic or cohesive: not flagged
+    for typ, new in (("C3D8H", "C3D8I"), ("C3D8T", "C3D8IT"), ("C3D8HT", "C3D8IT")):
+        _, conv, rep = convert_str(plastic.replace("TYPE=C3D8", "TYPE=" + typ), approximate=True)
         assert conv.geom.elements[1][0] == new and A.ccx_type(new) == "C3D8I", typ
+        assert "C3D8IH" not in rep.text(), typ
+        assert ("H" in typ) == (f"element {typ} -> C3D8I" in conv.reduced_physics), typ
     _, conv, _ = convert_str(plastic.replace("*Plastic\n10., 0.\n", ""))
     assert conv.reduced_physics == []
     assert not A.brick_locks("COH3D8") and not A.brick_locks("C3D8R") and A.brick_locks("C3D8HT")
@@ -22846,7 +22850,9 @@ def test_validate_checks_are_listed_and_selected_by_name_or_glob():
     assert got == ["nle10_thickplate", "nle10_surface_elements"], got
     got = [c.name for c in V.select_checks(["--only", "beam_circ_*, nle10_thickplate"])]
     assert got == [n for n in names if n.startswith("beam_circ_") or n == "nle10_thickplate"], got
-    for argv in (["--only", "no_such_check"], ["--only", "beam_circ_*,no_such_*"]):
+    # an unknown name, or a selection of nothing (--only '' ran no check and passed: R2-7)
+    for argv in (["--only", "no_such_check"], ["--only", "beam_circ_*,no_such_*"], ["--only", ""],
+                 ["--only", " , "]):
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 V.select_checks(argv)
