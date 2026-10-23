@@ -8,7 +8,7 @@ From 1.6.0 on, each version opens with an overview in plain language (what now c
 gives more correct answers, what changed in using the converter), followed by the detailed
 entries. The GitHub release notes use the same section.
 
-## Unreleased
+## 1.6.0 (October 2026)
 
 ### Overview
 

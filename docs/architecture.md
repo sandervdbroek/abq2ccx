@@ -371,7 +371,9 @@ default is the code page.
 
 ## Releasing
 
-Set `__version__` and the changelog heading, then publish a GitHub release tagged `v` +
-`__version__` (`v1.2.0`). [`release.yml`](../.github/workflows/release.yml) checks the tag,
-runs the unit tests, builds the sdist and wheel and uploads them to PyPI by trusted
-publishing: PyPI trusts that workflow in the `pypi` environment, so no token is stored.
+Set `__version__` and the changelog heading (the version's section opens with an overview in
+plain language, then the detailed entries: see the top of the changelog), then publish a GitHub
+release tagged `v` + `__version__` (`v1.2.0`) with that section as its notes.
+[`release.yml`](../.github/workflows/release.yml) checks the tag, runs the unit tests, builds
+the sdist and wheel and uploads them to PyPI by trusted publishing: PyPI trusts that workflow
+in the `pypi` environment, so no token is stored.
