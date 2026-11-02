@@ -19,7 +19,8 @@ entries. The GitHub release notes use the same section.
   longer stops ccx.
 * **More correct answers.** A connector load or motion whose connector cannot be converted is
   now left out with it, and reported, instead of being written onto a node attached to nothing,
-  where ccx dropped it without a message.
+  where ccx dropped it without a message. A base excitation's scale factor (`*BASE MOTION,
+  SCALE=`), which ccx ignored, now reaches ccx: a shaker run at 45 g responded as to 1 mm/s².
 
 ### Details
 
@@ -45,6 +46,18 @@ entries. The GitHub release notes use the same section.
   rest of the model, and out of memory before the solver). Above 10 million entries the report
   now warns with the numbers, and names a coupling on fewer nodes, or a `*KINEMATIC` one where
   the attachment is stiff, as the remedy.
+* **`*BASE MOTION, SCALE`** — Abaqus multiplies a base motion's amplitude by `SCALE`; ccx 2.23
+  reads no such parameter and ignored it with a warning, so a steady-state or modal base
+  excitation ran at the amplitude alone (a shaker deck at `SCALE=441292`, 45 g in mm/s², came out
+  441292 times too small). The card now names a copy of its amplitude scaled by the factor; one
+  without an amplitude is warned, as reduced physics.
+* **A shaker-table example** — `examples/shaker_assembly.inp`, a small model in the form of an
+  Abaqus/CAE export with the features of a real shaker deck: C3D10 parts whose names hold a
+  comma, an S8R + `STRI65` shroud tied to the plate, `AXIAL` bolts on kinematic couplings with an
+  `INFLUENCE RADIUS` preloaded under NLGEOM, a test mass on a distributing coupling, a Lanczos
+  `*FREQUENCY` step and `*STEADY STATE DYNAMICS` steps under `*BASE MOTION`
+  (`validate_with_ccx.py shaker_assembly`: both conversions solve every step, the preload acts
+  with `--approximate`, and the base excitation's scale reaches ccx).
 * **Connector loads and motions of connectors left out** — a history `*CONNECTOR LOAD` or
   `*CONNECTOR MOTION` became a `*CLOAD` / `*BOUNDARY` on a helper node, which the connector's
   `*EQUATION`s tie to its component. Where the connector itself was commented out (an `AXIAL`

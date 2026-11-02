@@ -45431,6 +45431,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         blocks = self._matrix_generate_steps(blocks)  # before anything reads the procedures
         blocks = self._geostatic_steps(blocks)        # likewise
         blocks = self._explicit_coupled_steps(blocks)     # likewise (--approximate)
+        blocks = self._base_motion_scale(blocks)      # before anything reads load amplitudes
         blocks = self._sp_amplitudes(blocks)          # before anything reads load amplitudes
         blocks = self._modal_ssd_motion(blocks)       # before anything reads BC values
         blocks = self._blank_periods(blocks)          # before the step model reads the periods
@@ -46295,6 +46296,69 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                                      "perturbation and direct steady-state dynamics)." if case else ""),
                                      at=b)
         return [swap.get(id(b), b) for b in blocks] if swap else blocks
+
+    def _base_motion_scale(self, blocks: List[Block]) -> List[Block]:
+        """*BASE MOTION, SCALE=s: Abaqus multiplies the motion's amplitude curve by s (default
+        1.0; Abaqus 2017 Keywords *BASE MOTION); ccx 2.23 reads no SCALE there and ignores it
+        with a 'parameter not recognized' warning (probed: a steady-state base acceleration of
+        SCALE=9810 responded as one of 1), so a shaker run at 45 g came out 441292 times too
+        small.  The card now names a copy of its amplitude, written after the original, whose
+        SCALEY is s times the original's (handle_amplitude applies it to the data points), and
+        drops SCALE.  A card without an AMPLITUDE, or one naming no *AMPLITUDE the deck has, keeps
+        SCALE, warned: its motion is s times too small in ccx."""
+        amps = {b.uparam("NAME"): b for b in blocks if b.keyword == "AMPLITUDE"}
+        made: Dict[Tuple[str, float], str] = {}
+        after: Dict[int, List[Block]] = {}
+        swap: Dict[int, Block] = {}
+        taken = set(amps)
+        for b in blocks:
+            if b.keyword != "BASE MOTION" or not b.has("SCALE"):
+                continue
+            try:
+                factor = pf(b.param("SCALE") or "1")
+            except ValueError:
+                continue
+            if factor == 1.0:
+                swap[id(b)] = Block(b.keyword, OrderedDict((k, v) for k, v in b.params.items()
+                                                           if k != "SCALE"), list(b.data)).placed(b)
+                continue
+            src = amps.get(b.uparam("AMPLITUDE"))
+            if src is None:
+                self.report.warn(f"*BASE MOTION, SCALE={b.param('SCALE')} without an *AMPLITUDE the "
+                                 f"converter can scale: ccx 2.23 ignores SCALE there, so this motion is "
+                                 f"{b.param('SCALE')} times too small in ccx — give it an amplitude "
+                                 f"scaled by that factor.", at=b)
+                self._reduces("*BASE MOTION SCALE without an amplitude (ccx ignores it)")
+                continue
+            key = (src.uparam("NAME"), factor)
+            if key not in made:
+                base, k = f"{src.param('NAME').strip().strip(chr(34))[:60]}_X", 1
+                while f"{base}{k}".upper() in taken:
+                    k += 1
+                made[key] = f"{base}{k}"
+                taken.add(made[key].upper())
+                try:
+                    old_y = pf(src.param("SCALEY") or "1")
+                except ValueError:
+                    old_y = 1.0
+                params = OrderedDict((k2, v) for k2, v in src.params.items())
+                params["NAME"] = made[key]
+                params["SCALEY"] = short_real(old_y * factor, 12)
+                after.setdefault(id(src), []).append(Block("AMPLITUDE", params, list(src.data)).placed(src))
+            params = OrderedDict((k2, v) for k2, v in b.params.items() if k2 != "SCALE")
+            params["AMPLITUDE"] = made[key]
+            swap[id(b)] = Block(b.keyword, params, list(b.data)).placed(b)
+            self.report.note(f"*BASE MOTION, SCALE={b.param('SCALE')} -> AMPLITUDE={made[key]}, a copy "
+                             f"of {src.param('NAME').strip()} scaled by that factor: ccx 2.23 reads no "
+                             f"SCALE on *BASE MOTION and would ignore it (probed: the motion at 1x).",
+                             at=b)
+        if not swap:
+            return blocks
+        out: List[Block] = []
+        for b in blocks:
+            out.append(swap.get(id(b), b))
+            out.extend(after.get(id(b), ()))
+        return out
 
     def _sp_amplitudes(self, blocks: List[Block]) -> List[Block]:
         """A static perturbation or *BUCKLE step's loads, BCs and temperatures on an amplitude:

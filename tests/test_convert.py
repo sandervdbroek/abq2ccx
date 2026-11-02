@@ -6748,6 +6748,33 @@ def test_distributing_coupling_with_an_element_on_its_reference_node_warns_of_a_
     assert "dense block" not in report.text()
 
 
+def test_base_motion_scale_becomes_a_scaled_copy_of_its_amplitude():
+    # ccx 2.23 reads no SCALE on *BASE MOTION ('parameter not recognized'): a shaker run at
+    # SCALE=441292 (45 g in mm/s^2) responded as to 1 mm/s^2.  The card names a copy of its
+    # amplitude scaled by the factor (validate_with_ccx.py shaker_assembly: exactly 9810
+    # times the response without SCALE); SCALE=1 just goes; without an amplitude: warned
+    deck = (HEX_MODEL + "*Amplitude, name=Amp-1\n1., 1., 3000., 1.\n"
+            "*Step\n*Frequency\n4,\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n1., 100., 5\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, type=ACCELERATION, dof=1, amplitude=Amp-1, scale=441292.\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n1., 100., 5\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, type=ACCELERATION, dof=2, amplitude=Amp-1, scale=441292.\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n1., 100., 5\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, type=ACCELERATION, dof=3, amplitude=Amp-1, scale=1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*AMPLITUDE, NAME=Amp-1\n1., 1., 3000., 1.\n" in body
+    assert "*AMPLITUDE, NAME=Amp-1_X1\n1, 441292, 3000, 441292\n" in body, body
+    assert body.count("*BASE MOTION, TYPE=ACCELERATION, DOF=1, AMPLITUDE=Amp-1_X1\n") == 1
+    assert body.count("*BASE MOTION, TYPE=ACCELERATION, DOF=2, AMPLITUDE=Amp-1_X1\n") == 1
+    assert "*BASE MOTION, TYPE=ACCELERATION, DOF=3, AMPLITUDE=Amp-1\n" in body
+    assert "SCALE=" not in body.upper().replace("SCALEY", "")
+    assert "*BASE MOTION, SCALE=441292. -> AMPLITUDE=Amp-1_X1, a copy of Amp-1 scaled" in rep.text()
+    assert not conv.reduced_physics
+    body, conv, rep = convert_str(deck.replace("dof=1, amplitude=Amp-1, scale", "dof=1, scale"))
+    assert "*BASE MOTION, SCALE=441292. without an *AMPLITUDE the converter can scale" in rep.text()
+    assert "*BASE MOTION SCALE without an amplitude (ccx ignores it)" in conv.reduced_physics
+
+
 def test_rigid_body_and_kinematic_coupling_on_one_reference_node():
     # ccx's kinematic coupling turns its reference node's DOFs 4-6, a *RIGID BODY its ROT NODE:
     # on one REF NODE the coupling's members translated but did not turn (code review 3 B26b).

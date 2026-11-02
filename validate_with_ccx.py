@@ -12018,6 +12018,60 @@ def check_distributing_mass_ref(ccx, env, tmp, shared):
     return failures
 
 
+@check("shaker_assembly", "a CAE shaker-table model: bolts, a test mass, modes and base excitation")
+def check_shaker_assembly(ccx, env, tmp, shared):
+    # --- a shaker-table model as Abaqus/CAE writes it -----------------------------------------
+    # C3D10 parts whose names hold a comma, an S8R + STRI65 shroud tied to the plate, four AXIAL
+    # bolt connectors on kinematic couplings with an INFLUENCE RADIUS, preloaded in an NLGEOM
+    # step, a 50 kg test mass on a distributing coupling, a Lanczos *FREQUENCY step and three
+    # *STEADY STATE DYNAMICS steps under *BASE MOTION, SCALE=9810.  Both conversions must
+    # solve every step.  With --approximate the bolts are written (SPRINGA + preload rows) and
+    # the preload lifts their reference nodes; without it they are commented out with their
+    # preload, which then moves nothing.  ccx 2.23 reads no SCALE on *BASE MOTION, so abq2ccx
+    # writes a scaled copy of the amplitude: the test mass must respond exactly 9810 times as
+    # much as in the same deck without SCALE.
+    failures = 0
+    text = open(os.path.join(EXAMPLES, "shaker_assembly.inp"), encoding="utf-8").read()
+    probe = text.replace("*Output, history, variable=PRESELECT\n*End Step",
+                         "*Output, history, variable=PRESELECT\n*Node Output, nset=_PickedSet706\nU\n*End Step", 1)
+    unscaled = probe.replace(", scale=9810.", "")
+    assert probe != text and unscaled.count("*Base Motion") == 3 and "scale=9810" not in unscaled
+    runs = {}
+    for kind, deck, approx in (("approx", probe, True), ("plain", probe, False), ("unscaled", unscaled, True)):
+        src = os.path.join(tmp, f"shaker_{kind}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        inp = os.path.join(tmp, f"shaker_{kind}.inp")
+        convert(src, inp, approximate=approx)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        runs[kind] = (status, {n: dat_displacement_history(dat, n) for n in (1, 2, 3, 4, 9)}
+                      if status == "solved" else {}, out)
+        shutil.rmtree(d, ignore_errors=True)
+    if any(r[0] != "solved" for r in runs.values()):
+        for kind, (status, _u, out) in runs.items():
+            if status != "solved":
+                print(f"FAIL  shaker_assembly ({kind}): did not solve ({status})")
+                print("      " + " / ".join(l.strip() for l in out.splitlines() if "ERROR" in l)[:200])
+                failures += 1
+        return failures
+    lift = [runs["approx"][1][n][0][2] for n in (1, 2, 3, 4)]
+    still = max(abs(x) for n in (1, 2, 3, 4) for x in runs["plain"][1][n][0])
+    ok = min(lift) > 0.01 and still < 1e-12
+    print(f"{'PASS' if ok else 'FAIL'}  shaker_assembly (bolt preload): --approximate lifts the bolt "
+          f"reference nodes u3 {min(lift):.4f}-{max(lift):.4f}; without it (bolts commented out) "
+          f"max |u| {still:.1e}")
+    failures += 0 if ok else 1
+    a, b = runs["approx"][1][9], runs["unscaled"][1][9]
+    ratios = [x / y for ua, ub in zip(a, b) for x, y in zip(ua, ub) if abs(y) > 1e-25]
+    ok = len(a) == len(b) and len(ratios) > 100 and all(abs(r / 9810.0 - 1.0) < 1e-5 for r in ratios)
+    print(f"{'PASS' if ok else 'FAIL'}  shaker_assembly (*BASE MOTION, SCALE=9810): test mass response "
+          f"{min(ratios, default=0):.4f}-{max(ratios, default=0):.4f} times the deck without SCALE "
+          f"({len(ratios)} values, all steps solved in both conversions)")
+    failures += 0 if ok else 1
+    return failures
+
+
 @check("assembly_rotated_instances",
        "assembly flattening: a turned instance against the same model written flat")
 def check_assembly_rotated_instances(ccx, env, tmp, shared):
