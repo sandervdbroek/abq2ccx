@@ -6775,6 +6775,35 @@ def test_base_motion_scale_becomes_a_scaled_copy_of_its_amplitude():
     assert "*BASE MOTION SCALE without an amplitude (ccx ignores it)" in conv.reduced_physics
 
 
+def test_base_motion_scale_on_shifted_and_analytic_amplitudes():
+    # Abaqus multiplies the whole amplitude curve by the base motion's SCALE: SHIFTY scales too
+    # (3 + 2, times 10: 50, not 32); an analytic copy (PERIODIC, MODULATED, DECAY) takes the
+    # factor on its amplitude terms, as the converter samples analytic forms without SCALEY:
+    # with SCALEY the copy was commented out and ccx stopped on the base motion's amplitude
+    base = HEX_MODEL.replace("*Elastic\n1000., 0.3\n", "*Elastic\n1000., 0.3\n*Density\n1e-9\n")
+    ssd = ("*Step\n*Frequency\n4,\n*End Step\n*Step\n*Steady State Dynamics\n1., 2500., 20, 3.\n"
+           "*Modal Damping\n1, 4, 0.02\n*Base Motion, dof=1, amplitude=A1, scale=10.\n*End Step\n")
+    body, conv, rep = convert_str(base + "*Amplitude, name=A1, shifty=2.\n1., 3., 3000., 3.\n" + ssd)
+    assert "*AMPLITUDE, NAME=A1_X1, SHIFTY=20.\n1, 30, 3000, 30\n" in body, body
+    md = ("*Step\n*Frequency\n4,\n*End Step\n*Step\n*Modal Dynamic\n0.001, 0.1\n*Modal Damping\n"
+          "1, 4, 0.02\n*Base Motion, dof=1, amplitude=P1, scale=9810.\n*End Step\n")
+    for amp in ("*Amplitude, name=P1, definition=PERIODIC\n1, 6.2832, 0., 0.5\n0., 1.\n",
+                "*Amplitude, name=P1, definition=MODULATED\n0.5, 1., 0., 6.2832, 31.4\n",
+                "*Amplitude, name=P1, definition=DECAY\n0.5, 1., 0., 0.2\n"):
+        body, conv, rep = convert_str(base + amp + md)
+        lines = body.splitlines()
+        rows = {ln: lines[i + 1] for i, ln in enumerate(lines) if ln.startswith("*AMPLITUDE, NAME=P1")}
+        orig = [float(x) for x in rows["*AMPLITUDE, NAME=P1"].split(",")]
+        scaled = [float(x) for x in rows["*AMPLITUDE, NAME=P1_X1"].split(",")]
+        assert orig[0::2] == scaled[0::2] and all(abs(b - 9810.0 * a) <= 1e-6 * abs(b) + 1e-9
+                                                  for a, b in zip(orig[1::2], scaled[1::2])), (orig, scaled)
+        assert "*BASE MOTION, DOF=1, AMPLITUDE=P1_X1" in body and not other_reduced(conv), conv.reduced_physics
+    # a definition the converter cannot scale keeps SCALE, warned
+    body, conv, rep = convert_str(base + "*Amplitude, name=P1, definition=USER, variables=1\n0.\n" + md)
+    assert "which the converter cannot scale" in rep.text()
+    assert "*BASE MOTION SCALE on an amplitude the converter cannot scale (ccx ignores it)" in conv.reduced_physics
+
+
 def test_steady_state_dynamics_ranges_split_into_steps_and_zero_hz_lifted():
     # ccx 2.23 reads one *STEADY STATE DYNAMICS data line: a step with several ranges (resonance
     # bands) -> one step per range with the step's loads, base motion, damping and output;
@@ -6818,6 +6847,9 @@ def test_base_motion_steady_state_output_tu_is_ccx_u():
         in rep.text()
     body, conv, rep = convert_str(deck.replace("*Base Motion, dof=1, amplitude=A1\n", "*Cload\n7, 3, 1.\n"))
     assert "with *BASE MOTION" not in rep.text()
+    # a TU-only request: output planning reads the card's step (no NODE PRINT was written)
+    body, conv, rep = convert_str(deck.replace("TU1, TU2, U3", "TU1, TU2"))
+    assert "*NODE PRINT, NSET=TOPN\nU\n" in _step(body, 2), _step(body, 2)
 
 
 def test_prestressed_modes_reach_steady_state_dynamics_with_perturbation():

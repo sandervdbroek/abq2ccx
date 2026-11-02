@@ -54,8 +54,10 @@ entries. The GitHub release notes use the same section.
 * **`*BASE MOTION, SCALE`** — Abaqus multiplies a base motion's amplitude by `SCALE`; ccx 2.23
   reads no such parameter and ignored it with a warning, so a steady-state or modal base
   excitation ran at the amplitude alone (a shaker deck at `SCALE=441292`, 45 g in mm/s², came out
-  441292 times too small). The card now names a copy of its amplitude scaled by the factor; one
-  without an amplitude is warned, as reduced physics.
+  441292 times too small). The card now names a copy of its amplitude scaled by the factor: the
+  point-wise forms' SCALEY and SHIFTY, the analytic forms' (PERIODIC, MODULATED, DECAY) amplitude
+  terms. One without an amplitude, or on a definition the converter cannot scale, is warned, as
+  reduced physics.
 * **Steady-state dynamics on prestressed modes** — ccx 2.23's `*STEADY STATE DYNAMICS` reads the
   modes of a perturbation `*FREQUENCY` step when its own `*STEP` card has `PERTURBATION` too; the
   converter dropped `PERTURBATION` from the frequency step instead (the preload's stress

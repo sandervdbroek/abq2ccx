@@ -202,7 +202,9 @@ TRANSLATED = {
         "is the total displacement, infinite at 0 Hz); under `*BASE MOTION`, output `TU` → `U` "
         "(ccx's `U` is the total displacement) and `U` warned (Abaqus' is relative to the base).",
     "*BASE MOTION": "`SCALE` (which ccx ignores) → the card names a copy of its amplitude scaled by "
-        "the factor; without an amplitude: warned (reduced physics).",
+        "the factor (the point-wise forms' `SCALEY` and `SHIFTY`, the analytic forms' amplitude "
+        "terms); without an amplitude, or on one the converter cannot scale: warned (reduced "
+        "physics).",
     "*GEOSTATIC": "→ `*STATIC` in a linear step of a model without pore pressure elements (the "
         "static solution from the initial stresses); with pore pressure, `UTOL` or a nonlinear step "
         "commented out, with `*NO ANALYSIS` in its place (reduced physics).",

@@ -41346,6 +41346,17 @@ class _Output:
             return "EL PRINT" if hist and b.param("ELSET") else "EL FILE"
         return b.keyword
 
+    def _in_base_motion_ssd(self, b: Block) -> bool:
+        """Output card ``b`` stands in a mode-based *STEADY STATE DYNAMICS step with a *BASE
+        MOTION: by the step model's cards, so _plan_output (before the emission writes the step)
+        and handle_output read the same."""
+        if self._base_ssd_cards is None:
+            self._base_ssd_cards = {id(c) for st in self.steps.steps
+                                    if st.proc == "STEADY STATE DYNAMICS" and
+                                    any(x.keyword == "BASE MOTION" for x in st.cards)
+                                    for c in st.cards}
+        return id(b) in self._base_ssd_cards
+
     def _output_card(self, b: Block, cc: str, report: "Report", twin: Optional[List[str]] = None):
         """(parameters, ccx labels) of output card ``b`` written as ``*cc``, with notes on
         what is dropped or renamed; labels None when nothing of the card is left.  Its
@@ -41409,8 +41420,7 @@ class _Output:
         outvars: List[str] = []
         # a mode-based steady-state dynamics step with *BASE MOTION: ccx's U is the total
         # displacement (probed: a held base node prints the base's -A/(2 pi f)^2), Abaqus' TU
-        base_ssd = self.emit.proc == "STEADY STATE DYNAMICS" and self.emit.step is not None and \
-            any(c.keyword == "BASE MOTION" for c in self.emit.step.cards)
+        base_ssd = self._in_base_motion_ssd(b)
         known_bases = set(ABQ_DROP_VARS) | set(ABQ_MAP_VARS) | \
             {"S", "E", "U", "V", "RF", "NT", "ME", "PEEQ", "THE", "SDV", "HFL", "ENER"}
         for v in invars:
@@ -44988,6 +44998,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._mass_hold_bc: List[str] = []
         self._mass_hold_nodes: set = set()
         self._freq_pert_written: set = set()       # *FREQUENCY steps written with PERTURBATION
+        self._base_ssd_cards: Optional[set] = None    # (_in_base_motion_ssd)
         self._kin_hold_eq: List[str] = []          # ... its *EQUATIONs on twist ROT NODEs
         self._kin_twist: Dict[int, Tuple[int, List[Vec]]] = {}    # _plan_kinematic_twists
         self._kin_twist_refused: Dict[int, Tuple[List[Vec], str]] = {}    # ... why not, per ref node
@@ -46467,7 +46478,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             if src is None:
                 self.report.warn(f"*BASE MOTION, SCALE={b.param('SCALE')} without an *AMPLITUDE the "
                                  f"converter can scale: ccx 2.23 ignores SCALE there, so this motion is "
-                                 f"{b.param('SCALE')} times too small in ccx — give it an amplitude "
+                                 f"{b.param('SCALE')} times too small in ccx: give it an amplitude "
                                  f"scaled by that factor.", at=b)
                 self._reduces("*BASE MOTION SCALE without an amplitude (ccx ignores it)")
                 continue
@@ -46478,14 +46489,19 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                     k += 1
                 made[key] = f"{base}{k}"
                 taken.add(made[key].upper())
-                try:
-                    old_y = pf(src.param("SCALEY") or "1")
-                except ValueError:
-                    old_y = 1.0
-                params = OrderedDict((k2, v) for k2, v in src.params.items())
-                params["NAME"] = made[key]
-                params["SCALEY"] = short_real(old_y * factor, 12)
-                after.setdefault(id(src), []).append(Block("AMPLITUDE", params, list(src.data)).placed(src))
+                copy = self._scaled_amplitude(src, made[key], factor)
+                if copy is None:
+                    del made[key]
+                    self.report.warn(f"*BASE MOTION, SCALE={b.param('SCALE')} on *AMPLITUDE "
+                                     f"{src.param('NAME').strip()}, DEFINITION="
+                                     f"{src.uparam('DEFINITION') or 'TABULAR'}, which the converter "
+                                     f"cannot scale: ccx 2.23 ignores SCALE there, so this motion is "
+                                     f"{b.param('SCALE')} times too small in ccx: give it an amplitude "
+                                     f"scaled by that factor.", at=b)
+                    self._reduces("*BASE MOTION SCALE on an amplitude the converter cannot scale "
+                                  "(ccx ignores it)")
+                    continue
+                after.setdefault(id(src), []).append(copy)
             params = OrderedDict((k2, v) for k2, v in b.params.items() if k2 != "SCALE")
             params["AMPLITUDE"] = made[key]
             swap[id(b)] = Block(b.keyword, params, list(b.data)).placed(b)
@@ -46500,6 +46516,51 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             out.append(swap.get(id(b), b))
             out.extend(after.get(id(b), ()))
         return out
+
+    @staticmethod
+    def _scaled_amplitude(src: Block, name: str, factor: float) -> Optional[Block]:
+        """*AMPLITUDE ``src`` times ``factor`` as a card named ``name`` (_base_motion_scale), or
+        None where the converter cannot scale it.  Abaqus multiplies the whole curve by a load's
+        or base motion's scale: the point-wise forms (TABULAR, EQUALLY SPACED, SMOOTH STEP) take
+        SCALEY and SHIFTY times the factor (Abaqus: SCALEY a + SHIFTY, which ccx applies too);
+        the analytic forms, which the converter samples without SCALEY / SHIFTY (amplitude_curve),
+        their amplitude terms: PERIODIC A0 and every A_k, B_k, MODULATED and DECAY A0 and A.  Any
+        other definition (USER, SOLUTION DEPENDENT, BUBBLE, ...), an analytic one with
+        SCALEX / SCALEY / SHIFTX / SHIFTY of its own, or data the converter cannot read: None."""
+        definition = (src.param("DEFINITION") or "TABULAR").strip().upper()
+        params = OrderedDict((k, v) for k, v in src.params.items())
+        params["NAME"] = name
+        if definition in ("TABULAR", "EQUALLY SPACED", "SMOOTH STEP"):
+            try:
+                y, dy = pf(src.param("SCALEY") or "1"), pf(src.param("SHIFTY") or "0")
+            except ValueError:
+                return None
+            params["SCALEY"] = short_real(y * factor, 12)
+            if src.has("SHIFTY") and dy != 0.0:
+                params["SHIFTY"] = short_real(dy * factor, 12)
+            return Block("AMPLITUDE", params, list(src.data)).placed(src)
+        if definition not in ("PERIODIC", "MODULATED", "DECAY") or \
+                any(src.has(k) for k in ("SCALEX", "SCALEY", "SHIFTX", "SHIFTY")) or src.has("INPUT"):
+            return None
+
+        def scale_fields(line: str, which) -> str:
+            f = line.split(",")
+            for i in range(len(f)):
+                if which(i) and f[i].strip():
+                    f[i] = " " + short_real(pf(f[i]) * factor, 12)
+            return ",".join(f)
+        try:
+            if definition == "PERIODIC":    # N, omega, t0, A0 / then the A_k, B_k pairs
+                data = [scale_fields(src.data[0], lambda i: i == 3)] + \
+                    [scale_fields(ln, lambda i: True) for ln in src.data[1:]]
+            else:                           # MODULATED: A0, A, t0, w1, w2; DECAY: A0, A, t0, td
+                fields = [x for ln in src.data for x in ln.split(",")]
+                while fields and not fields[-1].strip():
+                    fields.pop()
+                data = [scale_fields(",".join(fields), lambda i: i < 2)]
+        except (ValueError, IndexError):
+            return None
+        return Block("AMPLITUDE", params, data).placed(src)
 
     def _sp_amplitudes(self, blocks: List[Block]) -> List[Block]:
         """A static perturbation or *BUCKLE step's loads, BCs and temperatures on an amplitude:
