@@ -1143,6 +1143,49 @@ def test_flattened_set_names_made_unique():
     assert "names collide within CalculiX's 80-character name limit" in rep.text()
 
 
+def test_quoted_names_with_commas_written_with_underscores():
+    # ccx splits a card at every comma, quotes or not: ELSET="PLATE, A" is set "PLATE plus an
+    # unknown parameter, so names that agree up to the comma become one set (here a solid and
+    # a shell part: ccx stopped on the sections).  Every quoted name with a comma is written
+    # with '_' for it, the same in keyword parameters, data lines and the flattened instance
+    # names; *HEADING text stays as it is
+    deck = ('*HEADING\n"Shaker, rough" model\n'
+            '*PART, NAME="PLATE, A"\n' + HEX + '*NSET, NSET=BASE\n1, 2, 3, 4\n'
+            '*SOLID SECTION, ELSET=EALL, MATERIAL="Steel, 304"\n*END PART\n'
+            '*PART, NAME="PLATE, B"\n*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n'
+            '*ELEMENT, TYPE=S4, ELSET=SHELL\n1, 1, 2, 3, 4\n*NSET, NSET=EDGE\n1, 4\n'
+            '*SHELL SECTION, ELSET=SHELL, MATERIAL="Steel, 304"\n1.,\n*END PART\n'
+            '*ASSEMBLY, NAME=ASM\n*INSTANCE, NAME="PLATE, A-1", PART="PLATE, A"\n*END INSTANCE\n'
+            '*INSTANCE, NAME="PLATE, B-1", PART="PLATE, B"\n5., 0., 0.\n*END INSTANCE\n'
+            '*NSET, NSET="Load, tip", INSTANCE="PLATE, B-1"\n2, 3\n*END ASSEMBLY\n'
+            '*MATERIAL, NAME="Steel, 304"\n*ELASTIC\n200000., 0.3\n'
+            '*BOUNDARY\n"PLATE, A-1".BASE, ENCASTRE\n"PLATE, B-1".EDGE, ENCASTRE\n'
+            '*STEP\n*STATIC\n*CLOAD\n"Load, tip", 3, 1.\n*NODE PRINT, NSET="Load, tip"\nU\n*END STEP\n')
+    body, conv, rep = convert_str(deck)
+    cards = [ln for ln in body.splitlines() if not ln.startswith("**")]
+    head = cards.index("*HEADING")
+    assert cards[head + 1] == '"Shaker, rough" model'
+    commas = [ln for ln in cards[head + 2:] if any("," in q for q in A.QUOTED_TEXT.findall(ln))]
+    assert not commas, commas
+    assert '*MATERIAL, NAME="Steel_304"' in cards
+    assert '*SOLID SECTION, ELSET="PLATE_A-1"_EALL, MATERIAL="Steel_304"' in cards
+    assert '*SHELL SECTION, ELSET="PLATE_B-1"_SHELL, MATERIAL="Steel_304"' in cards
+    assert '"PLATE_A-1"_BASE, 1, 6' in cards and '"Load_tip", 3, 1.' in cards
+    assert '*NODE PRINT, NSET="Load_tip"' in cards
+    assert '6 quoted name(s) with a comma written with \'_\' for it' in rep.text()
+    assert not conv.reduced_physics or conv.reduced_physics == [S4R_FLAG]
+    # a new name another quoted name already has gets _2; a file name keeps its comma
+    deck2 = ('*NODE, NSET="A, B"\n1, 0., 0., 0.\n*NSET, NSET="A_B"\n1\n*NSET, NSET="a ,b"\n1\n'
+             '*ELEMENT, TYPE=MASS, ELSET=M\n2, 1\n*MASS, ELSET=M\n1.\n')
+    body2, _, _ = convert_str(deck2)
+    # ("A, B" and "a ,b" are one name to ccx and to the converter: one set, A_B_2)
+    assert '*NSET, NSET="A_B_2"\n1\n' in body2 and '*NSET, NSET="A_B"\n1\n' in body2, body2
+    blocks = [A.mkblock("INCLUDE", [("INPUT", '"model, part 1.inp"')], []),
+              A.mkblock("NSET", [("NSET", '"X, Y"')], ["1"])]
+    out = A.Converter(A.Report(), Opt())._comma_free_names(blocks)
+    assert out[0].params["INPUT"] == '"model, part 1.inp"' and out[1].params["NSET"] == '"X_Y"'
+
+
 def test_parameter_with_internal_comment():
     # A ** comment inside a *PARAMETER block must NOT terminate it.
     deck = ("*PARAMETER\nl = 2.0\n** a comment inside the block\nw = 3.0\n"
@@ -6642,6 +6685,197 @@ def test_distributing_coupling_on_a_shared_reference_node():
     assert "rotation rows are on the node's own DOFs 4-6" in rep.text() and not conv.reduced_physics
 
 
+def test_mass_on_a_distributing_reference_node_gets_a_zero_spring_to_a_held_node():
+    # a test mass (MASS element alone) on a distributing coupling's reference node, which only
+    # the coupling's *EQUATIONs tie: ccx 2.23 stopped ('add_sm_st' in *STATIC, 'add_sm_ei' in
+    # *FREQUENCY: coefficient should be 0).  A SPRINGA of stiffness 0 to a new node a model
+    # span away, held in DOFs 1-3 (again after OP=NEW), puts it in ccx's matrix structure
+    # (validate_with_ccx.py distributing_mass_ref: the same static answer as without the mass)
+    text = open(os.path.join(EXAMPLES, "distributing_mass_ref.inp"), encoding="utf-8").read()
+    deck = text + ("*Step, name=Again\n*Static\n*Boundary, op=NEW\nBOTTOM, ENCASTRE\n"
+                   "*Cload\nREF, 1, 10.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    springs = [(eid, conn) for eid, (typ, conn) in conv.geom.elements.items() if typ == "SPRINGA"]
+    assert len(springs) == 1 and springs[0][1][0] == 1000, springs
+    g = springs[0][1][1]
+    assert conv.geom.nodes[g][1:] == conv.geom.nodes[1000][1:] and conv.geom.nodes[g][0] < 0.0
+    assert ("*SPRING, ELSET=ABQ2CCX_MASS_HOLD\n0.\n*BOUNDARY\n" + f"{g}, 1, 3\n") in body
+    assert f"(OP=NEW removed it)\n*BOUNDARY\n{g}, 1, 3\n" in _step(body, 3)
+    assert "Distributing coupling on a reference node with MASS elements alone (node 1000)" in rep.text()
+    assert not conv.reduced_physics
+    # without the mass, or on a node that carries another element too: no spring
+    for variant in (text.replace("*Element, type=MASS, elset=TESTMASS\n9000, 1000\n*Mass, elset=TESTMASS\n0.05,\n", ""),
+                    text.replace("*Mass, elset=TESTMASS\n0.05,\n", "*Mass, elset=TESTMASS\n0.05,\n"
+                                 "*Element, type=SPRINGA, elset=S\n9001, 1000, 1\n*Spring, elset=S\n\n1.\n")):
+        assert variant != text
+        body, conv, rep = convert_str(variant)
+        assert "ABQ2CCX_MASS_HOLD" not in body and "MASS elements alone" not in rep.text()
+
+
+def test_distributing_coupling_with_an_element_on_its_reference_node_warns_of_a_dense_block():
+    # ccx eliminates a distributing coupling's reference node through its rows, so an element
+    # there (the test mass and its zero SPRINGA) couples every pair of the rows' n DOFs: about
+    # n (n + 1) / 2 matrix entries (a 6480-node coupling: 189 million, more than the rest of the
+    # model).  Warned above DENSE_COUPLING_ENTRIES; the example's 49 nodes (147 DOFs) are not
+    path = os.path.join(EXAMPLES, "distributing_mass_ref.inp")
+    for limit, warned in ((None, False), (10_000, True)):
+        report = A.Report()
+        conv = A.Converter(report, Opt())
+        if limit:
+            conv.DENSE_COUPLING_ENTRIES = limit
+        conv.convert(A.read_blocks(path, report))
+        text = report.text()
+        assert ("dense block" in text) == warned, text
+    assert re.search(r"distributing_mass_ref\.inp:\d+: Distributing coupling on reference node 1000, which "
+                     r"carries an element \(a mass or spring\), ties it to 147 DOFs of 49 coupling nodes: .*"
+                     r"a dense block of about 10,878 matrix entries", text), text
+    assert not conv.reduced_physics
+    # without the mass the node carries no element: no block, however low the limit
+    bare = open(path, encoding="utf-8").read().replace(
+        "*Element, type=MASS, elset=TESTMASS\n9000, 1000\n*Mass, elset=TESTMASS\n0.05,\n", "")
+    assert "TYPE=MASS" not in bare.upper()
+    fd, tmp = tempfile.mkstemp(suffix=".inp")
+    os.close(fd)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(bare)
+        report = A.Report()
+        conv = A.Converter(report, Opt())
+        conv.DENSE_COUPLING_ENTRIES = 0
+        conv.convert(A.read_blocks(tmp, report))
+    finally:
+        os.unlink(tmp)
+    assert "dense block" not in report.text()
+
+
+def test_base_motion_scale_becomes_a_scaled_copy_of_its_amplitude():
+    # ccx 2.23 reads no SCALE on *BASE MOTION ('parameter not recognized'): a shaker run at
+    # SCALE=441292 (45 g in mm/s^2) responded as to 1 mm/s^2.  The card names a copy of its
+    # amplitude scaled by the factor (validate_with_ccx.py shaker_assembly: exactly 9810
+    # times the response without SCALE); SCALE=1 just goes; without an amplitude: warned
+    deck = (HEX_MODEL + "*Amplitude, name=Amp-1\n1., 1., 3000., 1.\n"
+            "*Step\n*Frequency\n4,\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n1., 100., 5\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, type=ACCELERATION, dof=1, amplitude=Amp-1, scale=441292.\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n1., 100., 5\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, type=ACCELERATION, dof=2, amplitude=Amp-1, scale=441292.\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n1., 100., 5\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, type=ACCELERATION, dof=3, amplitude=Amp-1, scale=1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert "*AMPLITUDE, NAME=Amp-1\n1., 1., 3000., 1.\n" in body
+    assert "*AMPLITUDE, NAME=Amp-1_X1\n1, 441292, 3000, 441292\n" in body, body
+    assert body.count("*BASE MOTION, TYPE=ACCELERATION, DOF=1, AMPLITUDE=Amp-1_X1\n") == 1
+    assert body.count("*BASE MOTION, TYPE=ACCELERATION, DOF=2, AMPLITUDE=Amp-1_X1\n") == 1
+    assert "*BASE MOTION, TYPE=ACCELERATION, DOF=3, AMPLITUDE=Amp-1\n" in body
+    assert "SCALE=" not in body.upper().replace("SCALEY", "")
+    assert "*BASE MOTION, SCALE=441292. -> AMPLITUDE=Amp-1_X1, a copy of Amp-1 scaled" in rep.text()
+    assert not conv.reduced_physics
+    body, conv, rep = convert_str(deck.replace("dof=1, amplitude=Amp-1, scale", "dof=1, scale"))
+    assert "*BASE MOTION, SCALE=441292. without an *AMPLITUDE the converter can scale" in rep.text()
+    assert "*BASE MOTION SCALE without an amplitude (ccx ignores it)" in conv.reduced_physics
+
+
+def test_base_motion_scale_on_shifted_and_analytic_amplitudes():
+    # Abaqus multiplies the whole amplitude curve by the base motion's SCALE: SHIFTY scales too
+    # (3 + 2, times 10: 50, not 32); an analytic copy (PERIODIC, MODULATED, DECAY) takes the
+    # factor on its amplitude terms, as the converter samples analytic forms without SCALEY:
+    # with SCALEY the copy was commented out and ccx stopped on the base motion's amplitude
+    base = HEX_MODEL.replace("*Elastic\n1000., 0.3\n", "*Elastic\n1000., 0.3\n*Density\n1e-9\n")
+    ssd = ("*Step\n*Frequency\n4,\n*End Step\n*Step\n*Steady State Dynamics\n1., 2500., 20, 3.\n"
+           "*Modal Damping\n1, 4, 0.02\n*Base Motion, dof=1, amplitude=A1, scale=10.\n*End Step\n")
+    body, conv, rep = convert_str(base + "*Amplitude, name=A1, shifty=2.\n1., 3., 3000., 3.\n" + ssd)
+    assert "*AMPLITUDE, NAME=A1_X1, SHIFTY=20.\n1, 30, 3000, 30\n" in body, body
+    md = ("*Step\n*Frequency\n4,\n*End Step\n*Step\n*Modal Dynamic\n0.001, 0.1\n*Modal Damping\n"
+          "1, 4, 0.02\n*Base Motion, dof=1, amplitude=P1, scale=9810.\n*End Step\n")
+    for amp in ("*Amplitude, name=P1, definition=PERIODIC\n1, 6.2832, 0., 0.5\n0., 1.\n",
+                "*Amplitude, name=P1, definition=MODULATED\n0.5, 1., 0., 6.2832, 31.4\n",
+                "*Amplitude, name=P1, definition=DECAY\n0.5, 1., 0., 0.2\n"):
+        body, conv, rep = convert_str(base + amp + md)
+        lines = body.splitlines()
+        rows = {ln: lines[i + 1] for i, ln in enumerate(lines) if ln.startswith("*AMPLITUDE, NAME=P1")}
+        orig = [float(x) for x in rows["*AMPLITUDE, NAME=P1"].split(",")]
+        scaled = [float(x) for x in rows["*AMPLITUDE, NAME=P1_X1"].split(",")]
+        assert orig[0::2] == scaled[0::2] and all(abs(b - 9810.0 * a) <= 1e-6 * abs(b) + 1e-9
+                                                  for a, b in zip(orig[1::2], scaled[1::2])), (orig, scaled)
+        assert "*BASE MOTION, DOF=1, AMPLITUDE=P1_X1" in body and not other_reduced(conv), conv.reduced_physics
+    # a definition the converter cannot scale keeps SCALE, warned
+    body, conv, rep = convert_str(base + "*Amplitude, name=P1, definition=USER, variables=1\n0.\n" + md)
+    assert "which the converter cannot scale" in rep.text()
+    assert "*BASE MOTION SCALE on an amplitude the converter cannot scale (ccx ignores it)" in conv.reduced_physics
+
+
+def test_steady_state_dynamics_ranges_split_into_steps_and_zero_hz_lifted():
+    # ccx 2.23 reads one *STEADY STATE DYNAMICS data line: a step with several ranges (resonance
+    # bands) -> one step per range with the step's loads, base motion, damping and output;
+    # FREQUENCY SCALE / INTERVAL (not read by ccx) dropped; a range from 0 Hz under an
+    # acceleration base motion starts at 1e-3 of its upper bound (ccx's total displacement
+    # there is infinite at 0 Hz: NaN), but not under a plain load
+    deck = (HEX_MODEL + "*Amplitude, name=A1\n1., 1., 3000., 1.\n*Step\n*Frequency\n4,\n*End Step\n"
+            "*Step, perturbation\n*Steady State Dynamics, frequency scale=LINEAR, interval=RANGE\n"
+            "100., 120., 3,\n300., 320., 3, 1.\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, dof=1, amplitude=A1\n*Node Print, nset=EALLN\nU\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n0., 2500., 20, 3.\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, dof=2, amplitude=A1\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n0., 2500., 20, 3.\n*Modal Damping\n1, 4, 0.02\n"
+            "*Cload\n7, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    procs = re.findall(r"\*STEADY STATE DYNAMICS([^\n]*)\n([^\n]*)\n", body)
+    assert procs == [("", "100., 120., 3"), ("", "300., 320., 3, 1."), ("", "2.5, 2500., 20, 3."),
+                     ("", "0., 2500., 20, 3.")], procs
+    assert body.count("*BASE MOTION, DOF=1, AMPLITUDE=A1") == 2 and body.count("*MODAL DAMPING") == 4
+    text = rep.text()
+    assert "Step 2: *STEADY STATE DYNAMICS with 2 frequency ranges -> ccx steps 2-3" in text
+    assert "parameter(s) FREQUENCY SCALE, INTERVAL dropped (ccx reads neither)" in text
+    assert "where Abaqus' INTERVAL=RANGE places them otherwise" in text
+    assert "range from 0 Hz under an acceleration *BASE MOTION starts at 2.5 Hz" in text
+    assert text.count("range from 0 Hz") == 1
+
+
+def test_base_motion_steady_state_output_tu_is_ccx_u():
+    # ccx's U in a steady-state dynamics step with *BASE MOTION is the total displacement
+    # (Abaqus' TU): TU / TU1-3 -> U, U warned (Abaqus' U is relative to the base); a step without
+    # base motion is left alone
+    deck = (HEX_MODEL + "*Amplitude, name=A1\n1., 1., 3000., 1.\n*Step\n*Frequency\n4,\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n1., 2500., 20, 3.\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, dof=1, amplitude=A1\n*Output, history\n*Node Output, nset=TOPN\n"
+            "TU1, TU2, U3\n*End Step\n")
+    deck = deck.replace("*Boundary", "*Nset, nset=TOPN\n5, 6, 7, 8\n*Boundary", 1)
+    body, conv, rep = convert_str(deck)
+    assert "*NODE PRINT, NSET=TOPN\nU\n" in _step(body, 2), _step(body, 2)
+    assert "Output variable TU -> U in a steady-state dynamics step with *BASE MOTION" in rep.text()
+    assert "Output variable U in a steady-state dynamics step with *BASE MOTION: Abaqus' U is relative" \
+        in rep.text()
+    body, conv, rep = convert_str(deck.replace("*Base Motion, dof=1, amplitude=A1\n", "*Cload\n7, 3, 1.\n"))
+    assert "with *BASE MOTION" not in rep.text()
+    # a TU-only request: output planning reads the card's step (no NODE PRINT was written)
+    body, conv, rep = convert_str(deck.replace("TU1, TU2, U3", "TU1, TU2"))
+    assert "*NODE PRINT, NSET=TOPN\nU\n" in _step(body, 2), _step(body, 2)
+
+
+def test_prestressed_modes_reach_steady_state_dynamics_with_perturbation():
+    # ccx 2.23 reads perturbation eigenmodes in a *STEADY STATE DYNAMICS step whose own *STEP card
+    # has PERTURBATION (validate_with_ccx.py ssd_prestressed_bar: 83 Hz against 54 unstressed):
+    # the *FREQUENCY step after an NLGEOM preload keeps PERTURBATION and the steady-state steps
+    # reading it get it.  A *MODAL DYNAMIC reader segfaults ccx with it: dropped there, warned
+    deck = (HEX_MODEL + "*Step, nlgeom=YES\n*Static\n*Cload\n7, 3, 1.\n*End Step\n"
+            "*Step, perturbation\n*Frequency\n4,\n*End Step\n"
+            "*Step, perturbation\n*Steady State Dynamics\n1., 100., 5\n*Modal Damping\n1, 4, 0.02\n"
+            "*Cload\n7, 3, 1.\n*End Step\n"
+            "*Step, perturbation\n*Steady State Dynamics\n100., 200., 5\n*Modal Damping\n1, 4, 0.02\n"
+            "*Cload\n7, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert re.findall(r"\*STEP[^\n]*\n\*(\w+)", body) == ["STATIC", "FREQUENCY", "STEADY", "STEADY"]
+    assert [ln for ln in body.splitlines() if ln.startswith("*STEP")] == \
+        ["*STEP, NLGEOM=YES", "*STEP, PERTURBATION", "*STEP, PERTURBATION", "*STEP, PERTURBATION"]
+    assert "*STEP, PERTURBATION written on the *STEADY STATE DYNAMICS steps" in rep.text()
+    assert "prestress of a *FREQUENCY step that modal / steady-state dynamics read" not in conv.reduced_physics
+    body, conv, rep = convert_str(deck.replace(
+        "*Steady State Dynamics\n100., 200., 5\n*Modal Damping\n1, 4, 0.02\n",
+        "*Modal Dynamic\n0.001, 0.01\n*Modal Damping\n1, 4, 0.02\n"))
+    assert [ln for ln in body.splitlines() if ln.startswith("*STEP")][1:] == ["*STEP", "*STEP", "*STEP"]
+    assert "prestress of a *FREQUENCY step that modal / steady-state dynamics read" in conv.reduced_physics
+
+
 def test_rigid_body_and_kinematic_coupling_on_one_reference_node():
     # ccx's kinematic coupling turns its reference node's DOFs 4-6, a *RIGID BODY its ROT NODE:
     # on one REF NODE the coupling's members translated but did not turn (code review 3 B26b).
@@ -11973,8 +12207,9 @@ def test_frequency_prestress_follows_the_base_steps_nlgeom():
     # Abaqus extracts frequencies with the preload's stress stiffness only if the base state
     # includes NLGEOM, never with initial stresses in a first step; ccx 2.23 includes the base
     # state only with *STEP, PERTURBATION, whatever the earlier steps' NLGEOM (probed: a
-    # column under 0.37 of its buckling load, 16.87 Hz vs 20.95 Hz); its modal / steady-state
-    # dynamics refuse perturbation eigenmodes
+    # column under 0.37 of its buckling load, 16.87 Hz vs 20.95 Hz); its modal dynamics refuses
+    # perturbation eigenmodes (steady-state dynamics reads them with *STEP, PERTURBATION: test_
+    # prestressed_modes_reach_steady_state_dynamics_with_perturbation)
     load, modal = "*Cload\n7, 3, -1.\n", _deck_step("Modal Dynamic\n0.1, 1.")
 
     def heads(pre, freq="", after="", head="", model=BUCKLE_CUBE):
@@ -13444,6 +13679,44 @@ CONN_LOAD_HELD = ("*Node, nset=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 0., -
                   "*Connector Elasticity, component=1\n100.\n*Connector Elasticity, rigid\n2\n*Boundary\n"
                   "1, 1, 6\n3, 1, 6\n*Step\n*Static\n*Boundary\n2, 1, 1, 0.01\n{LOAD}*Node Print, nset=PROBE\n"
                   "U\n*End Step\n")
+
+
+def test_connector_load_and_motion_left_out_with_their_commented_out_connector():
+    # an AXIAL bolt (spring + preload) on a kinematic coupling's reference node under NLGEOM
+    # is commented out (its line turns with the nodes); its *CONNECTOR LOAD / MOTION went on
+    # as a *CLOAD / *BOUNDARY on a helper node tied to nothing, which ccx 2.23 drops without
+    # a message: they are left out with it, warned, and flagged as reduced physics
+    deck = ("*Node\n1, 0., 0., 0.\n2, 10., 0., 0.\n3, 10., 10., 0.\n4, 0., 10., 0.\n"
+            "5, 0., 0., 10.\n6, 10., 0., 10.\n7, 10., 10., 10.\n8, 0., 10., 10.\n"
+            "101, 5., 5., 20.\n102, 5., 5., 30.\n"
+            "*Element, type=C3D8, elset=BLOCK\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Solid Section, elset=BLOCK, material=STEEL\n*Material, name=STEEL\n*Elastic\n210000., 0.3\n"
+            "*Nset, nset=BOTTOM\n1, 2, 3, 4\n*Nset, nset=TOP\n5, 6, 7, 8\n"
+            "*Surface, type=NODE, name=TOPSURF\nTOP, 1.\n"
+            "*Coupling, constraint name=C1, ref node=101, surface=TOPSURF\n*Kinematic\n"
+            "*Element, type=CONN3D2, elset=BOLT\n2, 101, 102\n"
+            "*Connector Section, elset=BOLT, behavior=B1\nAxial,\n"
+            "*Connector Behavior, name=B1\n*Connector Elasticity, component=1\n86830.,\n"
+            "*Boundary\nBOTTOM, ENCASTRE\n102, ENCASTRE\n"
+            "*Step, name=pre, nlgeom=YES\n*Static\n1., 1., 1e-05, 1.\n"
+            "*Connector Load\nBOLT, 1, -1000.\n*End Step\n"
+            "*Step, name=pull, nlgeom=YES\n*Static\n1., 1., 1e-05, 1.\n"
+            "*Connector Motion\nBOLT, 1, 0.01\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    load, motion = conv._conn_act[(2, 1)], conv._conn_act[(2, 1)]
+    assert load == motion                    # (one helper per element and component)
+    assert not re.search(rf"^{load}, 1", body, re.M), body
+    assert "** abq2ccx: *CLOAD of a *CONNECTOR LOAD left out with its connectors" in _step(body, 1)
+    assert "** abq2ccx: *BOUNDARY of a *CONNECTOR MOTION left out with its connectors" in _step(body, 2)
+    assert re.search(r"\.inp:\d+: \*CONNECTOR LOAD / \*CONNECTOR MOTION on connector element\(s\) 2 "
+                     r"left out with them: those connectors are commented out", rep.text()), rep.text()
+    assert "*CONNECTOR LOAD / *CONNECTOR MOTION of connectors that are commented out" in conv.reduced_physics
+    # with --approximate the connector is written: the helper's *EQUATION ties the load to it
+    body, conv, rep = convert_str(deck, approximate=True)
+    h = conv._conn_act[(2, 1)]
+    assert f"*CLOAD\n{h}, 1, -1000." in body and f"*BOUNDARY\n{h}, 1, 1, 0.01" in body
+    assert any(any(n == h for n, _, _ in eq) for eq in _all_equations(body))
+    assert "left out with them" not in rep.text()
 
 
 def test_connector_load_on_a_determined_component_drops_only_the_load():

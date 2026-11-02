@@ -1,0 +1,106 @@
+*Heading
+A clamped steel bar stretched in an NLGEOM step: its modes about the preload, and steady-state
+** A steel bar 1000 x 10 x 10, clamped at both ends, stretched 0.5 mm (about 10.5 kN) in an NLGEOM
+** static step; a perturbation *FREQUENCY step about that preload (which raises the first bending
+** mode from 53 Hz to about 83 Hz) and a perturbation *STEADY STATE DYNAMICS step on those modes.
+*Node
+1, 0, 0., 0.
+2, 25, 0., 0.
+3, 50, 0., 0.
+4, 75, 0., 0.
+5, 100, 0., 0.
+6, 125, 0., 0.
+7, 150, 0., 0.
+8, 175, 0., 0.
+9, 200, 0., 0.
+10, 225, 0., 0.
+11, 250, 0., 0.
+12, 275, 0., 0.
+13, 300, 0., 0.
+14, 325, 0., 0.
+15, 350, 0., 0.
+16, 375, 0., 0.
+17, 400, 0., 0.
+18, 425, 0., 0.
+19, 450, 0., 0.
+20, 475, 0., 0.
+21, 500, 0., 0.
+22, 525, 0., 0.
+23, 550, 0., 0.
+24, 575, 0., 0.
+25, 600, 0., 0.
+26, 625, 0., 0.
+27, 650, 0., 0.
+28, 675, 0., 0.
+29, 700, 0., 0.
+30, 725, 0., 0.
+31, 750, 0., 0.
+32, 775, 0., 0.
+33, 800, 0., 0.
+34, 825, 0., 0.
+35, 850, 0., 0.
+36, 875, 0., 0.
+37, 900, 0., 0.
+38, 925, 0., 0.
+39, 950, 0., 0.
+40, 975, 0., 0.
+41, 1000, 0., 0.
+*Element, type=B32, elset=BAR
+1, 1, 2, 3
+2, 3, 4, 5
+3, 5, 6, 7
+4, 7, 8, 9
+5, 9, 10, 11
+6, 11, 12, 13
+7, 13, 14, 15
+8, 15, 16, 17
+9, 17, 18, 19
+10, 19, 20, 21
+11, 21, 22, 23
+12, 23, 24, 25
+13, 25, 26, 27
+14, 27, 28, 29
+15, 29, 30, 31
+16, 31, 32, 33
+17, 33, 34, 35
+18, 35, 36, 37
+19, 37, 38, 39
+20, 39, 40, 41
+*Nset, nset=LEFT
+1
+*Nset, nset=RIGHT
+41
+*Nset, nset=MID
+21
+*Beam Section, elset=BAR, material=STEEL, section=RECT
+10., 10.
+0., 0., 1.
+*Material, name=STEEL
+*Elastic
+210000., 0.3
+*Density
+7.85e-09
+*Boundary
+LEFT, ENCASTRE
+RIGHT, 2, 6
+*Step, name=Stretch, nlgeom=YES
+*Static
+1., 1., 1e-05, 1.
+*Boundary
+RIGHT, 1, 1, 0.5
+*End Step
+*Step, name=Modes, perturbation
+*Frequency, eigensolver=Lanczos
+4, , , , , 
+*End Step
+*Step, name=Harmonic, perturbation
+*Steady State Dynamics
+20., 120., 10, 1.
+*Modal Damping
+1, 4, 0.02
+*Cload
+MID, 2, 1.
+*Output, history
+*Node Output, nset=MID
+U2
+*End Step

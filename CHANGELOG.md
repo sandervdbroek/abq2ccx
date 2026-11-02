@@ -8,6 +8,86 @@ From 1.6.0 on, each version opens with an overview in plain language (what now c
 gives more correct answers, what changed in using the converter), followed by the detailed
 entries. The GitHub release notes use the same section.
 
+## Unreleased
+
+### Overview
+
+* **Fewer ccx failures.** Models whose part, instance, material or set names hold a comma (as
+  CAD imports often name parts) now run: ccx read such a name only up to the comma, so sets of
+  different parts merged and ccx stopped, or silently used one part's section for another's. A
+  point mass on a distributing coupling's reference node (a test mass on a shaker table) no
+  longer stops ccx.
+* **More correct answers.** A connector load or motion whose connector cannot be converted is
+  now left out with it, and reported, instead of being written onto a node attached to nothing,
+  where ccx dropped it without a message. A base excitation's scale factor (`*BASE MOTION,
+  SCALE=`), which ccx ignored, now reaches ccx: a shaker run at 45 g responded as to 1 mm/s².
+* **Steady-state dynamics.** A frequency response after a preload now uses the prestressed modes,
+  as in Abaqus (ccx needs `PERTURBATION` on both steps; the converter dropped it). A step with
+  several frequency bands computes all of them (ccx read the first only), a range from 0 Hz
+  under a base acceleration no longer gives NaN, and Abaqus' total displacement `TU` is
+  written (ccx's `U` there is the total one; a request for the relative `U` is warned).
+
+### Details
+
+* **Names with a comma** — Abaqus reads a comma inside a quoted name as part of the name
+  (`*Part, name="COLD PLATE, ASSY-11"`); ccx 2.23 splits a card at every comma, quotes or not,
+  and read `ELSET="PLATE, A"` as set `"PLATE` plus an unknown parameter. Names that agree up to
+  their comma became one set: a solid and a shell part stopped ccx on their sections, two solid
+  parts ran with the later section on both. The converter's own data-line readers split there
+  too. Every quoted name with a comma is now written with `_` for it (and the blanks around it),
+  the same in every card that names it, before the conversion reads the deck; a name another
+  quoted name already has gets `_2`. `*HEADING` text and file names stay as they are
+  (`validate_with_ccx.py assembly_comma_names`).
+* **A mass on a distributing coupling's reference node** — the coupling is written as
+  `*EQUATION`s, and ccx 2.23 stops on a node with `MASS` elements alone that only equations tie
+  ("coefficient should be 0": `add_sm_st` in a static step, `add_sm_ei` in `*FREQUENCY`). Such a
+  node now gets a `SPRINGA` of stiffness 0 to a new node held in DOFs 1-3 (again after
+  `*BOUNDARY, OP=NEW`), as connector nodes already did; it changes nothing (the same static
+  displacements as without the mass: `validate_with_ccx.py distributing_mass_ref`).
+* **Large distributing couplings with a mass or spring warned** — ccx eliminates such a
+  coupling's reference node through its `*EQUATION`s, so an element on the node couples every
+  pair of the coupling's n DOFs: a dense block of about n² / 2 matrix entries, which ccx stores
+  and factors in full (a test mass on a 6480-node coupling: 189 million entries, more than the
+  rest of the model, and out of memory before the solver). Above 10 million entries the report
+  now warns with the numbers, and names a coupling on fewer nodes, or a `*KINEMATIC` one where
+  the attachment is stiff, as the remedy.
+* **`*BASE MOTION, SCALE`** — Abaqus multiplies a base motion's amplitude by `SCALE`; ccx 2.23
+  reads no such parameter and ignored it with a warning, so a steady-state or modal base
+  excitation ran at the amplitude alone (a shaker deck at `SCALE=441292`, 45 g in mm/s², came out
+  441292 times too small). The card now names a copy of its amplitude scaled by the factor: the
+  point-wise forms' SCALEY and SHIFTY, the analytic forms' (PERIODIC, MODULATED, DECAY) amplitude
+  terms. One without an amplitude, or on a definition the converter cannot scale, is warned, as
+  reduced physics.
+* **Steady-state dynamics on prestressed modes** — ccx 2.23's `*STEADY STATE DYNAMICS` reads the
+  modes of a perturbation `*FREQUENCY` step when its own `*STEP` card has `PERTURBATION` too; the
+  converter dropped `PERTURBATION` from the frequency step instead (the preload's stress
+  stiffness lost, as reduced physics). It is now kept, and written on the steady-state steps that
+  read the modes (`validate_with_ccx.py ssd_prestressed_bar`: a bar stretched under NLGEOM, 83.15
+  Hz against 53.72 Hz unstressed, superposed by the steady-state step). Modal dynamics, where ccx
+  2.23 segfaults with it, and complex frequency steps keep the old behaviour.
+* **Steady-state frequency ranges** — ccx reads one `*STEADY STATE DYNAMICS` data line and
+  neither `FREQUENCY SCALE` nor `INTERVAL`; a step with several ranges (resonance bands) computed
+  the first only. Such a step now becomes one step per range, with the step's loads, base motion,
+  damping and output requests; the two parameters are dropped, noted (ccx divides each range at
+  the eigenfrequencies inside it, where Abaqus' `INTERVAL=RANGE` spreads the points evenly).
+* **Base motion output and 0 Hz** — ccx's `U` in a steady-state step with `*BASE MOTION` is the
+  total displacement, base included (Abaqus' `TU`; Abaqus' `U` is relative to the base). `TU` is
+  now written as `U` and a `U` request warned; a range from 0 Hz under a base acceleration starts
+  at 1e-3 of its upper bound, as ccx's total displacement is infinite at 0 Hz (it wrote NaN).
+* **A shaker-table example** — `examples/shaker_assembly.inp`, a small model in the form of an
+  Abaqus/CAE export with the features of a real shaker deck: C3D10 parts whose names hold a
+  comma, an S8R + `STRI65` shroud tied to the plate, `AXIAL` bolts on kinematic couplings with an
+  `INFLUENCE RADIUS` preloaded under NLGEOM, a test mass on a distributing coupling, a Lanczos
+  `*FREQUENCY` step and `*STEADY STATE DYNAMICS` steps under `*BASE MOTION`
+  (`validate_with_ccx.py shaker_assembly`: both conversions solve every step, the preload acts
+  with `--approximate`, and the base excitation's scale reaches ccx).
+* **Connector loads and motions of connectors left out** — a history `*CONNECTOR LOAD` or
+  `*CONNECTOR MOTION` became a `*CLOAD` / `*BOUNDARY` on a helper node, which the connector's
+  `*EQUATION`s tie to its component. Where the connector itself was commented out (an `AXIAL`
+  bolt with a preload under NLGEOM, say), the helper was tied to nothing and ccx dropped the
+  load without a message. The lines are now left out with the connector, warned, and the deck
+  counts the lost load or motion as reduced physics.
+
 ## 1.6.0 (October 2026)
 
 ### Overview

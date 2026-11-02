@@ -11929,6 +11929,221 @@ def check_kinematic_all_dofs(ccx, env, tmp, shared):
     return failures
 
 
+@check("assembly_comma_names", "part, instance, material and set names that hold a comma")
+def check_assembly_comma_names(ccx, env, tmp, shared):
+    # --- quoted names with a comma ---------------------------------------------------------
+    # A solid and a shell part whose names agree up to a comma ("PLATE, SOLID", "PLATE,
+    # SHELL"), materials "Steel, 304" / "Steel, 316" and assembly sets "Load, solid" / "Load,
+    # shell".  ccx splits a card at every comma, quotes or not: written as they are, the sets
+    # of both instances are one set "PLATE and ccx stops on the sections.  abq2ccx writes the
+    # names with '_' for the comma, so the deck must solve without a 'parameter not
+    # recognized' warning, exactly like the same deck with the names written without commas.
+    failures = 0
+    text = open(os.path.join(EXAMPLES, "assembly_comma_names.inp"), encoding="utf-8").read()
+    plain = text
+    for a, b in (("PLATE, SOLID", "PLATE_SOLID"), ("PLATE, SHELL", "PLATE_SHELL"),
+                 ("Steel, 304", "Steel_304"), ("Steel, 316", "Steel_316"),
+                 ("Load, solid", "Load_solid"), ("Load, shell", "Load_shell")):
+        plain = plain.replace(a, b)
+    res, outs = {}, {}
+    for kind, deck in (("comma", text), ("plain", plain)):
+        src = os.path.join(tmp, f"comma_names_{kind}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        inp = os.path.join(tmp, f"comma_names_{kind}.inp")
+        convert(src, inp)
+        d, status, outs[kind] = run_ccx(ccx, env, inp)
+        res[kind] = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+        shutil.rmtree(d, ignore_errors=True)
+    nodes = sorted(set(res["comma"]) & set(res["plain"]))
+    unknown = outs["comma"].count("parameter not recognized")
+    if len(nodes) == 6 and len(res["comma"]) == 6:
+        scale = max(abs(x) for n in nodes for x in res["plain"][n])
+        err = ccx_ratio(max(abs(a - b) for n in nodes for a, b in zip(res["comma"][n], res["plain"][n])),
+                        scale)
+        ok = err < 1e-12 and scale > 1e-3 and not unknown
+        print(f"{'PASS' if ok else 'FAIL'}  assembly_comma_names (names with a comma -> '_'): 6 loaded "
+              f"nodes vs the deck without commas, max difference {err:.1e} of max |u| {scale:.4f}; "
+              f"{unknown} 'parameter not recognized' warning(s)")
+        failures += 0 if ok else 1
+    else:
+        print(f"FAIL  assembly_comma_names: did not solve ({len(res['comma'])} / {len(res['plain'])} "
+              f"loaded nodes printed)")
+        print("      " + " / ".join(l.strip() for l in outs["comma"].splitlines() if "ERROR" in l)[:200])
+        failures += 1
+    return failures
+
+
+@check("distributing_mass_ref", "a test mass on a distributing coupling's reference node")
+def check_distributing_mass_ref(ccx, env, tmp, shared):
+    # --- a MASS element on a distributing coupling's reference node --------------------------
+    # A 50 kg point mass on the reference node of a distributing coupling to the top of a
+    # clamped plate (a test mass on a shaker table).  The coupling becomes *EQUATIONs, and
+    # ccx 2.23 stops on a node with MASS elements alone that only equations tie ('add_sm_st'
+    # in the static step, 'add_sm_ei' in the *FREQUENCY step: coefficient should be 0), so
+    # abq2ccx adds a SPRINGA of stiffness 0 to a held node.  The deck must solve both steps;
+    # the static step must move the reference node exactly as the same deck without the mass
+    # (a static load does not see it), the plate's symmetry must give equal first two modes,
+    # and the mass must lower the first frequency.
+    failures = 0
+    text = open(os.path.join(EXAMPLES, "distributing_mass_ref.inp"), encoding="utf-8").read()
+    bare = text.replace("*Element, type=MASS, elset=TESTMASS\n9000, 1000\n*Mass, elset=TESTMASS\n0.05,\n", "")
+    assert bare != text, "distributing_mass_ref.inp: its MASS cards moved"
+    res, freqs, outs = {}, {}, {}
+    for kind, deck in (("mass", text), ("bare", bare)):
+        src = os.path.join(tmp, f"dist_mass_{kind}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        inp = os.path.join(tmp, f"dist_mass_{kind}.inp")
+        convert(src, inp)
+        d, status, outs[kind] = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        res[kind] = dat_displacement_history(dat, 1000) if status == "solved" else []
+        freqs[kind] = dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T") if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+    if res["mass"] and res["bare"] and len(freqs["mass"]) >= 2 and freqs["bare"]:
+        u, u0 = res["mass"][0], res["bare"][0]
+        err = ccx_ratio(max(abs(a - b) for a, b in zip(u, u0)), abs(u0[2]))
+        f1, f2 = freqs["mass"][:2]
+        pair = ccx_ratio(abs(f1 - f2), f1)
+        ok = err < 1e-9 and pair < 1e-6 and f1 < freqs["bare"][0]
+        print(f"{'PASS' if ok else 'FAIL'}  distributing_mass_ref (zero SPRINGA on a MASS reference node): "
+              f"static u3 {u[2]:.6e} vs {u0[2]:.6e} without the mass (difference {err:.1e}); "
+              f"modes 1, 2 {f1:.2f}, {f2:.2f} Hz; first mode {freqs['bare'][0]:.1f} Hz without the mass")
+        failures += 0 if ok else 1
+    else:
+        print("FAIL  distributing_mass_ref: did not solve")
+        print("      " + " / ".join(l.strip() for l in outs["mass"].splitlines() if "ERROR" in l)[:200])
+        failures += 1
+    return failures
+
+
+@check("shaker_assembly", "a CAE shaker-table model: bolts, a test mass, modes and base excitation")
+def check_shaker_assembly(ccx, env, tmp, shared):
+    # --- a shaker-table model as Abaqus/CAE writes it -----------------------------------------
+    # C3D10 parts whose names hold a comma, an S8R + STRI65 shroud tied to the plate, four AXIAL
+    # bolt connectors on kinematic couplings with an INFLUENCE RADIUS, preloaded in an NLGEOM
+    # step, a 50 kg test mass on a distributing coupling, a Lanczos *FREQUENCY step and three
+    # *STEADY STATE DYNAMICS steps under *BASE MOTION, SCALE=9810 (one from 0 Hz, one with two
+    # resonance bands, which ccx computes only as two steps).  Both conversions must
+    # solve every step.  With --approximate the bolts are written (SPRINGA + preload rows) and
+    # the preload lifts their reference nodes; without it they are commented out with their
+    # preload, which then moves nothing.  ccx 2.23 reads no SCALE on *BASE MOTION, so abq2ccx
+    # writes a scaled copy of the amplitude: the test mass must respond exactly 9810 times as
+    # much as in the same deck without SCALE.
+    failures = 0
+    text = open(os.path.join(EXAMPLES, "shaker_assembly.inp"), encoding="utf-8").read()
+    probe = text.replace("*Output, history, variable=PRESELECT\n*End Step",
+                         "*Output, history, variable=PRESELECT\n*Node Output, nset=_PickedSet706\nU\n*End Step", 1)
+    unscaled = probe.replace(", scale=9810.", "")
+    assert probe != text and unscaled.count("*Base Motion") == 3 and "scale=9810" not in unscaled
+    runs = {}
+    for kind, deck, approx in (("approx", probe, True), ("plain", probe, False), ("unscaled", unscaled, True)):
+        src = os.path.join(tmp, f"shaker_{kind}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        inp = os.path.join(tmp, f"shaker_{kind}.inp")
+        convert(src, inp, approximate=approx)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        runs[kind] = (status, {n: dat_displacement_history(dat, n) for n in (1, 2, 3, 4, 9)}
+                      if status == "solved" else {}, out)
+        if kind == "approx" and status == "solved":
+            body = open(dat, encoding="utf-8", errors="replace").read()
+            freqs = {float(x) for x in re.findall(r"for set SSD_POINTS and time\s+(\S+)", body)}
+        shutil.rmtree(d, ignore_errors=True)
+    if any(r[0] != "solved" for r in runs.values()):
+        for kind, (status, _u, out) in runs.items():
+            if status != "solved":
+                print(f"FAIL  shaker_assembly ({kind}): did not solve ({status})")
+                print("      " + " / ".join(l.strip() for l in out.splitlines() if "ERROR" in l)[:200])
+                failures += 1
+        return failures
+    lift = [runs["approx"][1][n][0][2] for n in (1, 2, 3, 4)]
+    still = max(abs(x) for n in (1, 2, 3, 4) for x in runs["plain"][1][n][0])
+    ok = min(lift) > 0.01 and still < 1e-12
+    print(f"{'PASS' if ok else 'FAIL'}  shaker_assembly (bolt preload): --approximate lifts the bolt "
+          f"reference nodes u3 {min(lift):.4f}-{max(lift):.4f}; without it (bolts commented out) "
+          f"max |u| {still:.1e}")
+    failures += 0 if ok else 1
+    # the peaks step's two bands, each its own ccx step; the first range lifted off 0 Hz
+    bands = [sorted(f for f in freqs if lo <= f <= hi) for lo, hi in ((900.0, 1100.0), (1900.0, 2100.0))]
+    ok = all(len(b) >= 3 and b[0] == lo and b[-1] == hi for b, (lo, hi) in
+             zip(bands, ((900.0, 1100.0), (1900.0, 2100.0)))) and min(freqs) > 0.0 and 2.5 in freqs
+    print(f"{'PASS' if ok else 'FAIL'}  shaker_assembly (steady-state ranges): both resonance bands "
+          f"computed ({len(bands[0])} and {len(bands[1])} frequencies); the 0-2500 Hz range starts "
+          f"at {'2.5' if 2.5 in freqs else 'no'} Hz (1e-3 of its upper bound), lowest {min(freqs):g} Hz")
+    failures += 0 if ok else 1
+    a, b = runs["approx"][1][9], runs["unscaled"][1][9]
+    ratios = [x / y for ua, ub in zip(a, b) for x, y in zip(ua, ub) if abs(y) > 1e-25]
+    ok = len(a) == len(b) and len(ratios) > 100 and all(abs(r / 9810.0 - 1.0) < 1e-5 for r in ratios)
+    print(f"{'PASS' if ok else 'FAIL'}  shaker_assembly (*BASE MOTION, SCALE=9810): test mass response "
+          f"{min(ratios, default=0):.4f}-{max(ratios, default=0):.4f} times the deck without SCALE "
+          f"({len(ratios)} values, all steps solved in both conversions)")
+    failures += 0 if ok else 1
+    return failures
+
+
+@check("ssd_prestressed_bar", "steady-state dynamics on the modes about an NLGEOM preload")
+def check_ssd_prestressed_bar(ccx, env, tmp, shared):
+    # --- steady-state dynamics on prestressed modes ---------------------------------------------
+    # A clamped steel bar 1000 x 10 x 10 stretched 0.5 mm in an NLGEOM step, a perturbation
+    # *FREQUENCY step and a perturbation *STEADY STATE DYNAMICS step.  Abaqus extracts the modes
+    # about the preload, whose tension raises the first bending mode; ccx 2.23 does so only with
+    # *STEP, PERTURBATION, and its steady-state step reads such modes only with PERTURBATION on
+    # its own *STEP card (it stops on them otherwise: 'created with perturbation info').  The
+    # bar without the stretch must give the Euler-Bernoulli clamped-clamped frequency
+    # 22.373 / (2 pi L^2) sqrt(EI / rho A) = 53.2 Hz within 2 %, the stretched one at least 1.4
+    # times that, the steady-state step must superpose those prestressed modes (its
+    # participation-factor table) and its midspan response peak at the first of them.
+    failures = 0
+    text = open(os.path.join(EXAMPLES, "ssd_prestressed_bar.inp"), encoding="utf-8").read()
+    i, j = text.index("*Step, name=Stretch"), text.index("*Step, name=Modes")
+    bare = text[:i] + text[j:]
+    res = {}
+    for kind, deck in (("pre", text), ("bare", bare)):
+        src = os.path.join(tmp, f"bar_{kind}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        inp = os.path.join(tmp, f"bar_{kind}.inp")
+        convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        if status == "solved":
+            body = open(dat, encoding="utf-8", errors="replace").read()
+            freqs = dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T")
+            used = []                       # the modes of the first participation-factor table
+            i0 = body.find("P A R T I C I P A T I O N")
+            for line in (body[i0:].splitlines()[1:] if i0 >= 0 else []):
+                f = line.split()
+                if len(f) == 4 and f[0].isdigit():
+                    used.append(float(f[1]))
+                elif used and not line.strip():
+                    break
+            resp = {}
+            for m in re.finditer(r"displacements \(vx,vy,vz\) for set MID and time\s+(\S+)\n\n\s+21\s+\S+\s+(\S+)", body):
+                resp[float(m.group(1))] = resp.get(float(m.group(1)), 0.0) + float(m.group(2)) ** 2
+            res[kind] = (freqs, used, resp)
+        else:
+            print(f"FAIL  ssd_prestressed_bar ({kind}): did not solve ({status})")
+            print("      " + " / ".join(l.strip() for l in out.splitlines() if "ERROR" in l)[:200])
+            failures += 1
+        shutil.rmtree(d, ignore_errors=True)
+    if failures:
+        return failures
+    f_pre, used, resp = res["pre"]
+    f0 = res["bare"][0]
+    ref = 22.373 / (2 * math.pi * 1000.0 ** 2) * math.sqrt(210000.0 * 10.0 ** 4 / 12.0 / (7.85e-9 * 100.0))
+    peak = max(resp, key=resp.get) if resp else 0.0
+    ok = (abs(f0[0] / ref - 1.0) < 0.02 and f_pre[0] > 1.4 * f0[0] and len(used) >= 2 and
+          all(abs(a / b - 1.0) < 1e-5 for a, b in zip(used, f_pre)) and abs(peak / f_pre[0] - 1.0) < 1e-4)
+    print(f"{'PASS' if ok else 'FAIL'}  ssd_prestressed_bar (*STEP, PERTURBATION on *FREQUENCY and "
+          f"*STEADY STATE DYNAMICS): first mode {f0[0]:.2f} Hz unstressed (Euler-Bernoulli "
+          f"{ref:.2f}), {f_pre[0]:.2f} Hz stretched; the steady-state step superposes "
+          f"{', '.join(f'{x:.2f}' for x in used[:2])} Hz and peaks at {peak:.2f} Hz")
+    return failures + (0 if ok else 1)
+
+
 @check("assembly_rotated_instances",
        "assembly flattening: a turned instance against the same model written flat")
 def check_assembly_rotated_instances(ccx, env, tmp, shared):

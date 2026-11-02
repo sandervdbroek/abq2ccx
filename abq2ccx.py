@@ -1587,6 +1587,17 @@ def _split_commas(line: str) -> List[str]:
     return out
 
 
+# A quoted text on a keyword or data line (an Abaqus name with blanks or commas in it), and
+# the parameters whose quoted value is a file name, not a name (*INCLUDE, *RESTART, ...).
+QUOTED_TEXT = re.compile(r'"[^"]*"')
+FILE_NAME_PARAMS = frozenset({"INPUT", "INP", "FILE"})
+
+
+def ccx_name_key(name: str) -> str:
+    """``name`` as ccx 2.23 reads it: blanks removed, upper case (quotes kept)."""
+    return "".join(name.split()).upper()
+
+
 # Constants and functions permitted inside Abaqus ``*PARAMETER`` expressions (e.g.
 # ``strain = abs(stretch - 1.0)``, ``r = 2*pi``).  Constants are reachable as bare
 # names; functions only as ``f(...)`` calls.  Expressions are evaluated by
@@ -6254,12 +6265,17 @@ class StepModel:
         # eigenmodes of a perturbation step (_freq_read: _frequency_perturbation)
         read: set = set()
         last_freq = None
+        # ... the procedures of the steps that read each, and the frequency step each reads
+        self.freq_readers: Dict[int, set] = {}
+        self.freq_of: Dict[int, int] = {}
         for s in steps:
             if s.proc == "FREQUENCY":
                 last_freq = s.no
             elif last_freq and s.proc in ("MODAL DYNAMIC", "STEADY STATE DYNAMICS",
                                           "COMPLEX FREQUENCY"):
                 read.add(last_freq)
+                self.freq_readers.setdefault(last_freq, set()).add(s.proc)
+                self.freq_of[s.no] = last_freq
         self.freq_read = frozenset(read)
         # the longest step time and the latest total time at which the deck's steps read an
         # amplitude, over which _sample_amplitude tabulates an analytic amplitude (_amp_span;
@@ -27557,6 +27573,7 @@ class _Constraints:
                                              method=dist.uparam("WEIGHTING METHOD") or "UNIFORM",
                                              structural=dist.uparam("COUPLING") == "STRUCTURAL")
         plan["nodal"] = self.surfaces[surf.upper()][0].startswith("NODE")   # (_warn_distributing_kept)
+        plan["card"] = b                    # (the place of its warnings: _warn_dense_couplings)
         return plan
 
     def _dcoup_plans(self, b: Block, blocks: List[Block], expanded: Dict[int, str], u1: set,
@@ -27783,6 +27800,85 @@ class _Constraints:
             if "why" not in plan:
                 plan["rows"] = self._distributing_rows(plan)
         self._distributing_holds([p for p in plans if "why" not in p])
+        self._hold_mass_refs([p["ref"] for p in plans if "why" not in p and p.get("rows")])
+        self._warn_dense_couplings([p for p in plans if "why" not in p and p.get("rows")])
+
+    # a distributing coupling whose reference node carries an element adds a dense block of
+    # about this many entries (n DOFs: n (n + 1) / 2) to ccx's matrix before it is warned
+    DENSE_COUPLING_ENTRIES = 10_000_000
+
+    def _warn_dense_couplings(self, plans: List[dict]) -> None:
+        """Warn of a distributing coupling whose reference node carries an element (a MASS, a
+        spring, the zero SPRINGA of _hold_mass_refs) and whose rows tie it to many DOFs.  ccx
+        eliminates the node through the rows (its DOFs are their first terms), so the
+        element's stiffness and mass go to every pair of the rows' other DOFs: a dense block
+        of n (n + 1) / 2 entries for n DOFs, which ccx stores and factors in full (probed: a
+        1-node MASS on a 49-node coupling added 9180 of the predicted 10878 entries; a test
+        mass on a 6480-node coupling, 19440 DOFs, ran out of 14 GB before the solver while the
+        model without it reached the solver).  The physics is unchanged: the warning names the
+        cost and the remedies."""
+        refs = {p["ref"] for p in plans}
+        carried: set = set()
+        for _typ, conn in self.geom.elements.values():
+            carried.update(n for n in conn if n in refs)
+        for p in plans:
+            ref = p["ref"]
+            if ref not in carried:
+                continue
+            own = {ref, self._rb_rot.get(ref)}
+            dofs = {(n, d) for row in p["rows"] if row and row[0][0] in own
+                    for n, d, _v in row[1:] if n not in own}
+            entries = len(dofs) * (len(dofs) + 1) // 2
+            if entries <= self.DENSE_COUPLING_ENTRIES:
+                continue
+            self.report.warn(f"Distributing coupling on reference node {ref}, which carries an element "
+                             f"(a mass or spring), ties it to {len(dofs)} DOFs of "
+                             f"{len(p['members'])} coupling nodes: ccx eliminates the node through "
+                             f"those *EQUATIONs and couples every pair of the DOFs, a dense block of "
+                             f"about {entries:,} matrix entries that its solver stores and factors in "
+                             f"full, which can need far more memory than the rest of the model. "
+                             f"The physics is unchanged; a coupling on fewer nodes (the block grows "
+                             f"with their square) or a *KINEMATIC coupling, where the attachment is "
+                             f"stiff, avoids it.", at=p.get("card"))
+
+    def _hold_mass_refs(self, refs: List[int]) -> None:
+        """A distributing coupling's reference node on MASS elements alone, which only the
+        coupling's *EQUATIONs tie, gets a SPRINGA of stiffness 0 to a new node a model span
+        away along -x, held in DOFs 1-3 in every step.  ccx 2.23 leaves MASS elements out of
+        its matrix structure and stops on such a node: 'add_sm_st: coefficient should be 0'
+        in a static step, 'add_sm_ei' in a *FREQUENCY step (probed: a 50 kg point mass on a
+        plate's distributing coupling, a test mass on a shaker table) — as on connector nodes
+        (_plan_connector_rows).  The spring puts the node in the structure and changes nothing
+        (probed: the same displacements as without the mass, and the mode pairs the model's
+        symmetry gives)."""
+        want = {n for n in refs if n not in self._mass_hold_nodes}
+        if not want:
+            return
+        types_at: Dict[int, set] = {}
+        for typ, conn in self.geom.elements.values():
+            for n in conn:
+                if n in want:
+                    types_at.setdefault(n, set()).add(typ.upper())
+        held = [n for n in dedup(refs) if n in want and types_at.get(n) == {"MASS"}]
+        if not held:
+            return
+        name = self._u1_name("ABQ2CCX_MASS_HOLD")
+        lines: List[str] = []
+        for n in held:
+            g = max(self.geom.nodes) + 1
+            self.geom.add_node(g, vsub(self.geom.nodes[n], (self._model_span(), 0.0, 0.0)))
+            eid = self._next_ids()[1] + 1
+            self.geom.add_element(eid, "SPRINGA", [n, g])
+            self.geom.add_to_elset(name, [eid])
+            lines.append(f"{g}, 1, 3")
+            self._mass_hold_nodes.add(n)
+        self._mass_hold_cards += [f"*SPRING, ELSET={name}", "0.", "*BOUNDARY"] + lines
+        self._mass_hold_bc += (["*BOUNDARY"] if not self._mass_hold_bc else []) + lines
+        self.report.note(f"Distributing coupling on a reference node with MASS elements alone "
+                         f"(node {', '.join(map(str, held[:4]))}{' ...' if len(held) > 4 else ''}): "
+                         f"a SPRINGA of stiffness 0 to a held node added. ccx 2.23 stops on a MASS "
+                         f"node that only *EQUATIONs tie ('add_sm_st' / 'add_sm_ei: coefficient "
+                         f"should be 0', probed); the spring changes nothing.", once=True)
 
     def _distributing_holds(self, plans: List[dict]) -> None:
         """Rows that hold the rotations of a ROT NODE no distributing row on it ties: some
@@ -29252,8 +29348,7 @@ class _Constraints:
             params = [(k, v) for k, v in b.params.items() if k in keep]
             nb_ = mkblock("BOUNDARY" if b.keyword == "CONNECTOR MOTION" else "CLOAD", params, data).placed(b)
             out.append(nb_)
-            if b.keyword == "CONNECTOR LOAD":
-                self._conn_load_cards.append(nb_)
+            (self._conn_load_cards if b.keyword == "CONNECTOR LOAD" else self._conn_motion_cards).append(nb_)
             made[b.keyword] = True
         if made["CONNECTOR MOTION"] or made["CONNECTOR LOAD"]:
             self.report.note("History *CONNECTOR MOTION / *CONNECTOR LOAD -> *BOUNDARY / *CLOAD on DOF 1 "
@@ -29969,6 +30064,55 @@ class _Constraints:
                 return []
             out.append(terms)
         return out
+
+    def _drop_untied_actuation(self) -> None:
+        """The *CLOAD / *BOUNDARY lines of history *CONNECTOR LOAD / MOTION cards
+        (_plan_connector_actuation) on the helper node of a connector that is commented out
+        (_plan_connectors, _plan_connector_rows) left out, warned: with the connector gone the
+        helper is a node of no element and no equation, so ccx 2.23 drops a load there
+        without a message (probed: an AXIAL connector's load in an NLGEOM step, the connector
+        commented out, moved nothing) and a motion there moves nothing.  The load or motion
+        is lost with its connector, which its own warning reports as reduced physics."""
+        if not self._conn_act:
+            return
+        written = {it["eid"] for sec in self._conn_plan.values() if not sec["reason"]
+                   for it in sec["items"] if it["route"] != "skip"}
+        helpers = set(self._conn_act.values())
+        tied: set = set()                       # (a helper some written row or element uses)
+        for sec in self._conn_plan.values():
+            if not sec["reason"]:
+                for it in sec["items"]:
+                    if it["route"] == "rows":
+                        tied.update(n for eq in it.get("eqs", ()) for n, _d, _v in eq if n in helpers)
+        for _typ, conn in self.geom.elements.values():
+            tied.update(n for n in conn if n in helpers)
+        lost = {h for (e, _c), h in self._conn_act.items() if e not in written and h not in tied}
+        if not lost:
+            return
+        names = {str(h) for h in lost}
+        cards = [c for c in self._conn_load_cards + self._conn_motion_cards
+                 if any(ln.split(",")[0].strip() in names for ln in c.data)]
+        for card in cards:
+            card.data[:] = [ln for ln in card.data if ln.split(",")[0].strip() not in names]
+            if not card.data:
+                self._conn_dropped_cards.add(id(card))
+        eids = sorted({e for (e, _c), h in self._conn_act.items() if h in lost})
+        kinds = sorted({k for h in lost for k in self._conn_act_kind.get(h, ())})
+        listing = ", ".join(map(str, eids[:8])) + (f" and {len(eids) - 8} more" if len(eids) > 8 else "")
+        self.report.warn(f"{' / '.join('*' + k for k in kinds)} on connector element(s) {listing} "
+                         f"left out with them: those connectors are commented out (see their "
+                         f"warnings), so the helper node it acts on would be tied to nothing and "
+                         f"ccx 2.23 would drop the load without a message.",
+                         at=cards[0] if cards else None)
+        self._reduces(f"{' / '.join('*' + k for k in kinds)} of connectors that are commented out")
+
+    @staticmethod
+    def _dropped_actuation_line(b: Block) -> List[str]:
+        """The comment written for a *CLOAD / *BOUNDARY card of connector loads / motions that
+        _drop_untied_actuation left with no line."""
+        source = "*CONNECTOR LOAD" if b.keyword == "CLOAD" else "*CONNECTOR MOTION"
+        return [f"** abq2ccx: *{b.keyword} of a {source} left out with its connectors, which are "
+                f"commented out"]
 
     def _conn_element(self, typ: str, nodes: List[int], value: float) -> str:
         """A new SPRINGA / DASHPOTA element on ``nodes`` in the element set of its type and
@@ -30803,6 +30947,7 @@ class _Constraints:
             # SPRINGA of stiffness 0 to a new held node puts the node there, changing nothing
             for n in (it["a"], it["b"]):
                 if n is not None and n not in mass_held and n in mass_only and \
+                        n not in self._mass_hold_nodes and \
                         any(m == n for eq in eqs for m, _d, _v in eq):
                     mass_held.add(n)
                     g = max(self.geom.nodes) + 1
@@ -32943,6 +33088,11 @@ class _Loads:
                              f"not have (first: '{cut[0]}'): those DOFs are left out.")
         return out
 
+    def _ssd_reads_only(self, freq_no: int) -> bool:
+        """Only (modal) *STEADY STATE DYNAMICS steps read the eigenmodes of *FREQUENCY step
+        ``freq_no``: they can read perturbation eigenmodes (with *STEP, PERTURBATION)."""
+        return self._steps_now.freq_readers.get(freq_no) == {"STEADY STATE DYNAMICS"}
+
     def _frequency_perturbation(self, given: bool) -> bool:
         """Whether a *FREQUENCY step gets *STEP, PERTURBATION (``given``: the deck's).  Abaqus
         extracts frequencies about the base state with the preload's initial stress and load
@@ -32958,12 +33108,19 @@ class _Loads:
         expansion, no loads, no overclosure: _contact_overclosed) PERTURBATION is exact
         (probed: E halved by heating, 14.81 Hz; ccx resolves an overclosure in the first
         general step, with stresses, as Abaqus does, not in a first-step PERTURBATION).
-        ccx's modal / steady-state dynamics and complex frequency steps refuse an .eig file
-        written by a perturbation frequency step ('created with perturbation info'; probed):
-        PERTURBATION is left out on the frequency step they read (_freq_read).  Where only an
+        ccx's modal dynamics and complex frequency steps refuse an .eig file written by a
+        perturbation frequency step ('created with perturbation info'; modal dynamics with
+        *STEP, PERTURBATION segfaults; probed): PERTURBATION is left out on the frequency step
+        they read (_freq_read); steady-state dynamics reads such modes with PERTURBATION on its
+        own *STEP card (_ssd_reads_only, handle_step).  Where only an
         overclosure stresses a linear base, --approximate writes PERTURBATION: much closer to
         Abaqus than the plain step (probed: 28.80 Hz, 29.80 touching, 20.95 plain)."""
-        read = self.emit.no in self._freq_read
+        # ccx's *STEADY STATE DYNAMICS reads perturbation eigenmodes where its own *STEP card
+        # has PERTURBATION ('... does not contain the perturbation parameter on the *STEP
+        # card'; probed: a bar stretched in an NLGEOM step, 83.36 Hz prestressed against 53.58,
+        # superposed in the steady-state step), which handle_step writes there: only modal
+        # dynamics (which segfaults with it, probed) and complex frequency steps refuse them
+        read = self.emit.no in self._freq_read and not self._ssd_reads_only(self.emit.no)
         contact = self._freq_contact
         left = "the deck's PERTURBATION dropped" if given else "left out"
         if not self.emit.step.general_before:
@@ -32987,11 +33144,11 @@ class _Loads:
                 self._reduces("contact left out of a *FREQUENCY step (ccx's plain *FREQUENCY "
                               "drops it)")
                 return False
-            if given and read:
-                self.report.note("*STEP, PERTURBATION dropped on the first *FREQUENCY step "
-                                 "(no preload before it, so nothing changes; ccx's modal / "
-                                 "steady-state dynamics step refuses perturbation "
-                                 "eigenmodes).", once=True)
+            if given and self.emit.no in self._freq_read:
+                self.report.note("*STEP, PERTURBATION dropped on the first *FREQUENCY step, whose "
+                                 "eigenmodes a modal / steady-state dynamics step reads (no preload "
+                                 "before it, so nothing changes; those steps then need no "
+                                 "PERTURBATION of their own).", once=True)
             elif given and self._initial_stresses:
                 self.report.note("*STEP, PERTURBATION dropped on a *FREQUENCY step with no general "
                                  "step before it: Abaqus leaves initial stresses out there (only an "
@@ -33201,6 +33358,8 @@ class _Loads:
                         params[k] = v
                 elif proc == "BUCKLE":
                     params[k] = v
+                elif proc == "STEADY STATE DYNAMICS":
+                    pass                # (written below where its eigenmodes are perturbation ones)
                 elif proc is None:
                     self.report.note("*STEP, PERTURBATION dropped on a step without a ccx procedure "
                                      "(ccx reads it only on *FREQUENCY / *BUCKLE).", once=True)
@@ -33336,6 +33495,19 @@ class _Loads:
             params["PERTURBATION"] = None
         if proc in ("FREQUENCY", "BUCKLE") and "PERTURBATION" in params:
             self._perturbation_after_buckle(proc, params)
+        if proc == "FREQUENCY" and "PERTURBATION" in params:
+            self._freq_pert_written.add(cur.no)
+        if proc == "STEADY STATE DYNAMICS":
+            if self._steps_now.freq_of.get(cur.no) in self._freq_pert_written:
+                params["PERTURBATION"] = None
+                self.report.note("*STEP, PERTURBATION written on the *STEADY STATE DYNAMICS steps that "
+                                 "read the eigenmodes of a perturbation *FREQUENCY step: ccx 2.23 "
+                                 "superposes those prestressed modes only then (probed: a bar "
+                                 "stretched in an NLGEOM step, 83.36 Hz against 53.58 Hz unstressed; "
+                                 "without it ccx stops: 'created with perturbation info').", once=True)
+            elif step_block.has("PERTURBATION"):
+                self.report.note("*STEP, PERTURBATION dropped on a *STEADY STATE DYNAMICS step whose "
+                                 "eigenmodes are not perturbation ones (ccx would stop on it).", once=True)
         if not cur.perturbation:
             # its temperatures, loads and prescribed motion: the base state of the steps after
             # (_frequency_perturbation)
@@ -33473,6 +33645,8 @@ class _Loads:
         return out
 
     def handle_boundary(self, b: Block) -> List[str]:
+        if id(b) in self._conn_dropped_cards:        # _drop_untied_actuation
+            return self._dropped_actuation_line(b)
         if id(b) in self.steps.lc2:                  # (_plan_load_cases notes it)
             return ["** abq2ccx: *BOUNDARY, LOAD CASE=2 (buckling-mode BCs) left out: ccx has one "
                     "set of BCs per step"]
@@ -33586,6 +33760,9 @@ class _Loads:
         if self._kin_hold_bc and op_new:
             out += ["** abq2ccx: free reference node rotations held again (OP=NEW removed "
                     "it)"] + self._kin_hold_bc
+        if self._mass_hold_bc and op_new:
+            out += ["** abq2ccx: the nodes of zero springs on MASS reference nodes held again "
+                    "(OP=NEW removed it)"] + self._mass_hold_bc
         if self._truss_hub_bc and op_new:
             out += ["** abq2ccx: truss hub rotations held again (OP=NEW removed it)"] + self._truss_hub_bc
         if self._conn_bcs and op_new:
@@ -35077,6 +35254,8 @@ class _Loads:
         its ROT NODE — ccx silently ignores them on the REF NODE (verified: no rotation); the
         ROT NODE has the reference node's local axes if it has a *TRANSFORM.
         Abaqus ORIENTATION= (local load axes) and FOLLOWER=YES have no ccx counterpart."""
+        if id(b) in self._conn_dropped_cards:        # _drop_untied_actuation
+            return self._dropped_actuation_line(b)
         if b.has("USER"):
             return self._user_load_card(b)
         if self._op_new_load(b):
@@ -40076,6 +40255,7 @@ class _Loads:
         its count of dropped rotational BCs."""
         self.emit = EmitState()
         self._n_inactive_rot = self._n_inactive_rot_truss = 0
+        self._freq_pert_written = set()
 
     def _plan_initial_temperatures(self, blocks: List[Block]) -> None:
         """Where ccx needs the Abaqus default initial temperature (0) added."""
@@ -41166,6 +41346,17 @@ class _Output:
             return "EL PRINT" if hist and b.param("ELSET") else "EL FILE"
         return b.keyword
 
+    def _in_base_motion_ssd(self, b: Block) -> bool:
+        """Output card ``b`` stands in a mode-based *STEADY STATE DYNAMICS step with a *BASE
+        MOTION: by the step model's cards, so _plan_output (before the emission writes the step)
+        and handle_output read the same."""
+        if self._base_ssd_cards is None:
+            self._base_ssd_cards = {id(c) for st in self.steps.steps
+                                    if st.proc == "STEADY STATE DYNAMICS" and
+                                    any(x.keyword == "BASE MOTION" for x in st.cards)
+                                    for c in st.cards}
+        return id(b) in self._base_ssd_cards
+
     def _output_card(self, b: Block, cc: str, report: "Report", twin: Optional[List[str]] = None):
         """(parameters, ccx labels) of output card ``b`` written as ``*cc``, with notes on
         what is dropped or renamed; labels None when nothing of the card is left.  Its
@@ -41227,6 +41418,9 @@ class _Output:
         for rec in merged_data_records(b):
             invars.extend(x for x in rec if x != "")
         outvars: List[str] = []
+        # a mode-based steady-state dynamics step with *BASE MOTION: ccx's U is the total
+        # displacement (probed: a held base node prints the base's -A/(2 pi f)^2), Abaqus' TU
+        base_ssd = self._in_base_motion_ssd(b)
         known_bases = set(ABQ_DROP_VARS) | set(ABQ_MAP_VARS) | \
             {"S", "E", "U", "V", "RF", "NT", "ME", "PEEQ", "THE", "SDV", "HFL", "ENER"}
         for v in invars:
@@ -41243,6 +41437,18 @@ class _Output:
                 report.note("Output variable A (acceleration) dropped: ccx 2.23 writes no "
                             "accelerations (*NODE FILE / *NODE PRINT have no such label).", once=True)
                 continue
+            if base_ssd and re.fullmatch(r"TU[123]?", vu):
+                report.note("Output variable TU -> U in a steady-state dynamics step with *BASE "
+                            "MOTION: ccx 2.23's U there is the total displacement, base motion "
+                            "included, which is Abaqus' TU (probed: a held base node prints the "
+                            "base's -A/(2 pi f)^2).", once=True)
+                vu = "U"
+            elif base_ssd and vu in ("U", "UT"):
+                report.warn("Output variable U in a steady-state dynamics step with *BASE MOTION: "
+                            "Abaqus' U is relative to the moving base, ccx 2.23's U is the total "
+                            "displacement, base motion included (Abaqus' TU; probed). Relative = "
+                            "ccx's U minus the base's motion along the excited DOF: -A/(2 pi f)^2 "
+                            "for a base acceleration A.", once=True)
             if vu in ABQ_DROP_VARS:
                 report.note(f"Output variable {vu} dropped (no ccx equivalent; derive in "
                             f"post-processing).", once=True)
@@ -44717,9 +44923,12 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # value) -> the element set of the springs / dashpots written for them, and those sets'
         # cards written so far; the DASHPOTA elements among them
         self._conn_act: Dict[Tuple[int, int], int] = {}
-        # helper node -> the keywords acting on it; the *CLOAD cards made for the loads
+        # helper node -> the keywords acting on it; the *CLOAD cards made for the loads, and
+        # the *BOUNDARY cards made for the motions
         self._conn_act_kind: Dict[int, set] = {}
         self._conn_load_cards: List[Block] = []
+        self._conn_motion_cards: List[Block] = []
+        self._conn_dropped_cards: set = set()      # ids of those left with no line (_drop_untied_actuation)
         self._conn_bc_every: set = set()           # (node, DOF) with a BC in every step
         self._conn_fixed: Dict[int, set] = {}
         self._conn_fixed_cards: Dict[int, set] = {}     # id(model-data *CONNECTOR MOTION) -> elements
@@ -44783,6 +44992,13 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._rigid_planar_refs: List[int] = []
         self._rigid_planar_bc: List[str] = []
         self._kin_hold_bc: List[str] = []          # _plan_kinematic_holds
+        # _hold_mass_refs: the zero springs' *SPRING card and *BOUNDARY lines, their held nodes'
+        # *BOUNDARY card (again after OP=NEW), and the nodes they hold
+        self._mass_hold_cards: List[str] = []
+        self._mass_hold_bc: List[str] = []
+        self._mass_hold_nodes: set = set()
+        self._freq_pert_written: set = set()       # *FREQUENCY steps written with PERTURBATION
+        self._base_ssd_cards: Optional[set] = None    # (_in_base_motion_ssd)
         self._kin_hold_eq: List[str] = []          # ... its *EQUATIONs on twist ROT NODEs
         self._kin_twist: Dict[int, Tuple[int, List[Vec]]] = {}    # _plan_kinematic_twists
         self._kin_twist_refused: Dict[int, Tuple[List[Vec], str]] = {}    # ... why not, per ref node
@@ -45264,6 +45480,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                 gc.enable()
 
     def _convert(self, blocks: List[Block]) -> List[str]:
+        blocks = self._comma_free_names(blocks)    # first: every reader sees the names ccx will
         blocks = close_open_steps(blocks, self.report)     # (read_blocks' decks: none open)
         blocks = self._bc_dofs_in_range(self._cartesian_nodes(blocks))
         self._uel_nodes.update(user_element_nodes(blocks))     # (an instance's too)
@@ -45272,9 +45489,11 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             blocks = flatten_assembly(blocks, self.report, self.opt)
         blocks = self._move_between_cards(blocks)     # before anything splits the deck into steps
         blocks = self._split_load_cases(blocks)       # after it: its moved cards are the step's
+        blocks = self._ssd_bands(blocks)              # after it: each load case's step is split too
         blocks = self._matrix_generate_steps(blocks)  # before anything reads the procedures
         blocks = self._geostatic_steps(blocks)        # likewise
         blocks = self._explicit_coupled_steps(blocks)     # likewise (--approximate)
+        blocks = self._base_motion_scale(blocks)      # before anything reads load amplitudes
         blocks = self._sp_amplitudes(blocks)          # before anything reads load amplitudes
         blocks = self._modal_ssd_motion(blocks)       # before anything reads BC values
         blocks = self._blank_periods(blocks)          # before the step model reads the periods
@@ -45343,6 +45562,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_distributing_rows()          # after the ROT NODEs' axes
         self._plan_rigid_twins(blocks)          # after the ROT NODE axes
         self._plan_connector_rows(blocks)
+        self._drop_untied_actuation()           # after it: the connectors left out
         self._plan_embedded_bcs(blocks)         # before _plan_coupled_bcs, which redoes its cards
         self._plan_coupled_bcs(blocks)
         self._warn_rigid_mpc_steps(blocks)      # after the constraint plans (_rigid_constraints)
@@ -45449,6 +45669,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         if self._kin_hold_bc or self._kin_hold_eq:
             out += ["** abq2ccx: kinematic-coupling reference node rotations no coupled DOF "
                     "depends on (ccx stops on them free)"] + self._kin_hold_bc + self._kin_hold_eq
+        if self._mass_hold_cards:
+            out += ["** abq2ccx: zero springs to held nodes on distributing-coupling reference "
+                    "nodes with MASS elements alone (ccx stops on them otherwise)"] + self._mass_hold_cards
         out.extend(self.emit_other(blocks))
         self._warn_two_point_kept()
         self._warn_two_by_two_kept()
@@ -45486,6 +45709,68 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
                              + "; ".join(self.reduced_physics) + ". Its results are not the deck's "
                              "own solution (see the warnings above).")
+        return out
+
+    def _comma_free_names(self, blocks: List[Block]) -> List[Block]:
+        """The deck with every quoted name that holds a comma ("COLD PLATE, ASSY-1") written
+        with "_" for the comma and the blanks around it ("COLD PLATE_ASSY-1"), the same in
+        every card that names it.  Abaqus reads a quoted comma as part of the name; ccx 2.23
+        splits a card at every comma, quotes or not, so it reads ELSET="PLATE, A" as set
+        "PLATE plus an unknown parameter A" (probed: two cards *ELEMENT, ELSET="PLATE, A" and
+        ELSET="PLATE, B" fill one set "PLATE, whose second *SOLID SECTION then holds both
+        elements, with warnings only; a solid and a shell set that collide that way stop ccx
+        on the section).  The converter's own data-line readers split there too, and
+        instance names reach every flattened set and surface name.  A new name that another
+        quoted name already has (as ccx reads names: blanks removed, any case) gets _2, _3,
+        ...  *HEADING text and file names (INPUT=, FILE=) are left as they are."""
+        def texts(b: Block) -> List[str]:
+            vals = [v for k, v in b.params.items() if v and k not in FILE_NAME_PARAMS]
+            return vals + (list(b.data) if b.keyword != "HEADING" else [])
+
+        taken: set = set()                                  # quoted names without a comma
+        found: "OrderedDict[str, Tuple[str, Block]]" = OrderedDict()   # key -> (as written, card)
+        for b in blocks:
+            for t in texts(b):
+                if '"' in t:
+                    for q in QUOTED_TEXT.findall(t):
+                        if "," in q:
+                            found.setdefault(ccx_name_key(q), (q, b))
+                        else:
+                            taken.add(ccx_name_key(q))
+        if not found:
+            return blocks
+        new: Dict[str, str] = {}                            # key -> the name written for it
+        for k, (q, _b) in found.items():
+            base = re.sub(r"\s*,\s*", "_", q[1:-1])
+            cand, i = f'"{base}"', 1
+            while ccx_name_key(cand) in taken:
+                i += 1
+                cand = f'"{base}_{i}"'
+            taken.add(ccx_name_key(cand))
+            new[k] = cand
+
+        def fix(t: str) -> str:
+            if '"' not in t or "," not in t:
+                return t
+            return QUOTED_TEXT.sub(lambda m: new.get(ccx_name_key(m.group()), m.group())
+                                   if "," in m.group() else m.group(), t)
+
+        out: List[Block] = []
+        for b in blocks:
+            if not any('"' in t and "," in t for t in texts(b)):
+                out.append(b)
+                continue
+            params = [(k, fix(v) if v and k not in FILE_NAME_PARAMS else v) for k, v in b.params.items()]
+            data = [fix(x) for x in b.data] if b.keyword != "HEADING" else list(b.data)
+            out.append(mkblock(b.keyword, params, data).placed(b))
+        shown = ", ".join(f"{q} -> {new[k]}" for k, (q, _b) in list(found.items())[:4])
+        more = f" and {len(found) - 4} more" if len(found) > 4 else ""
+        self.report.note(f"{len(found)} quoted name(s) with a comma written with '_' for it, in "
+                         f"every card that names them: {shown}{more}.  ccx 2.23 splits a card at "
+                         f"every comma, quotes or not, so it would read such a name only up to "
+                         f"its comma (probed: ELSET=\"PLATE, A\" and ELSET=\"PLATE, B\" are one "
+                         f"set \"PLATE, the second card's section holding both elements).",
+                         at=next(iter(found.values()))[1])
         return out
 
     def _move_between_cards(self, blocks: List[Block]) -> List[Block]:
@@ -45603,6 +45888,96 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                              f"(Abaqus: equivalent to consecutive perturbation steps). Later step "
                              f"numbers in this report count the ccx steps.", at=cards[0])
             extra += len(names) - 1
+        return out
+
+    def _ssd_bands(self, blocks: List[Block]) -> List[Block]:
+        """Mode-based *STEADY STATE DYNAMICS steps as ccx 2.23 reads them.
+
+        * Several frequency ranges, one per data line (Abaqus: "Repeat this data line as often
+          as necessary to define frequency ranges", resonance bands, say) -> one step per range,
+          each with the step's loads, base motion, damping and output requests, in place: ccx
+          reads the first data line only (probed: a second band's frequencies were not
+          computed, with no message).
+        * FREQUENCY SCALE and INTERVAL dropped (ccx reads neither: 'parameter not recognized'):
+          ccx divides a range at the eigenfrequencies inside it and puts the number of points
+          in each part, with the bias toward them (Abaqus' default INTERVAL=EIGENFREQUENCY
+          spaces them so too, on a logarithmic scale); INTERVAL=RANGE / SPREAD place them
+          otherwise, so ccx computes the same response at other frequencies (probed: 150-170 Hz,
+          3 points, a mode at 159.15 Hz: 150, 154.58, 159.15, 164.58 and 170 Hz).
+        * A range from 0 Hz under an acceleration *BASE MOTION starts at 1e-3 of its upper
+          bound: ccx's displacement there is the total one, whose base part -A/(2 pi f)^2 is
+          infinite at 0 Hz, where ccx writes NaN for every node (probed; Abaqus' U, relative to
+          the base, is finite there)."""
+        out: List[Block] = []
+        s = extra = 0
+        for step, cards in deck_parts(blocks):
+            if not step:
+                out += cards
+                continue
+            s += 1
+            proc = step_procedure(cards)
+            if proc is None or proc.keyword != "STEADY STATE DYNAMICS" or proc.has("DIRECT"):
+                out += cards
+                continue
+            params = OrderedDict((k, v) for k, v in proc.params.items()
+                                 if k not in ("INTERVAL", "FREQUENCY SCALE"))
+            dropped = [k for k in proc.params if k not in params]
+            interval = proc.uparam("INTERVAL") or "EIGENFREQUENCY"
+            accel = any(b.keyword == "BASE MOTION" and (b.uparam("TYPE") or "ACCELERATION") ==
+                        "ACCELERATION" for b in cards)
+            ranges: List[str] = []
+            for line in proc.data:
+                f = [x.strip() for x in line.split(",")]
+                while f and not f[-1]:
+                    f.pop()
+                if not f:
+                    continue
+                try:
+                    lo, hi = pf(f[0]), pf(f[1]) if len(f) > 1 and f[1] else None
+                except ValueError:
+                    lo = hi = None
+                if accel and lo == 0.0 and hi:
+                    f[0] = short_real(hi * 1e-3, 6)
+                    self.report.note(f"Step {s}: *STEADY STATE DYNAMICS range from 0 Hz under an "
+                                     f"acceleration *BASE MOTION starts at {f[0]} Hz: ccx 2.23's "
+                                     f"displacement there is the total one, base motion included, "
+                                     f"whose base part -A/(2 pi f)^2 is infinite at 0 Hz, where ccx "
+                                     f"writes NaN for every node (probed; Abaqus' U, relative to the "
+                                     f"base, is finite there).", at=proc)
+                ranges.append(", ".join(f))
+            if dropped:
+                self.report.note(f"*STEADY STATE DYNAMICS parameter(s) {', '.join(dropped)} dropped "
+                                 f"(ccx reads neither): ccx divides each frequency range at the "
+                                 f"eigenfrequencies inside it and puts the number of points in "
+                                 f"each part" + ("" if interval == "EIGENFREQUENCY" else
+                                                 f", where Abaqus' INTERVAL={interval} places them "
+                                                 f"otherwise: the responses agree at the frequencies "
+                                                 f"both compute, ccx's include the eigenfrequencies "
+                                                 f"in the range") + ".", once=True, at=proc)
+            if len(ranges) <= 1:
+                if dropped or (ranges and ranges[0] != (proc.data[0] if proc.data else None)):
+                    new = Block(proc.keyword, params, ranges or list(proc.data)).placed(proc)
+                    out += [new if b is proc else b for b in cards]
+                else:
+                    out += cards
+                continue
+            for k, rng in enumerate(ranges):
+                group = []
+                for b in cards:
+                    if b is proc:
+                        group.append(Block(proc.keyword, params, [rng]).placed(proc))
+                    elif k == 0:
+                        group.append(b)
+                    else:
+                        group.append(Block(b.keyword, OrderedDict(b.params), list(b.data)).placed(b))
+                out += group
+            self.report.note(f"Step {s}: *STEADY STATE DYNAMICS with {len(ranges)} frequency ranges "
+                             f"-> ccx steps {s + extra}-{s + extra + len(ranges) - 1}, one range each "
+                             f"with the step's loads, base motion, damping and output requests: ccx "
+                             f"2.23 reads the first data line only (probed: the other ranges were "
+                             f"not computed). Later step numbers in this report count the ccx steps.",
+                             at=proc)
+            extra += len(ranges) - 1
         return out
 
     def _plan_deck_facts(self, blocks: List[Block]) -> None:
@@ -46073,6 +46448,119 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                                      "perturbation and direct steady-state dynamics)." if case else ""),
                                      at=b)
         return [swap.get(id(b), b) for b in blocks] if swap else blocks
+
+    def _base_motion_scale(self, blocks: List[Block]) -> List[Block]:
+        """*BASE MOTION, SCALE=s: Abaqus multiplies the motion's amplitude curve by s (default
+        1.0; Abaqus 2017 Keywords *BASE MOTION); ccx 2.23 reads no SCALE there and ignores it
+        with a 'parameter not recognized' warning (probed: a steady-state base acceleration of
+        SCALE=9810 responded as one of 1), so a shaker run at 45 g came out 441292 times too
+        small.  The card now names a copy of its amplitude, written after the original, whose
+        SCALEY is s times the original's (handle_amplitude applies it to the data points), and
+        drops SCALE.  A card without an AMPLITUDE, or one naming no *AMPLITUDE the deck has, keeps
+        SCALE, warned: its motion is s times too small in ccx."""
+        amps = {b.uparam("NAME"): b for b in blocks if b.keyword == "AMPLITUDE"}
+        made: Dict[Tuple[str, float], str] = {}
+        after: Dict[int, List[Block]] = {}
+        swap: Dict[int, Block] = {}
+        taken = set(amps)
+        for b in blocks:
+            if b.keyword != "BASE MOTION" or not b.has("SCALE"):
+                continue
+            try:
+                factor = pf(b.param("SCALE") or "1")
+            except ValueError:
+                continue
+            if factor == 1.0:
+                swap[id(b)] = Block(b.keyword, OrderedDict((k, v) for k, v in b.params.items()
+                                                           if k != "SCALE"), list(b.data)).placed(b)
+                continue
+            src = amps.get(b.uparam("AMPLITUDE"))
+            if src is None:
+                self.report.warn(f"*BASE MOTION, SCALE={b.param('SCALE')} without an *AMPLITUDE the "
+                                 f"converter can scale: ccx 2.23 ignores SCALE there, so this motion is "
+                                 f"{b.param('SCALE')} times too small in ccx: give it an amplitude "
+                                 f"scaled by that factor.", at=b)
+                self._reduces("*BASE MOTION SCALE without an amplitude (ccx ignores it)")
+                continue
+            key = (src.uparam("NAME"), factor)
+            if key not in made:
+                base, k = f"{src.param('NAME').strip().strip(chr(34))[:60]}_X", 1
+                while f"{base}{k}".upper() in taken:
+                    k += 1
+                made[key] = f"{base}{k}"
+                taken.add(made[key].upper())
+                copy = self._scaled_amplitude(src, made[key], factor)
+                if copy is None:
+                    del made[key]
+                    self.report.warn(f"*BASE MOTION, SCALE={b.param('SCALE')} on *AMPLITUDE "
+                                     f"{src.param('NAME').strip()}, DEFINITION="
+                                     f"{src.uparam('DEFINITION') or 'TABULAR'}, which the converter "
+                                     f"cannot scale: ccx 2.23 ignores SCALE there, so this motion is "
+                                     f"{b.param('SCALE')} times too small in ccx: give it an amplitude "
+                                     f"scaled by that factor.", at=b)
+                    self._reduces("*BASE MOTION SCALE on an amplitude the converter cannot scale "
+                                  "(ccx ignores it)")
+                    continue
+                after.setdefault(id(src), []).append(copy)
+            params = OrderedDict((k2, v) for k2, v in b.params.items() if k2 != "SCALE")
+            params["AMPLITUDE"] = made[key]
+            swap[id(b)] = Block(b.keyword, params, list(b.data)).placed(b)
+            self.report.note(f"*BASE MOTION, SCALE={b.param('SCALE')} -> AMPLITUDE={made[key]}, a copy "
+                             f"of {src.param('NAME').strip()} scaled by that factor: ccx 2.23 reads no "
+                             f"SCALE on *BASE MOTION and would ignore it (probed: the motion at 1x).",
+                             at=b)
+        if not swap:
+            return blocks
+        out: List[Block] = []
+        for b in blocks:
+            out.append(swap.get(id(b), b))
+            out.extend(after.get(id(b), ()))
+        return out
+
+    @staticmethod
+    def _scaled_amplitude(src: Block, name: str, factor: float) -> Optional[Block]:
+        """*AMPLITUDE ``src`` times ``factor`` as a card named ``name`` (_base_motion_scale), or
+        None where the converter cannot scale it.  Abaqus multiplies the whole curve by a load's
+        or base motion's scale: the point-wise forms (TABULAR, EQUALLY SPACED, SMOOTH STEP) take
+        SCALEY and SHIFTY times the factor (Abaqus: SCALEY a + SHIFTY, which ccx applies too);
+        the analytic forms, which the converter samples without SCALEY / SHIFTY (amplitude_curve),
+        their amplitude terms: PERIODIC A0 and every A_k, B_k, MODULATED and DECAY A0 and A.  Any
+        other definition (USER, SOLUTION DEPENDENT, BUBBLE, ...), an analytic one with
+        SCALEX / SCALEY / SHIFTX / SHIFTY of its own, or data the converter cannot read: None."""
+        definition = (src.param("DEFINITION") or "TABULAR").strip().upper()
+        params = OrderedDict((k, v) for k, v in src.params.items())
+        params["NAME"] = name
+        if definition in ("TABULAR", "EQUALLY SPACED", "SMOOTH STEP"):
+            try:
+                y, dy = pf(src.param("SCALEY") or "1"), pf(src.param("SHIFTY") or "0")
+            except ValueError:
+                return None
+            params["SCALEY"] = short_real(y * factor, 12)
+            if src.has("SHIFTY") and dy != 0.0:
+                params["SHIFTY"] = short_real(dy * factor, 12)
+            return Block("AMPLITUDE", params, list(src.data)).placed(src)
+        if definition not in ("PERIODIC", "MODULATED", "DECAY") or \
+                any(src.has(k) for k in ("SCALEX", "SCALEY", "SHIFTX", "SHIFTY")) or src.has("INPUT"):
+            return None
+
+        def scale_fields(line: str, which) -> str:
+            f = line.split(",")
+            for i in range(len(f)):
+                if which(i) and f[i].strip():
+                    f[i] = " " + short_real(pf(f[i]) * factor, 12)
+            return ",".join(f)
+        try:
+            if definition == "PERIODIC":    # N, omega, t0, A0 / then the A_k, B_k pairs
+                data = [scale_fields(src.data[0], lambda i: i == 3)] + \
+                    [scale_fields(ln, lambda i: True) for ln in src.data[1:]]
+            else:                           # MODULATED: A0, A, t0, w1, w2; DECAY: A0, A, t0, td
+                fields = [x for ln in src.data for x in ln.split(",")]
+                while fields and not fields[-1].strip():
+                    fields.pop()
+                data = [scale_fields(",".join(fields), lambda i: i < 2)]
+        except (ValueError, IndexError):
+            return None
+        return Block("AMPLITUDE", params, data).placed(src)
 
     def _sp_amplitudes(self, blocks: List[Block]) -> List[Block]:
         """A static perturbation or *BUCKLE step's loads, BCs and temperatures on an amplitude:
