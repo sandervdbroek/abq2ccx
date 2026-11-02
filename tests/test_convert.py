@@ -6712,6 +6712,42 @@ def test_mass_on_a_distributing_reference_node_gets_a_zero_spring_to_a_held_node
         assert "ABQ2CCX_MASS_HOLD" not in body and "MASS elements alone" not in rep.text()
 
 
+def test_distributing_coupling_with_an_element_on_its_reference_node_warns_of_a_dense_block():
+    # ccx eliminates a distributing coupling's reference node through its rows, so an element
+    # there (the test mass and its zero SPRINGA) couples every pair of the rows' n DOFs: about
+    # n (n + 1) / 2 matrix entries (a 6480-node coupling: 189 million, more than the rest of the
+    # model).  Warned above DENSE_COUPLING_ENTRIES; the example's 49 nodes (147 DOFs) are not
+    path = os.path.join(EXAMPLES, "distributing_mass_ref.inp")
+    for limit, warned in ((None, False), (10_000, True)):
+        report = A.Report()
+        conv = A.Converter(report, Opt())
+        if limit:
+            conv.DENSE_COUPLING_ENTRIES = limit
+        conv.convert(A.read_blocks(path, report))
+        text = report.text()
+        assert ("dense block" in text) == warned, text
+    assert re.search(r"distributing_mass_ref\.inp:\d+: Distributing coupling on reference node 1000, which "
+                     r"carries an element \(a mass or spring\), ties it to 147 DOFs of 49 coupling nodes: .*"
+                     r"a dense block of about 10,878 matrix entries", text), text
+    assert not conv.reduced_physics
+    # without the mass the node carries no element: no block, however low the limit
+    bare = open(path, encoding="utf-8").read().replace(
+        "*Element, type=MASS, elset=TESTMASS\n9000, 1000\n*Mass, elset=TESTMASS\n0.05,\n", "")
+    assert "TYPE=MASS" not in bare.upper()
+    fd, tmp = tempfile.mkstemp(suffix=".inp")
+    os.close(fd)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(bare)
+        report = A.Report()
+        conv = A.Converter(report, Opt())
+        conv.DENSE_COUPLING_ENTRIES = 0
+        conv.convert(A.read_blocks(tmp, report))
+    finally:
+        os.unlink(tmp)
+    assert "dense block" not in report.text()
+
+
 def test_rigid_body_and_kinematic_coupling_on_one_reference_node():
     # ccx's kinematic coupling turns its reference node's DOFs 4-6, a *RIGID BODY its ROT NODE:
     # on one REF NODE the coupling's members translated but did not turn (code review 3 B26b).

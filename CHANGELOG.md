@@ -38,6 +38,13 @@ entries. The GitHub release notes use the same section.
   node now gets a `SPRINGA` of stiffness 0 to a new node held in DOFs 1-3 (again after
   `*BOUNDARY, OP=NEW`), as connector nodes already did; it changes nothing (the same static
   displacements as without the mass: `validate_with_ccx.py distributing_mass_ref`).
+* **Large distributing couplings with a mass or spring warned** — ccx eliminates such a
+  coupling's reference node through its `*EQUATION`s, so an element on the node couples every
+  pair of the coupling's n DOFs: a dense block of about n² / 2 matrix entries, which ccx stores
+  and factors in full (a test mass on a 6480-node coupling: 189 million entries, more than the
+  rest of the model, and out of memory before the solver). Above 10 million entries the report
+  now warns with the numbers, and names a coupling on fewer nodes, or a `*KINEMATIC` one where
+  the attachment is stiff, as the remedy.
 * **Connector loads and motions of connectors left out** — a history `*CONNECTOR LOAD` or
   `*CONNECTOR MOTION` became a `*CLOAD` / `*BOUNDARY` on a helper node, which the connector's
   `*EQUATION`s tie to its component. Where the connector itself was commented out (an `AXIAL`

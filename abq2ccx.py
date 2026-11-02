@@ -27568,6 +27568,7 @@ class _Constraints:
                                              method=dist.uparam("WEIGHTING METHOD") or "UNIFORM",
                                              structural=dist.uparam("COUPLING") == "STRUCTURAL")
         plan["nodal"] = self.surfaces[surf.upper()][0].startswith("NODE")   # (_warn_distributing_kept)
+        plan["card"] = b                    # (the place of its warnings: _warn_dense_couplings)
         return plan
 
     def _dcoup_plans(self, b: Block, blocks: List[Block], expanded: Dict[int, str], u1: set,
@@ -27795,6 +27796,45 @@ class _Constraints:
                 plan["rows"] = self._distributing_rows(plan)
         self._distributing_holds([p for p in plans if "why" not in p])
         self._hold_mass_refs([p["ref"] for p in plans if "why" not in p and p.get("rows")])
+        self._warn_dense_couplings([p for p in plans if "why" not in p and p.get("rows")])
+
+    # a distributing coupling whose reference node carries an element adds a dense block of
+    # about this many entries (n DOFs: n (n + 1) / 2) to ccx's matrix before it is warned
+    DENSE_COUPLING_ENTRIES = 10_000_000
+
+    def _warn_dense_couplings(self, plans: List[dict]) -> None:
+        """Warn of a distributing coupling whose reference node carries an element (a MASS, a
+        spring, the zero SPRINGA of _hold_mass_refs) and whose rows tie it to many DOFs.  ccx
+        eliminates the node through the rows (its DOFs are their first terms), so the
+        element's stiffness and mass go to every pair of the rows' other DOFs: a dense block
+        of n (n + 1) / 2 entries for n DOFs, which ccx stores and factors in full (probed: a
+        1-node MASS on a 49-node coupling added 9180 of the predicted 10878 entries; a test
+        mass on a 6480-node coupling, 19440 DOFs, ran out of 14 GB before the solver while the
+        model without it reached the solver).  The physics is unchanged: the warning names the
+        cost and the remedies."""
+        refs = {p["ref"] for p in plans}
+        carried: set = set()
+        for _typ, conn in self.geom.elements.values():
+            carried.update(n for n in conn if n in refs)
+        for p in plans:
+            ref = p["ref"]
+            if ref not in carried:
+                continue
+            own = {ref, self._rb_rot.get(ref)}
+            dofs = {(n, d) for row in p["rows"] if row and row[0][0] in own
+                    for n, d, _v in row[1:] if n not in own}
+            entries = len(dofs) * (len(dofs) + 1) // 2
+            if entries <= self.DENSE_COUPLING_ENTRIES:
+                continue
+            self.report.warn(f"Distributing coupling on reference node {ref}, which carries an element "
+                             f"(a mass or spring), ties it to {len(dofs)} DOFs of "
+                             f"{len(p['members'])} coupling nodes: ccx eliminates the node through "
+                             f"those *EQUATIONs and couples every pair of the DOFs, a dense block of "
+                             f"about {entries:,} matrix entries that its solver stores and factors in "
+                             f"full, which can need far more memory than the rest of the model. "
+                             f"The physics is unchanged; a coupling on fewer nodes (the block grows "
+                             f"with their square) or a *KINEMATIC coupling, where the attachment is "
+                             f"stiff, avoids it.", at=p.get("card"))
 
     def _hold_mass_refs(self, refs: List[int]) -> None:
         """A distributing coupling's reference node on MASS elements alone, which only the
