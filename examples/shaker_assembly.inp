@@ -5920,7 +5920,7 @@ S,
 ** 
 *Step, name=SSD-X05, nlgeom=NO, perturbation
 *Steady State Dynamics
-1., 2500., 20, 3.
+0., 2500., 20, 3.
 *Modal Damping
 1, 300, 0.05
 ** 

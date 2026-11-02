@@ -21,6 +21,11 @@ entries. The GitHub release notes use the same section.
   now left out with it, and reported, instead of being written onto a node attached to nothing,
   where ccx dropped it without a message. A base excitation's scale factor (`*BASE MOTION,
   SCALE=`), which ccx ignored, now reaches ccx: a shaker run at 45 g responded as to 1 mm/s².
+* **Steady-state dynamics.** A frequency response after a preload now uses the prestressed modes,
+  as in Abaqus (ccx needs `PERTURBATION` on both steps; the converter dropped it). A step with
+  several frequency bands computes all of them (ccx read the first only), a range from 0 Hz
+  under a base acceleration no longer gives NaN, and Abaqus' total displacement `TU` is
+  written (ccx's `U` there is the total one; a request for the relative `U` is warned).
 
 ### Details
 
@@ -51,6 +56,22 @@ entries. The GitHub release notes use the same section.
   excitation ran at the amplitude alone (a shaker deck at `SCALE=441292`, 45 g in mm/s², came out
   441292 times too small). The card now names a copy of its amplitude scaled by the factor; one
   without an amplitude is warned, as reduced physics.
+* **Steady-state dynamics on prestressed modes** — ccx 2.23's `*STEADY STATE DYNAMICS` reads the
+  modes of a perturbation `*FREQUENCY` step when its own `*STEP` card has `PERTURBATION` too; the
+  converter dropped `PERTURBATION` from the frequency step instead (the preload's stress
+  stiffness lost, as reduced physics). It is now kept, and written on the steady-state steps that
+  read the modes (`validate_with_ccx.py ssd_prestressed_bar`: a bar stretched under NLGEOM, 83.15
+  Hz against 53.72 Hz unstressed, superposed by the steady-state step). Modal dynamics, where ccx
+  2.23 segfaults with it, and complex frequency steps keep the old behaviour.
+* **Steady-state frequency ranges** — ccx reads one `*STEADY STATE DYNAMICS` data line and
+  neither `FREQUENCY SCALE` nor `INTERVAL`; a step with several ranges (resonance bands) computed
+  the first only. Such a step now becomes one step per range, with the step's loads, base motion,
+  damping and output requests; the two parameters are dropped, noted (ccx divides each range at
+  the eigenfrequencies inside it, where Abaqus' `INTERVAL=RANGE` spreads the points evenly).
+* **Base motion output and 0 Hz** — ccx's `U` in a steady-state step with `*BASE MOTION` is the
+  total displacement, base included (Abaqus' `TU`; Abaqus' `U` is relative to the base). `TU` is
+  now written as `U` and a `U` request warned; a range from 0 Hz under a base acceleration starts
+  at 1e-3 of its upper bound, as ccx's total displacement is infinite at 0 Hz (it wrote NaN).
 * **A shaker-table example** — `examples/shaker_assembly.inp`, a small model in the form of an
   Abaqus/CAE export with the features of a real shaker deck: C3D10 parts whose names hold a
   comma, an S8R + `STRI65` shroud tied to the plate, `AXIAL` bolts on kinematic couplings with an

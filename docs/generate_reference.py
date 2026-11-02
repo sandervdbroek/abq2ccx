@@ -169,9 +169,11 @@ TRANSLATED = {
         "an `NLGEOM` general step, or after linear steps that only heat temperature-dependent "
         "materials (Abaqus uses the base temperatures, ccx's plain step the initial ones), "
         "dropped after other general steps without `NLGEOM`, on a first step with initial "
-        "stresses and before modal / steady-state dynamics, which refuse perturbation "
+        "stresses and before modal dynamics or complex frequency steps, which refuse perturbation "
         "eigenmodes (Abaqus includes the preload's stress stiffness only after `NLGEOM`; warned "
-        "where not exact); "
+        "where not exact), and written on the `*STEADY STATE DYNAMICS` steps that read the "
+        "modes of a perturbation `*FREQUENCY` step (ccx superposes those prestressed modes only "
+        "then); "
         "explicit steps get `INC=10000000` + `NLGEOM`, a `*MODAL DYNAMIC` step `INC=` where its "
         "period / increment exceeds its `INC` or 100 (Abaqus ignores `INC` there); a step whose displacement BCs get ccx's "
         "step ramp (see `*BOUNDARY`) gets `AMPLITUDE=STEP`, ccx's default there; a general step "
@@ -192,7 +194,15 @@ TRANSLATED = {
     "*STEADY STATE DYNAMICS": "native (ccx's is mode-based); a `*BOUNDARY` value in a mode-based "
         "or subspace-based step → 0, as Abaqus ignores it there (motion only through `*BASE "
         "MOTION`; warned). `DIRECT`: commented out, with `*NO ANALYSIS` in its place: ccx stops at "
-        "that step (ccx 2.23 has no direct solution and would run its modal form; reduced physics).",
+        "that step (ccx 2.23 has no direct solution and would run its modal form; reduced physics). "
+        "Several frequency ranges (data lines) → one step per range with the step's loads, base "
+        "motion, damping and output (ccx reads the first only); `FREQUENCY SCALE` and `INTERVAL` "
+        "dropped (ccx divides each range at the eigenfrequencies inside it); a range from 0 Hz "
+        "under an acceleration `*BASE MOTION` starts at 1e-3 of its upper bound (ccx's `U` there "
+        "is the total displacement, infinite at 0 Hz); under `*BASE MOTION`, output `TU` → `U` "
+        "(ccx's `U` is the total displacement) and `U` warned (Abaqus' is relative to the base).",
+    "*BASE MOTION": "`SCALE` (which ccx ignores) → the card names a copy of its amplitude scaled by "
+        "the factor; without an amplitude: warned (reduced physics).",
     "*GEOSTATIC": "→ `*STATIC` in a linear step of a model without pore pressure elements (the "
         "static solution from the initial stresses); with pore pressure, `UTOL` or a nonlinear step "
         "commented out, with `*NO ANALYSIS` in its place (reduced physics).",

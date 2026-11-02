@@ -6775,6 +6775,75 @@ def test_base_motion_scale_becomes_a_scaled_copy_of_its_amplitude():
     assert "*BASE MOTION SCALE without an amplitude (ccx ignores it)" in conv.reduced_physics
 
 
+def test_steady_state_dynamics_ranges_split_into_steps_and_zero_hz_lifted():
+    # ccx 2.23 reads one *STEADY STATE DYNAMICS data line: a step with several ranges (resonance
+    # bands) -> one step per range with the step's loads, base motion, damping and output;
+    # FREQUENCY SCALE / INTERVAL (not read by ccx) dropped; a range from 0 Hz under an
+    # acceleration base motion starts at 1e-3 of its upper bound (ccx's total displacement
+    # there is infinite at 0 Hz: NaN), but not under a plain load
+    deck = (HEX_MODEL + "*Amplitude, name=A1\n1., 1., 3000., 1.\n*Step\n*Frequency\n4,\n*End Step\n"
+            "*Step, perturbation\n*Steady State Dynamics, frequency scale=LINEAR, interval=RANGE\n"
+            "100., 120., 3,\n300., 320., 3, 1.\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, dof=1, amplitude=A1\n*Node Print, nset=EALLN\nU\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n0., 2500., 20, 3.\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, dof=2, amplitude=A1\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n0., 2500., 20, 3.\n*Modal Damping\n1, 4, 0.02\n"
+            "*Cload\n7, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    procs = re.findall(r"\*STEADY STATE DYNAMICS([^\n]*)\n([^\n]*)\n", body)
+    assert procs == [("", "100., 120., 3"), ("", "300., 320., 3, 1."), ("", "2.5, 2500., 20, 3."),
+                     ("", "0., 2500., 20, 3.")], procs
+    assert body.count("*BASE MOTION, DOF=1, AMPLITUDE=A1") == 2 and body.count("*MODAL DAMPING") == 4
+    text = rep.text()
+    assert "Step 2: *STEADY STATE DYNAMICS with 2 frequency ranges -> ccx steps 2-3" in text
+    assert "parameter(s) FREQUENCY SCALE, INTERVAL dropped (ccx reads neither)" in text
+    assert "where Abaqus' INTERVAL=RANGE places them otherwise" in text
+    assert "range from 0 Hz under an acceleration *BASE MOTION starts at 2.5 Hz" in text
+    assert text.count("range from 0 Hz") == 1
+
+
+def test_base_motion_steady_state_output_tu_is_ccx_u():
+    # ccx's U in a steady-state dynamics step with *BASE MOTION is the total displacement
+    # (Abaqus' TU): TU / TU1-3 -> U, U warned (Abaqus' U is relative to the base); a step without
+    # base motion is left alone
+    deck = (HEX_MODEL + "*Amplitude, name=A1\n1., 1., 3000., 1.\n*Step\n*Frequency\n4,\n*End Step\n"
+            "*Step\n*Steady State Dynamics\n1., 2500., 20, 3.\n*Modal Damping\n1, 4, 0.02\n"
+            "*Base Motion, dof=1, amplitude=A1\n*Output, history\n*Node Output, nset=TOPN\n"
+            "TU1, TU2, U3\n*End Step\n")
+    deck = deck.replace("*Boundary", "*Nset, nset=TOPN\n5, 6, 7, 8\n*Boundary", 1)
+    body, conv, rep = convert_str(deck)
+    assert "*NODE PRINT, NSET=TOPN\nU\n" in _step(body, 2), _step(body, 2)
+    assert "Output variable TU -> U in a steady-state dynamics step with *BASE MOTION" in rep.text()
+    assert "Output variable U in a steady-state dynamics step with *BASE MOTION: Abaqus' U is relative" \
+        in rep.text()
+    body, conv, rep = convert_str(deck.replace("*Base Motion, dof=1, amplitude=A1\n", "*Cload\n7, 3, 1.\n"))
+    assert "with *BASE MOTION" not in rep.text()
+
+
+def test_prestressed_modes_reach_steady_state_dynamics_with_perturbation():
+    # ccx 2.23 reads perturbation eigenmodes in a *STEADY STATE DYNAMICS step whose own *STEP card
+    # has PERTURBATION (validate_with_ccx.py ssd_prestressed_bar: 83 Hz against 54 unstressed):
+    # the *FREQUENCY step after an NLGEOM preload keeps PERTURBATION and the steady-state steps
+    # reading it get it.  A *MODAL DYNAMIC reader segfaults ccx with it: dropped there, warned
+    deck = (HEX_MODEL + "*Step, nlgeom=YES\n*Static\n*Cload\n7, 3, 1.\n*End Step\n"
+            "*Step, perturbation\n*Frequency\n4,\n*End Step\n"
+            "*Step, perturbation\n*Steady State Dynamics\n1., 100., 5\n*Modal Damping\n1, 4, 0.02\n"
+            "*Cload\n7, 3, 1.\n*End Step\n"
+            "*Step, perturbation\n*Steady State Dynamics\n100., 200., 5\n*Modal Damping\n1, 4, 0.02\n"
+            "*Cload\n7, 3, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    assert re.findall(r"\*STEP[^\n]*\n\*(\w+)", body) == ["STATIC", "FREQUENCY", "STEADY", "STEADY"]
+    assert [ln for ln in body.splitlines() if ln.startswith("*STEP")] == \
+        ["*STEP, NLGEOM=YES", "*STEP, PERTURBATION", "*STEP, PERTURBATION", "*STEP, PERTURBATION"]
+    assert "*STEP, PERTURBATION written on the *STEADY STATE DYNAMICS steps" in rep.text()
+    assert "prestress of a *FREQUENCY step that modal / steady-state dynamics read" not in conv.reduced_physics
+    body, conv, rep = convert_str(deck.replace(
+        "*Steady State Dynamics\n100., 200., 5\n*Modal Damping\n1, 4, 0.02\n",
+        "*Modal Dynamic\n0.001, 0.01\n*Modal Damping\n1, 4, 0.02\n"))
+    assert [ln for ln in body.splitlines() if ln.startswith("*STEP")][1:] == ["*STEP", "*STEP", "*STEP"]
+    assert "prestress of a *FREQUENCY step that modal / steady-state dynamics read" in conv.reduced_physics
+
+
 def test_rigid_body_and_kinematic_coupling_on_one_reference_node():
     # ccx's kinematic coupling turns its reference node's DOFs 4-6, a *RIGID BODY its ROT NODE:
     # on one REF NODE the coupling's members translated but did not turn (code review 3 B26b).
@@ -12106,8 +12175,9 @@ def test_frequency_prestress_follows_the_base_steps_nlgeom():
     # Abaqus extracts frequencies with the preload's stress stiffness only if the base state
     # includes NLGEOM, never with initial stresses in a first step; ccx 2.23 includes the base
     # state only with *STEP, PERTURBATION, whatever the earlier steps' NLGEOM (probed: a
-    # column under 0.37 of its buckling load, 16.87 Hz vs 20.95 Hz); its modal / steady-state
-    # dynamics refuse perturbation eigenmodes
+    # column under 0.37 of its buckling load, 16.87 Hz vs 20.95 Hz); its modal dynamics refuses
+    # perturbation eigenmodes (steady-state dynamics reads them with *STEP, PERTURBATION: test_
+    # prestressed_modes_reach_steady_state_dynamics_with_perturbation)
     load, modal = "*Cload\n7, 3, -1.\n", _deck_step("Modal Dynamic\n0.1, 1.")
 
     def heads(pre, freq="", after="", head="", model=BUCKLE_CUBE):
