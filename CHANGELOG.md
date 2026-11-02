@@ -8,6 +8,43 @@ From 1.6.0 on, each version opens with an overview in plain language (what now c
 gives more correct answers, what changed in using the converter), followed by the detailed
 entries. The GitHub release notes use the same section.
 
+## Unreleased
+
+### Overview
+
+* **Fewer ccx failures.** Models whose part, instance, material or set names hold a comma (as
+  CAD imports often name parts) now run: ccx read such a name only up to the comma, so sets of
+  different parts merged and ccx stopped, or silently used one part's section for another's. A
+  point mass on a distributing coupling's reference node (a test mass on a shaker table) no
+  longer stops ccx.
+* **More correct answers.** A connector load or motion whose connector cannot be converted is
+  now left out with it, and reported, instead of being written onto a node attached to nothing,
+  where ccx dropped it without a message.
+
+### Details
+
+* **Names with a comma** — Abaqus reads a comma inside a quoted name as part of the name
+  (`*Part, name="COLD PLATE, ASSY-11"`); ccx 2.23 splits a card at every comma, quotes or not,
+  and read `ELSET="PLATE, A"` as set `"PLATE` plus an unknown parameter. Names that agree up to
+  their comma became one set: a solid and a shell part stopped ccx on their sections, two solid
+  parts ran with the later section on both. The converter's own data-line readers split there
+  too. Every quoted name with a comma is now written with `_` for it (and the blanks around it),
+  the same in every card that names it, before the conversion reads the deck; a name another
+  quoted name already has gets `_2`. `*HEADING` text and file names stay as they are
+  (`validate_with_ccx.py assembly_comma_names`).
+* **A mass on a distributing coupling's reference node** — the coupling is written as
+  `*EQUATION`s, and ccx 2.23 stops on a node with `MASS` elements alone that only equations tie
+  ("coefficient should be 0": `add_sm_st` in a static step, `add_sm_ei` in `*FREQUENCY`). Such a
+  node now gets a `SPRINGA` of stiffness 0 to a new node held in DOFs 1-3 (again after
+  `*BOUNDARY, OP=NEW`), as connector nodes already did; it changes nothing (the same static
+  displacements as without the mass: `validate_with_ccx.py distributing_mass_ref`).
+* **Connector loads and motions of connectors left out** — a history `*CONNECTOR LOAD` or
+  `*CONNECTOR MOTION` became a `*CLOAD` / `*BOUNDARY` on a helper node, which the connector's
+  `*EQUATION`s tie to its component. Where the connector itself was commented out (an `AXIAL`
+  bolt with a preload under NLGEOM, say), the helper was tied to nothing and ccx dropped the
+  load without a message. The lines are now left out with the connector, warned, and the deck
+  counts the lost load or motion as reduced physics.
+
 ## 1.6.0 (October 2026)
 
 ### Overview

@@ -11929,6 +11929,95 @@ def check_kinematic_all_dofs(ccx, env, tmp, shared):
     return failures
 
 
+@check("assembly_comma_names", "part, instance, material and set names that hold a comma")
+def check_assembly_comma_names(ccx, env, tmp, shared):
+    # --- quoted names with a comma ---------------------------------------------------------
+    # A solid and a shell part whose names agree up to a comma ("PLATE, SOLID", "PLATE,
+    # SHELL"), materials "Steel, 304" / "Steel, 316" and assembly sets "Load, solid" / "Load,
+    # shell".  ccx splits a card at every comma, quotes or not: written as they are, the sets
+    # of both instances are one set "PLATE and ccx stops on the sections.  abq2ccx writes the
+    # names with '_' for the comma, so the deck must solve without a 'parameter not
+    # recognized' warning, exactly like the same deck with the names written without commas.
+    failures = 0
+    text = open(os.path.join(EXAMPLES, "assembly_comma_names.inp"), encoding="utf-8").read()
+    plain = text
+    for a, b in (("PLATE, SOLID", "PLATE_SOLID"), ("PLATE, SHELL", "PLATE_SHELL"),
+                 ("Steel, 304", "Steel_304"), ("Steel, 316", "Steel_316"),
+                 ("Load, solid", "Load_solid"), ("Load, shell", "Load_shell")):
+        plain = plain.replace(a, b)
+    res, outs = {}, {}
+    for kind, deck in (("comma", text), ("plain", plain)):
+        src = os.path.join(tmp, f"comma_names_{kind}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        inp = os.path.join(tmp, f"comma_names_{kind}.inp")
+        convert(src, inp)
+        d, status, outs[kind] = run_ccx(ccx, env, inp)
+        res[kind] = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {}
+        shutil.rmtree(d, ignore_errors=True)
+    nodes = sorted(set(res["comma"]) & set(res["plain"]))
+    unknown = outs["comma"].count("parameter not recognized")
+    if len(nodes) == 6 and len(res["comma"]) == 6:
+        scale = max(abs(x) for n in nodes for x in res["plain"][n])
+        err = ccx_ratio(max(abs(a - b) for n in nodes for a, b in zip(res["comma"][n], res["plain"][n])),
+                        scale)
+        ok = err < 1e-12 and scale > 1e-3 and not unknown
+        print(f"{'PASS' if ok else 'FAIL'}  assembly_comma_names (names with a comma -> '_'): 6 loaded "
+              f"nodes vs the deck without commas, max difference {err:.1e} of max |u| {scale:.4f}; "
+              f"{unknown} 'parameter not recognized' warning(s)")
+        failures += 0 if ok else 1
+    else:
+        print(f"FAIL  assembly_comma_names: did not solve ({len(res['comma'])} / {len(res['plain'])} "
+              f"loaded nodes printed)")
+        print("      " + " / ".join(l.strip() for l in outs["comma"].splitlines() if "ERROR" in l)[:200])
+        failures += 1
+    return failures
+
+
+@check("distributing_mass_ref", "a test mass on a distributing coupling's reference node")
+def check_distributing_mass_ref(ccx, env, tmp, shared):
+    # --- a MASS element on a distributing coupling's reference node --------------------------
+    # A 50 kg point mass on the reference node of a distributing coupling to the top of a
+    # clamped plate (a test mass on a shaker table).  The coupling becomes *EQUATIONs, and
+    # ccx 2.23 stops on a node with MASS elements alone that only equations tie ('add_sm_st'
+    # in the static step, 'add_sm_ei' in the *FREQUENCY step: coefficient should be 0), so
+    # abq2ccx adds a SPRINGA of stiffness 0 to a held node.  The deck must solve both steps;
+    # the static step must move the reference node exactly as the same deck without the mass
+    # (a static load does not see it), the plate's symmetry must give equal first two modes,
+    # and the mass must lower the first frequency.
+    failures = 0
+    text = open(os.path.join(EXAMPLES, "distributing_mass_ref.inp"), encoding="utf-8").read()
+    bare = text.replace("*Element, type=MASS, elset=TESTMASS\n9000, 1000\n*Mass, elset=TESTMASS\n0.05,\n", "")
+    assert bare != text, "distributing_mass_ref.inp: its MASS cards moved"
+    res, freqs, outs = {}, {}, {}
+    for kind, deck in (("mass", text), ("bare", bare)):
+        src = os.path.join(tmp, f"dist_mass_{kind}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        inp = os.path.join(tmp, f"dist_mass_{kind}.inp")
+        convert(src, inp)
+        d, status, outs[kind] = run_ccx(ccx, env, inp)
+        dat = os.path.join(d, "job.dat")
+        res[kind] = dat_displacement_history(dat, 1000) if status == "solved" else []
+        freqs[kind] = dat_eigen_table(dat, "E I G E N V A L U E   O U T P U T") if status == "solved" else []
+        shutil.rmtree(d, ignore_errors=True)
+    if res["mass"] and res["bare"] and len(freqs["mass"]) >= 2 and freqs["bare"]:
+        u, u0 = res["mass"][0], res["bare"][0]
+        err = ccx_ratio(max(abs(a - b) for a, b in zip(u, u0)), abs(u0[2]))
+        f1, f2 = freqs["mass"][:2]
+        pair = ccx_ratio(abs(f1 - f2), f1)
+        ok = err < 1e-9 and pair < 1e-6 and f1 < freqs["bare"][0]
+        print(f"{'PASS' if ok else 'FAIL'}  distributing_mass_ref (zero SPRINGA on a MASS reference node): "
+              f"static u3 {u[2]:.6e} vs {u0[2]:.6e} without the mass (difference {err:.1e}); "
+              f"modes 1, 2 {f1:.2f}, {f2:.2f} Hz; first mode {freqs['bare'][0]:.1f} Hz without the mass")
+        failures += 0 if ok else 1
+    else:
+        print("FAIL  distributing_mass_ref: did not solve")
+        print("      " + " / ".join(l.strip() for l in outs["mass"].splitlines() if "ERROR" in l)[:200])
+        failures += 1
+    return failures
+
+
 @check("assembly_rotated_instances",
        "assembly flattening: a turned instance against the same model written flat")
 def check_assembly_rotated_instances(ccx, env, tmp, shared):

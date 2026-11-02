@@ -1587,6 +1587,17 @@ def _split_commas(line: str) -> List[str]:
     return out
 
 
+# A quoted text on a keyword or data line (an Abaqus name with blanks or commas in it), and
+# the parameters whose quoted value is a file name, not a name (*INCLUDE, *RESTART, ...).
+QUOTED_TEXT = re.compile(r'"[^"]*"')
+FILE_NAME_PARAMS = frozenset({"INPUT", "INP", "FILE"})
+
+
+def ccx_name_key(name: str) -> str:
+    """``name`` as ccx 2.23 reads it: blanks removed, upper case (quotes kept)."""
+    return "".join(name.split()).upper()
+
+
 # Constants and functions permitted inside Abaqus ``*PARAMETER`` expressions (e.g.
 # ``strain = abs(stretch - 1.0)``, ``r = 2*pi``).  Constants are reachable as bare
 # names; functions only as ``f(...)`` calls.  Expressions are evaluated by
@@ -27783,6 +27794,46 @@ class _Constraints:
             if "why" not in plan:
                 plan["rows"] = self._distributing_rows(plan)
         self._distributing_holds([p for p in plans if "why" not in p])
+        self._hold_mass_refs([p["ref"] for p in plans if "why" not in p and p.get("rows")])
+
+    def _hold_mass_refs(self, refs: List[int]) -> None:
+        """A distributing coupling's reference node on MASS elements alone, which only the
+        coupling's *EQUATIONs tie, gets a SPRINGA of stiffness 0 to a new node a model span
+        away along -x, held in DOFs 1-3 in every step.  ccx 2.23 leaves MASS elements out of
+        its matrix structure and stops on such a node: 'add_sm_st: coefficient should be 0'
+        in a static step, 'add_sm_ei' in a *FREQUENCY step (probed: a 50 kg point mass on a
+        plate's distributing coupling, a test mass on a shaker table) — as on connector nodes
+        (_plan_connector_rows).  The spring puts the node in the structure and changes nothing
+        (probed: the same displacements as without the mass, and the mode pairs the model's
+        symmetry gives)."""
+        want = {n for n in refs if n not in self._mass_hold_nodes}
+        if not want:
+            return
+        types_at: Dict[int, set] = {}
+        for typ, conn in self.geom.elements.values():
+            for n in conn:
+                if n in want:
+                    types_at.setdefault(n, set()).add(typ.upper())
+        held = [n for n in dedup(refs) if n in want and types_at.get(n) == {"MASS"}]
+        if not held:
+            return
+        name = self._u1_name("ABQ2CCX_MASS_HOLD")
+        lines: List[str] = []
+        for n in held:
+            g = max(self.geom.nodes) + 1
+            self.geom.add_node(g, vsub(self.geom.nodes[n], (self._model_span(), 0.0, 0.0)))
+            eid = self._next_ids()[1] + 1
+            self.geom.add_element(eid, "SPRINGA", [n, g])
+            self.geom.add_to_elset(name, [eid])
+            lines.append(f"{g}, 1, 3")
+            self._mass_hold_nodes.add(n)
+        self._mass_hold_cards += [f"*SPRING, ELSET={name}", "0.", "*BOUNDARY"] + lines
+        self._mass_hold_bc += (["*BOUNDARY"] if not self._mass_hold_bc else []) + lines
+        self.report.note(f"Distributing coupling on a reference node with MASS elements alone "
+                         f"(node {', '.join(map(str, held[:4]))}{' ...' if len(held) > 4 else ''}): "
+                         f"a SPRINGA of stiffness 0 to a held node added. ccx 2.23 stops on a MASS "
+                         f"node that only *EQUATIONs tie ('add_sm_st' / 'add_sm_ei: coefficient "
+                         f"should be 0', probed); the spring changes nothing.", once=True)
 
     def _distributing_holds(self, plans: List[dict]) -> None:
         """Rows that hold the rotations of a ROT NODE no distributing row on it ties: some
@@ -29252,8 +29303,7 @@ class _Constraints:
             params = [(k, v) for k, v in b.params.items() if k in keep]
             nb_ = mkblock("BOUNDARY" if b.keyword == "CONNECTOR MOTION" else "CLOAD", params, data).placed(b)
             out.append(nb_)
-            if b.keyword == "CONNECTOR LOAD":
-                self._conn_load_cards.append(nb_)
+            (self._conn_load_cards if b.keyword == "CONNECTOR LOAD" else self._conn_motion_cards).append(nb_)
             made[b.keyword] = True
         if made["CONNECTOR MOTION"] or made["CONNECTOR LOAD"]:
             self.report.note("History *CONNECTOR MOTION / *CONNECTOR LOAD -> *BOUNDARY / *CLOAD on DOF 1 "
@@ -29969,6 +30019,55 @@ class _Constraints:
                 return []
             out.append(terms)
         return out
+
+    def _drop_untied_actuation(self) -> None:
+        """The *CLOAD / *BOUNDARY lines of history *CONNECTOR LOAD / MOTION cards
+        (_plan_connector_actuation) on the helper node of a connector that is commented out
+        (_plan_connectors, _plan_connector_rows) left out, warned: with the connector gone the
+        helper is a node of no element and no equation, so ccx 2.23 drops a load there
+        without a message (probed: an AXIAL connector's load in an NLGEOM step, the connector
+        commented out, moved nothing) and a motion there moves nothing.  The load or motion
+        is lost with its connector, which its own warning reports as reduced physics."""
+        if not self._conn_act:
+            return
+        written = {it["eid"] for sec in self._conn_plan.values() if not sec["reason"]
+                   for it in sec["items"] if it["route"] != "skip"}
+        helpers = set(self._conn_act.values())
+        tied: set = set()                       # (a helper some written row or element uses)
+        for sec in self._conn_plan.values():
+            if not sec["reason"]:
+                for it in sec["items"]:
+                    if it["route"] == "rows":
+                        tied.update(n for eq in it.get("eqs", ()) for n, _d, _v in eq if n in helpers)
+        for _typ, conn in self.geom.elements.values():
+            tied.update(n for n in conn if n in helpers)
+        lost = {h for (e, _c), h in self._conn_act.items() if e not in written and h not in tied}
+        if not lost:
+            return
+        names = {str(h) for h in lost}
+        cards = [c for c in self._conn_load_cards + self._conn_motion_cards
+                 if any(ln.split(",")[0].strip() in names for ln in c.data)]
+        for card in cards:
+            card.data[:] = [ln for ln in card.data if ln.split(",")[0].strip() not in names]
+            if not card.data:
+                self._conn_dropped_cards.add(id(card))
+        eids = sorted({e for (e, _c), h in self._conn_act.items() if h in lost})
+        kinds = sorted({k for h in lost for k in self._conn_act_kind.get(h, ())})
+        listing = ", ".join(map(str, eids[:8])) + (f" and {len(eids) - 8} more" if len(eids) > 8 else "")
+        self.report.warn(f"{' / '.join('*' + k for k in kinds)} on connector element(s) {listing} "
+                         f"left out with them: those connectors are commented out (see their "
+                         f"warnings), so the helper node it acts on would be tied to nothing and "
+                         f"ccx 2.23 would drop the load without a message.",
+                         at=cards[0] if cards else None)
+        self._reduces(f"{' / '.join('*' + k for k in kinds)} of connectors that are commented out")
+
+    @staticmethod
+    def _dropped_actuation_line(b: Block) -> List[str]:
+        """The comment written for a *CLOAD / *BOUNDARY card of connector loads / motions that
+        _drop_untied_actuation left with no line."""
+        source = "*CONNECTOR LOAD" if b.keyword == "CLOAD" else "*CONNECTOR MOTION"
+        return [f"** abq2ccx: *{b.keyword} of a {source} left out with its connectors, which are "
+                f"commented out"]
 
     def _conn_element(self, typ: str, nodes: List[int], value: float) -> str:
         """A new SPRINGA / DASHPOTA element on ``nodes`` in the element set of its type and
@@ -30803,6 +30902,7 @@ class _Constraints:
             # SPRINGA of stiffness 0 to a new held node puts the node there, changing nothing
             for n in (it["a"], it["b"]):
                 if n is not None and n not in mass_held and n in mass_only and \
+                        n not in self._mass_hold_nodes and \
                         any(m == n for eq in eqs for m, _d, _v in eq):
                     mass_held.add(n)
                     g = max(self.geom.nodes) + 1
@@ -33473,6 +33573,8 @@ class _Loads:
         return out
 
     def handle_boundary(self, b: Block) -> List[str]:
+        if id(b) in self._conn_dropped_cards:        # _drop_untied_actuation
+            return self._dropped_actuation_line(b)
         if id(b) in self.steps.lc2:                  # (_plan_load_cases notes it)
             return ["** abq2ccx: *BOUNDARY, LOAD CASE=2 (buckling-mode BCs) left out: ccx has one "
                     "set of BCs per step"]
@@ -33586,6 +33688,9 @@ class _Loads:
         if self._kin_hold_bc and op_new:
             out += ["** abq2ccx: free reference node rotations held again (OP=NEW removed "
                     "it)"] + self._kin_hold_bc
+        if self._mass_hold_bc and op_new:
+            out += ["** abq2ccx: the nodes of zero springs on MASS reference nodes held again "
+                    "(OP=NEW removed it)"] + self._mass_hold_bc
         if self._truss_hub_bc and op_new:
             out += ["** abq2ccx: truss hub rotations held again (OP=NEW removed it)"] + self._truss_hub_bc
         if self._conn_bcs and op_new:
@@ -35077,6 +35182,8 @@ class _Loads:
         its ROT NODE — ccx silently ignores them on the REF NODE (verified: no rotation); the
         ROT NODE has the reference node's local axes if it has a *TRANSFORM.
         Abaqus ORIENTATION= (local load axes) and FOLLOWER=YES have no ccx counterpart."""
+        if id(b) in self._conn_dropped_cards:        # _drop_untied_actuation
+            return self._dropped_actuation_line(b)
         if b.has("USER"):
             return self._user_load_card(b)
         if self._op_new_load(b):
@@ -44717,9 +44824,12 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # value) -> the element set of the springs / dashpots written for them, and those sets'
         # cards written so far; the DASHPOTA elements among them
         self._conn_act: Dict[Tuple[int, int], int] = {}
-        # helper node -> the keywords acting on it; the *CLOAD cards made for the loads
+        # helper node -> the keywords acting on it; the *CLOAD cards made for the loads, and
+        # the *BOUNDARY cards made for the motions
         self._conn_act_kind: Dict[int, set] = {}
         self._conn_load_cards: List[Block] = []
+        self._conn_motion_cards: List[Block] = []
+        self._conn_dropped_cards: set = set()      # ids of those left with no line (_drop_untied_actuation)
         self._conn_bc_every: set = set()           # (node, DOF) with a BC in every step
         self._conn_fixed: Dict[int, set] = {}
         self._conn_fixed_cards: Dict[int, set] = {}     # id(model-data *CONNECTOR MOTION) -> elements
@@ -44783,6 +44893,11 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._rigid_planar_refs: List[int] = []
         self._rigid_planar_bc: List[str] = []
         self._kin_hold_bc: List[str] = []          # _plan_kinematic_holds
+        # _hold_mass_refs: the zero springs' *SPRING card and *BOUNDARY lines, their held nodes'
+        # *BOUNDARY card (again after OP=NEW), and the nodes they hold
+        self._mass_hold_cards: List[str] = []
+        self._mass_hold_bc: List[str] = []
+        self._mass_hold_nodes: set = set()
         self._kin_hold_eq: List[str] = []          # ... its *EQUATIONs on twist ROT NODEs
         self._kin_twist: Dict[int, Tuple[int, List[Vec]]] = {}    # _plan_kinematic_twists
         self._kin_twist_refused: Dict[int, Tuple[List[Vec], str]] = {}    # ... why not, per ref node
@@ -45264,6 +45379,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                 gc.enable()
 
     def _convert(self, blocks: List[Block]) -> List[str]:
+        blocks = self._comma_free_names(blocks)    # first: every reader sees the names ccx will
         blocks = close_open_steps(blocks, self.report)     # (read_blocks' decks: none open)
         blocks = self._bc_dofs_in_range(self._cartesian_nodes(blocks))
         self._uel_nodes.update(user_element_nodes(blocks))     # (an instance's too)
@@ -45343,6 +45459,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_distributing_rows()          # after the ROT NODEs' axes
         self._plan_rigid_twins(blocks)          # after the ROT NODE axes
         self._plan_connector_rows(blocks)
+        self._drop_untied_actuation()           # after it: the connectors left out
         self._plan_embedded_bcs(blocks)         # before _plan_coupled_bcs, which redoes its cards
         self._plan_coupled_bcs(blocks)
         self._warn_rigid_mpc_steps(blocks)      # after the constraint plans (_rigid_constraints)
@@ -45449,6 +45566,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         if self._kin_hold_bc or self._kin_hold_eq:
             out += ["** abq2ccx: kinematic-coupling reference node rotations no coupled DOF "
                     "depends on (ccx stops on them free)"] + self._kin_hold_bc + self._kin_hold_eq
+        if self._mass_hold_cards:
+            out += ["** abq2ccx: zero springs to held nodes on distributing-coupling reference "
+                    "nodes with MASS elements alone (ccx stops on them otherwise)"] + self._mass_hold_cards
         out.extend(self.emit_other(blocks))
         self._warn_two_point_kept()
         self._warn_two_by_two_kept()
@@ -45486,6 +45606,68 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
                              + "; ".join(self.reduced_physics) + ". Its results are not the deck's "
                              "own solution (see the warnings above).")
+        return out
+
+    def _comma_free_names(self, blocks: List[Block]) -> List[Block]:
+        """The deck with every quoted name that holds a comma ("COLD PLATE, ASSY-1") written
+        with "_" for the comma and the blanks around it ("COLD PLATE_ASSY-1"), the same in
+        every card that names it.  Abaqus reads a quoted comma as part of the name; ccx 2.23
+        splits a card at every comma, quotes or not, so it reads ELSET="PLATE, A" as set
+        "PLATE plus an unknown parameter A" (probed: two cards *ELEMENT, ELSET="PLATE, A" and
+        ELSET="PLATE, B" fill one set "PLATE, whose second *SOLID SECTION then holds both
+        elements, with warnings only; a solid and a shell set that collide that way stop ccx
+        on the section).  The converter's own data-line readers split there too, and
+        instance names reach every flattened set and surface name.  A new name that another
+        quoted name already has (as ccx reads names: blanks removed, any case) gets _2, _3,
+        ...  *HEADING text and file names (INPUT=, FILE=) are left as they are."""
+        def texts(b: Block) -> List[str]:
+            vals = [v for k, v in b.params.items() if v and k not in FILE_NAME_PARAMS]
+            return vals + (list(b.data) if b.keyword != "HEADING" else [])
+
+        taken: set = set()                                  # quoted names without a comma
+        found: "OrderedDict[str, Tuple[str, Block]]" = OrderedDict()   # key -> (as written, card)
+        for b in blocks:
+            for t in texts(b):
+                if '"' in t:
+                    for q in QUOTED_TEXT.findall(t):
+                        if "," in q:
+                            found.setdefault(ccx_name_key(q), (q, b))
+                        else:
+                            taken.add(ccx_name_key(q))
+        if not found:
+            return blocks
+        new: Dict[str, str] = {}                            # key -> the name written for it
+        for k, (q, _b) in found.items():
+            base = re.sub(r"\s*,\s*", "_", q[1:-1])
+            cand, i = f'"{base}"', 1
+            while ccx_name_key(cand) in taken:
+                i += 1
+                cand = f'"{base}_{i}"'
+            taken.add(ccx_name_key(cand))
+            new[k] = cand
+
+        def fix(t: str) -> str:
+            if '"' not in t or "," not in t:
+                return t
+            return QUOTED_TEXT.sub(lambda m: new.get(ccx_name_key(m.group()), m.group())
+                                   if "," in m.group() else m.group(), t)
+
+        out: List[Block] = []
+        for b in blocks:
+            if not any('"' in t and "," in t for t in texts(b)):
+                out.append(b)
+                continue
+            params = [(k, fix(v) if v and k not in FILE_NAME_PARAMS else v) for k, v in b.params.items()]
+            data = [fix(x) for x in b.data] if b.keyword != "HEADING" else list(b.data)
+            out.append(mkblock(b.keyword, params, data).placed(b))
+        shown = ", ".join(f"{q} -> {new[k]}" for k, (q, _b) in list(found.items())[:4])
+        more = f" and {len(found) - 4} more" if len(found) > 4 else ""
+        self.report.note(f"{len(found)} quoted name(s) with a comma written with '_' for it, in "
+                         f"every card that names them: {shown}{more}.  ccx 2.23 splits a card at "
+                         f"every comma, quotes or not, so it would read such a name only up to "
+                         f"its comma (probed: ELSET=\"PLATE, A\" and ELSET=\"PLATE, B\" are one "
+                         f"set \"PLATE, the second card's section holding both elements).",
+                         at=next(iter(found.values()))[1])
         return out
 
     def _move_between_cards(self, blocks: List[Block]) -> List[Block]:

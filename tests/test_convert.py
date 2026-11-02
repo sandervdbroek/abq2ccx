@@ -1143,6 +1143,49 @@ def test_flattened_set_names_made_unique():
     assert "names collide within CalculiX's 80-character name limit" in rep.text()
 
 
+def test_quoted_names_with_commas_written_with_underscores():
+    # ccx splits a card at every comma, quotes or not: ELSET="PLATE, A" is set "PLATE plus an
+    # unknown parameter, so names that agree up to the comma become one set (here a solid and
+    # a shell part: ccx stopped on the sections).  Every quoted name with a comma is written
+    # with '_' for it, the same in keyword parameters, data lines and the flattened instance
+    # names; *HEADING text stays as it is
+    deck = ('*HEADING\n"Shaker, rough" model\n'
+            '*PART, NAME="PLATE, A"\n' + HEX + '*NSET, NSET=BASE\n1, 2, 3, 4\n'
+            '*SOLID SECTION, ELSET=EALL, MATERIAL="Steel, 304"\n*END PART\n'
+            '*PART, NAME="PLATE, B"\n*NODE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n'
+            '*ELEMENT, TYPE=S4, ELSET=SHELL\n1, 1, 2, 3, 4\n*NSET, NSET=EDGE\n1, 4\n'
+            '*SHELL SECTION, ELSET=SHELL, MATERIAL="Steel, 304"\n1.,\n*END PART\n'
+            '*ASSEMBLY, NAME=ASM\n*INSTANCE, NAME="PLATE, A-1", PART="PLATE, A"\n*END INSTANCE\n'
+            '*INSTANCE, NAME="PLATE, B-1", PART="PLATE, B"\n5., 0., 0.\n*END INSTANCE\n'
+            '*NSET, NSET="Load, tip", INSTANCE="PLATE, B-1"\n2, 3\n*END ASSEMBLY\n'
+            '*MATERIAL, NAME="Steel, 304"\n*ELASTIC\n200000., 0.3\n'
+            '*BOUNDARY\n"PLATE, A-1".BASE, ENCASTRE\n"PLATE, B-1".EDGE, ENCASTRE\n'
+            '*STEP\n*STATIC\n*CLOAD\n"Load, tip", 3, 1.\n*NODE PRINT, NSET="Load, tip"\nU\n*END STEP\n')
+    body, conv, rep = convert_str(deck)
+    cards = [ln for ln in body.splitlines() if not ln.startswith("**")]
+    head = cards.index("*HEADING")
+    assert cards[head + 1] == '"Shaker, rough" model'
+    commas = [ln for ln in cards[head + 2:] if any("," in q for q in A.QUOTED_TEXT.findall(ln))]
+    assert not commas, commas
+    assert '*MATERIAL, NAME="Steel_304"' in cards
+    assert '*SOLID SECTION, ELSET="PLATE_A-1"_EALL, MATERIAL="Steel_304"' in cards
+    assert '*SHELL SECTION, ELSET="PLATE_B-1"_SHELL, MATERIAL="Steel_304"' in cards
+    assert '"PLATE_A-1"_BASE, 1, 6' in cards and '"Load_tip", 3, 1.' in cards
+    assert '*NODE PRINT, NSET="Load_tip"' in cards
+    assert '6 quoted name(s) with a comma written with \'_\' for it' in rep.text()
+    assert not conv.reduced_physics or conv.reduced_physics == [S4R_FLAG]
+    # a new name another quoted name already has gets _2; a file name keeps its comma
+    deck2 = ('*NODE, NSET="A, B"\n1, 0., 0., 0.\n*NSET, NSET="A_B"\n1\n*NSET, NSET="a ,b"\n1\n'
+             '*ELEMENT, TYPE=MASS, ELSET=M\n2, 1\n*MASS, ELSET=M\n1.\n')
+    body2, _, _ = convert_str(deck2)
+    # ("A, B" and "a ,b" are one name to ccx and to the converter: one set, A_B_2)
+    assert '*NSET, NSET="A_B_2"\n1\n' in body2 and '*NSET, NSET="A_B"\n1\n' in body2, body2
+    blocks = [A.mkblock("INCLUDE", [("INPUT", '"model, part 1.inp"')], []),
+              A.mkblock("NSET", [("NSET", '"X, Y"')], ["1"])]
+    out = A.Converter(A.Report(), Opt())._comma_free_names(blocks)
+    assert out[0].params["INPUT"] == '"model, part 1.inp"' and out[1].params["NSET"] == '"X_Y"'
+
+
 def test_parameter_with_internal_comment():
     # A ** comment inside a *PARAMETER block must NOT terminate it.
     deck = ("*PARAMETER\nl = 2.0\n** a comment inside the block\nw = 3.0\n"
@@ -6640,6 +6683,33 @@ def test_distributing_coupling_on_a_shared_reference_node():
     assert plan["carrier"] == "kin" and 100 not in conv._rb_rot
     assert {d for eq in _equation_terms(body) for n, d, _c in eq if n == 100} == {1, 2, 3, 4, 5, 6}
     assert "rotation rows are on the node's own DOFs 4-6" in rep.text() and not conv.reduced_physics
+
+
+def test_mass_on_a_distributing_reference_node_gets_a_zero_spring_to_a_held_node():
+    # a test mass (MASS element alone) on a distributing coupling's reference node, which only
+    # the coupling's *EQUATIONs tie: ccx 2.23 stopped ('add_sm_st' in *STATIC, 'add_sm_ei' in
+    # *FREQUENCY: coefficient should be 0).  A SPRINGA of stiffness 0 to a new node a model
+    # span away, held in DOFs 1-3 (again after OP=NEW), puts it in ccx's matrix structure
+    # (validate_with_ccx.py distributing_mass_ref: the same static answer as without the mass)
+    text = open(os.path.join(EXAMPLES, "distributing_mass_ref.inp"), encoding="utf-8").read()
+    deck = text + ("*Step, name=Again\n*Static\n*Boundary, op=NEW\nBOTTOM, ENCASTRE\n"
+                   "*Cload\nREF, 1, 10.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    springs = [(eid, conn) for eid, (typ, conn) in conv.geom.elements.items() if typ == "SPRINGA"]
+    assert len(springs) == 1 and springs[0][1][0] == 1000, springs
+    g = springs[0][1][1]
+    assert conv.geom.nodes[g][1:] == conv.geom.nodes[1000][1:] and conv.geom.nodes[g][0] < 0.0
+    assert ("*SPRING, ELSET=ABQ2CCX_MASS_HOLD\n0.\n*BOUNDARY\n" + f"{g}, 1, 3\n") in body
+    assert f"(OP=NEW removed it)\n*BOUNDARY\n{g}, 1, 3\n" in _step(body, 3)
+    assert "Distributing coupling on a reference node with MASS elements alone (node 1000)" in rep.text()
+    assert not conv.reduced_physics
+    # without the mass, or on a node that carries another element too: no spring
+    for variant in (text.replace("*Element, type=MASS, elset=TESTMASS\n9000, 1000\n*Mass, elset=TESTMASS\n0.05,\n", ""),
+                    text.replace("*Mass, elset=TESTMASS\n0.05,\n", "*Mass, elset=TESTMASS\n0.05,\n"
+                                 "*Element, type=SPRINGA, elset=S\n9001, 1000, 1\n*Spring, elset=S\n\n1.\n")):
+        assert variant != text
+        body, conv, rep = convert_str(variant)
+        assert "ABQ2CCX_MASS_HOLD" not in body and "MASS elements alone" not in rep.text()
 
 
 def test_rigid_body_and_kinematic_coupling_on_one_reference_node():
@@ -13444,6 +13514,44 @@ CONN_LOAD_HELD = ("*Node, nset=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 0., -
                   "*Connector Elasticity, component=1\n100.\n*Connector Elasticity, rigid\n2\n*Boundary\n"
                   "1, 1, 6\n3, 1, 6\n*Step\n*Static\n*Boundary\n2, 1, 1, 0.01\n{LOAD}*Node Print, nset=PROBE\n"
                   "U\n*End Step\n")
+
+
+def test_connector_load_and_motion_left_out_with_their_commented_out_connector():
+    # an AXIAL bolt (spring + preload) on a kinematic coupling's reference node under NLGEOM
+    # is commented out (its line turns with the nodes); its *CONNECTOR LOAD / MOTION went on
+    # as a *CLOAD / *BOUNDARY on a helper node tied to nothing, which ccx 2.23 drops without
+    # a message: they are left out with it, warned, and flagged as reduced physics
+    deck = ("*Node\n1, 0., 0., 0.\n2, 10., 0., 0.\n3, 10., 10., 0.\n4, 0., 10., 0.\n"
+            "5, 0., 0., 10.\n6, 10., 0., 10.\n7, 10., 10., 10.\n8, 0., 10., 10.\n"
+            "101, 5., 5., 20.\n102, 5., 5., 30.\n"
+            "*Element, type=C3D8, elset=BLOCK\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "*Solid Section, elset=BLOCK, material=STEEL\n*Material, name=STEEL\n*Elastic\n210000., 0.3\n"
+            "*Nset, nset=BOTTOM\n1, 2, 3, 4\n*Nset, nset=TOP\n5, 6, 7, 8\n"
+            "*Surface, type=NODE, name=TOPSURF\nTOP, 1.\n"
+            "*Coupling, constraint name=C1, ref node=101, surface=TOPSURF\n*Kinematic\n"
+            "*Element, type=CONN3D2, elset=BOLT\n2, 101, 102\n"
+            "*Connector Section, elset=BOLT, behavior=B1\nAxial,\n"
+            "*Connector Behavior, name=B1\n*Connector Elasticity, component=1\n86830.,\n"
+            "*Boundary\nBOTTOM, ENCASTRE\n102, ENCASTRE\n"
+            "*Step, name=pre, nlgeom=YES\n*Static\n1., 1., 1e-05, 1.\n"
+            "*Connector Load\nBOLT, 1, -1000.\n*End Step\n"
+            "*Step, name=pull, nlgeom=YES\n*Static\n1., 1., 1e-05, 1.\n"
+            "*Connector Motion\nBOLT, 1, 0.01\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    load, motion = conv._conn_act[(2, 1)], conv._conn_act[(2, 1)]
+    assert load == motion                    # (one helper per element and component)
+    assert not re.search(rf"^{load}, 1", body, re.M), body
+    assert "** abq2ccx: *CLOAD of a *CONNECTOR LOAD left out with its connectors" in _step(body, 1)
+    assert "** abq2ccx: *BOUNDARY of a *CONNECTOR MOTION left out with its connectors" in _step(body, 2)
+    assert re.search(r"\.inp:\d+: \*CONNECTOR LOAD / \*CONNECTOR MOTION on connector element\(s\) 2 "
+                     r"left out with them: those connectors are commented out", rep.text()), rep.text()
+    assert "*CONNECTOR LOAD / *CONNECTOR MOTION of connectors that are commented out" in conv.reduced_physics
+    # with --approximate the connector is written: the helper's *EQUATION ties the load to it
+    body, conv, rep = convert_str(deck, approximate=True)
+    h = conv._conn_act[(2, 1)]
+    assert f"*CLOAD\n{h}, 1, -1000." in body and f"*BOUNDARY\n{h}, 1, 1, 0.01" in body
+    assert any(any(n == h for n, _, _ in eq) for eq in _all_equations(body))
+    assert "left out with them" not in rep.text()
 
 
 def test_connector_load_on_a_determined_component_drops_only_the_load():
