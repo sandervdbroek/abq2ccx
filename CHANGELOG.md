@@ -8,6 +8,22 @@ From 1.6.0 on, each version opens with an overview in plain language (what now c
 gives more correct answers, what changed in using the converter), followed by the detailed
 entries. The GitHub release notes use the same section.
 
+## Unreleased
+
+### Overview
+
+* **Terminal report on Windows.** The report's lines no longer reach the terminal's last column,
+  where the Windows console broke them a second time (blank lines inside paragraphs), and the
+  report is wrapped to the width of the terminal it is shown in.
+
+### Details
+
+* **Terminal report wrapping** — lines are wrapped one column short of the terminal's width: the
+  Windows console moves to the next line when a line fills its last column, so the line break
+  after it left a blank line. The width is `COLUMNS` where set, else that of the terminal stderr
+  writes to (the report's; it was stdout's), else 100 columns; the header lines are wrapped too,
+  a long path moving to an indented next line. `__version__` is 1.7.1.dev0.
+
 ## 1.7.0 (November 2026)
 
 ### Overview

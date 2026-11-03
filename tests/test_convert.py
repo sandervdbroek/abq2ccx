@@ -20063,7 +20063,9 @@ def test_terminal_report_is_grouped_numbered_wrapped_and_versioned():
     assert text.startswith("Reduced physics (ccx solves another model than the deck):\n"
                            "  - element STRI65 -> S6\n\nWarnings (1, and the reduced-physics summary above)\n"
                            "  1. deck.inp:12\n     A warning about something that matters, long enough to\n"), text
-    assert all(len(line) <= 60 for line in text.splitlines()), text
+    # one column short of the width: the Windows console wraps a line that fills the last
+    # column by itself, and the line break after it left a blank line in the paragraph
+    assert all(len(line) < 60 for line in text.splitlines()), text
     assert "  - deck.inp:40\n    Output variables AR1, AR2, TA1 dropped from *NODE PRINT\n    (not a ccx label there).\n" in text, text
     assert "    Output variable U3 -> U (CalculiX naming).\n" in text and "  - A note without a place.\n" in text
     assert "Notes (3)" in text and A.Report().console(80) == "No conversion issues were flagged.\n"
@@ -20082,6 +20084,29 @@ def test_terminal_report_is_grouped_numbered_wrapped_and_versioned():
     assert re.fullmatch(r"  \d+ nodes, 1 elements \| \d+ warning\(s\), \d+ note\(s\), \d+ commented card\(s\)", head[1]), head
     assert head[2] == f"  Full report: {os.path.join(d, 'a_ccx.log')} (and at the top of the converted deck)"
     assert log.startswith(f"abq2ccx {A.__version__}: {deck} -> {os.path.join(d, 'a_ccx.inp')} (") and "\n\n[" in log
+
+
+def test_report_width_reads_columns_then_stderrs_terminal():
+    # COLUMNS where set, else the terminal stderr writes to (the report's; shutil asked
+    # stdout's), else 100 columns; always within 60-120
+    saved = os.environ.get("COLUMNS")
+    try:
+        for value, want in (("80", 80), ("300", 120), ("20", 60)):
+            os.environ["COLUMNS"] = value
+            assert A.report_width() == want, value
+        os.environ.pop("COLUMNS", None)
+        err, sys.stderr = sys.stderr, io.StringIO()     # (no terminal: no fileno)
+        try:
+            assert A.report_width() == 100
+        finally:
+            sys.stderr = err
+    finally:
+        if saved is None:
+            os.environ.pop("COLUMNS", None)
+        else:
+            os.environ["COLUMNS"] = saved
+    lines = A.wrap_for_terminal("a " * 100, 60, "  - ", "    ")
+    assert max(map(len, lines)) == 59 and lines[0].startswith("  - a a")
 
 
 def _still_runs(pid):

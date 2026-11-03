@@ -66,7 +66,7 @@ from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
 
-__version__ = "1.7.0"
+__version__ = "1.7.1.dev0"
 
 # ---------------------------------------------------------------------------
 # Element reference data
@@ -929,14 +929,11 @@ class Report:
         under its place in the deck and wrapped to ``width`` (the terminal's, 60-120 columns);
         entries 'Output variable X <the same rest>' of one card in one, 'Output variables X,
         Y, ...'; then the instance map."""
-        if width is None:
-            width = shutil.get_terminal_size((100, 24)).columns
-        width = max(60, min(120, width))
+        width = max(60, min(120, report_width() if width is None else width))
         out: List[str] = []
 
         def para(text: str, first: str, rest: str) -> None:
-            out.extend(textwrap.wrap(text, width, initial_indent=first, subsequent_indent=rest,
-                                     break_long_words=False, break_on_hyphens=False) or [first.rstrip()])
+            out.extend(wrap_for_terminal(text, width, first, rest))
         groups: "OrderedDict[tuple, list]" = OrderedDict()
         for k, (level, msg) in enumerate(self.entries):
             if level == "WARNING" and self.reduced and msg.startswith("Reduced physics"):
@@ -998,6 +995,31 @@ class Report:
             lines.append(f"  ... and {len(self.instances) - limit} more instance(s) (--json lists "
                          f"them all)")
         return lines
+
+
+def report_width() -> int:
+    """The width the terminal report wraps to: COLUMNS where set, else that of the terminal the
+    report goes to (stderr; shutil.get_terminal_size asks stdout's), else 100 columns (a
+    report redirected to a file), within 60-120."""
+    try:
+        cols = int(os.environ.get("COLUMNS", "") or 0)
+    except ValueError:
+        cols = 0
+    if cols <= 0:
+        try:
+            cols = os.get_terminal_size(sys.stderr.fileno()).columns
+        except (AttributeError, ValueError, OSError):
+            cols = 100
+    return max(60, min(120, cols))
+
+
+def wrap_for_terminal(text: str, width: int, first: str = "", rest: str = "") -> List[str]:
+    """``text`` wrapped for a terminal ``width`` columns wide, one column short of it: the
+    Windows console moves to the next line when a line fills its last column, so the line
+    break after such a line left a blank line inside the paragraph.  Long words (a path, a set
+    name) stay whole."""
+    return textwrap.wrap(text, width - 1, initial_indent=first, subsequent_indent=rest,
+                         break_long_words=False, break_on_hyphens=False) or [first.rstrip()]
 
 
 def _wrap(text: str, width: int) -> List[str]:
@@ -50138,9 +50160,12 @@ def _convert_one(path: str, args) -> Tuple[int, dict]:
                  [f"  Full report: {os.path.splitext(out_path)[0]}.log (and at the top of the "
                   f"converted deck)"] if not args.no_log else
                  ["  Full report: at the top of the converted deck"])
-        sys.stderr.write("\n".join([f"abq2ccx {__version__}: {verb} {path}",
-                                    f"  {len(conv.geom.nodes):,} nodes, {len(conv.geom.elements):,} "
-                                    f"elements | {report.summary()}"] + where) + "\n\n")
+        width = report_width()
+        head = [f"abq2ccx {__version__}: {verb} {path}",
+                f"  {len(conv.geom.nodes):,} nodes, {len(conv.geom.elements):,} elements | "
+                f"{report.summary()}"] + where
+        sys.stderr.write("\n".join(x for i, line in enumerate(head) for x in wrap_for_terminal(
+            line.strip(), width, line[:len(line) - len(line.lstrip())], "    " if i else "  ")) + "\n\n")
         sys.stderr.write(report.console())
 
     strict = args.strict and (report.n_warnings > 0 or report.n_commented > 0)
