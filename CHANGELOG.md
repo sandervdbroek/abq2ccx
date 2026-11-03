@@ -8,6 +8,29 @@ From 1.6.0 on, each version opens with an overview in plain language (what now c
 gives more correct answers, what changed in using the converter), followed by the detailed
 entries. The GitHub release notes use the same section.
 
+## Unreleased
+
+### Overview
+
+* **More correct answers.** `*BOUNDARY, FIXED` on a translation of a node with a `*TRANSFORM`,
+  where earlier loads moved it, now holds the node where the step finds it. ccx held it at the
+  wrong value (the global component read as the local one), with a warning.
+
+### Details
+
+* **`*BOUNDARY, FIXED` on `*TRANSFORM` translations moved by loads** — where the held value is
+  unknown, the node now gets a helper node without a `*TRANSFORM`, tied to its local DOFs by
+  `*EQUATION`s, and FIXED goes on the helper. Every `*BOUNDARY` on the node's translations is
+  written on the helper: ccx drops the equations when a `*BOUNDARY, OP=NEW` step gives a BC on
+  another of its local DOFs again. Exact against the model turned into the node's axes
+  (`validate_with_ccx.py fixed_helper`: a cube with `*FREQUENCY` and restore steps, an S4
+  plate). Not where the node has rotational BCs or other constraints, elements other than
+  solids, plane elements, S3/S4/S4R or B31 (shells and beams: no `*DYNAMIC` step), an initial
+  velocity, or in decks with explicit or modal dynamics: those keep the warning. In an implicit
+  `*DYNAMIC` step the value is right, but ccx's response to a BC that stops a moving DOF along
+  an oblique axis differs from one along a global axis (3-14 % on one C3D8, as with ccx's own
+  BCs on transformed nodes): warned.
+
 ## 1.7.0 (November 2026)
 
 ### Overview

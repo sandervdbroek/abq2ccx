@@ -35002,8 +35002,10 @@ class _Loads:
         of its load), which the restore of a static perturbation step after another step
         (BaseStateRestore._add_base) adds the base value to - where the base state holds the
         DOF or it is at rest.  Else a rotation is left out of the card (free in that step)
-        and a translation keeps FIXED, warned, with reduced physics.  The card's other DOFs
-        keep FIXED; its pieces go to _amp_cards (handle_boundary)."""
+        and a translation keeps FIXED (_fixed_unknown: _plan_fixed_helpers holds it exactly
+        through a helper node where it can, else warns, with reduced physics).  The card's
+        other DOFs keep FIXED; its pieces go to _amp_cards (handle_boundary)."""
+        self._fixed_unknown = []
         model = model_data(blocks)
         mid_ends = {m: (a, c) for a, c, m, _s in self._between()}
         todo: List[Tuple[int, Block, List[dict]]] = []
@@ -35054,7 +35056,7 @@ class _Loads:
             end = dict(next(folds))
             start.append(start[-1] if step.no in self._pert_idx else end)   # (the base state again)
         lost: List[str] = []                        # rotations left out
-        misread: List[str] = []                     # translations left to ccx's FIXED
+        misread = self._fixed_unknown               # translations left to ccx's FIXED
         what = {True: "translations of nodes with a *TRANSFORM (ccx 2.23 holds the global "
                       "component there)", False: "shell/beam rotations (ccx's FIXED takes no rotations)"}
         for s, b, lines in todo:
@@ -35094,7 +35096,7 @@ class _Loads:
                         if v is not None:
                             entries_out.append((None, f"{n}, {d}, {d}, {short_real(v, 12)}"))
                         elif d <= 3:
-                            misread.append(f"node {n} DOF {d} (step {s})")
+                            misread.append((n, d, s))
                             left.append(d)
                         else:
                             lost.append(f"node {n} DOF {d} (step {s})")
@@ -35131,22 +35133,14 @@ class _Loads:
                              f"rotations (it stops on them). Give the rotation its value as a BC.",
                              once=True)
             self._reduces("*BOUNDARY, FIXED rotations left free (ccx's FIXED takes no rotations)")
-        if misread:
-            self.report.warn(f"*BOUNDARY, FIXED on translations of nodes with a *TRANSFORM whose value "
-                             f"at the end of the previous step the converter does not know (moved by "
-                             f"loads, or held by a BC it cannot evaluate: {', '.join(misread[:4])}"
-                             f"{', ...' if len(misread) > 4 else ''}): kept as FIXED, which ccx 2.23 "
-                             f"holds at the node's global displacement component, read as the local "
-                             f"value (probed), not where Abaqus holds it. Give the DOF its value as a "
-                             f"BC.", once=True)
-            self._reduces("*BOUNDARY, FIXED on *TRANSFORM translations held at the global component "
-                          "(ccx 2.23)")
 
     def _fixed_holds(self, n: int, d: int) -> bool:
         """Whether ccx 2.23's *BOUNDARY, FIXED holds DOF ``d`` (1-6) of node ``n`` where the
         previous step left it, as Abaqus does: _holdable, and a translation along a local axis
-        of the node that is the global one (_fixed_misread)."""
-        return self._holdable(n, d) is not None and not self._fixed_misread(n, d)
+        of the node that is the global one (_fixed_misread), or held through a helper node
+        (_plan_fixed_helpers)."""
+        return (n, d) in self._fixed_helper or \
+            (self._holdable(n, d) is not None and not self._fixed_misread(n, d))
 
     def _fixed_misread(self, n: int, d: int) -> bool:
         """Whether ccx 2.23's *BOUNDARY, FIXED does not hold DOF ``d`` (1-6) of node ``n``
@@ -44537,6 +44531,232 @@ class _PostPasses:
             deck.swap(j, lines)
         return deck.edited()
 
+    # the element types besides the solids (C3D) _fixed_helper_nodes' form was probed on, or
+    # that ccx expands as those: shells and beams that are no knot, plane stress / strain
+    _FIXED_HELPER_TYPES = frozenset(("S3", "S4", "S4R", "B31", "B31R", "CPS3", "CPS4", "CPS4R",
+                                     "CPE3", "CPE4", "CPE4R"))
+
+    def _plan_fixed_helpers(self, blocks: List[Block], deck: EmittedDeck) -> None:
+        """*BOUNDARY, FIXED on a translation of a node with a *TRANSFORM whose value at the
+        start of the step the converter does not know (_fixed_unknown: moved by loads, or held
+        by a BC it cannot evaluate), which ccx 2.23 holds at the node's global component, read
+        as the local value (bounadd.f; _plan_fixed_values).  Exact: a helper node X at the
+        node, without a *TRANSFORM, and the model-data *EQUATION ``n, d, 1., X, d, -1.`` (the
+        node's local term first: ccx eliminates one of the node's global DOFs for it), so X's
+        DOF d is the node's local one in every step, and FIXED on X holds it where the previous
+        step left it (probed against the model turned into the node's axes, within 5e-7: C3D8
+        with and without other BCs on the node, NLGEOM, *FREQUENCY and static perturbation
+        steps around it, S3 / S4 / S4R, CPS4; B31 against the value written by hand).  Every
+        *BOUNDARY line on the node's translations, in every step, goes to its helper
+        (_fixed_helper_nodes, after the passes that write BCs): another one on such a DOF would
+        be a second constraint on that direction, whose cascade pivot vanishes, and one on
+        another local DOF, given again in a step with *BOUNDARY, OP=NEW, makes ccx drop the
+        helper's equations (probed: the node then moves off the held helper).  The base-state
+        restore reads such a DOF as one FIXED holds (_fixed_holds), as on a node without a
+        *TRANSFORM.  Not where the node has BCs on its rotations or other constraints
+        (equations, rigid bodies, couplings, ties, *MPCs), elements not probed, a knot (a shell
+        or beam node in a deck with *DYNAMIC steps may become one), an initial velocity, a
+        converter midside node next to it, a *TRANSFORM inside a step or axes ccx cannot
+        eliminate a global DOF for each equation along (equations.f, _settle_dependents), nor
+        in a deck with explicit or modal dynamics: there the FIXED stays, warned, with reduced
+        physics.  In an implicit *DYNAMIC step the held value is right, but ccx answers a BC
+        that stops a moving DOF along an oblique axis otherwise than one along a global axis,
+        its own BCs on a *TRANSFORM node too (probed: 3-14 % on one C3D8 against the turned
+        model, at any time increment): warned."""
+        self._fixed_helper = set()
+        cands = self._fixed_unknown
+        if not cands:
+            return
+        steps = self.steps.steps
+        nodes = sorted({n for n, _, _ in cands})
+        why: Dict[int, str] = {}                # node -> why the helper form does not apply
+        modal = ("MODAL DYNAMIC", "STEADY STATE DYNAMICS", "COMPLEX FREQUENCY")
+        whole = "the deck has an explicit step" if any(st.abaqus_explicit for st in steps) else \
+            "the deck has a modal dynamics step" if any(st.proc in modal for st in steps) else None
+        dyn = any(st.proc == "DYNAMIC" for st in steps)
+        at = self._elements_at(set(nodes))
+        sections: Optional[Dict[int, tuple]] = None
+        near = {x for a, c, m, _s in self._between() for x in (a, c, m)}
+        for n in nodes:
+            types = {ccx_type(self.geom.elements[e][0]) for e in at.get(n, ())}
+            if whole:
+                why.setdefault(n, whole)
+            elif n in self._ref_nodes or n in self._rb_rot or n in self._untr or n in near:
+                why.setdefault(n, "the converter's constraints or midside nodes at it")
+            elif not types or any(not t.startswith("C3D") and t not in self._FIXED_HELPER_TYPES
+                                  for t in types):
+                why.setdefault(n, "elements at it the helper node form was not probed on")
+            elif any(t[:1] in "SB" for t in types):
+                sections = sections if sections is not None else self._knot_sections(blocks)
+                if dyn or self._ccx_knot(n, sections, at) is not False:
+                    why.setdefault(n, "a shell or beam node that ccx may make a knot")
+        sets = self._mesh_sets.read(deck)
+        isint = re.compile(r"[-+]?\d+").fullmatch
+        nsurf: Dict[str, List[int]] = {}
+        for c in deck.cards:
+            if c.keyword == "SURFACE" and c.uparam("TYPE") == "NODE":
+                nsurf[c.uparam("NAME")] = [m for rec in c.records() if rec and rec[0].strip()
+                                           for m in sets.members("NSET", rec[0].strip()) or []]
+
+        def node_ids(tok: str, surface: bool = False) -> Optional[List[int]]:
+            tok = tok.strip()
+            got = sets.members("NSET", tok) if tok else None
+            if got is None and surface and tok:
+                got = nsurf.get(tok.upper()) or self._surface_member_nodes(tok) or None
+            return got
+        eqs = self._emitted_equations(deck)
+        tied = {m for _, terms in eqs for m, _, _ in terms}     # nodes of other constraints
+        read = {ci for ci, _ in eqs}
+        unread = any(c.keyword == "EQUATION" and ci not in read for ci, c in enumerate(deck.cards))
+        for c in deck.cards:
+            kw, found = c.keyword, []           # (found: the cards' node lists, None unread)
+            if kw == "RIGID BODY":
+                found = [[int(v) for v in (c.param("REF NODE") or "", c.param("ROT NODE") or "")
+                          if isint(v.strip())]]
+                found.append(node_ids(c.param("NSET") or "") if c.param("NSET") else
+                             [m for e in self.geom.elset((c.param("ELSET") or "").strip())
+                              if e in self.geom.elements for m in self.geom.elements[e][1]])
+            elif kw == "COUPLING":
+                ref = (c.param("REF NODE") or "").strip()
+                found = [[int(ref)] if isint(ref) else None, node_ids(c.param("SURFACE") or "", True)]
+            elif kw == "MPC":
+                found = [[int(t) for rec in c.records() for t in rec[1:] if isint(t.strip())]]
+            elif kw == "TIE":
+                found = [node_ids(t, True) for rec in c.records() for t in rec[:2] if t.strip()]
+            elif kw == "TRANSFORM" and c.step != 0:
+                for m in [m for m in node_ids(c.param("NSET") or "") or nodes if m in nodes]:
+                    why.setdefault(m, "a *TRANSFORM inside a step")
+            elif kw == "INITIAL CONDITIONS" and c.uparam("TYPE").startswith("VELOCITY"):
+                found = [node_ids(rec[0]) for rec in c.records() if rec and rec[0].strip()]
+                for m in [m for ns in found for m in (nodes if ns is None else ns) if m in nodes]:
+                    why.setdefault(m, "an initial velocity on it")
+                continue
+            unread |= any(ns is None for ns in found)
+            tied.update(m for ns in found if ns for m in ns)
+        for n in nodes:
+            if unread:
+                why.setdefault(n, "a constraint card whose nodes the converter cannot read")
+            elif n in tied:
+                why.setdefault(n, "other constraints on it (equations, rigid bodies, couplings, "
+                                  "ties or *MPCs)")
+        # every *BOUNDARY line on the nodes left can move (a set the converter cannot read: on all):
+        # on all their translations that have one (ccx 2.23 lets a *BOUNDARY, OP=NEW step that
+        # gives a BC on another local DOF of the node again drop the helper's equations;
+        # probed), none on their rotations (ccx's MPCs too)
+        held: Dict[int, set] = {n: {d for m, d, _ in cands if m == n} for n in nodes}
+        for c in deck.cards:
+            if c.keyword != "BOUNDARY":
+                continue
+            for j in c.rows:
+                f = trimmed_fields(deck.lines[j].split(","))
+                ns = sets.members("NSET", f[0]) if f else []
+                hit = [n for n in (nodes if ns is None else ns) if n in nodes and n not in why]
+                rng = bc_dof_range(f) if ns is not None else None
+                if hit and rng is None:
+                    why.update((n, "a *BOUNDARY line the converter cannot read") for n in hit)
+                elif hit and rng[0] <= 6 and rng[1] >= 4:
+                    why.update((n, "BCs on its rotations") for n in hit)
+                for n in hit if rng else ():
+                    held[n].update(range(rng[0], min(rng[1], 3) + 1))
+        for n in nodes:
+            if 3 in held[n] and n not in why and \
+                    any(ccx_type(self.geom.elements[e][0]).startswith("CP") for e in at.get(n, ())):
+                why[n] = "a BC on DOF 3 of a plane element's node"
+            ax = self._local_axes(n)
+            taken: set = set()                  # ccx's dependent global DOFs (_settle_dependents)
+            for d in sorted(held[n]) if n not in why else ():
+                g = next((g for g in (d, d % 3 + 1, (d + 1) % 3 + 1) if isinstance(ax, tuple) and
+                          g not in taken and abs(ax[d - 1][g - 1]) >= 1e-5), None)
+                if g is None:
+                    why[n] = "local axes ccx cannot eliminate a DOF of for each equation"
+                taken.add(g)
+        moved = sorted({(n, d) for n in nodes if n not in why for d in held[n]})
+        self._fixed_helper = set(moved)
+        if moved:
+            some = list(dict.fromkeys(f"node {n} DOF {d}" for n, d, _ in cands if n not in why))
+            self.report.note(f"*BOUNDARY, FIXED on translations of nodes with a *TRANSFORM whose "
+                             f"value at the end of the previous step the converter does not know "
+                             f"({', '.join(some[:4])}{', ...' if len(some) > 4 else ''}): held through "
+                             f"a helper node at the node without a *TRANSFORM, tied to its local DOFs "
+                             f"by *EQUATIONs, FIXED on the helper (ccx 2.23 holds a transformed "
+                             f"node's global component instead; probed); every *BOUNDARY on the node's "
+                             f"translations is written on the helper. Exact.", once=True)
+            dyn_at = sorted({s for n, d, s in cands if (n, d) in moved and steps[s - 1].proc == "DYNAMIC"})
+            if dyn_at:
+                self.report.warn(f"*BOUNDARY, FIXED on translations of nodes with a *TRANSFORM in "
+                                 f"*DYNAMIC step(s) {', '.join(map(str, dyn_at))}, held through a "
+                                 f"helper node at the right value: but ccx 2.23 answers a BC that "
+                                 f"stops a moving DOF along an oblique axis otherwise than one along "
+                                 f"a global axis, as with its own BCs on a *TRANSFORM node (probed: "
+                                 f"3-14 % on one C3D8 against the model turned into the node's axes, "
+                                 f"at any time increment).", once=True)
+        left = [f"node {n} DOF {d} (step {s})" for n, d, s in cands if n in why]
+        if left:
+            first = next(why[n] for n, _, _ in cands if n in why)
+            self.report.warn(f"*BOUNDARY, FIXED on translations of nodes with a *TRANSFORM whose value "
+                             f"at the end of the previous step the converter does not know (moved by "
+                             f"loads, or held by a BC it cannot evaluate: {', '.join(left[:4])}"
+                             f"{', ...' if len(left) > 4 else ''}): kept as FIXED, which ccx 2.23 "
+                             f"holds at the node's global displacement component, read as the local "
+                             f"value (probed), not where Abaqus holds it. The exact form (a helper "
+                             f"node tied to the DOF, FIXED on it) does not apply there: {first}. Give "
+                             f"the DOF its value as a BC.", once=True)
+            self._reduces("*BOUNDARY, FIXED on *TRANSFORM translations held at the global component "
+                          "(ccx 2.23)")
+
+    def _fixed_helper_nodes(self, deck: EmittedDeck) -> EmittedDeck:
+        """_plan_fixed_helpers' form written, after every other pass that writes *BOUNDARY (the
+        base-state restore gives such DOFs lines too): every *BOUNDARY line on a DOF of
+        _fixed_helper on its node's helper node (a set's other nodes keep it, node by node),
+        and the helper nodes with their *EQUATIONs in model data."""
+        moved = sorted(self._fixed_helper)
+        if not moved:
+            return deck
+        sets = self._mesh_sets.read(deck)
+        helper = {n: self._emitted_top_node(deck) + 1 + i
+                  for i, n in enumerate(sorted({n for n, _ in moved}))}
+        for c in deck.cards:
+            if c.keyword != "BOUNDARY":
+                continue
+            for j in c.rows:
+                f = trimmed_fields(deck.lines[j].split(","))
+                ns = sets.members("NSET", f[0]) if f else None
+                rng = bc_dof_range(f) if ns is not None else None
+                if rng is None:                 # (none on a helper's DOF: _plan_fixed_helpers)
+                    continue
+                ns = list(dict.fromkeys(ns))
+                lo, hi = rng
+                ds = [d for d in range(lo, hi + 1) if any((m, d) in self._fixed_helper for m in ns)]
+                if not ds:
+                    continue
+                tail = f[3:]
+                out = [", ".join([f[0], str(a), str(b)] + tail)
+                       for a, b in dof_runs([d for d in range(lo, hi + 1) if d not in ds])]
+                for m in ns:
+                    out += [", ".join([str(m), str(a), str(b)] + tail)
+                            for a, b in dof_runs([d for d in ds if (m, d) not in self._fixed_helper])]
+                    out += [", ".join([str(helper[m]), str(a), str(b)] + tail)
+                            for a, b in dof_runs([d for d in ds if (m, d) in self._fixed_helper])]
+                deck.swap(j, out)
+        lines = ["** abq2ccx: helper nodes, each carrying local translations of a node with a "
+                 "*TRANSFORM held by *BOUNDARY, FIXED (on the helper, as every *BOUNDARY on them): "
+                 "ccx 2.23 holds the node's global component there", "*NODE"]
+        lines += [f"{helper[n]}, " + ", ".join(short_real(x, 12) for x in self.geom.nodes[n])
+                  for n in helper]
+        lines.append("*EQUATION")
+        for n, d in moved:
+            lines += ["2", f"{n}, {d}, 1., {helper[n]}, {d}, -1."]
+        deck.insert_before(deck.steps[0].head, lines)
+        return deck.edited()
+
+    def _emitted_top_node(self, deck: EmittedDeck) -> int:
+        """The highest node number of the mesh and of the converted deck's *NODE cards."""
+        top = max(self.geom.nodes, default=0)
+        for c in deck.cards:
+            if c.keyword == "NODE":
+                top = max([top] + [int(r[0]) for r in c.records() if r and r[0].strip().isdigit()])
+        return top
+
     # ccx 2.23's truss elements: gen3dnor expands each of their nodes with gen3dtruss
     _CCX_TRUSSES = frozenset(("T2D2", "T3D2", "T3D3"))
     # cards whose ccx constraints may carry an SPC its nonlinear solver updates (nonlinmpc)
@@ -44628,10 +44848,7 @@ class _PostPasses:
             if on]
         if not harms:
             return deck
-        top = max(self.geom.nodes, default=0)
-        for c in deck.cards:
-            if c.keyword == "NODE":
-                top = max([top] + [int(r[0]) for r in c.records() if r and r[0].strip().isdigit()])
+        top = self._emitted_top_node(deck)
         k = len(first) + 1
         nodes = [top + 1 + i for i in range((k + 2) // 3)]
         lines = [f"** abq2ccx: {k} one-term equations on {len(nodes)} new unconnected nodes, which "
@@ -45148,6 +45365,11 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # need ccx's own step ramp
         self._amp_cards: Dict[int, List[object]] = {}
         self._ramp_steps: set = set()
+        # (node, DOF, step) of the FIXED translations on nodes with a *TRANSFORM whose value
+        # _plan_fixed_values does not know, and those of their (node, DOF) held through a
+        # helper node (_plan_fixed_helpers)
+        self._fixed_unknown: List[Tuple[int, int, int]] = []
+        self._fixed_helper: set = set()
         # id(displacement *BOUNDARY) -> the BCs in force before it on the ends of the nodes the
         # converter put between two (_plan_held_bcs)
         self._bc_held: Dict[int, Dict[int, Dict[int, Tuple[Optional[float], Optional[str]]]]] = {}
@@ -45877,6 +46099,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # *END STEP (close_open_steps); a pass's edits on another step's cards would mislead ccx
         assert len(deck.steps) == len(self.emit.written) and \
             all(st.end is not None for st in deck.steps), "a step written inside another"
+        self._plan_fixed_helpers(blocks, deck)  # before the restore, which asks _fixed_holds
         deck = self._settle_dependents(deck)
         deck = self._unread_body_surfaces(deck)
         deck = self._restore_base_states(deck)
@@ -45890,6 +46113,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_knot_equations(blocks, deck)     # after _settle_dependents: the terms as written
         deck = self._initial_gradients_back(deck)   # after the audit: the initial state is no load
         deck = self._shift_total_time(deck)     # after every pass that writes load cards
+        deck = self._fixed_helper_nodes(deck)   # after every other pass that writes *BOUNDARY
         deck = self._truss_bc_index(deck)       # after every pass that writes *BOUNDARY
         out = self._short_fields(deck.render())     # last: every card is written
         if self.reduced_physics:

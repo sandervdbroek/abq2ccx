@@ -24791,14 +24791,17 @@ def test_base_restore_keeps_fixed_on_transforms_along_the_global_axes():
 def test_fixed_transformed_translations_held_at_local_values():
     # ccx 2.23 holds a FIXED translation of a *TRANSFORM node at its global displacement
     # component, read as the local value: the value the step finds it at instead (0 at rest,
-    # a BC's value, in the local axes); unknown: FIXED kept, warned
+    # a BC's value, in the local axes); unknown: through a helper node (_plan_fixed_helpers),
+    # which carries every *BOUNDARY on the node's translations (local u2's too)
     s1 = "*Step\n*Static\n*Boundary\n7, 2, 2, 0.01\n*Cload\n7, 1, 1.\n*End Step\n"
     body, conv, rep = convert_str(FIXED_TR_HEX + s1 + "*Step\n*Static\n*Boundary, op=NEW\nBOT, 1, 3\n"
                                   "*Boundary, fixed\n7, 1, 3\n*Cload, op=NEW\n6, 2, 1.\n*End Step\n")
-    assert "*BOUNDARY\n7, 2, 2, 0.01\n*BOUNDARY, FIXED\n7, 1, 1\n7, 3, 3\n" in _step(body, 2)
-    assert "node 7 DOF 1 (step 2), node 7 DOF 3 (step 2)): kept as FIXED" in rep.text()
-    assert conv.reduced_physics == ["*BOUNDARY, FIXED on *TRANSFORM translations held at the global "
-                                    "component (ccx 2.23)"]
+    assert "*BOUNDARY\n9, 2, 2, 0.01\n*BOUNDARY, FIXED\n9, 1, 1\n9, 3, 3\n" in _step(body, 2)
+    assert "*BOUNDARY\n9, 2, 2, 0.01\n" in _step(body, 1) and "7, 2, 2" not in body
+    assert "*NODE\n9, 1., 1., 1.\n*EQUATION\n2\n7, 1, 1., 9, 1, -1.\n2\n7, 2, 1., 9, 2, -1.\n2\n" \
+           "7, 3, 1., 9, 3, -1.\n*STEP" in body
+    assert "(node 7 DOF 1, node 7 DOF 3): held through a helper node" in rep.text()
+    assert not conv.reduced_physics
     body, conv, _ = convert_str(FIXED_TR_HEX + "*Boundary, fixed\n7, 1, 3\n*Step\n*Static\n*Boundary, "
                                 "fixed\nTOP, 1, 3\n*Cload\n6, 2, 1.\n*End Step\n")
     assert "*BOUNDARY\n7, 1, 1, 0.\n7, 2, 2, 0.\n7, 3, 3, 0.\n*STEP" in body      # model data: at rest
@@ -24809,8 +24812,8 @@ def test_fixed_transformed_translations_held_at_local_values():
     turned = FIXED_TR_HEX.replace("1., 1., 0.5, -1., 1., 1.", "0., 1., 0., -1., 0., 0.")
     body, conv, rep = convert_str(turned + "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Static\n"
                                   "*Boundary, fixed\n7, 1, 3\n*End Step\n")
-    assert "*BOUNDARY, FIXED\n7, 1, 3\n" in body and "held at their value" not in body
-    assert "node 7 DOF 2 (step 2)): kept" in rep.text() and "node 7 DOF 3" not in rep.text()
+    assert "*BOUNDARY, FIXED\n9, 1, 3\n" in body and "held at their value" not in body
+    assert "(node 7 DOF 1, node 7 DOF 2): held through" in rep.text() and "node 7 DOF 3" not in rep.text()
     body, conv, rep = convert_str(turned + "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Static\n"
                                   "*Boundary, fixed\n7, 3, 3\n*End Step\n")
     assert "*BOUNDARY, FIXED\n7, 3, 3\n" in body and "FIXED on translations" not in rep.text()
@@ -24836,6 +24839,54 @@ def test_fixed_transformed_translations_held_at_local_values():
     assert conv.reduced_physics == ["element B31 -> B32R (SECTION=PIPE needs a 3-node beam in ccx)"]
 
 
+def test_fixed_unknown_transformed_translations_through_helper_nodes():
+    # a FIXED translation of a *TRANSFORM node moved by loads: a helper node tied to the local
+    # DOF by an *EQUATION carries every *BOUNDARY on that DOF, in every step (another on the
+    # node would be a second constraint on that direction)
+    s1 = "*Step\n*Static\n*Boundary\nTOP, 2, 2, 0.05\n*Cload\n7, 1, 1.\n*End Step\n"
+    s2 = "*Step\n*Static\n*Boundary, op=NEW\nBOT, 1, 3\n*Cload, op=NEW\n6, 2, 1.\n*End Step\n"
+    s3 = "*Step\n*Static\n*Boundary, fixed\nN7, 2, 2\n*End Step\n"
+    body, conv, rep = convert_str(FIXED_TR_HEX + s1 + s2 + s3)
+    assert "*BOUNDARY\n5, 2, 2, 0.05\n6, 2, 2, 0.05\n9, 2, 2, 0.05\n8, 2, 2, 0.05\n" in _step(body, 1)
+    assert "*BOUNDARY, FIXED\n9, 2, 2\n" in _step(body, 3) and "7, 2, 2" not in body
+    assert "*EQUATION\n2\n7, 2, 1., 9, 2, -1.\n*STEP" in body and not conv.reduced_physics
+    # a *FREQUENCY step, then a general step: the base state's FIXED given again, on the helper
+    body, conv, _ = convert_str(FIXED_TR_HEX + "*Step\n*Static\n*Cload\n7, 2, 1.\n*End Step\n" + s3 +
+                                "*Step\n*Frequency\n2\n*End Step\n*Step\n*Static\n*Cload\n6, 1, 1.\n"
+                                "*End Step\n")
+    assert "\n9, 2, 2\n" in _step(body, 4) and "7, 2, 2" not in body and not conv.reduced_physics
+    # in an implicit *DYNAMIC step: held, warned (ccx's response to stopping an oblique DOF)
+    dyn = "*Step\n*Dynamic\n0.1, 1.\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Dynamic\n0.1, 1.\n" \
+        "*Boundary, fixed\n7, 2, 2\n*End Step\n"
+    body, conv, rep = convert_str(FIXED_TR_HEX + dyn)
+    assert "*BOUNDARY, FIXED\n9, 2, 2\n" in _step(body, 2) and not conv.reduced_physics
+    assert "*DYNAMIC step(s) 2, held through a helper node" in rep.text()
+    # not where the node has other constraints, an initial velocity, or in explicit decks:
+    # FIXED kept, warned
+    two = "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n" + s3
+    for extra, steps, why in (
+            ("*Node\n20, 2., 2., 2.\n*Equation\n2\n7, 3, 1., 20, 3, -1.\n", two, "other constraints on it"),
+            ("*Initial Conditions, type=velocity\n7, 1, 1.\n", two, "an initial velocity on it"),
+            ("", two.replace("*Static", "*Dynamic, explicit\n, 0.001"), "the deck has an explicit step")):
+        body, conv, rep = convert_str(FIXED_TR_HEX + extra + steps)
+        assert "*BOUNDARY, FIXED\nN7, 2, 2\n" in _step(body, 2) and "helper" not in body, why
+        assert f"does not apply there: {why}" in rep.text(), why
+        assert "*BOUNDARY, FIXED on *TRANSFORM translations held at the global component (ccx 2.23)" \
+            in conv.reduced_physics
+    # a shell node in a deck with *DYNAMIC steps (ccx may knot it): kept
+    shell = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, elset=P\n"
+             "1, 1, 2, 3, 4\n*Shell Section, elset=P, material=M\n0.1\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+             "*Density\n1.\n*Nset, nset=N3\n3\n*Transform, nset=N3\n1., 1., 0.5, -1., 1., 1.\n*Boundary\n1, 1, 6\n"
+             "4, 1, 6\n")
+    steps = "*Step\n*Static\n*Cload\n3, 3, 1.\n*End Step\n*Step\n*Static\n*Boundary, fixed\n3, 2, 2\n*End Step\n"
+    body, conv, _ = convert_str(shell + steps)
+    assert "*BOUNDARY, FIXED\n5, 2, 2\n" in _step(body, 2) and not conv.reduced_physics     # (static only)
+    body, conv, rep = convert_str(shell + steps + "*Step\n*Dynamic\n0.1, 1.\n*End Step\n")
+    assert "a shell or beam node that ccx may make a knot" in rep.text()
+    body, conv, rep = convert_str(shell + steps.replace("*Cload\n3, 3, 1.\n", "*Boundary\n3, 4, 4\n*Cload\n3, 3, 1.\n"))
+    assert "does not apply there: BCs on its rotations" in rep.text()
+
+
 def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
     # FIXED in a linear perturbation step holds the base state: 0, which a static perturbation
     # step's restore adds the base value to (a rotation was written as that value, then doubled)
@@ -24846,10 +24897,11 @@ def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
     sp = "*Step, perturbation\n*Static\n*Boundary, fixed\n7, 2, 2\n*Cload\n6, 2, 1.\n*End Step\n"
     body, _, _ = convert_str(FIXED_TR_HEX + "*Step\n*Static\n*Boundary\n7, 2, 2, 0.01\n*End Step\n" + sp)
     assert "*BOUNDARY\n7, 2, 2, 0.01\n" in _step(body, 2)
-    # (the base state leaves it free and it moved: unknown, FIXED kept)
+    # (the base state leaves it free and it moved: unknown, FIXED through a helper node, which
+    # holds the base state, as on a node without a *TRANSFORM)
     body, conv, _ = convert_str(FIXED_TR_HEX + "*Step\n*Static\n*Cload\n7, 2, 1.\n*End Step\n" + sp)
-    assert "*BOUNDARY, FIXED\n7, 2, 2\n" in _step(body, 2) and \
-        "*BOUNDARY, FIXED on *TRANSFORM translations held at the global component (ccx 2.23)" in conv.reduced_physics
+    assert "*BOUNDARY, FIXED\n9, 2, 2\n" in _step(body, 2) and \
+        conv.reduced_physics == ["*STEP, PERTURBATION static step after a general step"]
     shell = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, elset=P\n"
              "1, 1, 2, 3, 4\n*Shell Section, elset=P, material=M\n0.1\n*Material, name=M\n*Elastic\n1000., 0.3\n"
              "*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Static\n*Boundary\n2, 5, 5, 0.01\n3, 5, 5, 0.01\n*End Step\n"
