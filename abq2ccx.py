@@ -913,8 +913,9 @@ class Report:
                 lines.append(prefix + chunk)
         for line in self.instance_lines():
             indent = (len(line) - len(line.lstrip())) * " "
-            for i, chunk in enumerate(_wrap(line.replace(" -> ", "\0"), 66)):   # keep pairs whole
-                lines.append("** " + indent + ("  " if i else "") + chunk.replace("\0", " -> "))
+            # (an "old -> new" pair stays whole: a placeholder of the arrow's own width, no blank)
+            for i, chunk in enumerate(_wrap(line.replace(" -> ", PAIR_ARROW), 66)):
+                lines.append("** " + indent + ("  " if i else "") + chunk.replace(PAIR_ARROW, " -> "))
         lines.append("** ====================================================================")
         return lines
 
@@ -970,8 +971,8 @@ class Report:
         for line in inst:                       # (an "old -> new" pair stays on one line)
             indent = " " * (len(line) - len(line.lstrip()))
             at = len(out)
-            para(line.strip().replace(" -> ", "\0"), indent, indent + "    ")
-            out[at:] = [x.replace("\0", " -> ") for x in out[at:]]
+            para(line.strip().replace(" -> ", PAIR_ARROW), indent, indent + "    ")
+            out[at:] = [x.replace(PAIR_ARROW, " -> ") for x in out[at:]]
         if not inst and out[-1] == "":
             out.pop()
         return "\n".join(out) + "\n"
@@ -995,6 +996,12 @@ class Report:
             lines.append(f"  ... and {len(self.instances) - limit} more instance(s) (--json lists "
                          f"them all)")
         return lines
+
+
+# " -> " while a line is wrapped: as wide (4 characters), without a blank to break at, so an
+# "old -> new" pair stays on one line and the line's width is counted right (a 1-character
+# placeholder let an instance map's lines run 3 characters per pair past the width)
+PAIR_ARROW = "\0->\0"
 
 
 def report_width() -> int:

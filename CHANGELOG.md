@@ -23,7 +23,10 @@ entries. The GitHub release notes use the same section.
   default) then lost the line break after it, so the next line ran on ('... NUMBER INTERVAL /
   TIME    INTERVAL / TIME POINTS ...'). The width is `COLUMNS` where set, else that of the terminal stderr
   writes to (the report's; it was stdout's), else 100 columns; the header lines are wrapped too,
-  a long path moving to an indented next line. `__version__` is 1.7.1.dev0.
+  a long path moving to an indented next line. The instance map, which keeps each 'old -> new'
+  pair on one line, counted the pair's ' -> ' as one character while wrapping, so its lines ran
+  3 characters per pair past the width (80 at 80 columns): it counts all four now, in the deck's
+  header too, where a line can break one pair earlier. `__version__` is 1.7.1.dev0.
 
 ## 1.7.0 (November 2026)
 

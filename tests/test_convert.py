@@ -19864,8 +19864,10 @@ def test_instance_map_of_two_blocks():
         "  I1 (part BLOCK): nodes 1-8 (+0), elements 1-1 (+0); BOT -> I1_BOT, TOPF -> I1_TOPF, ALL -> I1_ALL",
         "  I2 (part BLOCK): nodes 9-16 (+8), elements 2-2 (+1); BOT -> I2_BOT, TOPF -> I2_TOPF, ALL -> I2_ALL"]
     head = rep.header_comment_lines()
-    assert "**   I2 (part BLOCK): nodes 9-16 (+8), elements 2-2 (+1); BOT -> I2_BOT," in head
-    assert "**     TOPF -> I2_TOPF, ALL -> I2_ALL" in head       # wrapped between pairs
+    assert "**   I1 (part BLOCK): nodes 1-8 (+0), elements 1-1 (+0); BOT -> I1_BOT," in head
+    assert "**     TOPF -> I1_TOPF, ALL -> I1_ALL" in head       # wrapped between pairs
+    assert "**   I2 (part BLOCK): nodes 9-16 (+8), elements 2-2 (+1);" in head   # (69 > 66: moves)
+    assert "**     BOT -> I2_BOT, TOPF -> I2_TOPF, ALL -> I2_ALL" in head
 
 
 def test_instance_map_of_rotated_instances():
@@ -20098,6 +20100,23 @@ def test_terminal_report_is_grouped_numbered_wrapped_and_versioned():
     assert re.fullmatch(r"  \d+ nodes, 1 elements \| \d+ warning\(s\), \d+ note\(s\), \d+ commented card\(s\)", head[1]), head
     assert head[2] == f"  Full report: {os.path.join(d, 'a_ccx.log')} (and at the top of the converted deck)"
     assert log.startswith(f"abq2ccx {A.__version__}: {deck} -> {os.path.join(d, 'a_ccx.inp')} (") and "\n\n[" in log
+
+
+def test_instance_map_lines_stay_short_of_the_width_at_every_width():
+    # the instance map keeps each "old -> new" pair on one line through a placeholder as wide as
+    # " -> " (one character let its lines run 3 characters per pair past the width: 80 at 80,
+    # 105 at 105): at every width its lines stay one column short, and no pair is split
+    body, conv, rep = convert(os.path.join(EXAMPLES, "assembly_comma_names.inp"))
+    for width in range(60, 121):
+        text = rep.console(width)
+        inst = text[text.index("Instances"):].splitlines()
+        assert all(len(line) < width or " " not in line.strip() for line in inst), (width, inst)
+        assert "\0" not in text and all(not line.rstrip().endswith("->") and not line.lstrip().startswith("->")
+                                         for line in inst), (width, inst)
+    lines = rep.header_comment_lines()                       # the deck header: chunks of 66
+    inst = lines[next(i for i, x in enumerate(lines) if x.startswith("** Instances")):-1]
+    assert "\0" not in "".join(lines) and all(len(x) <= 3 + 4 + 66 for x in inst), inst
+    assert all(not x.rstrip().endswith("->") and not x[3:].lstrip().startswith("->") for x in inst)
 
 
 def test_report_width_reads_columns_then_stderrs_terminal():
