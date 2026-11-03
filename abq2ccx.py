@@ -26616,7 +26616,8 @@ class _Constraints:
             return self._kin_dynamic_cards(b, plan, plan["groups"])
         if plan.get("ties_only"):
             return self._ties_beside_lines(b, plan)
-        self._warn_ties_refused(b)
+        if id(b) in self._kin_ties_refused:
+            return self._ties_refused_lines(b)
         own: "OrderedDict[str, set]" = OrderedDict()            # member -> the DOFs it couples
         across: set = set()                                     # ... on a line over DOFs 3 and 4
         for tok, dofs in recs:
@@ -27516,7 +27517,9 @@ class _Constraints:
             return dropped
         if beside:
             return self._ties_beside_lines(b, self.emit.last_coupling)
-        self._warn_ties_refused(b)
+        if id(b) in self._kin_ties_refused:
+            self.emit.last_coupling = {"commented": True}       # (and its *KINEMATIC)
+            return self._ties_refused_lines(b)
         if kind in ("rb", "rbk"):
             return self._coupling_as_rigid_body(self.emit.last_coupling)
         if kind == "kdyn":
@@ -28490,6 +28493,12 @@ class _Constraints:
         groups = plan.get("groups") or [(plan["members"], plan["dofs"])]
         ties = self._rotation_ties_per_member(groups, plan["ref"], 0, plan["frame"])
         self._warn_modal_ties(ties)
+        if not ties:
+            return self._comment_out(
+                "Kinematic coupling of rotations only of shell/beam nodes whose rotations could not be "
+                "tied (see the warning above: a *TRANSFORM on a node, an ORIENTATION's axes not known "
+                "or under NLGEOM); commented out — rotations are NOT coupled.",
+                [emit_keyword(b.keyword, b.params)] + list(b.data), "*KINEMATIC rotation-only coupling")
         return self._comment_out(
             "Kinematic coupling of rotations only of shell/beam nodes on a reference node that a "
             "coupling of translations shares -> *EQUATION ties theta(node) = theta(ref) of each "
@@ -28498,15 +28507,15 @@ class _Constraints:
             "tied); the card itself is left out (ccx's *KINEMATIC couples translations only). "
             "Exact.", [emit_keyword(b.keyword, b.params)] + list(b.data), False, warn=False) + ties
 
-    def _warn_ties_refused(self, b: Block) -> None:
-        """Warn of a kinematic coupling of rotations only of shell/beam nodes left out because
-        another constraint uses its reference node's rotation (_plan_ties_refs)."""
-        why = self._kin_ties_refused.get(id(b))
-        if why:
-            self.report.warn(f"Kinematic coupling of rotations only of shell/beam nodes whose "
-                             f"reference node's rotation {why} also uses: the rotation ties to a "
-                             f"ROT NODE would turn apart from it, so the rotations are NOT coupled "
-                             f"(the line is dropped) — verify.", once=True)
+    def _ties_refused_lines(self, b: Block) -> List[str]:
+        """A kinematic coupling of rotations only of shell/beam nodes left out because another
+        constraint uses its reference node's rotation (_plan_ties_refs): commented out (ccx's
+        *KINEMATIC would couple nothing), reduced physics."""
+        return self._commented(b, f"Kinematic coupling of rotations only of shell/beam nodes whose "
+                                  f"reference node's rotation {self._kin_ties_refused[id(b)]} also "
+                                  f"uses: rotation ties to a ROT NODE would turn apart from it, so the "
+                                  f"coupling is commented out — rotations are NOT coupled.",
+                               reduces="*KINEMATIC rotation-only coupling")
 
     def _warn_modal_ties(self, ties: List[str]) -> None:
         """Warn of rotation ties of a kinematic coupling of rotations only (_kin_dynamic_cards,
@@ -29045,7 +29054,7 @@ class _Constraints:
         users = self._rotation_users(blocks)
         bodies = {n for bs in self._mpc_bodies.values() for body in bs for n in [body["ref"]] + list(body["members"])}
         what = {"rigid": "a *RIGID BODY", "mpc": "an *MPC", "distributing": "a distributing coupling",
-                "spring": "a spring, dashpot or rotary inertia", "connector": "a rigid connector (BEAM, WELD)"}
+                "spring": "a spring or dashpot", "connector": "a rigid connector (BEAM, WELD)"}
         out: set = set()
         for ref in refs:
             # (a ROTARYI there is left out with its card, reduced physics: it acts on nothing)
@@ -30200,7 +30209,7 @@ class _Constraints:
             # some rotations of shell/beam nodes, tied as theta_k(node) = theta_k(ref) (a 2-D
             # beam's DOF 6 is all of its rotations; an ORIENTATION's: _rotation_ties_along)
             per: Dict[int, set] = {}
-            for ns, ds in cg[1]:
+            for ns, ds in cg[1] if id(b) not in self._kin_ties_refused else ():
                 for n in ns:
                     per.setdefault(n, set()).update(ds & {4, 5, 6})
             if self._coupling_frame(b) is None and any(
@@ -30323,11 +30332,11 @@ class _Constraints:
 
         def add_dyn(b: Block, ref: int, groups: List[Tuple[List[int], set]], members: List[int]) -> None:
             frame = self._coupling_frame(b)
-            plain = bool(members) and (
+            plain = bool(members) and ref not in refused and (
                 (dynamic and not any(n in structural or n in self._plane_only for n in members)) or
                 ((self._linear_rigid or ref in self._kin_eq_refs or ref in self._kin_twist_eq) and
                  all(self._kin_line_form(ref, ns, ds, frame) in ("eq", "ties") for ns, ds in groups)) or
-                (ref not in refused and self._kin_ties_only(ref, groups, frame)))
+                self._kin_ties_only(ref, groups, frame))
             dyn.setdefault(ref, []).append((id(b), plain, plain and any(
                 self._kin_line_form(ref, ns, ds, frame) in ("rb", "eq", "ties") for ns, ds in groups)))
         for i, b in enumerate(blocks):
@@ -31960,7 +31969,7 @@ class _Constraints:
                                  tie + pin)
             else:
                 lines = (self._coupling_groups(blocks, i) or (ref, []))[1]
-                if not lines:
+                if not lines or id(b) in self._kin_ties_refused:      # (commented out)
                     continue
                 kind, rb = "kin", plan in ("rb", "rbk")
                 if b.keyword == "COUPLING":

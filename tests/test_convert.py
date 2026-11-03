@@ -5181,6 +5181,15 @@ def test_kinematic_rotation_only_lines_beside_other_constraints():
         body, conv, rep = convert_str(native + extra + step)
         assert 100 not in conv._rb_rot or not any(f",{conv._rb_rot[100]}," in e for e in _equations(body))
         assert rep.reduced == ["*KINEMATIC rotation-only coupling"] and f"rotation {who}" in rep.text()
+        assert not any(l.startswith(("*COUPLING", "*KINEMATIC")) for l in _live(body))
+    # ... also in a deck of linear rigid equations (a *DYNAMIC step without NLGEOM), which had
+    # the 'ties' form before: no ties to a ROT NODE beside the connector body's
+    dyn = step.replace("*Static", "*Dynamic\n0.01, 0.1").replace("100,5,2.", "100,5,0.005")
+    body, conv, rep = convert_str(native.replace("*Elastic\n1000.,0.3\n", "*Elastic\n1000.,0.3\n*Density\n1e-6\n")
+                                  + "*Node\n200,2.5,0.5,0\n*Element, type=CONN3D2, elset=CN\n60, 100, 200\n"
+                                  "*Connector Section, elset=CN\nBeam\n" + dyn)
+    assert not any(e.startswith(("5,", "6,")) for e in _equations(body))
+    assert "*KINEMATIC rotation-only coupling" in rep.reduced and "rotation a rigid connector" in rep.text()
     # a connector whose rows read the ROT NODE (HINGE), or a rotary inertia (left out itself): tied
     for extra in ("*Node\n200,2.5,0.5,0\n*Element, type=CONN3D2, elset=CN\n60, 100, 200\n"
                   "*Connector Section, elset=CN\nHinge\n",
@@ -5199,6 +5208,11 @@ def test_kinematic_rotation_only_lines_beside_other_constraints():
     # nodes whose rotations cannot be tied (a *TRANSFORM on them): commented out, said so
     _, _, rep = convert_str(native + "*Transform, nset=R\n0.,1.,0.,-1.,0.,0.\n" + step)
     assert "could not be tied" in rep.text() and "nodes without rotations" not in rep.text()
+    # ... beside a coupling of some translations on a reference node with a *TRANSFORM
+    _, _, rep = convert_str(native + other.replace("1, 3\n", "1, 2\n") +
+                            "*Nset, nset=REFN\n100\n*Transform, nset=REFN\n0.,1.,0.,-1.,0.,0.\n" + step)
+    assert "could not be tied" in rep.text() and "which carry ccx's coupling rotation" not in rep.text()
+    assert "*KINEMATIC rotation-only coupling" in rep.reduced
 
 
 def _bc_lines(body):
