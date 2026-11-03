@@ -26630,15 +26630,68 @@ def test_knot_drilling_rotation_held_on_shell_nodes():
                                        "5, 1, 6\n*End Step\n")
     assert "*BOUNDARY, OP=NEW" in _step(body, 3)
     assert "drilling rotations held again\n*BOUNDARY\n3, 6, 6\n" in _step(body, 3)
-    # a normal off the global axes: an *EQUATION; in a deck with a *MODAL DYNAMIC step, where
-    # ccx crashes at random on equations that eliminate a knot's rotation, none: warned
-    body, conv, _ = convert_str(strip(turn=30.0))
+    # a normal off the global axes: a *BOUNDARY on its largest global component, which only
+    # fixes how much of the rotation vector lies along the normal (probed: the same answers as
+    # n . theta = 0 in statics, *BUCKLE, *MODAL DYNAMIC; ccx crashes at random in *MODAL
+    # DYNAMIC on that equation, never on the BC), also in a *MODAL DYNAMIC deck and with a
+    # moment in the shell's plane
+    for kw in ({}, {"last": "*Modal Dynamic\n1e-4, 0.01"}, {"extra": "3, 4, 1.\n"}):
+        body, conv, rep = convert_str(strip(turn=30.0, **kw))
+        assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not _equation_terms(body), kw
+        assert not conv.reduced_physics and "may depend on round-off" not in rep.text()
+    # a moment about the normal, which the BC would turn partly into the shell's plane:
+    # n . theta = 0; in a *MODAL DYNAMIC deck (the equation crashes ccx there) or on a node
+    # with a *TRANSFORM (ccx misreads equation rotation terms there), none: warned
+    body, conv, _ = convert_str(strip("3, 6, 1.\n", turn=30.0))
     rows = [r for r in _equation_terms(body) if len(r) == 2 and r[0][0] == 3]
     assert len(rows) == 1 and {d for _, d, _ in rows[0]} == {5, 6} and not conv.reduced_physics
-    body, conv, rep = convert_str(strip(turn=30.0, last="*Modal Dynamic\n1e-4, 0.01"))
+    body, conv, rep = convert_str(strip("3, 6, 1.\n", turn=30.0, last="*Modal Dynamic\n1e-4, 0.01"))
     assert hold not in body and "crashes ccx's *MODAL DYNAMIC step at random" in rep.text()
     assert "knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)" in \
         conv.reduced_physics
+    # an unread moment value counts as one about the normal
+    body, conv, _ = convert_str(strip("3, 6, 1.5x\n", turn=30.0))
+    assert hold + "*BOUNDARY\n3, 6, 6" not in body and [r for r in _equation_terms(body) if r[0][0] == 3]
+    # (PR #9 review) where ccx turns the knot finitely (NLGEOM, its nonlinear solver), the BC's
+    # share along the normal changes a moment's or a rotational BC's work: R(theta + alpha n) is
+    # not R(theta) (probed: a strip off the axes bent by an in-plane moment under NLGEOM 10 %
+    # off, then ccx stopped; n . theta = 0 as the strip in the xy-plane, 1.6e-6): the equation
+    # under an in-plane moment or a BC about an in-plane axis in an NLGEOM step; a linear step's
+    # moment keeps the BC; in a *MODAL DYNAMIC deck warned
+    def first(card, nlgeom=True, **kw):
+        return strip(turn=30.0, **kw).replace("*Step\n*Frequency", "*Step" + (", nlgeom" if nlgeom else "") +
+                                              f"\n*Static\n{card}*End Step\n*Step\n*Frequency", 1)
+    for card in ("*Cload\n3, 4, 0.01\n", "*Boundary\n3, 4, 4\n*Cload\n3, 3, 0.1\n"):
+        body, conv, _ = convert_str(first(card))
+        rows = [r for r in _equation_terms(body) if r[0][0] == 3]
+        assert hold + "*BOUNDARY\n3, 6, 6" not in body and len(rows) == 1, card
+        assert {d for _, d, _ in rows[0]} == {5, 6}
+    body, _, _ = convert_str(first("*Cload\n3, 4, 0.01\n", nlgeom=False))
+    assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not _equation_terms(body)
+    # forces alone under NLGEOM keep the BC, but the eigenvalue / modal steps after that step
+    # are not right with it (nor with the equation: probed, omega^2 0.3-1.0 % low): warned;
+    # along an axis exact
+    body, conv, rep = convert_str(first("*Cload\n3, 3, 0.01\n"))
+    assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and conv._knot_gauges == [3]
+    assert "held about the normal by a *BOUNDARY on a global rotation" in rep.text()
+    assert ("knot drilling holds off the global axes wrong in the eigenvalue / modal steps after a step "
+            "ccx runs through its nonlinear solver") in conv.reduced_physics
+    body, conv, rep = convert_str(strip().replace("*Step\n*Frequency", "*Step, nlgeom\n*Static\n*Cload\n"
+                                                  "3, 3, 0.01\n*End Step\n*Step\n*Frequency", 1))
+    assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not conv._knot_gauges and not conv.reduced_physics
+    body, conv, rep = convert_str(first("*Cload\n3, 4, 0.01\n", last="*Modal Dynamic\n1e-4, 0.01"))
+    assert hold not in body and "a step ccx solves with finite rotations" in rep.text()
+    assert "knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)" in \
+        conv.reduced_physics
+    # a knot on a node with a *TRANSFORM: ccx reads a rotational BC there about the global axes
+    # (the knot's rotation node has no transform; probed exact), so it is held all the same
+    tr = "*Nset, nset=T\n3\n*Transform, nset=T\n1., 0., 0., 0., 0., 1.\n"
+    for turn in (0.0, 30.0):
+        body, conv, _ = convert_str(strip(turn=turn).replace("*Material", tr + "*Material"))
+        assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not conv.reduced_physics
+    body, conv, rep = convert_str(strip("3, 6, 1.\n", turn=30.0).replace("*Material", tr + "*Material"))
+    assert hold not in body and "misreads *EQUATION terms on DOFs 4-6" in rep.text()
+    assert "knot drilling rotations without stiffness (*TRANSFORM nodes)" in conv.reduced_physics
     # a BC on the node's rotation about the normal in every step: left as it is; one in the
     # last step only leaves the steps before to the hold (and replaces it there), one about
     # another axis leaves that rotation free, so it is held all the same
@@ -26787,11 +26840,40 @@ def test_knot_drilling_held_where_op_new_releases_a_clamp():
             "*BOUNDARY\n9, 6, 6\n18, 6, 6\n") in _step(body, 2)
     assert "rotation about the shell normal held (by a *BOUNDARY) where no BC holds it" in rep.text()
     assert not other_reduced(conv)
-    # a normal off the global axes: the *EQUATION would act in step 1 too, where the clamp
-    # holds its dependent rotation (ccx stops on that): warned
+    # a normal off the global axes: the *BOUNDARY on its largest component, which the clamp
+    # holds in step 1 (an *EQUATION would act there too, where ccx stops on a BC on its
+    # dependent; probed: as converted before, ccx stopped, exit 201; held, the twin's answer)
     body, conv, rep = convert_str(strip(30.0))
-    assert "drilling rotations held" not in body and "with rotational BCs in some steps only" in rep.text()
+    assert "drilling rotations held again\n*BOUNDARY\n9, 6, 6\n18, 6, 6\n" in _step(body, 2)
+    assert "held (no stiffness acts on it)" not in body and not other_reduced(conv)
+    # steps that hold different rotations (5 in step 1, 6 in step 2, none in step 3): no one
+    # BC fits them all, warned
+    s = strip(30.0).replace("9, 1, 6\n18, 1, 6\n", "9, 5, 5\n18, 5, 5\n").replace(
+        "*Step, nlgeom", "*Step\n*Static\n*Boundary, op=NEW\n1, 1, 6\n10, 1, 6\n9, 6, 6\n18, 6, 6\n"
+        "*End Step\n*Step, nlgeom")
+    body, conv, rep = convert_str(s)
+    assert {9, 18} <= set(conv._knots) and "drilling rotations held" not in body
+    assert "held about different axes from step to step" in rep.text()
     assert "knot drilling rotations without stiffness (rotational BCs in some steps only)" in conv.reduced_physics
+
+
+def test_modal_dynamic_deck_with_mpcs_on_knots_warned():
+    # ccx 2.23 crashes at random in a *MODAL DYNAMIC step when an MPC eliminates a knot's DOF
+    # (probed: a kinematic coupling of a shell edge 11 of 60 runs, DOFs 1-3 only 14 of 60; SPCs
+    # on the knots none of 60): no ccx form avoids it for shell nodes, warned
+    why = "crashes at random in that step"
+    deck = (S4 + "*Density\n1e-3\n*Boundary\n1, 1, 6\n4, 1, 6\n*Surface, type=node, name=RS\nR\n"
+            "*Coupling, constraint name=C, ref node=100, surface=RS\n*Kinematic\n{dofs}"
+            "*Step\n*Frequency\n3\n*End Step\n*Step\n*{proc}\n*Cload\n100, 3, 1.\n*End Step\n")
+    for dofs in ("", "1, 3\n"):
+        _, conv, rep = convert_str(deck.format(dofs=dofs, proc="Modal Dynamic\n1e-4, 0.01"))
+        assert {5, 6} <= set(conv._knots) and why in rep.text() and not other_reduced(conv), dofs
+    _, conv, rep = convert_str(deck.format(dofs="", proc="Steady State Dynamics\n1., 10., 3"))
+    assert {5, 6} <= set(conv._knots) and why not in rep.text()
+    # knots the modal step's force makes, held by SPCs only: none
+    _, conv, rep = convert_str(S4 + "*Density\n1e-3\n*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Frequency\n3\n"
+                               "*End Step\n*Step\n*Modal Dynamic\n1e-4, 0.01\n*Cload\n5, 3, 1.\n*End Step\n")
+    assert 5 in conv._knots and why not in rep.text()
 
 
 CREEP_SHELL_FLAG = ("creeping *SHELL SECTION (ccx 2.23 integrates it through the thickness at its "
