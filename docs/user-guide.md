@@ -56,8 +56,12 @@ equations — ccx 2.23 ends a diverged solution, and such a step, with "Job fini
 same, so `--run` reads the results and names the first NaN/Inf value, or the step.
 
 **Outputs:** `<output>.inp`, the CalculiX deck, with the report as `**` comments at the
-top; `<output>.log`, the same report as text; and a one-line summary plus the report on
-stderr. Run the deck with `ccx <output>` (no `.inp` extension). `--run` streams ccx's output
+top; `<output>.log`, the same report as text, one line per entry under a line with the
+converter's version; and the report on stderr, laid out for reading: a header with the version,
+the model's size, the counts and where the full report is, then what the ccx model drops or
+replaces (reduced physics) as a list, the warnings numbered, the notes, each under its file and
+line and wrapped to the terminal's width (an `Output variable ...` entry repeated for several
+variables of one card is shown once, listing them), and the instance map of an assembly. Run the deck with `ccx <output>` (no `.inp` extension). `--run` streams ccx's output
 to stderr as it comes and to `<output>.ccx.log` (its first 100 MB, then its last lines), and
 ends with ccx's own `*ERROR` and `*WARNING` lines.
 An `*IMPERFECTION, FILE=job` reads modes from another job's results: give that job's deck,

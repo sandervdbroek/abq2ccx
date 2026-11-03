@@ -58,6 +58,7 @@ import signal
 import stat
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import traceback
@@ -65,7 +66,7 @@ from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
 
-__version__ = "1.6.0"
+__version__ = "1.7.0.dev0"
 
 # ---------------------------------------------------------------------------
 # Element reference data
@@ -921,6 +922,62 @@ class Report:
         lines = [f"[{level}] {self.shown(k)}" for k, (level, _) in enumerate(self.entries)] or \
             ["No conversion issues were flagged."]
         return "\n".join(lines + self.instance_lines()) + "\n"
+
+    def console(self, width: Optional[int] = None) -> str:
+        """The report as the terminal shows it (text(), the .log, keeps one line per entry):
+        the reduced-physics summary as a list, the warnings numbered and then the notes, each
+        under its place in the deck and wrapped to ``width`` (the terminal's, 60-120 columns);
+        entries 'Output variable X <the same rest>' of one card in one, 'Output variables X,
+        Y, ...'; then the instance map."""
+        if width is None:
+            width = shutil.get_terminal_size((100, 24)).columns
+        width = max(60, min(120, width))
+        out: List[str] = []
+
+        def para(text: str, first: str, rest: str) -> None:
+            out.extend(textwrap.wrap(text, width, initial_indent=first, subsequent_indent=rest,
+                                     break_long_words=False, break_on_hyphens=False) or [first.rstrip()])
+        groups: "OrderedDict[tuple, list]" = OrderedDict()
+        for k, (level, msg) in enumerate(self.entries):
+            if level == "WARNING" and self.reduced and msg.startswith("Reduced physics"):
+                continue                        # (the list below)
+            m = re.fullmatch(r"Output variable (\S+) (.+)", msg, re.S)
+            key = (level, self.where.get(k, ""), m.group(2)) if m else (level, k)
+            groups.setdefault(key, []).append(m.group(1) if m else msg)
+        if self.reduced:
+            out.append("Reduced physics (ccx solves another model than the deck):")
+            for what in self.reduced:
+                para(what, "  - ", "    ")
+            out.append("")
+        for level, title, mark in (("WARNING", "Warnings", "{n}. "), ("NOTE", "Notes", "- ")):
+            items = [(key, vals) for key, vals in groups.items() if key[0] == level]
+            if not items:
+                continue
+            out.append(f"{title} ({len(items)}" + (", and the reduced-physics summary above)"
+                                                   if level == "WARNING" and self.reduced else ")"))
+            for n, (key, vals) in enumerate(items, 1):
+                head = "  " + mark.format(n=n)
+                pad = " " * len(head)
+                where = key[1] if len(key) == 3 else self.where.get(key[1], "")
+                text = (f"Output variable{'s' if len(vals) > 1 else ''} {', '.join(vals)} {key[2]}"
+                        if len(key) == 3 else vals[0])
+                if where:
+                    out.append(head + where)
+                    para(text, pad, pad)
+                else:
+                    para(text, head, pad)
+            out.append("")
+        if not out:
+            out = ["No conversion issues were flagged.", ""]
+        inst = self.instance_lines()
+        for line in inst:                       # (an "old -> new" pair stays on one line)
+            indent = " " * (len(line) - len(line.lstrip()))
+            at = len(out)
+            para(line.strip().replace(" -> ", "\0"), indent, indent + "    ")
+            out[at:] = [x.replace("\0", " -> ") for x in out[at:]]
+        if not inst and out[-1] == "":
+            out.pop()
+        return "\n".join(out) + "\n"
 
     def instance_lines(self, limit: int = 20, names: int = 8) -> List[str]:
         """The instance map of a flattened assembly (none for a flat deck): each instance's
@@ -50045,16 +50102,22 @@ def _convert_one(path: str, args) -> Tuple[int, dict]:
             try:
                 with open(log_path, "w", encoding="utf-8", errors="backslashreplace",
                           newline="\n") as fh:
+                    fh.write(f"abq2ccx {__version__}: {path} -> {out_path} ({len(conv.geom.nodes)} "
+                             f"nodes, {len(conv.geom.elements)} elements, {report.summary()})\n\n")
                     fh.write(report.text())
             except OSError as exc:
                 sys.stderr.write(f"abq2ccx: cannot write {log_path}: {exc}\n")
 
     if not args.json_out and not args.quiet:
-        verb = "checked" if args.check else "wrote"
-        sys.stderr.write(f"abq2ccx: {verb} {path if args.check else out_path} "
-                         f"({len(conv.geom.nodes)} nodes, {len(conv.geom.elements)} elements, "
-                         f"{report.summary()})\n")
-        sys.stderr.write(report.text())
+        verb = "checked" if args.check else f"wrote {out_path} from"
+        where = ([] if args.check else
+                 [f"  Full report: {os.path.splitext(out_path)[0]}.log (and at the top of the "
+                  f"converted deck)"] if not args.no_log else
+                 ["  Full report: at the top of the converted deck"])
+        sys.stderr.write("\n".join([f"abq2ccx {__version__}: {verb} {path}",
+                                    f"  {len(conv.geom.nodes):,} nodes, {len(conv.geom.elements):,} "
+                                    f"elements | {report.summary()}"] + where) + "\n\n")
+        sys.stderr.write(report.console())
 
     strict = args.strict and (report.n_warnings > 0 or report.n_commented > 0)
     run = run_ccx(out_path, args.ccx, args.quiet, not args.json_out, report.instances,

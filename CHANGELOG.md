@@ -12,6 +12,11 @@ entries. The GitHub release notes use the same section.
 
 ### Overview
 
+* **A readable report.** The terminal report now opens with the converter's version, the
+  model's size and where the full report is, lists the reduced physics, numbers the warnings,
+  puts each entry under its place in the deck and wraps it to the terminal, and shows repeated
+  output-variable notes once. The development version is 1.7.0.dev0, so an install from GitHub
+  is told apart from the 1.6.0 release.
 * **Leaner tie output.** A `*TIE` whose slave surface reaches far beyond its master (a whole plate
   tied to a small shroud) is written with only the slave faces near the master: ccx printed a
   warning for every other slave node (87522 of them, 15 MB of output, for one shaker model) and
@@ -33,6 +38,13 @@ entries. The GitHub release notes use the same section.
 
 ### Details
 
+* **Terminal report** — stderr shows a header (`abq2ccx <version>: wrote <output> from <deck>`,
+  the node and element counts, the warning / note / commented-card counts, the `.log`), the
+  reduced physics as a list, the warnings numbered and then the notes, each under its
+  `file:line` and wrapped to the terminal's width (60 to 120 columns), entries `Output variable
+  X <the same rest>` of one card as one `Output variables X, Y, ...`, and the instance map with
+  each `old -> new` pair on one line. The `.log` keeps one line per entry, now under a line with
+  the version; the deck's `**` header is unchanged. `__version__` is 1.7.0.dev0.
 * **`*TIE` slave surfaces trimmed** — ccx 2.23 ties only the slave nodes it finds a master face
   for within the position tolerance, and prints 'no tied MPC generated ... no opposite master
   face' for every other one; Abaqus ties none beyond the tolerance either. A tie whose slave

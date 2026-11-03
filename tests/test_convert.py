@@ -19982,6 +19982,46 @@ def _main_code(argv):
     return code, err.getvalue()
 
 
+def test_terminal_report_is_grouped_numbered_wrapped_and_versioned():
+    # stderr: a header with the version, the counts and where the full report is; reduced
+    # physics as a list; the warnings numbered, then the notes, each under its place and wrapped
+    # to the width; 'Output variable X <the same rest>' entries of one card in one.  The .log
+    # keeps one line per entry (text()), under a line with the version
+    rep = A.Report()
+    rep.warn("A warning about something that matters, long enough to be wrapped onto a second "
+             "line at sixty columns.", at="deck.inp:12")
+    for v in ("AR1", "AR2", "TA1"):
+        rep.note(f"Output variable {v} dropped from *NODE PRINT (not a ccx label there).", at="deck.inp:40")
+    rep.note("Output variable U3 -> U (CalculiX naming).", at="deck.inp:40")
+    rep.note("A note without a place.")
+    rep.reduce("element STRI65 -> S6")
+    rep.warn("Reduced physics — ccx solves a different model than this Abaqus deck: element STRI65 -> "
+             "S6. Its results are not the deck's own solution (see the warnings above).")
+    text = rep.console(60)
+    assert text.startswith("Reduced physics (ccx solves another model than the deck):\n"
+                           "  - element STRI65 -> S6\n\nWarnings (1, and the reduced-physics summary above)\n"
+                           "  1. deck.inp:12\n     A warning about something that matters, long enough to\n"), text
+    assert all(len(line) <= 60 for line in text.splitlines()), text
+    assert "  - deck.inp:40\n    Output variables AR1, AR2, TA1 dropped from *NODE PRINT\n    (not a ccx label there).\n" in text, text
+    assert "    Output variable U3 -> U (CalculiX naming).\n" in text and "  - A note without a place.\n" in text
+    assert "Notes (3)" in text and A.Report().console(80) == "No conversion issues were flagged.\n"
+    d = tempfile.mkdtemp()
+    try:
+        deck = os.path.join(d, "a.inp")
+        with open(deck, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(HEX_MODEL + "*Step\n*Static\n*Cload\n7, 3, 1.\n*End Step\n")
+        code, err = _main_code([deck])
+        with open(os.path.join(d, "a_ccx.log"), encoding="utf-8") as fh:
+            log = fh.read()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    head = err.splitlines()
+    assert code == 0 and head[0] == f"abq2ccx {A.__version__}: wrote {os.path.join(d, 'a_ccx.inp')} from {deck}", err
+    assert re.fullmatch(r"  \d+ nodes, 1 elements \| \d+ warning\(s\), \d+ note\(s\), \d+ commented card\(s\)", head[1]), head
+    assert head[2] == f"  Full report: {os.path.join(d, 'a_ccx.log')} (and at the top of the converted deck)"
+    assert log.startswith(f"abq2ccx {A.__version__}: {deck} -> {os.path.join(d, 'a_ccx.inp')} (") and "\n\n[" in log
+
+
 def _still_runs(pid):
     """Whether process ``pid`` still runs (a zombie does not), asked for up to 5 s."""
     import subprocess
