@@ -11652,12 +11652,15 @@ class _Mesh:
             masters.setdefault((id(slave), prop), (slave, []))[1].append(master)
         self._gc_adjust = set()
         none: Tuple[set, set] = (set(), set())
+        flush: set = set()
         for (_, prop), (slave, ms) in masters.items():
             lines_of.setdefault(prop, []).append((slave, ms))
             own = set().union(*(cut.get((id(slave), id(m)), none)[0] for m in ms))
-            if self._gc_overclosed(self._gc_trimmed(slave, own),
-                                   [self._gc_trimmed(m, cut.get((id(slave), id(m)), none)[1]) for m in ms]):
+            s_faces = self._gc_trimmed(slave, own)
+            m_faces = [self._gc_trimmed(m, cut.get((id(slave), id(m)), none)[1]) for m in ms]
+            if self._gc_overclosed(s_faces, m_faces):
                 self._gc_adjust.add(prop)
+            flush.update(self._gc_flush(s_faces, m_faces, reach))
         n_lines, gone = self._gc_write(blocks, bodies, lines_of, cut)
         n_joined += gone
         new = self._gc_blocks
@@ -11677,6 +11680,19 @@ class _Mesh:
                              f"union of its masters, each body only slave or only master, the struck, "
                              f"yielding or finer-meshed one the slave. Abaqus' self-contact of each "
                              f"body, edge-to-edge contact and {form} have no ccx form here.", once=True)
+        if flush and n_lines:
+            self.report.warn(f"*CONTACT (--approximate): {len(flush)} slave node(s) of the generated pairs "
+                             f"(node {min(flush)}, ...) lie on an edge where their master's faces end, "
+                             f"straight off those faces: faces that end flush (a lid on a block of the "
+                             f"same footprint, stacked blocks, bodies cut by one symmetry plane) or a "
+                             f"slave node right over a master's edge. ccx 2.23's node-to-surface "
+                             f"contact can miss such nodes (probed, two blocks pressed together: 81 % of "
+                             f"a hand-written pair's force, 12 % where the slave's mesh is the coarser, "
+                             f"which the hand-written pair misses too; three stacked blocks: 87 % of the "
+                             f"exact force). For two bodies, a hand-written pair of the facing faces "
+                             f"only, the finer mesh the slave, carried the full force.", once=True)
+            self._reduces("general contact where two bodies' faces end flush (ccx's node-to-surface "
+                          "contact can miss the slave nodes on the master's edges)")
         for msg in why:
             self.report.warn(f"*CONTACT (--approximate): {msg}", once=True)
         if skipped_self:
@@ -12305,6 +12321,82 @@ class _Mesh:
             if best is not None and -best[2] < best[1] < -tol:
                 return True
         return False
+
+    def _gc_flush(self, slave: dict, masters: List[dict], reach: float) -> set:
+        """The nodes of ``slave``'s exterior continuum faces that lie straight off a master
+        face opposed to theirs (normals within 25 degrees of opposite), at most twice that
+        face's size and ``reach`` away (or overclosed by a thousandth of it), onto an edge of
+        that face where the master's facing faces end: an edge no other master face shares, or
+        a convex one whose other face turns away by more than 60 degrees.  Faces that end
+        flush (a lid on a block of the same footprint, stacked blocks, bodies cut by one
+        symmetry plane), or a slave node right over a master's edge (a mesh line over a
+        support's edge).  ccx 2.23's node-to-surface contact can miss such nodes:
+        probed on two blocks pressed together, a lid of the block's footprint carried 0.81 of
+        a hand-written pair's force (a coarser master), 0.12 where the slave's mesh is the
+        coarser (the hand-written pair missed them too), the same meshes 0.974 of the exact
+        force (as the hand-written pair: penalty contact); three stacked blocks 0.875 of it.
+        Shell, membrane and rigid sheets are not checked."""
+        nodes = self.geom.nodes
+
+        def facets(g: dict) -> List[Tuple[Tuple[int, ...], List[Vec], Vec, float, Vec]]:
+            """(corners, their points, outward unit normal, largest edge, centroid) per face."""
+            out = []
+            for cs, e in g.get("solid", ()):
+                conn = self.geom.elements[e][1]
+                if len(cs) < 3 or any(n not in nodes for n in list(cs) + list(conn)):
+                    continue
+                p = [nodes[n] for n in cs]
+                nrm = functools.reduce(vadd, (vcross(p[i - 1], p[i]) for i in range(len(p))))
+                if vnorm(nrm) == 0.0:
+                    continue
+                nrm = vunit(nrm)
+                mid = vscale(functools.reduce(vadd, (nodes[n] for n in conn)), 1.0 / len(conn))
+                if vdot(nrm, vsub(p[0], mid)) < 0:
+                    nrm = vscale(nrm, -1.0)
+                size = max(vnorm(vsub(p[i], p[i - 1])) for i in range(len(p)))
+                out.append((tuple(cs), p, nrm, size, vscale(functools.reduce(vadd, p), 1.0 / len(p))))
+            return out
+
+        edges: List[Tuple[Vec, Vec, Vec, float]] = []     # (a, b, the face's normal, its size)
+        for m in masters:
+            fs = facets(m)
+            by_edge: Dict[frozenset, List[int]] = {}
+            for i, (cs, _p, _n, _s, _c) in enumerate(fs):
+                for j in range(len(cs)):
+                    by_edge.setdefault(frozenset((cs[j - 1], cs[j])), []).append(i)
+            for i, (cs, p, n, s, _c) in enumerate(fs):
+                for j in range(len(cs)):
+                    if all(vdot(fs[k][2], n) < 0.5 and vdot(vsub(fs[k][4], p[j]), n) < 0
+                           for k in by_edge[frozenset((cs[j - 1], cs[j]))] if k != i):
+                        edges.append((p[j - 1], p[j], n, s))
+        if not edges:
+            return set()
+        cell = max(s for *_x, s in edges)
+        grid: Dict[Tuple[int, ...], List[Tuple[int, Vec]]] = {}      # slave nodes with a face normal
+        for cs, p, n, _s, _c in facets(slave):
+            for k, x in zip(cs, p):
+                grid.setdefault(tuple(int(math.floor(x[a] / cell)) for a in range(3)), []).append((k, n))
+        out: set = set()
+        for a, b, n, s in edges:
+            far, tol = min(reach, 2.0 * s), 1e-3 * s
+            ab = vsub(b, a)
+            ln = vnorm(ab)
+            if ln == 0.0:
+                continue
+            u = vscale(ab, 1.0 / ln)
+            box = [a, b, vadd(a, vscale(n, far)), vadd(b, vscale(n, far))]
+            lo = [int(math.floor((min(x[i] for x in box) - tol) / cell)) for i in range(3)]
+            hi = [int(math.floor((max(x[i] for x in box) + tol) / cell)) for i in range(3)]
+            for key in itertools.product(*(range(lo[i], hi[i] + 1) for i in range(3))):
+                for k, ns in grid.get(key, ()):
+                    if k in out or vdot(ns, n) > -0.9:
+                        continue
+                    v = vsub(nodes[k], a)
+                    t, along = vdot(v, n), vdot(v, u)
+                    if -tol <= t <= far and -tol <= along <= ln + tol and \
+                            vnorm(vsub(v, vadd(vscale(u, along), vscale(n, t)))) <= tol:
+                        out.add(k)
+        return out
 
     def _gc_sheet_normal(self, e: int) -> Vec:
         """The SPOS normal of a shell, membrane or rigid element; of a 2-node one (R2D2,
@@ -13802,6 +13894,64 @@ class _Mesh:
                          f"load 37 % high; S8R within 1 %)."
                          + added)
 
+    def _plan_s8r_strips(self, blocks: List[Block]) -> None:
+        """``_s8r_strips``: (the S8R elements _warn_s8r_strips reports, those written as S8).
+        An S8R element with two opposite edges that no other shell shares — a strip one
+        element wide, a lone element, one hanging off a plate by an edge — drifts in a model
+        with a step ccx runs through its nonlinear solver (_solver_steps, NLGEOM too): ccx 2.23
+        expands an S8R into one C3D20R brick, whose zero-energy mode such an element leaves
+        free; the linear solve stays on the right answer, the iterations drift along the mode
+        (probed against the linear *STATIC step, cantilever strips of 1 x 1 to 1 x 8 elements,
+        an L of strips: 6-410 % of max |u| under a never-reached *PLASTIC, 12 % to 86 times
+        under NLGEOM at a load 1e-4 as small, 60-25000 x in a *DYNAMIC step of near-zero mass;
+        holding the long edges in z makes it worse; two elements across, a plate's corner
+        elements and S8 on any mesh exact).  Under --approximate they become S8 (ccx's C3D20
+        expansion, fully integrated: no zero-energy mode, exact in the nonlinear solver; a
+        stiffer element than S8R: a cantilever strip of 4 x 1 elements 2-7 % stiffer for
+        elements 5-50 thicknesses wide, of one element 11-17 %), but for those of a composite section (ccx runs composite shells on S8R
+        and S6 only) or of a plastic or creeping material (whose through-thickness rule, 2
+        Gauss points on S8R and 3 on S8, _plan_plastic_shells flags or layers).  After
+        _plan_solver_facts, before the planners that read the final element types."""
+        self._s8r_strips = ([], [])
+        if not any(self._solver_steps) or not self._mechanical:
+            return
+        hit = self._s8r_strip_elements()
+        if not hit or not self._approx:
+            self._s8r_strips = (hit, [])
+            return
+        inelastic = (self._plastic_materials(blocks) if self._steps_can_yield(blocks) else set()) | \
+            self._creeping_materials(blocks)
+        keep: set = set()
+        for b in blocks:
+            if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION") and \
+                    (b.has("COMPOSITE") or b.uparam("MATERIAL") in inelastic):
+                keep.update(self.geom.elset((b.param("ELSET") or "").strip()))
+        made = [e for e in hit if e not in keep]
+        for e in made:
+            typ, conn = self.geom.elements[e]
+            new = "S8" + split_suffixes(typ)[1]
+            self.geom.elements[e] = (new, conn)
+            self._elem_types.add(new)
+        self._s8r_strips = ([e for e in hit if e in keep], made)
+
+    def _s8r_strip_elements(self) -> List[int]:
+        """The S8R elements with two opposite edges no other shell shares (_plan_s8r_strips)."""
+        shells = [(e, conn) for e, (typ, conn) in self.geom.elements.items() if ccx_type(typ) in SHELL_TYPES]
+        count: Dict[frozenset, int] = {}
+        for _e, conn in shells:
+            corners = conn[:len(conn) // 2] if len(conn) in (6, 8) else conn
+            for i in range(len(corners)):
+                k = frozenset((corners[i], corners[(i + 1) % len(corners)]))
+                count[k] = count.get(k, 0) + 1
+        hit = []
+        for e, conn in shells:
+            if ccx_type(self.geom.elements[e][0]) != "S8R" or len(conn) != 8:
+                continue
+            free = [count[frozenset((conn[i], conn[(i + 1) % 4]))] == 1 for i in range(4)]
+            if (free[0] and free[2]) or (free[1] and free[3]):
+                hit.append(e)
+        return hit
+
     def _plan_s3_shells(self, blocks: List[Block]) -> None:
         """The triangles ccx runs as S3 (S3, S3R, STRI3, a collapsed S4) left after the
         composite upgrade.  ccx 2.23 expands an S3 into one C3D6 wedge through the thickness
@@ -14293,7 +14443,10 @@ class _Mesh:
         linear shells joined to them by an edge too); a section with S8 or without a constant
         thickness is left as it is (and flagged)."""
         plastic = self._plastic_materials(blocks) if self._steps_can_yield(blocks) else set()
-        self._flag_plastic_composites(blocks, plastic)
+        opts = self._material_options(blocks)
+        creeping = {m for m in self._creeping_materials(blocks) if not self._linear_creep(opts[m])}
+        self._flag_plastic_composites(blocks, plastic, creeping)
+        self._flag_inelastic_shells(blocks, plastic, creeping)
         found: List[Tuple[Block, List[int], Dict[str, int], int, bool]] = []
         for b in blocks:
             mat = b.uparam("MATERIAL")
@@ -14395,23 +14548,30 @@ class _Mesh:
                    "midside node, and so do the node sets of BCs, couplings, ties and output.")
         self.report.warn(f"[APPROX] {what} written as {layered}: {why}.{added}")
 
-    def _flag_plastic_composites(self, blocks: List[Block], plastic: set) -> None:
-        """Composite *SHELL SECTIONs (_plan_plastic_shells' plastic materials, ``plastic``)
-        with a plastic layer the middle of the section crosses.  ccx 2.23 integrates every layer
+    def _flag_plastic_composites(self, blocks: List[Block], plastic: set, creeping: set) -> None:
+        """Composite *SHELL SECTIONs (_plan_plastic_shells' plastic materials, ``plastic``, and
+        nonlinearly creeping ones, ``creeping``) with such a layer the middle of the section
+        crosses, on the shells ccx expands or on continuum shells (one solid per ply:
+        _plan_ply_split).  ccx 2.23 integrates every layer
         at 2 Gauss points through its thickness, Abaqus at the layer's Simpson points (3 by
         default).  Fully plastic, a layer's stress moment is |z| times the yield stress, which
         both rules integrate exactly where |z| has no kink, so they agree on every layer but the
         one the middle crosses (the plastic neutral surface of a layup of one yield stress):
         one layer, 0.667 (Abaqus) against 1.155 (ccx) times the fully plastic moment; the middle
         of 3 equal layers, 0.963 against 1.017 for the section (code check R2-4, by hand
-        integration).  So such a section is reduced physics, unless the deck asks for 2 Gauss
-        points in that layer; an even layup whose middle lies between two layers is not."""
+        integration).  In steady creep bending the stress follows |z|^(1/n), smooth but for the
+        middle too: one layer at Norton exponent 3 bends at 2.1 (Abaqus) against 0.71 (ccx)
+        times the exact rate (section theory; ccx's 0.705 probed).  So such a section is reduced
+        physics, unless the deck asks for 2 Gauss points in that layer; an even layup whose
+        middle lies between two layers is not."""
         hits: List[str] = []
+        kinds: set = set()
         for b in blocks:
             elset = (b.param("ELSET") or "").strip()
             if b.keyword != "SHELL SECTION" or not b.has("COMPOSITE") or \
-                    self._continuum_shell_elset(elset) or \
-                    not any(e in self.geom.elements and ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS
+                    not any(e in self.geom.elements and
+                            (ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS or
+                             self.geom.elements[e][0].upper() in PLY_SOLID)
                             for e in self.geom.elset(elset)):
                 continue
             rows = [g for g in (trimmed_fields(r) for r in merged_data_records(b)) if g]
@@ -14430,20 +14590,118 @@ class _Mesh:
             for th, npts, mat in layers:
                 lo, z = z, z + th
                 if lo + tol < mid < z - tol:
-                    if mat in plastic and not (gauss and npts == 2):
+                    if mat in plastic | creeping and not (gauss and npts == 2):
                         hits.append(elset)
+                        kinds.add("plastic" if mat in plastic else "creeping")
                     break
         if not hits:
             return
-        self.report.warn(f"Composite *SHELL SECTION with a plastic layer the middle of the section "
+        what = " or ".join(sorted(kinds, reverse=True))
+        self.report.warn(f"Composite *SHELL SECTION with a {what} layer the middle of the section "
                          f"crosses (ELSET={', '.join(hits[:3])}{', ...' if len(hits) > 3 else ''}): "
                          f"ccx 2.23 integrates every layer at 2 Gauss points through its thickness, "
-                         f"Abaqus at the layer's Simpson points (3 by default); fully plastic they "
-                         f"agree on the other layers but part on that one (a one-layer section "
-                         f"carries 1.155 times the fully plastic moment in ccx, 0.667 in Abaqus). A "
-                         f"layup whose middle lies between two layers avoids it.")
-        self._reduces("plastic composite *SHELL SECTION with a layer through the middle (ccx 2.23 "
-                      "integrates it at 2 Gauss points, Abaqus at its Simpson points)")
+                         f"Abaqus at the layer's Simpson points (3 by default); "
+                         + ("fully plastic they agree on the other layers but part on that one (a "
+                            "one-layer section carries 1.155 times the fully plastic moment in ccx, "
+                            "0.667 in Abaqus)" if "plastic" in kinds else "")
+                         + ("; " if len(kinds) > 1 else "")
+                         + ("in creep bending they part on that one (a one-layer section creeping "
+                            "with stress exponent 3 bends at 0.71 times the exact steady rate in "
+                            "ccx, 2.1 times it in Abaqus)" if "creeping" in kinds else "")
+                         + ". A layup whose middle lies between two layers avoids it.")
+        self._reduces(f"{what} composite *SHELL SECTION with a layer through the middle (ccx 2.23 "
+                      f"integrates it at 2 Gauss points, Abaqus at its Simpson points)")
+
+    def _flag_inelastic_shells(self, blocks: List[Block], plastic: set, creeping: set) -> None:
+        """Homogeneous *SHELL SECTIONs ccx 2.23 integrates through the thickness at other points
+        than Abaqus, beyond _plan_plastic_shells' plastic sections on the shells ccx expands: a
+        creeping material (``creeping``: a nonlinear creep law in a deck that creeps) on those
+        shells, and a plastic or creeping one on continuum shells (SC6R / SC8R), which ccx runs
+        as one C3D8I / C3D6 solid through the thickness, with 2 Gauss points there.  Abaqus
+        integrates the section at its own points, 5 Simpson by default.  Bent, the stress
+        redistributes through the thickness and the rules part: 2 Gauss points carry 1.155
+        times the fully plastic moment (as on the sheet shells), and in Norton creep, where the
+        steady stress follows |z|^(1/n), they bend at 0.71 / 0.52 times the exact curvature
+        rate at stress exponent 3 / 5, 3 Gauss points (S6, S8) at about 1.3 / 1.7 times it,
+        where 5 Simpson points give 0.98.  Probed on 2.23 (a strip, b = t, in 4-point bending):
+        plastic SC8R carries 1.15 times its limit load, elastic to the end; creeping S8R and
+        SC8R bend at 0.705 / 0.52 times the exact rate, linear creep (n = 1) exactly.  Reduced
+        physics, unless the deck asks for as many Gauss points as ccx takes (SECTION
+        INTEGRATION=GAUSS); stretched, the rules agree."""
+        if not (plastic or creeping):
+            return
+        sheet: List[Tuple[str, Dict[str, int], str]] = []
+        cont: List[Tuple[str, int, str, str]] = []
+        for b in blocks:
+            mat = b.uparam("MATERIAL")
+            elset = (b.param("ELSET") or "").strip()
+            if b.keyword != "SHELL SECTION" or b.has("COMPOSITE") or mat not in plastic | creeping:
+                continue
+            rec = next((r for r in merged_data_records(b) if any(x.strip() for x in r)), [])
+            gauss = b.uparam("SECTION INTEGRATION") == "GAUSS"
+            try:
+                npts = pint(rec[1]) if len(rec) > 1 and rec[1].strip() else (3 if gauss else 5)
+            except ValueError:
+                npts = 3 if gauss else 5
+            rule = f"{npts} {'Gauss' if gauss else 'Simpson'}"
+            if self._continuum_shell_elset(elset):
+                if not (gauss and npts == 2):
+                    cont.append((elset, len(self._existing(elset)), rule,
+                                 "plastic" if mat in plastic else "creeping"))
+                continue
+            if mat in plastic:
+                continue                            # (_plan_plastic_shells)
+            kinds: Dict[str, int] = {}
+            for e in self.geom.elset(elset):
+                ct = ccx_type(self.geom.elements[e][0]) if e in self.geom.elements else ""
+                if ct in SHEET_SHELLS:
+                    kinds[ct] = kinds.get(ct, 0) + 1
+            if kinds and not (gauss and all(SHELL_SECTION_POINTS[k] == npts for k in kinds)):
+                sheet.append((elset, kinds, rule))
+
+        def sets(rows: list) -> str:
+            names = [r[0] for r in rows]
+            return f"ELSET={', '.join(names[:3])}{', ...' if len(names) > 3 else ''}"
+        creep_why = ("in Norton creep (stress exponent 3 / 5) 2 Gauss points bend at 0.71 / 0.52 "
+                     "times the exact steady curvature rate, 3 at about 1.3 / 1.7 times it, 5 "
+                     "Simpson points at 0.98 (probed: a strip in 4-point bending, 0.705 / 0.52 on "
+                     "S8R and SC8R alike); linear creep (exponent 1) agrees")
+        if sheet:
+            kinds = {}
+            for _s, ks, _r in sheet:
+                for k, v in ks.items():
+                    kinds[k] = kinds.get(k, 0) + v
+            by_pts: Dict[int, List[str]] = {}
+            for k in sorted(kinds):
+                by_pts.setdefault(SHELL_SECTION_POINTS[k], []).append(k)
+            pts = "; ".join(f"{n} on {' / '.join(ks)}" + (", on the mid-surface, where bending never "
+                                                           "creeps" if n == 1 else "")
+                            for n, ks in sorted(by_pts.items(), reverse=True))
+            self.report.warn(f"*SHELL SECTION of a creeping material ({len(sheet)} section(s): "
+                             f"{sets(sheet)}; {sum(kinds.values())} elements, {'/'.join(sorted(kinds))}): "
+                             f"ccx 2.23 integrates an expanded shell's section through the thickness "
+                             f"at its brick's Gauss points ({pts}), Abaqus at the section's "
+                             f"{' / '.join(sorted({r for _s, _k, r in sheet}))} points, so in creep "
+                             f"bending, as the stress redistributes through the thickness, they part: "
+                             f"{creep_why}; stretched, they agree.")
+            self._reduces("creeping *SHELL SECTION (ccx 2.23 integrates it through the thickness at its "
+                          "brick's Gauss points, not at the section's points)")
+        if cont:
+            what = " or ".join(sorted({r[3] for r in cont}, reverse=True))
+            self.report.warn(f"Continuum shells (SC6R / SC8R) of a {what} material ({len(cont)} "
+                             f"section(s): {sets(cont)}; {sum(r[1] for r in cont)} elements): ccx 2.23 "
+                             f"runs each as one C3D8I / C3D6 solid through the thickness, integrated "
+                             f"at 2 Gauss points there, Abaqus at the section's "
+                             f"{' / '.join(sorted({r[2] for r in cont}))} points, so in bending they "
+                             f"part: "
+                             + ("plastic, 2 Gauss points stay elastic up to 1.73 times the first-"
+                                "yield moment and carry 1.155 times the fully plastic one (probed: a "
+                                "strip in 4-point bending reaches 1.15 times its limit load)"
+                                if "plastic" in what else "")
+                             + ("; creeping, " if what == "plastic or creeping" else "")
+                             + (creep_why if "creeping" in what else "") + "; stretched, they agree.")
+            self._reduces(f"{what} continuum shells SC6R / SC8R (ccx 2.23 integrates them through the "
+                          f"thickness at 2 Gauss points, not at the section's points)")
 
     def _plan_quadratic_shells(self, blocks: List[Block]) -> None:
         """Composite shells ccx cannot run -> the quadratic shells it can.  ccx 2.23 reads
@@ -16753,7 +17011,21 @@ class _Mesh:
     def handle_model_change(self, b: Block) -> List[str]:
         """*MODEL CHANGE: ccx 2.23 stops without TYPE= ('model change can only be used for
         contact pairs or elements', modelchanges.f), so Abaqus' default TYPE=ELEMENT is written
-        (_warn_model_change_readds: what ccx cannot add back)."""
+        (_warn_model_change_readds: what ccx cannot add back).  Elements added strain free (ADD
+        without a value: Abaqus' default, and ccx's; ADD=STRAIN FREE) stop ccx in a step it
+        runs linearly ('a strain-free addition of elements ... is only possible for nonlinear
+        calculations', modelchanges.f): a *STATIC or *VISCO step _solver_steps calls linear (ccx
+        runs a heat transfer step nonlinearly), where ADD=WITH STRAIN runs: warned."""
+        add = (b.param("ADD") or "").replace(" ", "").upper()
+        if b.has("ADD") and add in ("", "STRAINFREE") and b.uparam("TYPE") in ("", "ELEMENT") and \
+                0 < self.emit.no <= len(self._solver_steps) and not self._solver_steps[self.emit.no - 1] \
+                and self.emit.step.proc in ("STATIC", "VISCO"):
+            self.report.warn(f"*MODEL CHANGE, ADD{'=STRAIN FREE' if add else ''} in step {self.emit.no}, "
+                             f"which ccx runs linearly: ccx 2.23 adds elements strain free only in a "
+                             f"nonlinear step and stops here ('a strain-free addition of elements ... is "
+                             f"only possible for nonlinear calculations'). ADD=WITH STRAIN runs, and is "
+                             f"the same where the elements' nodes have not moved since they were "
+                             f"removed.", once=True)
         if b.has("TYPE"):
             return self.passthrough(b)
         self.report.note("*MODEL CHANGE without TYPE: TYPE=ELEMENT written (Abaqus' default; ccx "
@@ -22430,19 +22702,46 @@ class _Materials:
         Poisson's ratio from LOCKING_NU, or a *HYPERELASTIC row whose small-strain one reaches
         it: the deck's own, D1 = 0 incompressible; where ccx replaces a tiny D1, _check_hyper_d1
         flags that)."""
-        creeps = any(b.keyword == "VISCO" or (b.keyword in ("COUPLED TEMPERATURE-DISPLACEMENT", "SOILS")
-                                              and b.uparam("CREEP") != "NONE") for b in blocks)
+        creeping = self._creeping_materials(blocks)
         yields = self._steps_can_yield(blocks)
         out: Dict[str, str] = {}
         for m, opts in self._material_options(blocks).items():
             kws = {c.keyword for c in opts[1:]}
             if "PLASTIC" in kws and yields:
                 out[m] = "plastic"
-            elif creeps and "CREEP" in kws and not kws & {"DRUCKER PRAGER", "CAP PLASTICITY"}:
+            elif m in creeping:
                 out[m] = "creeping"
             elif any(nu >= LOCKING_NU for c in opts[1:] for nu in self._poisson_ratios(c)):
                 out[m] = "nearly incompressible"
         return out
+
+    def _creeping_materials(self, blocks: List[Block]) -> set:
+        """The materials (upper case) with a *CREEP option, not of a Drucker-Prager or cap
+        material, in a deck with a step that creeps: *VISCO, or *COUPLED TEMPERATURE-
+        DISPLACEMENT / *SOILS without CREEP=NONE."""
+        if not any(b.keyword == "VISCO" or (b.keyword in ("COUPLED TEMPERATURE-DISPLACEMENT", "SOILS")
+                                            and b.uparam("CREEP") != "NONE") for b in blocks):
+            return set()
+        out = set()
+        for m, opts in self._material_options(blocks).items():
+            kws = {c.keyword for c in opts[1:]}
+            if "CREEP" in kws and not kws & {"DRUCKER PRAGER", "CAP PLASTICITY"}:
+                out.add(m)
+        return out
+
+    @staticmethod
+    def _linear_creep(opts: List[Block]) -> bool:
+        """Every *CREEP card among material options ``opts`` is a power law (LAW=TIME or STRAIN)
+        of stress exponent 1 on every row: linear creep, whose bending any rule through a
+        shell's thickness integrates exactly."""
+        cards = [c for c in opts if c.keyword == "CREEP"]
+        try:
+            return bool(cards) and all(
+                c.uparam("LAW") in ("", "TIME", "STRAIN") and bool(rows) and
+                all(len(r) > 1 and r[1].strip() and pf(r[1]) == 1.0 for r in rows)
+                for c in cards for rows in [[r for r in merged_data_records(c) if r and r[0].strip()]])
+        except ValueError:
+            return False
 
     @staticmethod
     def _poisson_ratios(c: Block) -> List[float]:
@@ -26186,44 +26485,35 @@ class _Constraints:
                       "linear step")
 
     def _warn_s8r_strips(self) -> None:
-        """Warn (reduced physics) where an S8R element has two opposite edges that no other
-        shell shares — a strip one element wide, a lone element, one hanging off a plate by
-        an edge — in a model with a step ccx runs through its nonlinear solver (_solver_steps,
-        NLGEOM too).  ccx 2.23 expands an S8R into one C3D20R brick, whose zero-energy mode
-        such an element leaves free; the linear solve stays on the right answer, the
-        iterations drift along the mode (probed against the linear *STATIC step, cantilever
-        strips of 1 x 1 to 1 x 8 elements, an L of strips: 9-410 % of max |u| under a
-        never-reached *PLASTIC, 30-78 % under NLGEOM at a load 1e-4 as small, 60-25000 x in a
-        *DYNAMIC step of near-zero mass; holding the long edges in z makes it worse; two
-        elements across, a plate's corner elements and S8 on any mesh exact)."""
-        steps = [why for why in self._solver_steps if why]
-        if not steps or not self._mechanical:
+        """Report _plan_s8r_strips' S8R strips: those left as S8R reduced physics, those
+        --approximate wrote as S8 [APPROX]."""
+        left, made = self._s8r_strips
+        if not (left or made):
             return
-        shells = [(e, conn) for e, (typ, conn) in self.geom.elements.items() if ccx_type(typ) in SHELL_TYPES]
-        count: Dict[frozenset, int] = {}
-        for _e, conn in shells:
-            corners = conn[:len(conn) // 2] if len(conn) in (6, 8) else conn
-            for i in range(len(corners)):
-                k = frozenset((corners[i], corners[(i + 1) % len(corners)]))
-                count[k] = count.get(k, 0) + 1
-        hit = []
-        for e, conn in shells:
-            if ccx_type(self.geom.elements[e][0]) != "S8R" or len(conn) != 8:
-                continue
-            free = [count[frozenset((conn[i], conn[(i + 1) % 4]))] == 1 for i in range(4)]
-            if (free[0] and free[2]) or (free[1] and free[3]):
-                hit.append(e)
-        if not hit:
-            return
-        self.report.warn(f"{len(hit)} S8R element(s) (e.g. element {min(hit)}) have two opposite edges "
-                         f"that no other shell shares (a strip one element wide, a lone element), in "
-                         f"a model with {steps[0]}, which ccx 2.23 runs through its nonlinear solver: "
-                         f"ccx expands an S8R into one C3D20R brick, whose zero-energy mode such an "
-                         f"element leaves free, and the iterations drift along it (probed against the "
-                         f"linear step: 9-410 % of max |u| with a never-reached *PLASTIC, 30-78 % under "
-                         f"NLGEOM, far off in *DYNAMIC; two elements across, or S8, exact). Mesh such "
-                         f"strips at least two elements wide, or use S8.", once=True)
-        self._reduces("S8R strips one element wide in a step ccx iterates (C3D20R zero-energy mode)")
+        why = next(w for w in self._solver_steps if w)
+        drift = ("ccx expands an S8R into one C3D20R brick, whose zero-energy mode such an element "
+                 "leaves free, and the iterations drift along it (probed against the linear step: "
+                 "6-410 % of max |u| with a never-reached *PLASTIC, 12 % to 86 times under NLGEOM, far "
+                 "off in *DYNAMIC; two elements across, or S8, exact)")
+        what = ("have two opposite edges that no other shell shares (a strip one element wide, a lone "
+                f"element), in a model with {why}, which ccx 2.23 runs through its nonlinear solver")
+        if made:
+            self.report.warn(f"[APPROX] S8R strips one element wide written as S8: {len(made)} S8R "
+                             f"element(s) (e.g. "
+                             f"element {min(made)}) {what}: {drift}. ccx's S8 is a C3D20 brick, fully "
+                             f"integrated, without that mode, so the iterations keep the linear answer; "
+                             f"it is a stiffer element than S8R (a cantilever strip of 4 x 1 elements "
+                             f"bends 2-7 % less, of one element 11-17 %).", once=True)
+        if left:
+            advice = ("Left as S8R: their composite section (ccx runs composite shells on S8R and S6 "
+                      "only) or plastic or creeping material (whose integration through the thickness "
+                      "S8 changes); mesh such strips at least two elements wide." if self._approx else
+                      "Rerun with --approximate to write them as S8 (a stiffer element: 2-7 % on a "
+                      "cantilever strip of 4 x 1 elements), or mesh such strips at least two elements "
+                      "wide.")
+            self.report.warn(f"{len(left)} S8R element(s) (e.g. element {min(left)}) {what}: {drift}. "
+                             f"{advice}", once=True)
+            self._reduces("S8R strips one element wide in a step ccx iterates (C3D20R zero-energy mode)")
 
     def handle_mpc(self, b: Block) -> List[str]:
         """Abaqus ``*MPC``, converted line by line (a line ccx cannot take is commented out
@@ -38661,9 +38951,11 @@ class _Loads:
         (Keywords *VISCO), ccx stops ('no strictly positive value for the parameter CETOL').
         DIRECT gives ccx's fixed increments, with a CETOL no creep increment reaches: under
         DIRECT ccx 2.23 stops once one exceeds it ('solution seems to diverge'; probed).
-        A creep increment cap goes on as handle_step planned it (_creep_visco)."""
+        A creep increment cap goes on as handle_step planned it (_creep_visco); Abaqus'
+        stabilization parameters do not (_stabilize_dropped)."""
         if b is self._visco_capped[0]:
             b = self._visco_capped[1]
+        b = self._stabilize_dropped(b)
         if (b.param("CETOL") or "").strip():
             return self.passthrough(b)
         keep = OrderedDict((k, v) for k, v in b.params.items() if k != "CETOL")
@@ -38887,20 +39179,11 @@ class _Loads:
                                      f"if an increment does not converge).", once=True)
             elif k in ("SOLVER", "TIME RESET", "TOTAL TIME AT START", "EXPLICIT", "RIKS"):
                 params[k] = v
-            elif k in ("STABILIZE", "ALLSDTOL", "CONTINUE", "FACTOR"):
-                self.report.warn(f"*STATIC {k} dropped: ccx has no automatic (viscous) "
-                                 f"stabilization, so a deck that relies on it to pass an "
-                                 f"instability may not converge.", once=True)
+            elif k in self._STABILIZE_PARAMS:
+                self._warn_stabilize_param(b, k)
             else:
                 self.report.note(f"*STATIC parameter {k} dropped (not a ccx parameter).", once=True)
-        why = self._solver_steps[self.emit.no - 1] if 0 < self.emit.no <= len(self._solver_steps) else ""
-        if why and self._stabilized(b):
-            self.report.warn(f"*STATIC, STABILIZE in step {self.emit.no}, which ccx runs through its "
-                             f"nonlinear solver ({why}): Abaqus adds viscous forces there to pass "
-                             f"local instabilities (buckles, wrinkles, softening, contact closing), "
-                             f"ccx solves the unstabilized problem — it may not converge, and where "
-                             f"it does, its path need not be the stabilized one.", once=True)
-            self._reduces("*STATIC automatic stabilization (STABILIZE) dropped in a nonlinear step")
+        self._warn_stabilized(b)
         data = list(b.data)
         freed = self._direct_freed(b, self.emit.step.ccx_period)     # (b: the step's procedure)
         if freed:
@@ -38937,9 +39220,51 @@ class _Loads:
                                      "*STATIC, RIKS step (ccx has no arc-length solver)")
         return [emit_keyword("STATIC", params)] + data
 
+    # Abaqus' automatic stabilization parameters of a quasi-static procedure card: ccx has no
+    # such stabilization, and ignores them with a warning ('parameter not recognized')
+    _STABILIZE_PARAMS = ("STABILIZE", "ALLSDTOL", "CONTINUE", "FACTOR")
+
+    def _warn_stabilize_param(self, b: Block, k: str) -> None:
+        """Parameter ``k`` of _STABILIZE_PARAMS on procedure card ``b``, dropped."""
+        self.report.warn(f"*{b.keyword} {k} dropped: ccx has no automatic (viscous) "
+                         f"stabilization, so a deck that relies on it to pass an "
+                         f"instability may not converge.", once=True)
+
+    def _warn_stabilized(self, b: Block) -> None:
+        """Procedure card ``b`` (*STATIC, *VISCO, *COUPLED TEMPERATURE-DISPLACEMENT) of the
+        step being written asks for stabilization (_stabilized) in a step ccx runs through its
+        nonlinear solver (_solver_steps): reduced physics, as ccx solves the unstabilized
+        problem.  (Abaqus' *SOILS and *STEADY STATE TRANSPORT, which take STABILIZE too, have no
+        ccx counterpart: ccx stops at such a step.)"""
+        why = self._solver_steps[self.emit.no - 1] if 0 < self.emit.no <= len(self._solver_steps) else ""
+        if why and self._stabilized(b):
+            self.report.warn(f"*{b.keyword}, STABILIZE in step {self.emit.no}, which ccx runs through its "
+                             f"nonlinear solver ({why}): Abaqus adds viscous forces there to pass "
+                             f"local instabilities (buckles, wrinkles, softening, contact closing), "
+                             f"ccx solves the unstabilized problem — it may not converge, and where "
+                             f"it does, its path need not be the stabilized one.", once=True)
+            self._reduces(f"*{b.keyword} automatic stabilization (STABILIZE) dropped in a nonlinear step")
+
+    def _stabilize_dropped(self, b: Block) -> Block:
+        """Procedure card ``b`` without its _STABILIZE_PARAMS (each warned), and the reduced
+        physics of a stabilized nonlinear step (_warn_stabilized): handle_visco and
+        handle_coupled_temperature_displacement (handle_static drops them in its own loop)."""
+        gone = [k for k in b.params if k in self._STABILIZE_PARAMS]
+        for k in gone:
+            self._warn_stabilize_param(b, k)
+        self._warn_stabilized(b)
+        if not gone:
+            return b
+        return Block(b.keyword, OrderedDict((k, v) for k, v in b.params.items() if k not in gone), b.data)
+
+    def handle_coupled_temperature_displacement(self, b: Block) -> List[str]:
+        """``*COUPLED TEMPERATURE-DISPLACEMENT``: as given, without Abaqus' stabilization
+        parameters (_stabilize_dropped)."""
+        return self.passthrough(self._stabilize_dropped(b))
+
     @staticmethod
     def _stabilized(b: Block) -> bool:
-        """``*STATIC`` card ``b`` asks for Abaqus' automatic stabilization: STABILIZE (a
+        """Procedure card ``b`` asks for Abaqus' automatic stabilization: STABILIZE (a
         dissipated energy fraction, 2e-4 without a value) not zero, or its FACTOR (a damping
         factor, which overrides that fraction) not zero."""
         if not b.has("STABILIZE"):
@@ -45133,6 +45458,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._linear_rigid = self._dyn_before_nl = False
         self._solver_why = ""
         self._solver_steps: List[str] = []         # per step: that why, or "" (_plan_solver_facts)
+        self._s8r_strips: Tuple[List[int], List[int]] = ([], [])    # (_plan_s8r_strips)
         self._expanded: set = set()                # nodes of elements ccx expands to 3-D
         # *BOUNDARY, TYPE=VELOCITY / ACCELERATION (see _plan_velocity_bcs): what replaces each
         # such card, what each step appends for the ones it keeps, the amplitudes only they
@@ -45437,6 +45763,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         "BUCKLE": "handle_buckle",
         "HEAT TRANSFER": "handle_heat_transfer",
         "VISCO": "handle_visco",
+        "COUPLED TEMPERATURE-DISPLACEMENT": "handle_coupled_temperature_displacement",
         "PLASTIC": "handle_plastic",
         "DAMAGE INITIATION": "handle_damage_initiation",
         "DEPVAR": "handle_depvar",
@@ -45732,6 +46059,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._read_steps(blocks)                # after the last planner that rewrites a step card
         self._plan_mass_scaling_factors(blocks)     # before every planner reading material names
         self._plan_solver_facts(blocks)         # after the step model and _plan_rigid
+        self._plan_s8r_strips(blocks)           # after it: its steps; before the final-type readers
         self._reset_emission()                  # (handle_step advances the step cursor)
         self._plan_node_classes(blocks)         # after the mesh planners: the final element types
         self._plan_shared_ref_couplings(blocks)     # after it: the members with rotations
@@ -45822,7 +46150,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_beam_section_axes(blocks)        # after them (_untr); may add knot beams
         self._warn_beam_moment_stops(blocks)        # after it: its knot beams
         self._warn_finite_rotations(blocks)         # after every planner adding knot beams
-        self._warn_s8r_strips()                     # after the mesh planners: the final types
+        self._warn_s8r_strips()                     # _plan_s8r_strips' strips
         self._warn_dashpot_steps(blocks)            # after _plan_dashpots: its rows
         self._plan_circ_explicit_increment(blocks)
         self._plan_rigid_contact_increment(blocks)

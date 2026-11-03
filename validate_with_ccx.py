@@ -331,10 +331,11 @@ def dat_displacement(dat_path, node):
 
 
 # The element-formulation flags a check's vehicle may carry beside what the check is about:
-# ccx's C3D8 locking where the material keeps its volume, its S3 wedge, a plastic shell
-# section's 2 Gauss points through the thickness (Converter._plan_volume_locking,
-# _plan_s3_shells, _plan_plastic_shells)
-VEHICLE_FLAGS = ("element C3D8 of a ", "element S3 (", "plastic *SHELL SECTION")
+# ccx's C3D8 locking where the material keeps its volume, its S3 wedge, a plastic or creeping
+# shell section's (a continuum shell's too) 2 Gauss points through the thickness
+# (Converter._plan_volume_locking, _plan_s3_shells, _plan_plastic_shells, _flag_inelastic_shells)
+VEHICLE_FLAGS = ("element C3D8 of a ", "element S3 (", "plastic *SHELL SECTION", "creeping *SHELL SECTION",
+                 "plastic continuum shells", "creeping continuum shells", "plastic or creeping continuum shells")
 
 
 def other_reduced(conv):
@@ -19550,6 +19551,34 @@ def check_t155(ccx, env, tmp, shared):
               f"{'warned' if flags[1] else 'not warned'}")
     failures += 0 if ok else 1
     return failures
+
+
+@check("s8r_strip_s8", "S8R strips one element wide written as S8 under --approximate")
+def check_s8r_strip_s8(ccx, env, tmp, shared):
+    # --- task 159: an S8R strip one element wide in an NLGEOM step (a load 1e-4 as large, so
+    # the answer is the linear one): as written it drifts along the C3D20R's zero-energy mode;
+    # --approximate writes S8 (C3D20), which keeps its own linear answer ---
+    review_run, same = shared["review_run"], shared["same"]
+
+    def small(text):
+        return re.sub(r"(?m)^(\d+, 3, )([0-9.eE+-]+)$", lambda m: f"{m.group(1)}{float(m.group(2)) * 1e-4:.8g}",
+                      text)
+    nl = small(t155_s8r_deck(1, False)).replace("*STEP\n", "*STEP, NLGEOM\n")
+    lin = {typ: small(t155_s8r_deck(1, False)).replace("TYPE=S8R", f"TYPE={typ}") for typ in ("S8R", "S8")}
+    runs = [review_run(nl, "s8r_strip_s8_nl", dat_node_blocks, approximate=True),
+            review_run(lin["S8"], "s8r_strip_s8_lin", dat_node_blocks),
+            review_run(nl, "s8r_strip_s8r_nl", dat_node_blocks),
+            review_run(lin["S8R"], "s8r_strip_s8r_lin", dat_node_blocks)]
+    with open(os.path.join(tmp, "s8r_strip_s8_nl.inp"), encoding="utf-8") as fh:
+        written = "*ELEMENT, TYPE=S8\n" in fh.read()
+    ok = all(runs) and written
+    if ok:
+        (d, m), (d0, m0) = same(runs[0:2]), same(runs[2:4])
+        ok = d <= 1e-4 * m and m > 1e-9 and d0 > 0.03 * m0
+        print(f"{'PASS' if ok else 'FAIL'}  s8r_strip_s8 (an S8R cantilever strip one element wide, "
+              f"NLGEOM at a small load): --approximate's S8 {d / m:.1e} of |u| {m:.4g} off its linear "
+              f"answer; as written (S8R) {d0 / m0:.3g} off")
+    return 0 if ok else 1
 
 
 @check("norton_creep_floor",

@@ -8,6 +8,54 @@ From 1.6.0 on, each version opens with an overview in plain language (what now c
 gives more correct answers, what changed in using the converter), followed by the detailed
 entries. The GitHub release notes use the same section.
 
+## Unreleased
+
+### Overview
+
+* **Honest flags for weaker physics.** The converter now says so where ccx runs a model with
+  weaker physics than the deck's: creeping shells, plastic or creeping continuum shells (ccx
+  bends them at 2 points through the thickness), stabilized `*VISCO` and coupled
+  temperature-displacement steps (ccx has no stabilization), a strain-free `*MODEL CHANGE, ADD`
+  in a step ccx runs linearly (where ccx stops), and `--approximate`'s general contact between
+  bodies whose faces end flush.
+* **Shell strips under `--approximate`.** An `S8R` strip one element wide drifts in ccx's
+  nonlinear solver (up to many times its deflection); `--approximate` now writes it as `S8`,
+  which keeps the right answer.
+
+### Details
+
+* **Creeping and continuum shells** — ccx 2.23 integrates an expanded shell's section through
+  the thickness at its brick's Gauss points and runs a continuum shell (`SC6R`/`SC8R`) as one
+  `C3D8I`/`C3D6` solid, 2 Gauss points through the thickness; Abaqus takes the section's
+  points (5 Simpson by default). In Norton creep bending 2 points give 0.71 / 0.52 times the
+  exact steady curvature rate at stress exponent 3 / 5 (5 Simpson points 0.98), and a plastic
+  continuum shell carries 1.15 times its limit load (probed on a strip in 4-point bending). A
+  creeping `*SHELL SECTION` (a nonlinear creep law in a deck that creeps), a plastic or creeping
+  continuum shell, and a composite section whose creeping layer the middle crosses (continuum
+  shells too) are now reduced physics, as plastic sheet shells already were; linear creep and a
+  `SECTION INTEGRATION=GAUSS` rule with ccx's points are not.
+* **Stabilization on `*VISCO` and coupled steps** — `STABILIZE`, `FACTOR`, `ALLSDTOL` and
+  `CONTINUE` on `*VISCO` and `*COUPLED TEMPERATURE-DISPLACEMENT` went to ccx, which ignores
+  them; they are now dropped with a warning, and a stabilized step ccx iterates is reduced
+  physics, as on `*STATIC`. (`*SOILS` and `*STEADY STATE TRANSPORT` have no ccx counterpart.)
+* **Strain-free `*MODEL CHANGE, ADD`** — ccx 2.23 adds elements strain free (`ADD`, as in
+  Abaqus, or `ADD=STRAIN FREE`) only in a step it runs nonlinearly and stops otherwise ('a
+  strain-free addition of elements ... is only possible for nonlinear calculations'); such a
+  card in a linear `*STATIC` or `*VISCO` step is now warned, naming `ADD=WITH STRAIN`, which runs.
+* **Flush faces in general contact** — under `--approximate`, slave nodes of the generated pairs
+  that lie on an edge where their master's faces end, straight off those faces (a lid on a
+  block of the same footprint, stacked blocks), are now warned of: ccx's node-to-surface
+  contact can miss them (two blocks: 81 % of a hand-written pair's force, 12 % with the coarser
+  mesh the slave, which a hand-written pair misses too; three stacked blocks 87 % of the exact
+  force).
+* **`S8R` strips as `S8`** — an `S8R` with two opposite edges no other shell shares (a strip one
+  element wide, a lone element) in a model with a step ccx iterates drifts along its
+  `C3D20R`'s zero-energy mode (warned since 1.6.0). `--approximate` now writes such elements as
+  `S8` (`C3D20`), which stays on its linear answer (to 2e-6 under NLGEOM on strips, a plate's
+  appendix, an L of strips; as written up to 86 times off) and bends 1–7 % less than `S8R`
+  on strips of 4 to 8 elements (elements 5–50 thicknesses wide), 11–17 % on one; composite and plastic or creeping sections stay
+  `S8R` (`validate_with_ccx.py s8r_strip_s8`).
+
 ## 1.7.0 (November 2026)
 
 ### Overview
