@@ -19,6 +19,18 @@ entries. The GitHub release notes use the same section.
   some steps only. Without that hold ccx found spurious buckling factors (0.93 for 3.18), gave
   a plate 0.36 of its deflection, or stopped. Models with a modal transient step whose
   constraints act on such knots are now warned that ccx may crash at random there.
+* **Honest flags for weaker physics.** The converter now says so where ccx runs a model with
+  weaker physics than the deck's: creeping shells, plastic or creeping continuum shells (ccx
+  bends them at 2 points through the thickness), stabilized `*VISCO` and coupled
+  temperature-displacement steps (ccx has no stabilization), a strain-free `*MODEL CHANGE, ADD`
+  in a step ccx reads as linear (where ccx stops), and `--approximate`'s general contact where
+  bodies' faces end flush.
+* **Shell strips under `--approximate`.** An `S8R` strip one element wide drifts in ccx's
+  nonlinear solver (up to many times its deflection); `--approximate` now writes it as `S8`,
+  which keeps the right answer.
+* **More correct answers.** `*BOUNDARY, FIXED` on a translation of a node with a `*TRANSFORM`,
+  where earlier loads moved it, now holds the node where the step finds it. ccx held it at the
+  wrong value (the global component read as the local one), with a warning.
 
 ### Details
 
@@ -50,6 +62,59 @@ entries. The GitHub release notes use the same section.
   `*EQUATION` on a knot. A coupling of shell nodes needs the knots and ccx makes the reference
   node's rotations dependent itself, so no form avoids it; one of about 300 runs that finished
   printed other results. Such decks are now warned (rerun a crash, compare two runs).
+
+* **Creeping and continuum shells** — ccx 2.23 integrates an expanded shell's section through
+  the thickness at its brick's Gauss points and runs a continuum shell (`SC6R`/`SC8R`) as one
+  `C3D8I`/`C3D6` solid, 2 Gauss points through the thickness; Abaqus takes the section's
+  points (5 Simpson by default). In Norton creep bending 2 points give 0.71 / 0.52 times the
+  exact steady curvature rate at stress exponent 3 / 5 (5 Simpson points 0.98), and a plastic
+  continuum shell carries 1.15 times its limit load (probed on a strip in 4-point bending). A
+  creeping `*SHELL SECTION` (a nonlinear creep law in a deck that creeps; judged on the shells
+  as written, after `--approximate`'s `S4R` / `S3` rewrites), a plastic or creeping continuum
+  shell one element through the thickness (stacked ones integrate at 4 or more points), and a
+  composite section whose plastic or creeping layer the middle crosses (continuum shells too)
+  are now reduced physics, as plastic sheet shells already were; linear creep and a `SECTION
+  INTEGRATION=GAUSS` rule with ccx's points are not.
+* **Stabilization on `*VISCO` and coupled steps** — `STABILIZE`, `FACTOR`, `ALLSDTOL` and
+  `CONTINUE` on `*VISCO` and `*COUPLED TEMPERATURE-DISPLACEMENT` went to ccx, which ignores
+  them; they are now dropped with a warning, and a stabilized step ccx iterates is reduced
+  physics, as on `*STATIC`. (`*SOILS` and `*STEADY STATE TRANSPORT` have no ccx counterpart.)
+* **Strain-free `*MODEL CHANGE, ADD`** — ccx 2.23 adds elements strain free (`ADD`, as in
+  Abaqus, or `ADD=STRAIN FREE`) only in a step it runs nonlinearly and stops otherwise ('a
+  strain-free addition of elements ... is only possible for nonlinear calculations'), judged by
+  ccx's own flag as it reads the deck (set by NLGEOM, a nonlinear material, a contact pair or an
+  `*MPC`, turned off by a `*FREQUENCY` or `*BUCKLE` step); such a card is now warned, naming
+  `ADD=WITH STRAIN`, which runs.
+* **Flush faces in general contact** — under `--approximate`, slave nodes of the generated pairs
+  that lie on an edge where their master's faces end, straight off those faces (a lid on a
+  block of the same footprint, stacked blocks, or a conformal mesh line right under a block's
+  edge), are now warned of: ccx's node-to-surface
+  contact can miss them (two blocks: 81 % of a hand-written pair's force, 12 % with the coarser
+  mesh the slave, which a hand-written pair misses too; three stacked blocks 87 % of the exact
+  force).
+* **`S8R` strips as `S8`** — an `S8R` with two opposite edges no other shell shares (a strip one
+  element wide, a lone element) in a model with a step ccx iterates drifts along its
+  `C3D20R`'s zero-energy mode (warned since 1.6.0). `--approximate` now writes such elements as
+  `S8` (`C3D20`), which stays on its linear answer (to 2e-6 under NLGEOM on strips, a plate's
+  appendix, an L of strips; as written up to 86 times off) and bends 2–7 % less than `S8R`
+  on a strip of 4 elements (elements 5–50 thicknesses wide), 11–17 % on one; composite and
+  plastic or nonlinearly creeping sections stay `S8R`, and strips of a `*RIGID BODY` are left
+  alone (`validate_with_ccx.py s8r_strip_s8`).
+
+* **`*BOUNDARY, FIXED` on `*TRANSFORM` translations moved by loads** — where the held value is
+  unknown, the node now gets a helper node without a `*TRANSFORM`, tied to its local DOFs by
+  `*EQUATION`s, and FIXED goes on the helper. Every `*BOUNDARY` on the node's translations is
+  written on the helper: with a BC of the node's own on another local DOF, a later
+  `*BOUNDARY, OP=NEW` step leaves ccx's equations unmet. Exact against the model turned into the
+  node's axes (`validate_with_ccx.py fixed_helper`: a cube with `*FREQUENCY` and restore steps,
+  an S4 plate). Not where the node has rotational BCs or other constraints, elements other than
+  solids, CPS3/CPS4/CPS4R, CPE3/CPE4/CPE4R, S3/S4/S4R or B31/B31R (shells and beams: not knots,
+  no `*DYNAMIC` step), an initial velocity, a converter midside node next to it or a
+  `*TRANSFORM` inside a step, or in decks with explicit or modal dynamics: those keep the
+  warning. In an implicit `*DYNAMIC` step the held value is right, but ccx answers a BC that
+  stops a moving DOF along an oblique axis otherwise than one along a global axis, as with its
+  own BCs on transformed nodes (one C3D8: the model 3-21 % of its peak displacement off, the
+  node's free local DOFs up to 38 %): warned as reduced physics.
 
 ## 1.7.0 (November 2026)
 

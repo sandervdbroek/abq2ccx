@@ -331,10 +331,11 @@ def dat_displacement(dat_path, node):
 
 
 # The element-formulation flags a check's vehicle may carry beside what the check is about:
-# ccx's C3D8 locking where the material keeps its volume, its S3 wedge, a plastic shell
-# section's 2 Gauss points through the thickness (Converter._plan_volume_locking,
-# _plan_s3_shells, _plan_plastic_shells)
-VEHICLE_FLAGS = ("element C3D8 of a ", "element S3 (", "plastic *SHELL SECTION")
+# ccx's C3D8 locking where the material keeps its volume, its S3 wedge, a plastic or creeping
+# shell section's (a continuum shell's too) 2 Gauss points through the thickness
+# (Converter._plan_volume_locking, _plan_s3_shells, _plan_plastic_shells, _flag_inelastic_shells)
+VEHICLE_FLAGS = ("element C3D8 of a ", "element S3 (", "plastic *SHELL SECTION", "creeping *SHELL SECTION",
+                 "plastic continuum shells", "creeping continuum shells", "plastic or creeping continuum shells")
 
 
 def other_reduced(conv):
@@ -8554,6 +8555,58 @@ def fixed_transform_deck(kind):
     return ("*HEADING\nfixed transform\n" + cube + tr + "*STEP\n*STATIC\n*BOUNDARY\n" + given +
             "*CLOAD\n6, 1, 5.\n8, 2, 5.\n" + pr + "*END STEP\n*STEP\n*STATIC\n*BOUNDARY, OP=NEW\nBOT, 1, 3\n" +
             hold + "*CLOAD, OP=NEW\n5, 1, 10.\n6, 3, -5.\n" + pr + "*END STEP\n")
+
+
+def fixed_helper_deck(kind):
+    """Decks of the helper-node check: *BOUNDARY, FIXED on translations of a node with an
+    oblique *TRANSFORM, moved by loads before (a value the converter does not know), and twins
+    turned into the node's local axes (x' = R^T x, the other nodes' loads turned the same way):
+    without a *TRANSFORM, where ccx's FIXED holds a DOF along a global axis exactly.
+
+    * cube / cube_twin: the C3D8 cube of fixed_transform_deck: step 1 prescribes node 7's local
+      u2 and loads the node, step 2 (*BOUNDARY, OP=NEW on the base) holds its local u1-u3 with
+      FIXED under other loads (u2 at its known value, u1 and u3 through the helper node), step
+      3 a *FREQUENCY step, step 4 other loads (the base state's FIXED given again);
+    * plate / plate_twin: a 2 x 2 S4 plate clamped along x = 0, its free corner node 9 loaded,
+      then its local u2 held with FIXED under other loads."""
+    twin = kind.endswith("_twin")
+    ax = _t133_axes("obl", (0., 0., 0.))
+
+    def turn(v):
+        return tuple(sum(e[k] * v[k] for k in range(3)) for e in ax) if twin else v
+
+    def nodes(xyz):
+        return "*NODE, NSET=ALLN\n" + "".join(f"{n}, " + ", ".join(f"{c:.15g}" for c in turn(x)) + "\n"
+                                              for n, x in sorted(xyz.items()))
+
+    def loads(own, ls, op=""):
+        out = "*CLOAD" + op + "\n"
+        for n, f in ls:
+            g = f if n == own else turn(f)          # (a load on the node is in its local axes)
+            out += "".join(f"{n}, {d + 1}, {g[d]:.15g}\n" for d in range(3) if g[d] != 0.0)
+        return out
+    tr = "" if twin else "*TRANSFORM, NSET=NN\n%g, %g, %g, %g, %g, %g\n" % (_T133_A + _T133_B)
+    pr = "*NODE PRINT, NSET=ALLN, GLOBAL=YES\nU\n"
+    if kind.startswith("cube"):
+        xyz = {1: (0, 0, 0), 2: (1, 0, 0), 3: (1, 1, 0), 4: (0, 1, 0), 5: (0, 0, 1), 6: (1, 0, 1),
+               7: (1, 1, 1), 8: (0, 1, 1)}
+        return ("*HEADING\nfixed helper, cube\n" + nodes(xyz) + "*ELEMENT, TYPE=C3D8, ELSET=E\n"
+                "1, 1, 2, 3, 4, 5, 6, 7, 8\n*NSET, NSET=BOT\n1, 2, 3, 4\n*NSET, NSET=NN\n7\n"
+                "*SOLID SECTION, ELSET=E, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n1.\n" +
+                tr + "*BOUNDARY\nBOT, 1, 3\n*STEP\n*STATIC\n*BOUNDARY\n7, 2, 2, 0.01\n" +
+                loads(7, [(6, (5., 0., 0.)), (7, (3., 0., -2.)), (8, (0., 5., 0.))]) + pr + "*END STEP\n"
+                "*STEP\n*STATIC\n*BOUNDARY, OP=NEW\nBOT, 1, 3\n*BOUNDARY, FIXED\n7, 1, 3\n" +
+                loads(7, [(5, (10., 0., 0.)), (6, (0., 0., -5.))], ", OP=NEW") + pr + "*END STEP\n"
+                "*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP\n*STATIC\n" +
+                loads(7, [(8, (0., 5., 0.)), (5, (0., 0., 4.))], ", OP=NEW") + pr + "*END STEP\n")
+    xyz = {1 + i + 3 * j: (float(i), float(j), 0.) for j in range(3) for i in range(3)}
+    return ("*HEADING\nfixed helper, plate\n" + nodes(xyz) + "*ELEMENT, TYPE=S4, ELSET=E\n1, 1, 2, 5, 4\n"
+            "2, 2, 3, 6, 5\n3, 4, 5, 8, 7\n4, 5, 6, 9, 8\n*NSET, NSET=NN\n9\n*SHELL SECTION, ELSET=E, "
+            "MATERIAL=M\n0.1\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n" + tr +
+            "*BOUNDARY\n1, 1, 6\n4, 1, 6\n7, 1, 6\n*STEP\n*STATIC\n" +
+            loads(9, [(9, (2., 1., -0.02)), (6, (1., 0., 0.01))]) + pr + "*END STEP\n*STEP\n*STATIC\n"
+            "*BOUNDARY, FIXED\n9, 2, 2\n" + loads(9, [(3, (0., 0., 0.02)), (6, (0.5, 2., 0.))], ", OP=NEW") +
+            pr + "*END STEP\n")
 
 
 def _t133_axes(kind, p):
@@ -19110,6 +19163,65 @@ def check_t133(ccx, env, tmp, shared):
     return failures
 
 
+@check("fixed_helper", "*BOUNDARY, FIXED on *TRANSFORM translations moved by loads: helper nodes")
+def check_fixed_helper(ccx, env, tmp, shared):
+    # --- *BOUNDARY, FIXED on *TRANSFORM translations whose value the converter does not know:
+    # a helper node tied to the local DOF, FIXED on it, against the model turned into the
+    # node's axes (ccx 2.23's own FIXED holds the global component there) ---
+    failures = 0
+    ax = _t133_axes("obl", (0., 0., 0.))
+
+    def local(u):
+        return tuple(sum(e[k] * u[k] for k in range(3)) for e in ax)
+
+    def solve(kind):
+        """(the displacement blocks, report text, reduced physics) of fixed_helper_deck(kind)
+        converted and solved, or None."""
+        src, inp = os.path.join(tmp, f"fh_{kind}_src.inp"), os.path.join(tmp, f"fh_{kind}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(fixed_helper_deck(kind))
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        blocks = dat_node_blocks(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if blocks is None:
+            print(f"FAIL  fixed_helper {kind}: did not solve ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+        return None if blocks is None else (blocks, rep.text(), conv.reduced_physics)
+    for kind, node, dofs, what in (
+            ("cube", 7, (1, 3), "a C3D8 cube, node 7's local u1-u3 held with FIXED (u2 at the value "
+                                "step 1 gave it, u1 and u3 moved by its loads), then a *FREQUENCY step "
+                                "and a step giving the base state again"),
+            ("plate", 9, (2,), "a 2 x 2 S4 plate, its free corner's local u2 held with FIXED after a "
+                               "step that loads the corner")):
+        got, ref = solve(kind), solve(kind + "_twin")
+        ok = bool(got and ref)
+        if ok:
+            # the static steps' blocks (the *FREQUENCY step prints its modes, of either sign)
+            pick = [0, 1, -1] if kind == "cube" else [0, 1]
+            a = [{n: local(u) for n, u in got[0][i].items()} for i in pick]
+            b = [ref[0][i] for i in pick]
+            ok = all(set(p) == set(q) for p, q in zip(a, b))
+            err = max(abs(x - y) for p, q in zip(a, b) for n in q for x, y in zip(p.get(n, ()), q[n])) \
+                if ok else math.inf
+            scale = max(abs(x) for q in b for u in q.values() for x in u)
+            held = max(abs(a[1][node][d - 1] - a[0][node][d - 1]) for d in dofs)
+            moved = max(abs(x - y) for n in b[1] for x, y in zip(b[1][n], b[0][n]))
+            # (ccx 2.23's FIXED held the global components at step 1: so far off)
+            before = max(abs(got[0][0][node][d - 1] - a[0][node][d - 1]) for d in dofs)
+            helper = "held through a helper node" in " ".join(got[1].split())
+            ok = ok and err <= 1e-5 * scale and held <= 1e-6 * scale and moved > 1e-3 and \
+                before > 1e-3 and helper and not got[2] and not ref[2]
+            print(f"{'PASS' if ok else 'FAIL'}  fixed_helper_{kind} ({what}): the model turned into the "
+                  f"node's axes, held there by ccx's FIXED along a global axis ({err:.1e} apart of "
+                  f"{scale:.3g}; the node held to {held:.1e}, the model moved {moved:.4g} in step 2; "
+                  f"before: held at step 1's global components, {before:.4g} off)")
+            if not helper or got[2]:
+                print("      helper node form not used, or reduced: " + "; ".join(got[2]))
+        failures += 0 if ok else 1
+    return failures
+
+
 @check("contact_property_tables", "contact property tables ccx reads otherwise than Abaqus")
 def check_contact_property_tables(ccx, env, tmp, shared):
     # --- contact property tables ccx reads otherwise than Abaqus -------------------------------
@@ -19613,6 +19725,34 @@ def check_t155(ccx, env, tmp, shared):
               f"{'warned' if flags[1] else 'not warned'}")
     failures += 0 if ok else 1
     return failures
+
+
+@check("s8r_strip_s8", "S8R strips one element wide written as S8 under --approximate")
+def check_s8r_strip_s8(ccx, env, tmp, shared):
+    # --- task 159: an S8R strip one element wide in an NLGEOM step (a load 1e-4 as large, so
+    # the answer is the linear one): as written it drifts along the C3D20R's zero-energy mode;
+    # --approximate writes S8 (C3D20), which keeps its own linear answer ---
+    review_run, same = shared["review_run"], shared["same"]
+
+    def small(text):
+        return re.sub(r"(?m)^(\d+, 3, )([0-9.eE+-]+)$", lambda m: f"{m.group(1)}{float(m.group(2)) * 1e-4:.8g}",
+                      text)
+    nl = small(t155_s8r_deck(1, False)).replace("*STEP\n", "*STEP, NLGEOM\n")
+    lin = {typ: small(t155_s8r_deck(1, False)).replace("TYPE=S8R", f"TYPE={typ}") for typ in ("S8R", "S8")}
+    runs = [review_run(nl, "s8r_strip_s8_nl", dat_node_blocks, approximate=True),
+            review_run(lin["S8"], "s8r_strip_s8_lin", dat_node_blocks),
+            review_run(nl, "s8r_strip_s8r_nl", dat_node_blocks),
+            review_run(lin["S8R"], "s8r_strip_s8r_lin", dat_node_blocks)]
+    with open(os.path.join(tmp, "s8r_strip_s8_nl.inp"), encoding="utf-8") as fh:
+        written = "*ELEMENT, TYPE=S8\n" in fh.read()
+    ok = all(runs) and written
+    if ok:
+        (d, m), (d0, m0) = same(runs[0:2]), same(runs[2:4])
+        ok = d <= 1e-4 * m and m > 1e-9 and d0 > 0.03 * m0
+        print(f"{'PASS' if ok else 'FAIL'}  s8r_strip_s8 (an S8R cantilever strip one element wide, "
+              f"NLGEOM at a small load): --approximate's S8 {d / m:.1e} of |u| {m:.4g} off its linear "
+              f"answer; as written (S8R) {d0 / m0:.3g} off")
+    return 0 if ok else 1
 
 
 @check("norton_creep_floor",
