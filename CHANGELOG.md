@@ -21,6 +21,9 @@ entries. The GitHub release notes use the same section.
 * **Shell strips under `--approximate`.** An `S8R` strip one element wide drifts in ccx's
   nonlinear solver (up to many times its deflection); `--approximate` now writes it as `S8`,
   which keeps the right answer.
+* **More correct answers.** `*BOUNDARY, FIXED` on a translation of a node with a `*TRANSFORM`,
+  where earlier loads moved it, now holds the node where the step finds it. ccx held it at the
+  wrong value (the global component read as the local one), with a warning.
 
 ### Details
 
@@ -61,6 +64,21 @@ entries. The GitHub release notes use the same section.
   on a strip of 4 elements (elements 5–50 thicknesses wide), 11–17 % on one; composite and
   plastic or nonlinearly creeping sections stay `S8R`, and strips of a `*RIGID BODY` are left
   alone (`validate_with_ccx.py s8r_strip_s8`).
+
+* **`*BOUNDARY, FIXED` on `*TRANSFORM` translations moved by loads** — where the held value is
+  unknown, the node now gets a helper node without a `*TRANSFORM`, tied to its local DOFs by
+  `*EQUATION`s, and FIXED goes on the helper. Every `*BOUNDARY` on the node's translations is
+  written on the helper: with a BC of the node's own on another local DOF, a later
+  `*BOUNDARY, OP=NEW` step leaves ccx's equations unmet. Exact against the model turned into the
+  node's axes (`validate_with_ccx.py fixed_helper`: a cube with `*FREQUENCY` and restore steps,
+  an S4 plate). Not where the node has rotational BCs or other constraints, elements other than
+  solids, CPS3/CPS4/CPS4R, CPE3/CPE4/CPE4R, S3/S4/S4R or B31/B31R (shells and beams: not knots,
+  no `*DYNAMIC` step), an initial velocity, a converter midside node next to it or a
+  `*TRANSFORM` inside a step, or in decks with explicit or modal dynamics: those keep the
+  warning. In an implicit `*DYNAMIC` step the held value is right, but ccx answers a BC that
+  stops a moving DOF along an oblique axis otherwise than one along a global axis, as with its
+  own BCs on transformed nodes (one C3D8: the model 3-21 % of its peak displacement off, the
+  node's free local DOFs up to 38 %): warned as reduced physics.
 
 ## 1.7.0 (November 2026)
 
