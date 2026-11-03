@@ -30,12 +30,17 @@ entries. The GitHub release notes use the same section.
   knot: the solid is joined at the node and the shell's section turns rigidly about it, its
   rotation about the normal held. Probed: the skin as a layer of the shell's own expansion
   elements exactly (S4, S4R; also NLGEOM, frequencies, dynamics), S8R within 7e-4
-  (`validate_with_ccx.py tie_leftovers_offset_top` / `_bot`; before 11 % off). In a deck with an
-  explicit step or U1 beams, which stop ccx with knot beams, it is warned as reduced physics.
+  (`validate_with_ccx.py tie_leftovers_offset_top` / `_bot`; before 11 % off). They turn linearly
+  where ccx iterates a step without NLGEOM (plastic, coupled), but finitely in a `*DYNAMIC` step
+  (7e-3 at 0.17 rad), warned there as for other knots. In a deck with an explicit step or U1
+  beams, which stop ccx with knot beams, it is warned as reduced physics.
 * **`*TIE, TIED NSET`** — the line's slave becomes a node surface of the slave nodes in the set
   (none of the master's), with a `POSITION TOLERANCE` that reaches each of them: Abaqus ties
   those nodes whatever their distance from the master, and ccx's `ADJUST` moves them onto it as
-  Abaqus' does. A set with no slave node ties nothing (a comment); an undefined one is warned.
+  Abaqus' does; an instance-qualified set (`U1.TN`) resolves. A set with no slave node ties
+  nothing (a comment); an undefined one is warned. Set nodes beyond the master's edge, which
+  Abaqus ties to its nearest point, ccx ties to nothing ('no opposite master face'): warned as
+  reduced physics.
   `validate_with_ccx.py tie_leftovers_nset` / `_nset_skin` / `_nset_plane`: the set's nodes
   merged (tied by equations with `ADJUST=NO`), exactly. On plane, axisymmetric, membrane or beam
   elements ccx's `ADJUST` moves a node but not the solid it expands the element to (9-11 % off),

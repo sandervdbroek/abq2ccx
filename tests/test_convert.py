@@ -1280,6 +1280,33 @@ def test_tie_tied_nset_ties_the_sets_slave_nodes_whatever_their_distance():
     assert conv.reduced_physics == ["*TIE, TIED NSET: slave nodes of expanded elements moved onto the master"]
     body, conv, rep = convert_str(plane.format(", ADJUST=NO"))
     assert "SL_TIED, MA" in body and not conv.reduced_physics
+    # set nodes beyond the master's edge: Abaqus ties them to its nearest point (the edge), ccx
+    # to nothing ('no opposite master face'): warned, reduced physics, not "Exact"
+    wide = TIED_NSET_BLOCKS.replace("*ELEMENT, TYPE=C3D8, ELSET=UP\n2, 15, 16, 17, 18, 19, 20, 21, 22\n",
+                                    "23, 2.,0.,{z}\n24, 2.,1.,{z}\n25, 2.,0.,2.\n26, 2.,1.,2.\n"
+                                    "*ELEMENT, TYPE=C3D8, ELSET=UP\n2, 15, 16, 17, 18, 19, 20, 21, 22\n"
+                                    "3, 16, 23, 24, 17, 20, 25, 26, 21\n")
+    body, conv, rep = convert_str(wide.format(z="1.", slave="\nUP, S1", tie="*NSET, NSET=TN\n15, 16, 17, 18, 23, "
+                                              "24\n*TIE, NAME=GLUE, TIED NSET=TN, ADJUST=NO\nSL, MA\n"))
+    assert "SL_TIED, MA" in body and "2 of its slave node(s) (e.g. node 23) have no master face" in rep.text()
+    assert conv.reduced_physics == ["*TIE, TIED NSET: slave nodes beyond the master's edge left untied"]
+    assert "in that set (not on MA)" in rep.text() and "TIED NSET). Exact." not in rep.text()
+
+
+def test_tie_tied_nset_of_an_instance():
+    # an instance-qualified TIED NSET (CAE's *NSET in a part) resolves like a data-line member
+    part = ("*PART, NAME={0}\n*NODE\n1, 0.,0.,{1}\n2, 1.,0.,{1}\n3, 1.,1.,{1}\n4, 0.,1.,{1}\n5, 0.,0.,{2}\n"
+            "6, 1.,0.,{2}\n7, 1.,1.,{2}\n8, 0.,1.,{2}\n*ELEMENT, TYPE=C3D8, ELSET=E\n1, 1,2,3,4,5,6,7,8\n{3}"
+            "*SOLID SECTION, ELSET=E, MATERIAL=M\n*END PART\n")
+    deck = (part.format("LOW", "0.", "1.", "*SURFACE, NAME=MA\nE, S2\n*NSET, NSET=BASE\n1, 2, 3, 4\n") +
+            part.format("UP", "1.3", "2.3", "*SURFACE, NAME=SL\nE, S1\n*NSET, NSET=TN\n1, 2\n") +
+            "*ASSEMBLY, NAME=A\n*INSTANCE, NAME=L1, PART=LOW\n*END INSTANCE\n*INSTANCE, NAME=U1, PART=UP\n"
+            "*END INSTANCE\n*TIE, NAME=GLUE, TIED NSET=U1.TN\nU1.SL, L1.MA\n*END ASSEMBLY\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n100., 0.3\n*STEP\n*STATIC\n*BOUNDARY\nL1.BASE, 1, 3\n*END STEP\n")
+    body, conv, rep = convert_str(deck)
+    assert "*SURFACE, NAME=U1_SL_TIED, TYPE=NODE\n9\n10\n*TIE, NAME=GLUE, POSITION TOLERANCE=0.315\n" \
+        "U1_SL_TIED, L1_MA\n" in body
+    assert "is not a node set" not in rep.text() and not conv.reduced_physics
 
 
 def test_offset_shell_nodes_on_solids_get_knot_beams():
@@ -1303,6 +1330,14 @@ def test_offset_shell_nodes_on_solids_get_knot_beams():
     body, conv, rep = convert_str(deck.format(off=", OFFSET=SPOS", step="*DYNAMIC, EXPLICIT\n, 1e-3"))
     assert not conv._knots and "The knot beams that join it at the node were not added" in rep.text()
     assert "shell OFFSET at nodes shared with solids (ccx joins the midsurface)" in conv.reduced_physics
+    # these knots turn linearly in a step ccx iterates without NLGEOM (a never-reached *PLASTIC:
+    # probed equal to the layer twin at 0.1 rad), not in a *DYNAMIC step (7e-3 at 0.17 rad)
+    turned = "shell/beam rotations turned with the finite rotation in a geometrically linear step"
+    plastic = deck.replace("*ELASTIC\n100., 0.3\n", "*ELASTIC\n100., 0.3\n*PLASTIC\n1e9, 0.\n")
+    body, conv, rep = convert_str(plastic.format(off=", OFFSET=-0.5", step="*STATIC"))
+    assert sorted(conv._knots) == [5, 6, 7, 8] and turned not in conv.reduced_physics
+    body, conv, rep = convert_str(deck.format(off=", OFFSET=-0.5", step="*DYNAMIC\n0.1, 1."))
+    assert sorted(conv._knots) == [5, 6, 7, 8] and turned in conv.reduced_physics
 
 
 def test_tie_slave_trimming_on_a_shell_master_with_a_section_thickness():

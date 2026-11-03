@@ -9827,8 +9827,10 @@ class _Mesh:
         wedge).  But ccx moves a node of elements it expands (plane, axisymmetric, membrane,
         beam) and not the solid it expands them to: such nodes off the master with ADJUST are
         9-11 % off the nodes moved (CPS4 / CAX4), warned, reduced physics (shells:
-        _shell_tie_slave).  None where the surfaces or the set are not the deck's (an
-        undefined set: warned, the line kept)."""
+        _shell_tie_slave).  Set nodes beyond the master's edge, which Abaqus ties to its
+        nearest point there, ccx ties to nothing (_beyond_master): warned, reduced physics.
+        None where the surfaces or the set are not the deck's (an undefined set: warned, the
+        line kept)."""
         nset = (b.param("TIED NSET") or "").strip()
         sd, md = self.surfaces.get(slave.upper()), self.surfaces.get(master.upper())
         if sd is None or md is None or md[0].startswith("NODE"):
@@ -9872,6 +9874,14 @@ class _Mesh:
                              f"(probed: CPS4 / CAX4 strips 11 % / 9 % off the nodes moved; ADJUST=NO "
                              f"exact) — verify.", once=True)
             self._reduces("*TIE, TIED NSET: slave nodes of expanded elements moved onto the master")
+        beyond = self._beyond_master(chosen, mf, tol)
+        if beyond:
+            self.report.warn(f"*TIE {b.param('NAME') or ''}, TIED NSET={nset}: {len(beyond)} of its slave "
+                             f"node(s) (e.g. node {beyond[0]}) have no master face opposite them (beyond "
+                             f"the edge of {master}): Abaqus ties them to the nearest point of the master "
+                             f"(its edge), ccx 2.23 ties no such node ('no tied MPC generated ... no "
+                             f"opposite master face'), so they stay free — verify.", once=True)
+            self._reduces("*TIE, TIED NSET: slave nodes beyond the master's edge left untied")
         self._reserve_names()
         name = self._fresh_name(f"{slave}_TIED")
         self._mem_surfaces[key] = name
@@ -9880,8 +9890,55 @@ class _Mesh:
                          f"the {len(chosen)} node(s) of {slave} in that set (not on {master}), with a "
                          f"POSITION TOLERANCE that reaches each of them: Abaqus ties exactly those "
                          f"nodes, whatever their distance from the master (ccx has no TIED NSET)."
-                         f"{'' if moved else ' Exact.'}", once=True)
+                         f"{'' if moved or beyond else ' Exact.'}", once=True)
         return name, [f"*SURFACE, NAME={name}, TYPE=NODE"] + [str(n) for n in chosen], tol
+
+    def _beyond_master(self, nodes: Sequence[int], facets: Sequence[Tuple[int, List[int], int]],
+                       tol: float) -> List[int]:
+        """The nodes of ``nodes`` that project onto no facet of ``facets`` (_facet: element,
+        nodes, corners) within ``tol`` of it — its triangles (a quadrilateral split along a
+        diagonal) or its segment, with 1 % of the facet's size to spare.  ccx 2.23 ties a node
+        only to a master face opposite it, its projection inside the face within 2.5 % of the
+        element size ('no tied MPC generated ... no opposite master face', gentiedmpc), where
+        Abaqus measures to the nearest point of the master, an edge too ("Mesh tie
+        constraints")."""
+        pts = self.geom.nodes
+        items: List[Tuple[List[float], List[float], float, List[Tuple[Vec, ...]]]] = []
+        for _e, fn, c in facets:
+            ps = [pts.get(n) for n in fn[:c]]
+            if c < 2 or len(ps) < c or any(p is None for p in ps):
+                continue
+            parts: List[Tuple[Vec, ...]] = [(ps[0], ps[1])] if c == 2 else \
+                [(ps[0], ps[1], ps[2])] + ([(ps[0], ps[2], ps[3])] if c == 4 else [])
+            items.append(([min(p[k] for p in ps) - tol for k in range(3)],
+                          [max(p[k] for p in ps) + tol for k in range(3)],
+                          max(math.dist(a, q) for a in ps for q in ps), parts))
+        cell = max([hi[k] - lo[k] for lo, hi, _s, _p in items for k in range(3)] or [0.0]) or 1.0
+        grid: Dict[Tuple[int, ...], List[int]] = {}
+        for i, (lo, hi, _s, _p) in enumerate(items):
+            for key in itertools.product(*[range(math.floor(lo[k] / cell), math.floor(hi[k] / cell) + 1)
+                                           for k in range(3)]):
+                grid.setdefault(key, []).append(i)
+
+        def off(p: Vec, part: Tuple[Vec, ...]) -> float:
+            """How far the projection of ``p`` onto the plane (line) of ``part`` lies outside it."""
+            if len(part) == 2:
+                ab = vsub(part[1], part[0])
+                t = vdot(vsub(p, part[0]), ab) / vdot(ab, ab) if vdot(ab, ab) else 0.0
+                return (max(0.0, -t) + max(0.0, t - 1.0)) * vnorm(ab)
+            nrm = vcross(vsub(part[1], part[0]), vsub(part[2], part[0]))
+            if not vnorm(nrm):
+                return math.inf
+            d = vsub(p, closest_on_triangle(p, *part))
+            return vnorm(vsub(d, vscale(nrm, vdot(d, nrm) / vdot(nrm, nrm))))
+        out = []
+        for n in nodes:
+            p = pts[n]
+            if not any(all(items[i][0][k] <= p[k] <= items[i][1][k] for k in range(3)) and
+                       any(off(p, part) <= 0.01 * items[i][2] for part in items[i][3])
+                       for i in grid.get(tuple(math.floor(p[k] / cell) for k in range(3)), [])):
+                out.append(n)
+        return out
 
     def _surface_turns(self, surf: str) -> bool:
         """Whether surface ``surf`` lies on elements with rotations (conventional shells,
@@ -26257,6 +26314,11 @@ class _Constraints:
         # (knot beams of _plan_beam_section_axes whose rotations stay held at zero turn nothing)
         knots = (set(self._knots) | {n for n in own if self._ccx_knot(n, sections, at) is True}) - \
             self._still_knots
+        if not {st.no for st in self.steps if st.proc == "DYNAMIC"} & set(steps):
+            # (an offset skin's knots on solids turn linearly there: probed, a never-reached
+            # *PLASTIC at 0.1 rad equal to the linear layer twin to 7 digits; a *DYNAMIC step
+            # turns them, 7e-3 at 0.17 rad)
+            knots -= self._offset_knots
         if knots:
             # (nor does a knot whose DOFs 4-6 displacement BCs hold at zero up to the last such
             # step: its RIGID MPC only translates; probed exact on a B31 frame joint)
@@ -33280,6 +33342,7 @@ class _Constraints:
             self._reduces("shell OFFSET at nodes shared with solids (ccx joins the midsurface)")
             return
         self._add_knot_beams(need, blocks)
+        self._offset_knots = set(need)
         self.report.note(f"{what}; each got a force-free knot beam (elset/material {KNOT_SET}, no "
                          f"density), which joins the solid at the node with the shell's section rigid "
                          f"about it (probed: the skin as a layer of its expansion elements exactly).",
@@ -43399,7 +43462,8 @@ class _PostPasses:
         Not by an equation in a deck with a *MODAL DYNAMIC step: ccx 2.23 crashes there at
         random on any equation that eliminates a knot's rotation (probed: 9-12 of 50 runs, exit
         -11 / -10 / -6, as the step starts; a *BOUNDARY there: none of 50), so such a knot
-        stays as it was, warned."""
+        stays as it was, warned — silently where solids share the node: probed free on an
+        offset skin turned 30 deg (_plan_offset_solid_knots), its layer twin's response to 6e-9."""
         knots = set(self._knots)
         if not knots or getattr(self.opt, "solid_dof", False):
             return deck
@@ -43477,7 +43541,8 @@ class _PostPasses:
             if any((n, d) in anywhere for _n, d, _c in terms):
                 mixed.append(n)
             elif "MODAL DYNAMIC" in self.steps.procs:
-                loose.append(n)
+                if len(own) == len(types):          # (with solids at it: probed harmless free, an
+                    loose.append(n)                 # offset skin turned 30 deg, 6e-9 off its twin)
             else:
                 rows.append(terms)
         if loose:
@@ -45074,6 +45139,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # (n1, n2, beam axis); they are in _untr too (their cards in local components)
         self._sect_axes: Dict[int, Tuple[Vec, Vec, Vec]] = {}
         self._still_knots: set = set()             # ... and their knot beams held at zero throughout
+        self._offset_knots: set = set()            # knots of offset shells on solids (_plan_offset_solid_knots)
         self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
         # *DISTRIBUTION orientations (see _plan_distributions)
         self._dist_cards: Dict[str, Block] = {}    # NAME -> *DISTRIBUTION, "" too (_plan_deck_facts)
@@ -47104,7 +47170,7 @@ ELEM_IC_TYPES = {"DAMAGE INITIATION", "ENRICHMENT", "HARDENING", "INITIAL GAP", 
 # instance-qualified value here must be resolved exactly like a data-line member;
 # a plain name is already global.  (REF/ROT NODE point at a node or 1-node set.)
 REF_PARAMS = {"NSET", "ELSET", "SURFACE", "SLAVE", "MASTER", "REF NODE", "ROT NODE", "PIN NSET",
-              "TIE NSET", "ANALYTICAL SURFACE"}
+              "TIE NSET", "TIED NSET", "ANALYTICAL SURFACE"}
 # ... and those that do so on one card only: the pre-tension node and the truss or beam
 # element of a *PRE-TENSION SECTION (a number or a one-member set).
 CARD_REF_PARAMS = {"PRE-TENSION SECTION": ("NODE", "ELEMENT"), "EMBEDDED ELEMENT": ("HOST ELSET",)}
