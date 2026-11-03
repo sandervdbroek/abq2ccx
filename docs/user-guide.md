@@ -120,6 +120,7 @@ a different model without saying so. With it, these reframings are made, each wi
 * a connector under NLGEOM whose linear form is not exact (a hinge between two moving
   bodies), and connector springs, dashpots, motions and loads on rotation components or turning
   local directions under NLGEOM → written in their linear form;
+* `SPRING1` / `SPRING2` on rotations (DOFs 4-6) under NLGEOM → written in their linear form;
 * an `*MPC LINK` → ccx's distance MPC in a deck whose first step is linear and a later one
   NLGEOM;
 * `S4R` shells (ccx 2.23 bends them only through their `C3D8R`'s hourglass stiffness) → `S4`,

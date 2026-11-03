@@ -10495,7 +10495,6 @@ class _Mesh:
                         card_of.setdefault(e, b)
                         self._dashpot_cards.add(id(b))
         dropped: "OrderedDict[Tuple[str, str], List[int]]" = OrderedDict()
-        span = self._model_span()
         unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
         made: Dict[str, int] = {}
         for e, typ in types.items():
@@ -10524,32 +10523,10 @@ class _Mesh:
             if why:
                 dropped.setdefault((typ, why), []).append(e)
                 continue
-            v = vunit(axes[0][ds[0] - 1])
-            plane = n in self._plane_only
-            g = max(self.geom.nodes) + 1
-            self.geom.add_node(g, vsub(self.geom.nodes[n], vscale(v, span)))
-            self.geom.elements[e] = ("DASHPOTA", [n, g])
-            w1 = vunit(vcross((0.0, 0.0, 1.0), v)) if plane else \
-                vunit(vcross(v, unit[min(range(3), key=lambda k: abs(v[k]))]))
-            w2 = vcross(v, w1)
-            frame = (v, w1, w2)
-            rows = [[(g, k + 1, f[k]) for k in range(3) if abs(f[k]) > 1e-12] for f in frame]
-            if len(ends) > 1:                      # (DASHPOT2: g moves with node b's DOF j)
-                rows[0] += self._dir_terms(ends[1], vscale(vunit(axes[1][ds[1] - 1]), -1.0), plan=True)
-            rows[1] += self._dir_terms(n, vscale(w1, -1.0), plan=True)
-            if not plane:                          # (a plane model's node does not leave it)
-                rows[2] += self._dir_terms(n, vscale(w2, -1.0), plan=True)
-            # g's DOFs are eliminated, a different one in each row (the largest product)
-            p = max(itertools.permutations(range(3)),
-                    key=lambda q: abs(frame[0][q[0]] * frame[1][q[1]] * frame[2][q[2]]))
-            for j, rw in enumerate(rows):
-                first = next(t for t in rw if t[0] == g and t[1] == p[j] + 1)
-                self._dashpot_rows.append([first] + [t for t in rw if t is not first])
-            # the node's temperatures; a step that solves for them: its temperature (ccx gives
-            # the ground node one, and a free one stops ccx, probed: exit 255)
-            self._tied_nodes.append((n, n, g, 0.0))
-            if self._mpc_thermal:
-                self._dashpot_rows.append([(g, 11, 1.0), (n, 11, -1.0)])
+            # (DASHPOT2: g moves with node b's DOF j)
+            far = self._dir_terms(ends[1], vscale(vunit(axes[1][ds[1] - 1]), -1.0), plan=True) \
+                if len(ends) > 1 else []
+            self._line_element(e, "DASHPOTA", n, vunit(axes[0][ds[0] - 1]), far, self._dashpot_rows)
             made[typ] = made.get(typ, 0) + 1
         for (typ, why), es in dropped.items():
             self.report.warn(f"{typ} element(s) {', '.join(map(str, es[:5]))}"
@@ -10576,67 +10553,265 @@ class _Mesh:
                              f"it: the dashpot acts on Abaqus' relative velocity in the fixed "
                              f"directions, also under NLGEOM (validate_with_ccx.py dashpot2_dofs).")
 
-    def _plan_transformed_springs(self, blocks: List[Block]) -> None:
-        """SPRING1 / SPRING2 elements on a node with a *TRANSFORM, of a *SPRING without
-        ORIENTATION=: Abaqus' DOF d there is the node's local one ('Transformed coordinate
-        systems': a transform 'should not be defined at a node that is connected only to a
-        SPRING1 or SPRING2 element', as they have one active DOF), ccx 2.23 springs the global
-        DOF (probed: a SPRING1 on DOF 1, k = 100, of a node turned 30 degrees about z and held
-        across its local axis 1 moved 1/75 along it under a unit force, where 1/100 is right; an
-        ORIENTATION= it reads as Abaqus does).  So the node's place in the element goes to a new
-        node t without one, tied by u_t,d = u_n . v (v the local axis d) and held in its other
-        DOFs (_spring_rows): the spring acts on the local DOF, also under NLGEOM (springs act in
-        a fixed direction).  One t per node and DOF; it takes the node's temperatures.  A
-        rotational DOF off its global axis, or undefined local axes: warned."""
-        twin: Dict[Tuple[int, int], int] = {}
-        made: set = set()
-        lost: List[str] = []
+    def _line_element(self, e: int, typ: str, n: int, v: Vec, far: List[Tuple[int, int, float]],
+                      rows: List[List[Tuple[int, int, float]]]) -> None:
+        """Element ``e`` as a ``typ`` (DASHPOTA / SPRINGA) from node ``n`` to a new node g a
+        model span away along -v (v a unit vector), which *EQUATIONs (into ``rows``) hold at
+        u_g . v = -``far`` (the terms of the other end's DOF, negated; none: ground) and
+        u_g . w = u_n . w for the two w normal to v (a plane model's node: the one in its
+        plane): the line n-g stays along v, so the element acts along v at any motion
+        (_plan_dashpots, _plan_springs).  g takes n's temperatures, and where a step solves
+        for them T_g = T_n (ccx gives the ground node one, and a free one stops ccx, probed:
+        exit 255)."""
+        unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        plane = n in self._plane_only
+        g = max(self.geom.nodes) + 1
+        self.geom.add_node(g, vsub(self.geom.nodes[n], vscale(v, self._model_span())))
+        self.geom.elements[e] = (typ, [n, g])
+        w1 = vunit(vcross((0.0, 0.0, 1.0), v)) if plane else \
+            vunit(vcross(v, unit[min(range(3), key=lambda k: abs(v[k]))]))
+        w2 = vcross(v, w1)
+        frame = (v, w1, w2)
+        rws = [[(g, k + 1, f[k]) for k in range(3) if abs(f[k]) > 1e-12] for f in frame]
+        rws[0] += far
+        rws[1] += self._dir_terms(n, vscale(w1, -1.0), plan=True)
+        if not plane:                          # (a plane model's node does not leave it)
+            rws[2] += self._dir_terms(n, vscale(w2, -1.0), plan=True)
+        # g's DOFs are eliminated, a different one in each row (the largest product)
+        p = max(itertools.permutations(range(3)),
+                key=lambda q: abs(frame[0][q[0]] * frame[1][q[1]] * frame[2][q[2]]))
+        for j, rw in enumerate(rws):
+            first = next(t for t in rw if t[0] == g and t[1] == p[j] + 1)
+            rows.append([first] + [t for t in rw if t is not first])
+        self._tied_nodes.append((n, n, g, 0.0))
+        if self._mpc_thermal:
+            rows.append([(g, 11, 1.0), (n, 11, -1.0)])
+
+    def _plan_springs(self, blocks: List[Block]) -> None:
+        """SPRING1 / SPRING2 elements that ccx 2.23 springs wrongly, rewritten — every element
+        of their *SPRING card, which then loses its DOF line and ORIENTATION= (handle_spring).
+        Abaqus' DOF acts along a fixed direction v: the card's ORIENTATION axis, else the
+        node's *TRANSFORM axis (its DOFs are local), else the global one.
+
+        * Translations: ccx springs the global DOF at a node with a *TRANSFORM (probed: a
+          SPRING1 of 100 on DOF 1 of a node turned 30 degrees moved 1/75 for 1/100), and its
+          small-strain solve drops what a nonzero BC on an MPC's other DOFs puts on a spring
+          on the MPC's eliminated DOF (probed: u5x = 0.5 u6x + u300x with u300x = 0.01 moved a
+          SPRING1's node 8.78e-3 for 7.70e-3; a rigid body's member, a kinematic coupling's,
+          under a moving reference node likewise; a beam node is right).  A spring on a node
+          with a *TRANSFORM or any constraint becomes a SPRINGA from its first node to a node
+          held on the DOF's line (_line_element): exact, also under NLGEOM (probed) — but on
+          a member of ccx's own rigid body or kinematic coupling, whose equations ccx solves
+          off under NLGEOM (1.2 %, probed), where a deck with NLGEOM keeps the SPRING1 / SPRING2
+          (warned where a small-strain step would mishandle it).
+        * Rotations (DOFs 4-6): ccx's springs act on translations only (probed: a SPRING1 on
+          DOF 5 of a beam tip changed nothing).  A helper node h whose DOF 1 an *EQUATION
+          ties to v . theta (less the second end's DOF for a SPRING2), held across it, gets a
+          SPRINGA to a held node a span away along -x — the rotation where ccx carries it: a
+          reference point's ROT NODE, DOFs 4-6 of a kinematic coupling's reference node, of a
+          U1 node or of a knot (a shell/beam node gets a knot beam).  Exact for small
+          rotations; under NLGEOM [APPROX] (--approximate), else the element is left out.  On
+          a node without rotations (a solid's, a free one) the element is left out: nothing
+          else stiffens that DOF in Abaqus.
+        The new nodes take the node's temperatures (T = T_n where a step solves for them)."""
+        cards = []
         for b in blocks:
-            if b.keyword != "SPRING" or (b.param("ORIENTATION") or "").strip() or not b.data:
+            if b.keyword != "SPRING" or id(b) in self._joint_cards or not b.data:
                 continue
+            es = [e for e in self.geom.elset((b.param("ELSET") or "").strip())
+                  if self.geom.elements.get(e, ("",))[0].upper() in ("SPRING1", "SPRING2")]
             try:
                 ds = [pint(x) for x in trimmed_fields(b.data[0].split(",")) if x]
             except ValueError:
                 continue
-            for e in self.geom.elset((b.param("ELSET") or "").strip()):
-                typ, conn = self.geom.elements.get(e, ("", []))
-                k_n = {"SPRING1": 1, "SPRING2": 2}.get(typ.upper(), 0)
-                if not k_n or len(ds) < k_n or len(conn) < k_n:
+            if es:
+                cards.append((b, es, ds))
+        if not cards:
+            return
+        unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        steps = [st for st in self.steps if st.proc and st.proc != "HEAT TRANSFER"]
+        nl = any(st.ccx_nlgeom or st.explicit for st in steps)
+        small = any(not (st.ccx_nlgeom or st.explicit) for st in steps)
+        tied = self._constraint_nodes(blocks, set()) | self._ref_nodes | set(self._rb_rot) | \
+            {n for rows in self._embed_rows.values() for n, _w, _d in rows}
+        rigid = {m for c in self._rigid_constraints(blocks) if c.get("emit") != "eq" for m in c["elim"]}
+        kin, u1n = self._kinematic_refs(blocks), self._u1_nodes()
+        # a rigid body's TIE member turns with the body (its reference node's rotation): as
+        # _plan_connector_rows, also the deck's reference node _plan_free_ref_nodes made one
+        body_of = {m: body["ref"] for bodies in self._mpc_bodies.values() for body in bodies
+                   for m in body["members"] if m != body["ref"]}
+        for b in blocks:
+            ref = self._ref_node(b) if b.keyword == "RIGID BODY" else None
+            for m in self._rigid_body_members(b)[0] if ref is not None else ():
+                if m != ref:
+                    body_of.setdefault(m, ref)
+        knots: List[int] = []                   # (shell/beam nodes that get knot beams)
+        pending: List[int] = []                 # (... for the element being written)
+
+        def rot_terms(n: int, v: Vec) -> Union[str, List[Tuple[int, int, float]]]:
+            """The *EQUATION terms of v . theta_n where ccx carries node n's rotation, "" where
+            it has none, or why they have no form."""
+            if n in self._rb_rot:
+                return self._dir_terms(self._rb_rot[n], v, plan=True)
+            if n in u1n or n in kin or n in self._rot_nodes:
+                if n in self._transformed:
+                    return "ccx misreads DOFs 4-6 of a node with a *TRANSFORM in an *EQUATION"
+                if n not in u1n and n not in kin and n not in self._knots:
+                    if self._explicit_deck or self._u1:
+                        return (f"the knot beam that would give shell/beam node {n} rotations in an "
+                                f"*EQUATION stops ccx {'explicit dynamics' if self._explicit_deck else 'beside U1 beams'}")
+                    pending.append(n)
+                return [(n, k + 4, v[k]) for k in range(3) if abs(v[k]) > 1e-12]
+            if n in body_of and body_of[n] != n:
+                return rot_terms(body_of[n], v)
+            return "" if n not in self._ref_nodes else f"ccx carries no rotation on reference node {n}"
+        lines = rots = 0
+        dropped: "OrderedDict[str, List[int]]" = OrderedDict()
+        loose: List[int] = []                   # (rotations of nodes without any in ccx)
+        kept: List[int] = []                    # (left as they are: members of ccx's rigid MPCs)
+        unknown: List[str] = []                 # (left as they are: undefined local axes)
+        approx = False
+        for b, es, ds in cards:
+            name = (b.param("ORIENTATION") or "").strip()
+            items: List[Tuple[int, List[Tuple[int, int]]]] = []
+            need, risky, unk = False, [], []
+            for e in es:
+                conn = self.geom.elements[e][1]
+                k = 1 if self.geom.elements[e][0].upper() == "SPRING1" else 2
+                if len(ds) < k or len(conn) < k:
                     continue
-                new = list(conn)
-                for k in range(k_n):
-                    n, d = conn[k], ds[k]
-                    ax = self._mpc_frame(n)
-                    if ax is None or not 1 <= d <= 6:
+                ends = list(zip(conn[:k], ds[:k]))
+                items.append((e, ends))
+                for n, d in ends:
+                    ax = self._conn_axes(name) if name else (self._mpc_frame(n) or unit)
+                    if 4 <= d <= 6:
+                        need = True             # (a rotation)
+                    elif not 1 <= d <= 3 or ax is None or isinstance(ax, str):
+                        if isinstance(ax, str):     # (as it is: ccx springs the global DOF)
+                            unk.append(f"node {n} DOF {d} ({ax})")
+                    elif not name and abs(ax[d - 1][d - 1] - 1.0) > 1e-12:
+                        need = True             # (Abaqus' local DOF, ccx's global one)
+                    elif n in tied:
+                        if nl and n in rigid:
+                            risky.append(e)
+                        else:
+                            need = True
+            if not need:
+                kept += dedup(risky)
+                unknown += unk
+                continue
+            if risky:
+                self.report.warn(f"SPRING1 / SPRING2 on a member node of a rigid body or kinematic "
+                                 f"coupling (e.g. element {risky[0]}) in a deck with NLGEOM, of a *SPRING "
+                                 f"card the converter writes as SPRINGAs to held nodes: ccx 2.23 solves "
+                                 f"their *EQUATIONs on such a node off under NLGEOM (probed: 1.2 %) — "
+                                 f"exact for small motions only.", once=True)
+                self._reduces("SPRING1 / SPRING2 on a rigid-body member under NLGEOM")
+            self._spring_cards.add(id(b))
+            for e, ends in items:
+                why, vs = None, []
+                for n, d in ends:
+                    ax = self._conn_axes(name) if name else (self._mpc_frame(n) or unit)
+                    why = (f"its node {n} is not defined" if n not in self.geom.nodes else
+                           f"its DOF line ({b.data[0].strip()}) names no displacement or rotation"
+                           if not 1 <= d <= 6 else
+                           f"the axes of its ORIENTATION={name} are not known" if ax is None else
+                           f"the local axes of node {n} are not known ({ax})" if isinstance(ax, str) else None)
+                    if why:
+                        break
+                    vs.append(vunit(ax[(d - 1) % 3]))
+                if not why and all(d <= 3 for _n, d in ends):
+                    n = ends[0][0]
+                    if n in self._plane_only and abs(vs[0][2]) > 1e-9:
+                        why = "its direction leaves the plane of its plane model's node"
+                    else:
+                        far = self._dir_terms(ends[1][0], vscale(vs[1], -1.0), plan=True) if len(ends) > 1 else []
+                        self._line_element(e, "SPRINGA", n, vs[0], far, self._spring_rows)
+                        lines += 1
                         continue
-                    if isinstance(ax, str) or (d > 3 and abs(ax[d - 4][d - 4] - 1.0) > 1e-9):
-                        lost.append(f"node {n} DOF {d}" + (f" ({ax})" if isinstance(ax, str) else ""))
-                    if isinstance(ax, str) or d > 3 or abs(ax[d - 1][d - 1] - 1.0) <= 1e-12:
-                        continue                                    # (or the global axis)
-                    v = ax[d - 1]
-                    if (n, d) not in twin:
-                        t = twin[(n, d)] = max(self.geom.nodes) + 1
-                        self.geom.add_node(t, self.geom.nodes[n])
-                        self._spring_rows.append([(t, d, 1.0)] + self._dir_terms(n, vscale(v, -1.0), plan=True))
-                        self._spring_rows += [[(t, j, 1.0)] for j in (1, 2, 3) if j != d]
-                        self._tied_nodes.append((n, n, t, 0.0))
-                        if self._mpc_thermal:
-                            self._spring_rows.append([(t, 11, 1.0), (n, 11, -1.0)])
-                    new[k] = twin[(n, d)]
-                if new != list(conn):
-                    self.geom.elements[e] = (typ, new)
-                    made.add(e)
-        if lost:
-            self.report.warn(f"SPRING1 / SPRING2 on a node with a *TRANSFORM ({', '.join(lost[:3])}"
-                             f"{' ...' if len(lost) > 3 else ''}): Abaqus springs the node's local DOF, "
-                             f"ccx 2.23 the global one, and a rotation there (or undefined local axes) "
-                             f"has no form here — the spring acts on the global DOF.", once=True)
-            self._reduces("SPRING1 / SPRING2 on a transformed node's rotation")
-        if made:
-            self.report.note(f"{len(made)} SPRING1 / SPRING2 element(s) on nodes with a *TRANSFORM: "
-                             f"Abaqus springs the node's local DOF, ccx 2.23 the global one (probed) -> "
-                             f"the spring on a new node without one, tied to the node's local DOF and "
-                             f"held in its others: exact (validate_with_ccx.py spring_transform).")
+                # (u_h1 = v1 . q1 - v2 . q2: the terms of -v1 . q1 and v2 . q2)
+                terms: List[Tuple[int, int, float]] = []
+                pending.clear()
+                for (n, d), v, sign in zip(ends, vs, (-1.0, 1.0)) if why is None else ():
+                    got = rot_terms(n, vscale(v, sign)) if d > 3 else self._dir_terms(n, vscale(v, sign), plan=True)
+                    if isinstance(got, str):
+                        why = got
+                        break
+                    terms += got
+                if why == "":                   # (a rotation of a node without any in ccx)
+                    loose.append(e)
+                elif why is None and nl and (self._explicit_deck or not self._approx):
+                    why = ("a rotation under NLGEOM, which its linear form carries for small rotations "
+                           "only (rerun with --approximate)" if not self._explicit_deck else
+                           "a rotation in a deck with explicit dynamics, which stops on its form")
+                if why is not None:
+                    if why:
+                        dropped.setdefault(why, []).append(e)
+                    del self.geom.elements[e]
+                    continue
+                knots += pending
+                approx = approx or nl
+                n = ends[0][0]
+                h = max(self.geom.nodes) + 1
+                self.geom.add_node(h, self.geom.nodes[n])
+                g = h + 1
+                self.geom.add_node(g, vsub(self.geom.nodes[n], (self._model_span(), 0.0, 0.0)))
+                self.geom.elements[e] = ("SPRINGA", [h, g])
+                self._spring_rows += [[(h, 1, 1.0)] + terms, [(h, 2, 1.0)], [(h, 3, 1.0)]] + \
+                    [[(g, k, 1.0)] for k in (1, 2, 3)]
+                for x in (h, g):
+                    self._tied_nodes.append((n, n, x, 0.0))
+                    if self._mpc_thermal:
+                        self._spring_rows.append([(x, 11, 1.0), (n, 11, -1.0)])
+                rots += 1
+        gone = {e for es in dropped.values() for e in es} | set(loose)
+        for sname, ids in self.geom.elsets.items() if gone else ():
+            if any(e in gone for e in ids):
+                self.geom.elsets[sname] = [i for i in ids if i not in gone]
+        for why, es in dropped.items():
+            self.report.warn(f"SPRING1 / SPRING2 element(s) {', '.join(map(str, es[:5]))}"
+                             f"{' ...' if len(es) > 5 else ''} left out: {why}.", once=True)
+            self._reduces("SPRING1 / SPRING2 element left out")
+        if loose:
+            self.report.note(f"SPRING1 / SPRING2 element(s) {', '.join(map(str, loose[:5]))}"
+                             f"{' ...' if len(loose) > 5 else ''} on a rotation of a node that has none "
+                             f"in ccx (a solid's or a free node) left out: in Abaqus nothing else "
+                             f"stiffens that DOF, so the spring carries no load.", once=True)
+        if unknown:
+            self.report.warn(f"SPRING1 / SPRING2 on a node with a *TRANSFORM whose local axes are not "
+                             f"known ({', '.join(dedup(unknown)[:3])}{' ...' if len(unknown) > 3 else ''}): "
+                             f"Abaqus springs the node's local DOF, ccx 2.23 the global one, on which "
+                             f"the spring acts.", once=True)
+            self._reduces("SPRING1 / SPRING2 on a transformed node's undefined local DOF")
+        if kept and small:
+            self.report.warn(f"SPRING1 / SPRING2 on a member node of a rigid body or kinematic coupling "
+                             f"(e.g. element {kept[0]}) in a deck with NLGEOM and small-strain steps: in "
+                             f"those ccx 2.23 drops what a nonzero BC on the constraint's other DOFs puts "
+                             f"on the spring (probed), and the converter's SPRINGA form is off under NLGEOM "
+                             f"(probed: 1.2 %) — the springs are kept as they are.", once=True)
+            self._reduces("SPRING1 / SPRING2 on a rigid-body member in small-strain steps")
+        if knots:
+            self._add_knot_beams(knots, blocks)
+            self.report.note(f"Rotational springs on shell/beam nodes: ccx ignores DOFs 4-6 of a plain "
+                             f"shell/beam node in an *EQUATION, so the {len(dedup(knots))} node(s) got "
+                             f"force-free knot beams (elset/material {KNOT_SET}), which give them real "
+                             f"rotations.", once=True)
+        if lines:
+            self.report.note(f"{lines} SPRING1 / SPRING2 element(s) on a node with a *TRANSFORM or a "
+                             f"constraint -> a SPRINGA from the node to a new node held on the DOF's line "
+                             f"by *EQUATIONs: ccx 2.23 springs the global DOF of a transformed node, and "
+                             f"its small-strain solve drops what a nonzero BC on a constraint's other "
+                             f"DOFs puts on a spring on its eliminated DOF (probed); exact, also under "
+                             f"NLGEOM (validate_with_ccx.py spring_transform, spring_dependent).", once=True)
+        if rots:
+            self.report.note(f"{rots} SPRING1 / SPRING2 element(s) on rotations (DOFs 4-6), which ccx "
+                             f"2.23's springs ignore (probed) -> a SPRINGA from a helper node whose DOF 1 "
+                             f"an *EQUATION ties to the rotation (on the ROT NODE, the reference node's "
+                             f"or a knot's DOFs 4-6), held across it, to a held node: exact for small "
+                             f"rotations (validate_with_ccx.py spring_rotation).", once=True)
+        if approx:
+            self.report.warn("[APPROX] Rotational SPRING1 / SPRING2 under NLGEOM written in their linear "
+                             "form: exact for small rotations only.", once=True)
 
     def _plan_anisotropic_masses(self, blocks: List[Block]) -> None:
         """*MASS, TYPE=ANISOTROPIC: principal masses M11, M22, M33 along the axes v_i of its
@@ -11080,13 +11255,13 @@ class _Mesh:
 
     def _dashpot_lines(self) -> List[str]:
         """The *EQUATIONs that keep each DASHPOT1 / DASHPOT2's new node on its line
-        (_plan_dashpots), tie the springs' nodes on transformed nodes (_plan_transformed_springs)
+        (_plan_dashpots), the SPRING1 / SPRING2 ones' and their helper nodes (_plan_springs)
         and the anisotropic masses' (_plan_anisotropic_masses)."""
         out: List[str] = [f"*SPRING, ELSET={FREE_MASS_SET}", "0."] if self._free_mass_rows else []
         for rows, what in ((self._dashpot_rows, "DASHPOT1 / DASHPOT2 -> DASHPOTA to a new node kept on "
                                                 "the DOF's line"),
-                           (self._spring_rows, "SPRING1 / SPRING2 on a transformed node -> on a new node "
-                                               "tied to its local DOF"),
+                           (self._spring_rows, "SPRING1 / SPRING2 -> SPRINGA to a new node held on the "
+                                               "DOF's line, or from a helper node tied to a rotation"),
                            (self._amass_rows, "*MASS, TYPE=ANISOTROPIC -> principal masses on new nodes "
                                               "tied along their axes"),
                            (self._free_mass_rows, "point masses on nodes of no other element: a zero "
@@ -11184,9 +11359,19 @@ class _Mesh:
         card stops ccx ('*SPRING card without data', on SPRINGA 'one degree of freedom ...';
         probed: '100.', '1.e-3' and '1.d2' read) — so the numbers of the data lines get one
         (dotted_number).  The first line of a SPRINGA card, which Abaqus leaves blank (read_blocks
-        keeps it), is left out where data lines follow: a DOF line there stops ccx too."""
+        keeps it), is left out where data lines follow: a DOF line there stops ccx too.  A card
+        of SPRING1 / SPRING2 elements _plan_springs wrote as SPRINGAs loses its DOF line and
+        ORIENTATION=; one whose elements it all left out is commented out."""
         if id(b) in self._joint_cards:
             return self._joint_subcard(b)
+        if id(b) in self._spring_cards:         # (_plan_springs: SPRINGAs now)
+            if not self._elset_types(b):
+                return self._comment_out("*SPRING card of SPRING1 / SPRING2 elements all left out (see "
+                                         "above): commented out.", [emit_keyword("SPRING", b.params)] +
+                                         list(b.data), False, warn=False)
+            params = OrderedDict((k, v) for k, v in b.params.items() if k != "ORIENTATION")
+            return self.passthrough(Block(b.keyword, params, [",".join(map(dotted_number, ln.split(",")))
+                                                              for ln in b.data[1:]]))
         lines = list(b.data)
         first = 0
         if lines and dof_line(lines[0]):
@@ -28482,7 +28667,8 @@ class _Constraints:
         *FREQUENCY step comes after a step ccx runs through its nonlinear solver: there ccx
         carries the members' equations wrongly (_warn_knot_equations) and exits 255 on the
         tetrahedron, where without it the *FREQUENCY step runs (probed: *DYNAMIC, NLGEOM, plastic
-        and coupled first steps)."""
+        and coupled first steps).  A *KINEMATIC COUPLING's lines of all translations likewise
+        (the new nodes as lines of their DOFs)."""
         if not any(b.keyword == "FREQUENCY" for b in blocks) or \
                 any(t.upper().startswith(AXISYMMETRIC_PREFIXES) for t, _ in self.geom.elements.values()):
             return
@@ -28510,7 +28696,17 @@ class _Constraints:
         for i, b in enumerate(blocks):
             # a kinematic coupling of all translations (ccx's *KINEMATIC, or the *RIGID BODY /
             # equations it is written as): its node surface, or its plan's members, take the
-            # new nodes (not within an INFLUENCE RADIUS, nor in a planar model's coupling)
+            # new nodes (not within an INFLUENCE RADIUS, nor in a planar model's coupling); a
+            # *KINEMATIC COUPLING's lines of all translations, as lines of the same DOFs
+            if b.keyword == "KINEMATIC COUPLING" and id(b) not in self._planar_kin:
+                cg = self._coupling_groups(blocks, i)
+                plan = self._coupling_plan.get(id(b)) or {}
+                for members, ds in cg[1] if cg is not None else ():
+                    if {1, 2, 3} <= ds and plan.get("kind") in (None, "kin"):
+                        bodies.append((b, {"dofs": ds}, members))
+                    elif {1, 2, 3} <= ds and plan.get("kind") in ("rb", "rbk", "kdyn") and "members" in plan:
+                        bodies.append((None, plan, members))
+                continue
             cg = self._coupling_groups(blocks, i) if b.keyword == "COUPLING" else None
             if cg is None or len(cg[1]) != 1 or not {1, 2, 3} <= cg[1][0][1] or \
                     b.param("INFLUENCE RADIUS") is not None or id(b) in self._planar_kin:
@@ -28547,6 +28743,8 @@ class _Constraints:
                 continue
             if card is not None and card.keyword == "SURFACE":
                 card.data = list(card.data) + [str(m) for m in new]
+            elif card is not None and card.keyword == "KINEMATIC COUPLING":
+                card.data = list(card.data) + [f"{m}, {min(body['dofs'])}, {max(body['dofs'])}" for m in new]
             elif card is not None:
                 self._add_rigid_members(card, new)
             else:
@@ -28559,6 +28757,7 @@ class _Constraints:
                              f"carries — ccx 2.23's *FREQUENCY stops on such a mass ('add_bo_st: "
                              f"coefficient should be 0'); the tetrahedron moves rigidly with the "
                              f"body, so the solution is the same.", once=True)
+        self._mass_tets_left = set(left)        # (_hold_tied_masses leaves them as they are too)
         if left:
             self.report.note(f"*MASS on {len(left)} member node(s) in no other element (e.g. node "
                              f"{left[0]}) of a rigid body with shell/beam members, every *FREQUENCY "
@@ -43225,6 +43424,99 @@ class _PostPasses:
                          f"and a SPC'; probed), so it is left out. Exact.", once=True)
         return deck.edited()
 
+    def _hold_tied_masses(self, deck: EmittedDeck) -> EmittedDeck:
+        """Nodes on MASS elements alone that the converted deck's *EQUATIONs tie: ccx 2.23
+        leaves MASS elements out of its matrix structure (mastruct.c) and stops where one sits
+        on a DOF an equation eliminates ('add_sm_st' / 'add_sm_ei: coefficient should be 0',
+        probed: a point mass tied to the corners of two bricks), or where an equation names
+        some of its translations only ('add_bo_st' in a *FREQUENCY step).  Such a node gets a
+        SPRINGA of stiffness 0 to a new node a model span away along -x, held by one-term
+        *EQUATIONs, which puts it in the structure and changes nothing (probed: the static and
+        *FREQUENCY answers of a twin with a zero SPRING1 there) — as _hold_mass_refs does for
+        distributing couplings' reference nodes and _plan_connector_rows for connector nodes —
+        where equations eliminate one of its translations and name all three, or name some
+        and BCs hold the others in every step, or every mechanical step is a *DYNAMIC or
+        *FREQUENCY one (its free translations then move as Abaqus' point mass does).  A static
+        step would be singular on the free ones (probed): there it is warned.  Not on the
+        rigid-body members _plan_member_mass_tets leaves as they are (ccx exits 255 on any
+        element there, probed)."""
+        kinds: Dict[int, set] = {}
+        for typ, conn in self.geom.elements.values():
+            for n in conn:
+                kinds.setdefault(n, set()).add(typ.upper())
+        bare = {n for n, ts in kinds.items() if ts == {"MASS"} and n in self.geom.nodes} - self._mass_tets_left
+        tied: Dict[int, set] = {}
+        dependent: set = set()
+        for _ci, terms in self._emitted_equations(deck) if bare else ():
+            for k, (n, d, _c) in enumerate(terms):
+                if n in bare and 1 <= d <= 3:
+                    tied.setdefault(n, set()).add(d)
+                    if k == 0:
+                        dependent.add(n)
+        if not tied:
+            return deck
+        sets = self._mesh_sets.read(deck)
+
+        def held(c: EmittedCard) -> set:
+            """(node, DOF) of the translations of tied nodes a *BOUNDARY card holds."""
+            out: set = set()
+            for rec in c.records():
+                if rec and rec[0]:
+                    lo, hi = bc_dof_range(rec) or (1, 3)
+                    nodes = sets.members("NSET", rec[0]) or ([int(rec[0])] if rec[0].isdigit() else [])
+                    out.update((n, d) for n in nodes if n in tied for d in (1, 2, 3) if lo <= d <= hi)
+            return out
+        state = set().union(*(held(c) for c in deck.model if c.keyword == "BOUNDARY"))
+        always = set(state)                     # (held in every step)
+        for st in deck.steps:
+            for c in st.cards:
+                if c.keyword == "BOUNDARY":
+                    if c is st.acting("BOUNDARY"):
+                        state = set()
+                    state |= held(c)
+            always &= state
+        moving = all(st.proc in ("DYNAMIC", "FREQUENCY") for st in self.steps
+                     if st.proc and st.proc != "HEAT TRANSFER")
+        cure, left = [], []
+        for n in sorted(tied):
+            free = {1, 2, 3} - tied[n]
+            if not free and n not in dependent:
+                continue                        # (runs as it is, probed)
+            if not free or moving or all((n, d) in always for d in free):
+                cure.append(n)
+            else:
+                left.append(n)
+        if left:
+            self.report.warn(f"{len(left)} node(s) on MASS elements alone (e.g. node {left[0]}) that "
+                             f"*EQUATIONs tie in some translations only: ccx 2.23 may stop on them "
+                             f"('coefficient should be 0', probed), and the zero spring that cures it "
+                             f"would leave their other translations, which no BC holds in every step, "
+                             f"without stiffness in this deck's static steps — hold or tie those.", once=True)
+        if not cure:
+            return deck
+        name = self._u1_name("ABQ2CCX_MASS_HOLD")
+        nid, eid = self._next_ids()
+        nodes, elems, rows = ["*NODE"], [f"*ELEMENT, TYPE=SPRINGA, ELSET={name}"], []
+        for n in cure:
+            nid += 1
+            eid += 1
+            x = vsub(self.geom.nodes[n], (self._model_span(), 0.0, 0.0))
+            self.geom.add_node(nid, x)
+            self.geom.add_element(eid, "SPRINGA", [n, nid])
+            nodes.append(node_line(nid, *x))
+            elems.append(f"{eid}, {n}, {nid}")
+            rows += [[(nid, k, 1.0)] for k in (1, 2, 3)] + \
+                ([[(nid, 11, 1.0), (n, 11, -1.0)]] if self._mpc_thermal else [])
+        at = next((c.line for c in deck.cards if c.keyword == "STEP"), len(deck.lines))
+        deck.insert_at(at, ["** abq2ccx: zero springs to held nodes on point masses that only "
+                            "*EQUATIONs tie (ccx stops on them otherwise)"] + nodes + elems +
+                       [f"*SPRING, ELSET={name}", "0."] + self._equation_lines(rows))
+        self.report.note(f"{len(cure)} node(s) on MASS elements alone that *EQUATIONs tie (e.g. node "
+                         f"{cure[0]}): a SPRINGA of stiffness 0 to a held node added. ccx 2.23 stops on "
+                         f"such a node ('add_sm_st' / 'add_sm_ei: coefficient should be 0', probed); "
+                         f"the spring changes nothing (validate_with_ccx.py tied_point_mass).", once=True)
+        return deck.edited()
+
     def _hold_knot_drilling(self, blocks: List[Block], deck: EmittedDeck) -> EmittedDeck:
         """The drilling rotation of a converter knot beam's knot on a smooth shell node — one
         that ccx 2.23 would make no knot by itself (one group of shells, _ccx_knot's test),
@@ -45097,7 +45389,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._dashpot_cards: set = set()           # *DASHPOTs of DASHPOT1 / 2 elements (_plan_dashpots)
         self._dashpot_rows: List[List[Tuple[int, int, float]]] = []   # their ground nodes' *EQUATIONs
         self._free_mass_rows: List[List[Tuple[int, int, float]]] = []   # _plan_free_masses' held nodes
-        self._spring_rows: List[List[Tuple[int, int, float]]] = []    # _plan_transformed_springs' nodes
+        self._spring_rows: List[List[Tuple[int, int, float]]] = []    # _plan_springs' new nodes
+        self._spring_cards: set = set()         # ids of the *SPRING cards _plan_springs rewrote
+        self._mass_tets_left: set = set()       # MASS-only members _plan_member_mass_tets left as they are
         self._amass: Dict[int, Tuple[float, List[Tuple[str, float]]]] = {}   # _plan_anisotropic_masses
         self._amass_rows: List[List[Tuple[int, int, float]]] = []     # its nodes' *EQUATIONs
         self._conn_held: set = set()               # (node, DOF) held at zero in every step
@@ -45785,7 +46079,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_offset_gradients(blocks)     # after it: the lines it reads and the point lines
         self._plan_print_sets(blocks)           # after the mesh planners: their nodes and elements
         self._plan_dashpots(blocks)             # after the planners above: the nodes' *TRANSFORM axes
-        self._plan_transformed_springs(blocks)  # likewise
+        self._plan_springs(blocks)              # likewise
         self._plan_anisotropic_masses(blocks)   # after _plan_node_classes: the nodes with rotations
         self._plan_free_masses(blocks)          # after it and the planners adding elements above
         self._plan_driven_dashpots(blocks)      # after _plan_dashpots: their rows
@@ -45878,6 +46172,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         assert len(deck.steps) == len(self.emit.written) and \
             all(st.end is not None for st in deck.steps), "a step written inside another"
         deck = self._settle_dependents(deck)
+        deck = self._hold_tied_masses(deck)     # after it: the equations as written
         deck = self._unread_body_surfaces(deck)
         deck = self._restore_base_states(deck)
         deck = self._buckle_displacements(deck)  # after the BCs the restore gives back
