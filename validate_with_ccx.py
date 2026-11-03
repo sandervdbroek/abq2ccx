@@ -12150,7 +12150,7 @@ def check_tie_slave_trimmed(ccx, env, tmp, shared):
     # A 20 x 20 block tied onto the middle of a 100 x 100 plate whose whole top face is the slave
     # surface.  ccx ties only the slave nodes opposite the block and prints 'no tied MPC
     # generated' for every other one; abq2ccx ties the plate through a surface of the slave
-    # faces within reach of the block.  The answer must be the deck's: exactly that of the same
+    # faces near the block.  The answer must be the deck's: exactly that of the same
     # deck with POSITION TOLERANCE=1000 (every face within reach: nothing trimmed, the nodes
     # off the block have no master face opposite them at any tolerance), with fewer warnings.
     failures = 0

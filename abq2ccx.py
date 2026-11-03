@@ -9762,14 +9762,13 @@ class _Mesh:
         SNEG labels).  ccx 2.23 prints 'no tied MPC generated ... no opposite master face' for
         every node of the others (87522 of a plate's 89341 slave nodes, 15 MB of output) and
         ties none of them; nor does Abaqus, which ties a slave node only within the position
-        tolerance of the master surface (Mesh tie constraints).  ``reach`` is the tolerance
-        (``tol``: the one written, or the deck's; none given: the master's largest facet extent,
-        beyond ccx's default, a fraction of the element size) plus 1.5 times that extent, plus
-        the half thickness and offset of a master shell, which ccx expands to faces that far
-        off: every point of a master facet lies within one extent of each node of it (the half
-        more covers ccx's in-face tolerance at a facet's edge), and of an expanded shell face
-        within that and the offset, so a slave node farther than ``reach`` from every master
-        node lies farther than the tolerance from the master surface.  Exact."""
+        tolerance of the master surface (Mesh tie constraints).  A slave node is within reach
+        when it lies in the bounding box of a master facet grown by the tolerance (``tol``: the
+        one written, or the deck's; none given: the facet's extent, beyond ccx's default, a
+        fraction of the element size), a tenth of the facet's extent (ccx's in-face tolerance at
+        its edges) and a shell master's half thickness and offset (ccx's expanded face): a point
+        within the tolerance of a facet lies in that box, so a node in none of them is tied by
+        neither code.  Exact."""
         sd, md = self.surfaces.get(slave.upper()), self.surfaces.get(master.upper())
         if not sd or not md or md[0].startswith("NODE"):
             return None, []
@@ -9790,27 +9789,34 @@ class _Mesh:
         if not mfaces:
             return None, []
 
-        def extent(ns: List[int]) -> float:
+        # each master facet's bounding box, grown by the tolerance (none given: the facet's
+        # extent, beyond ccx's default), a tenth of its extent (ccx's in-face tolerance at its
+        # edges) and a shell master's half thickness and offset (ccx's expanded face)
+        boxes: List[Tuple[Vec, Vec]] = []
+        for e, ns in mfaces:
             ps = [xyz[n] for n in ns]
-            return math.sqrt(sum((max(p[k] for p in ps) - min(p[k] for p in ps)) ** 2 for k in range(3)))
-        shell = max((t * (0.5 + abs(off)) for e, _ns in mfaces
-                     for t, off in [self._shell_sec.get(e, (0.0, 0.0))]), default=0.0)
-        size = max(extent(ns) for _e, ns in mfaces)
-        reach = (tol if tol is not None else size) + 1.5 * size + shell
+            lo = tuple(min(p[k] for p in ps) for k in range(3))
+            hi = tuple(max(p[k] for p in ps) for k in range(3))
+            size = math.sqrt(sum((hi[k] - lo[k]) ** 2 for k in range(3)))
+            t, off = self._shell_sec.get(e, (0.0, 0.0))
+            grow = (tol if tol is not None else size) + 0.1 * size + t * (0.5 + abs(off))
+            boxes.append((tuple(lo[k] - grow for k in range(3)), tuple(hi[k] + grow for k in range(3))))
+        reach = max(max(h[k] - l[k] for k in range(3)) for l, h in boxes)
         if not reach > 0.0:
             return None, []
         cell = lambda p: (math.floor(p[0] / reach), math.floor(p[1] / reach), math.floor(p[2] / reach))
-        grid: Dict[Tuple[int, int, int], List[Vec]] = {}
-        for n in {n for _e, ns in mfaces for n in ns}:
-            grid.setdefault(cell(xyz[n]), []).append(xyz[n])
-        r2, near = reach * reach, {}
+        grid: Dict[Tuple[int, int, int], List[int]] = {}
+        for i, (l, h) in enumerate(boxes):
+            (a0, a1, a2), (b0, b1, b2) = cell(l), cell(h)
+            for key in itertools.product(range(a0, b0 + 1), range(a1, b1 + 1), range(a2, b2 + 1)):
+                grid.setdefault(key, []).append(i)
+        near: Dict[int, bool] = {}
 
         def close(n: int) -> bool:
             if n not in near:
-                p, (i, j, k) = xyz[n], cell(xyz[n])
-                near[n] = any((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2 <= r2
-                              for di in (-1, 0, 1) for dj in (-1, 0, 1) for dk in (-1, 0, 1)
-                              for q in grid.get((i + di, j + dj, k + dk), ()))
+                p = xyz[n]
+                near[n] = any(all(boxes[i][0][k] <= p[k] <= boxes[i][1][k] for k in range(3))
+                              for i in grid.get(cell(p), ()))
             return near[n]
         if sd[0].startswith("NODE"):
             nodes = dedup(n for token, _f in sd[1] for n in self._resolve_nodes(token))
@@ -9838,8 +9844,8 @@ class _Mesh:
         name = self._fresh_name(f"{slave}_NEAR")
         self._mem_surfaces[key] = name
         self.report.note(f"*TIE {tie}: slave surface {slave} -> {name}, the {len(kept)} of its {total} "
-                         f"{what} within {short_real(reach, 4)} of master surface {master} (the "
-                         f"position tolerance plus 1.5 times its largest facet, plus a shell's half "
+                         f"{what}{'' if card == 'NODE' else ' with a node'} near master surface {master} (in a facet's bounding box "
+                         f"grown by the position tolerance, a tenth of the facet and a shell's half "
                          f"thickness): ccx 2.23 prints 'no tied MPC generated' for every node of the "
                          f"others and ties none of them, nor does Abaqus (beyond the position "
                          f"tolerance). Exact.")
