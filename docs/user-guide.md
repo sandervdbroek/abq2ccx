@@ -161,7 +161,8 @@ a different model without saying so. With it, these reframings are made, each wi
   pairs between the bodies that can meet (their exterior faces; the struck, yielding or finer
   body the slave, one line per slave body), without self-contact and edge-to-edge contact.
   Not yet where two bodies' faces end flush (a lid on a block of the same footprint, stacked
-  blocks), which the converter warns of: ccx can miss the slave nodes on the master's edges
+  blocks) or a conformal mesh line runs right under a block's edge, which the converter warns
+  of: ccx can miss the slave nodes on the master's edges
   (probed: 81 % of a hand-written pair's force, 12 % with the coarser mesh the slave, three
   stacked blocks 87 % of the exact force).
 
