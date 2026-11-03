@@ -9273,25 +9273,43 @@ def knot_buckle_deck(modal=True, plane=OBLIQUE_PLANE):
     return out
 
 
+def knot_moment_deck(plane=None):
+    """An S4 cantilever strip 1 x 0.1 (10 elements, thickness 0.01, E 1.2e7, nu 0) in ``plane``
+    (None: the xy-plane), bent under NLGEOM by tip moments 0.05 about its in-plane axis e2
+    (about 0.5 rad), the tip printed; a *FREQUENCY and a *STEADY STATE DYNAMICS step then load
+    the tip along the normal, so the converter puts knot beams there (PR #9 review)."""
+    nodes = "".join(f"{1 + i + 11 * j}, {in_plane(plane, 0.1 * i, 0.1 * j)}\n" for j in range(2) for i in range(11))
+    els = "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 13}, {i + 12}\n" for i in range(10))
+    e2 = (plane or (None, (0.0, 1.0, 0.0)))[1]
+    moment = "".join(f"{n}, {4 + g}, {0.05 * c:.15g}\n" for n in (11, 22) for g, c in enumerate(e2) if c)
+    return ("*NODE\n" + nodes + "*ELEMENT, TYPE=S4, ELSET=E\n" + els + "*NSET, NSET=TIP\n11, 22\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1.2e7, 0.\n*DENSITY\n1e-3\n*SHELL SECTION, ELSET=E, MATERIAL=M\n"
+            "0.01\n*BOUNDARY\n1, 1, 6\n12, 1, 6\n*STEP, NLGEOM\n*STATIC\n0.05, 1.\n*CLOAD\n" + moment +
+            "*NODE PRINT, NSET=TIP\nU\n*END STEP\n*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP\n"
+            "*STEADY STATE DYNAMICS\n1., 10., 3\n*CLOAD\n" + along(plane, 11, 2, 1.0) + along(plane, 22, 2, 1.0) +
+            "*END STEP\n")
+
+
 def knot_drilling_deck(modal=True, nx=30, ny=10, transform=False, mid=None):
     """An S4 plate 1000 x 50, thickness 10, clamped at both ends, loaded across its width at
     one and two thirds of its length in a static step; ``modal``: a *FREQUENCY and a *STEADY
     STATE DYNAMICS step load the first line too, so the converter puts knot beams on those
     nodes (ccx misapplies forces on plain shell nodes in modal steps).  ``transform``: that
-    line has a *TRANSFORM turned 30 deg about x, its loads in its local axes; ``mid`` (by
-    default with ``transform``): the middle line printed instead of the first."""
+    line has a *TRANSFORM turned 90 deg about x (its local 3 = -y lies in the plate, so only a
+    hold read about the global axes holds the drilling rotation), its loads in its local
+    axes; ``mid`` (by default with ``transform``): the middle line printed instead of the
+    first."""
     ids = {(i, j): 1 + i + (nx + 1) * j for j in range(ny + 1) for i in range(nx + 1)}
     nodes = "".join(f"{ids[(i, j)]}, {1000. * i / nx}, {50. * j / ny}, 0.\n"
                     for j in range(ny + 1) for i in range(nx + 1))
     els = "".join(f"{i + 1 + nx * j}, {ids[(i, j)]}, {ids[(i + 1, j)]}, {ids[(i + 1, j + 1)]}, "
                   f"{ids[(i, j + 1)]}\n" for j in range(ny) for i in range(nx))
     line = lambda i: ", ".join(str(ids[(i, j)]) for j in range(ny + 1))
-    c, s = math.cos(math.radians(30.0)), math.sin(math.radians(30.0))
-    l1 = f"L1, 2, {22.73 * s:.15g}\nL1, 3, {22.73 * c:.15g}\n" if transform else "L1, 3, 22.73\n"
+    l1 = "L1, 2, 22.73\n" if transform else "L1, 3, 22.73\n"
     out = (f"*NODE, NSET=NALL\n{nodes}*ELEMENT, TYPE=S4, ELSET=E\n{els}*NSET, NSET=L1\n{line(nx // 3)}\n"
            f"*NSET, NSET=L2\n{line(2 * nx // 3)}\n*NSET, NSET=MID\n{line(nx // 2)}\n"
            f"*NSET, NSET=ENDS\n{line(0)}, {line(nx)}\n" +
-           (f"*TRANSFORM, NSET=L1\n1., 0., 0., 0., {c:.15g}, {s:.15g}\n" if transform else "") +
+           ("*TRANSFORM, NSET=L1\n1., 0., 0., 0., 0., 1.\n" if transform else "") +
            "*MATERIAL, NAME=M\n*ELASTIC\n210000., 0.3\n*DENSITY\n7.8e-9\n*SHELL SECTION, ELSET=E, MATERIAL=M\n"
            f"10.\n*BOUNDARY\nENDS, 1, 6\n*STEP\n*STATIC\n*CLOAD\n{l1}L2, 3, 22.73\n"
            f"*NODE PRINT, NSET={'MID' if (transform if mid is None else mid) else 'L1'}\nU\n*END STEP\n")
@@ -19927,6 +19945,30 @@ def check_shell_knot_limits(ccx, env, tmp, shared):
         print(f"{'PASS' if ok else 'FAIL'}  knot_transform (the S4 plate with knot beams on a loaded line "
               f"that has a *TRANSFORM): the middle line as without knots ({err:.1e} apart; |u| {moved:.4g}; "
               f"before 0.36 of it)")
+    failures += 0 if ok else 1
+
+    # a knot off the axes where ccx turns it finitely under a moment in the shell's plane: the
+    # BC's share of its rotation vector along the normal changes the moment's work there (PR #9
+    # review: 10 % off, then ccx stopped), so it is held by n . theta = 0.  Against the strip in
+    # the xy-plane, at every increment of the NLGEOM step, in the strip's axes
+    def increments(path):
+        out = {round(t, 9): {int(r[0]): r[1:4] for r in rows} for st, title, _, t, rows in A.dat_blocks(path)
+               if st == 1 and title == "displacements" and t is not None}
+        return out or None
+    runs = [review_run(knot_moment_deck(p), "knot_moment" + ("" if p else "_flat"), increments)
+            for p in (OBLIQUE_PLANE, None)]
+    ok = all(runs)
+    if ok:
+        got, ref = runs
+        times = sorted(set(got) & set(ref))
+        err = max(abs(sum(a * c for a, c in zip(got[t][n], OBLIQUE_PLANE[k])) - ref[t][n][k])
+                  for t in times for n in (11, 22) for k in range(3))
+        turn = abs(ref[1.0][11][2]) if 1.0 in ref else 0.0
+        ok = 1.0 in got and 1.0 in ref and err < 1e-5 * turn and turn > 0.3
+        print(f"{'PASS' if ok else 'FAIL'}  knot_moment (an S4 strip off the global axes bent about 0.5 rad "
+              f"under NLGEOM by an in-plane tip moment, knot beams at the tip): {len(times)} increments "
+              f"as in the xy-plane ({err:.1e} off, tip u_n {turn:.4g}; the BC hold: 10 % off, then ccx "
+              f"stopped)")
     failures += 0 if ok else 1
 
     # released_knot off the global axes: the clamp holds the knots' rotations in step 1, so an

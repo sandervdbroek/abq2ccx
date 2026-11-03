@@ -25,19 +25,23 @@ entries. The GitHub release notes use the same section.
 * **Knot drilling holds** — the drilling rotation of a knot beam's knot on a smooth shell node is
   now held by a `*BOUNDARY` on the global rotation with the largest component along the normal,
   wherever the normal lies: off the axes that fixes only how much of the rotation vector lies
-  along the normal, which moves nothing (probed: the same answers as `n . theta = 0` in static,
-  `*BUCKLE`, `*FREQUENCY`, `*MODAL DYNAMIC` and `NLGEOM` steps; ccx writes no rotations). It
-  replaces the equation, which ccx 2.23's `*MODAL DYNAMIC` step crashed on at random (26 of 100
-  runs; the BC: none of 100), which would act in every step where BCs hold the knot in some
-  (ccx stops on a BC on its dependent DOF), and which ccx misreads on a node with a `*TRANSFORM`
-  (ccx reads a rotational BC on a knot about the global axes there). So knots off the axes in
-  decks with a `*MODAL DYNAMIC` step, knots on `*TRANSFORM` nodes and knots with rotational BCs
-  in some steps only (the BC on a rotation each such step holds) are held now. Under a moment
-  about the normal, which the BC would turn partly into the shell's plane, the equation stays,
-  warned where it cannot be written (`validate_with_ccx.py knot_buckle`, `knot_transform`,
-  `released_knot_oblique`; before: `*BUCKLE` factors 0.93 for 3.18, 0.36 of the plate's
-  deflection, ccx stopped). The spurious `*BUCKLE` factors at loaded knots noted earlier (0.596
-  before 4.988) were this free rotation.
+  along the normal, which moves nothing while the rotations are small or nothing acts on the
+  knot's rotation (probed: the same answers as `n . theta = 0` in static, `*BUCKLE`,
+  `*FREQUENCY` and `*MODAL DYNAMIC` steps, and under `NLGEOM` with forces only; ccx writes no
+  rotations). It replaces the equation, which ccx 2.23's `*MODAL DYNAMIC` step crashed on at
+  random (26 of 100 runs; the BC: none of 100), which would act in every step where BCs hold
+  the knot in some (ccx stops on a BC on its dependent DOF), and which ccx misreads on a node
+  with a `*TRANSFORM` (ccx reads a rotational BC on a knot about the global axes there). So
+  knots off the axes in decks with a `*MODAL DYNAMIC` step, knots on `*TRANSFORM` nodes and
+  knots with rotational BCs in some steps only (the BC on a rotation each such step holds) are
+  held now. The equation stays under a moment about the normal, which the BC would turn partly
+  into the shell's plane, and where ccx turns the knot finitely (`NLGEOM`, its nonlinear
+  solver) under a moment, a rotational BC or a rotation tie, where the BC's share along the
+  normal changes the answer (a strip off the axes bent 0.5 rad by an in-plane moment: 10 % off,
+  then ccx stopped); it is warned where it cannot be written (`validate_with_ccx.py
+  knot_buckle`, `knot_transform`, `knot_moment`, `released_knot_oblique`; before: `*BUCKLE`
+  factors 0.93 for 3.18, 0.36 of the plate's deflection, ccx stopped). The spurious `*BUCKLE`
+  factors at loaded knots noted earlier (0.596 before 4.988) were this free rotation.
 * **MPCs on knots in `*MODAL DYNAMIC` decks warned** — ccx 2.23 crashes at random in a `*MODAL
   DYNAMIC` step (heap corruption; exit -6 / -10 / -11 in 3-25 % of runs) when an MPC eliminates
   a DOF of a knot: a kinematic coupling or rigid body on shell nodes, its rotation ties, an

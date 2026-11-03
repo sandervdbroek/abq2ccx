@@ -26593,9 +26593,32 @@ def test_knot_drilling_rotation_held_on_shell_nodes():
     assert hold not in body and "crashes ccx's *MODAL DYNAMIC step at random" in rep.text()
     assert "knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)" in \
         conv.reduced_physics
+    # an unread moment value counts as one about the normal
+    body, conv, _ = convert_str(strip("3, 6, 1.5x\n", turn=30.0))
+    assert hold + "*BOUNDARY\n3, 6, 6" not in body and [r for r in _equation_terms(body) if r[0][0] == 3]
+    # (PR #9 review) where ccx turns the knot finitely (NLGEOM, its nonlinear solver), the BC's
+    # share along the normal changes a moment's or a rotational BC's work: R(theta + alpha n) is
+    # not R(theta) (probed: a strip off the axes bent by an in-plane moment under NLGEOM 10 %
+    # off, then ccx stopped; n . theta = 0 as the strip in the xy-plane, 1.6e-6): the equation
+    # under an in-plane moment or a BC about an in-plane axis in an NLGEOM step; a linear step's
+    # moment keeps the BC; in a *MODAL DYNAMIC deck warned
+    def first(card, nlgeom=True, **kw):
+        return strip(turn=30.0, **kw).replace("*Step\n*Frequency", "*Step" + (", nlgeom" if nlgeom else "") +
+                                              f"\n*Static\n{card}*End Step\n*Step\n*Frequency", 1)
+    for card in ("*Cload\n3, 4, 0.01\n", "*Boundary\n3, 4, 4\n*Cload\n3, 3, 0.1\n"):
+        body, conv, _ = convert_str(first(card))
+        rows = [r for r in _equation_terms(body) if r[0][0] == 3]
+        assert hold + "*BOUNDARY\n3, 6, 6" not in body and len(rows) == 1, card
+        assert {d for _, d, _ in rows[0]} == {5, 6}
+    body, _, _ = convert_str(first("*Cload\n3, 4, 0.01\n", nlgeom=False))
+    assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not _equation_terms(body)
+    body, conv, rep = convert_str(first("*Cload\n3, 4, 0.01\n", last="*Modal Dynamic\n1e-4, 0.01"))
+    assert hold not in body and "a step ccx solves with finite rotations" in rep.text()
+    assert "knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)" in \
+        conv.reduced_physics
     # a knot on a node with a *TRANSFORM: ccx reads a rotational BC there about the global axes
     # (the knot's rotation node has no transform; probed exact), so it is held all the same
-    tr = "*Nset, nset=T\n3\n*Transform, nset=T\n0., 1., 0., -1., 0., 0.\n"
+    tr = "*Nset, nset=T\n3\n*Transform, nset=T\n1., 0., 0., 0., 0., 1.\n"
     for turn in (0.0, 30.0):
         body, conv, _ = convert_str(strip(turn=turn).replace("*Material", tr + "*Material"))
         assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not conv.reduced_physics

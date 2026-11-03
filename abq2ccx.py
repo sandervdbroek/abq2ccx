@@ -43246,15 +43246,21 @@ class _PostPasses:
         and again after each *BOUNDARY, OP=NEW ccx acts on that leaves it free in its step
         (ccx's BC state, the emitted deck's).  Along a global axis that is the rotation about
         the normal; off the axes it fixes only how much of the knot's rotation vector lies
-        along the normal, which moves nothing (probed against n . theta = 0 and the plain
-        shells: statics, *FREQUENCY, *BUCKLE, *MODAL DYNAMIC, NLGEOM, to print precision; ccx
-        writes no rotations, U holds translations only).  Where a deck BC holds a part of the
-        turn in some steps, k is one that each such step holds (that BC replaces the hold
-        there; none: warned).  On a node with a *TRANSFORM too: ccx reads a rotational BC on a
+        along the normal, which moves nothing where the rotations are small or nothing acts on
+        the rotation vector (probed against n . theta = 0 and the plain shells: statics,
+        *FREQUENCY, *BUCKLE, *MODAL DYNAMIC, forces under NLGEOM, to print precision; ccx
+        writes no rotations, U holds translations only).  Not so where ccx turns the knot
+        finitely (NLGEOM, its nonlinear solver: _solver_steps) under a moment, a rotational BC
+        beside the hold or a rotation tie: R(theta + alpha n) is not R(theta) there (code
+        review of PR #9: a strip off the axes bent by an in-plane moment under NLGEOM, 10 %
+        off, then ccx stopped; n . theta = 0 as the strip in the xy-plane), so such a knot
+        takes n . theta = 0 as below.  Where a deck BC holds a part of the turn in some
+        steps, k is one that each such step holds (that BC replaces the hold there; none:
+        warned).  On a node with a *TRANSFORM too: ccx reads a rotational BC on a
         knot about the global axes (bounadd keeps DOFs 4-6 as SPCs, gen3dnor gives the knot's
         rotation node no transform; probed exact), while it misreads *EQUATION rotation terms
         there.  A moment about the normal, which the BC would turn partly into one in the
-        shell's plane, needs n . theta = 0 instead: an *EQUATION eliminating a rotation no
+        shell's plane, needs n . theta = 0 too: an *EQUATION eliminating a rotation no
         other equation eliminates, where no *BOUNDARY holds one of its rotations in any step
         (the equation acts in all of them, and ccx stops on a BC on its dependent DOF), and not
         in a deck with a *MODAL DYNAMIC step — ccx 2.23 crashes there at random on any MPC that
@@ -43304,7 +43310,12 @@ class _PostPasses:
                     state |= rotations(c)
             states.append(set(state))
         phases = states or [model]              # (a deck without steps: its model data)
-        moments: Dict[int, List[List[float]]] = {}  # node -> each *CLOAD card's moment on it
+        # per step: ccx turns the knots with their finite rotation there (NLGEOM, its nonlinear
+        # solver: _solver_steps; every step where the conversion has other steps than the deck)
+        solver = [bool(w) for w in self._solver_steps]
+        turned = solver if len(solver) == len(phases) else [any(solver)] * len(phases)
+        # node -> (the step from which it acts, the moment) of each *CLOAD card on it
+        moments: Dict[int, List[Tuple[int, List[float]]]] = {}
         for c in deck.cards:
             if c.keyword == "CLOAD":
                 card: Dict[int, List[float]] = {}
@@ -43318,7 +43329,7 @@ class _PostPasses:
                         for m in sets.members("NSET", rec[0]) or ([int(rec[0])] if rec[0].isdigit() else []):
                             card.setdefault(m, [0.0, 0.0, 0.0])[d - 4] += v
                 for m, v in card.items():
-                    moments.setdefault(m, []).append(v)
+                    moments.setdefault(m, []).append((max(c.step, 1), v))
         modal = "MODAL DYNAMIC" in self.steps.procs
         rows: List[List[Tuple[int, int, float]]] = []
         bcs: List[Tuple[int, int]] = []         # (n, the global rotation held)
@@ -43354,7 +43365,16 @@ class _PostPasses:
             common = {d for _n, d, _c in terms}.intersection(*(h for h in held if h))
             picks = [d for _n, d, c in terms if d in common and (n, d) not in dependent and
                      abs(c) >= 0.1 * vnorm(nrm)]
-            if picks and not any(abs(vdot(nrm, m)) > 1e-9 * vnorm(m) for m in moments.get(n, ())):
+            loads = moments.get(n, ())
+            drilled = any(not all(math.isfinite(x) for x in m) or abs(vdot(nrm, m)) > 1e-9 * vnorm(m)
+                          for _s, m in loads)
+            # a moment, a rotational BC beside the hold or a rotation tie where ccx turns the
+            # knot finitely: the BC's share along the normal turns the rest too
+            finite = any(any(m) and any(turned[s - 1:]) for s, m in loads) or \
+                (bool(tie.get(n)) and any(turned)) or \
+                any(t and not h and any((n, d) in s for d in (4, 5, 6))
+                    for t, h, s in zip(turned, held, phases))
+            if picks and not drilled and not finite:
                 bcs.append((n, picks[0]))       # (terms: the largest component first)
             elif any(held) or not picks:
                 mixed.append(n)
@@ -43364,10 +43384,11 @@ class _PostPasses:
                 local.append(n)
             else:
                 rows.append(terms)
-        moment = ("a moment about the normal, which a *BOUNDARY on one of its global rotations "
-                  "would turn partly into one in the shell's plane")
+        moment = ("a moment about the normal, or a moment, rotational BC or rotation tie in a step "
+                  "ccx solves with finite rotations (NLGEOM, its nonlinear solver), which a "
+                  "*BOUNDARY on one of its global rotations would change")
         free = ("so ccx 2.23's solution may depend on round-off (probed: a knotted S4 beam 2 % to "
-                "50x too stiff, *BUCKLE factors 0.99 for 3.18)")
+                "50x too stiff, *BUCKLE factors 0.93 for 3.18)")
         if loose:
             self.report.warn(f"{len(loose)} knot(s) of the converter's knot beams on shell nodes whose "
                              f"normal is off the global axes (e.g. node {loose[0]}), under {moment}, in "
