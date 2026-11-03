@@ -26614,6 +26614,9 @@ class _Constraints:
         plan = self._coupling_plan.get(id(b)) or {}
         if plan.get("kind") == "kdyn":
             return self._kin_dynamic_cards(b, plan, plan["groups"])
+        if plan.get("ties_only"):
+            return self._ties_beside_lines(b, plan)
+        self._warn_ties_refused(b)
         own: "OrderedDict[str, set]" = OrderedDict()            # member -> the DOFs it couples
         across: set = set()                                     # ... on a line over DOFs 3 and 4
         for tok, dofs in recs:
@@ -26707,9 +26710,7 @@ class _Constraints:
             if len(group) < 2:
                 continue
             members = [[n for n in self._coupling_nodes(b)[0] if n != ref] for _, b in group]
-            span = set(range(1, 7)) if any(n in self._rot_nodes for ms in members for n in ms) \
-                else {1, 2, 3}
-            sets = []
+            dofs = []
             for i, _b in group:
                 ds: set = set()
                 try:
@@ -26720,7 +26721,18 @@ class _Constraints:
                             ds.update(range(lo, (pint(g[1]) if len(g) > 1 and g[1] else lo) + 1))
                 except ValueError:
                     ds = {0}
-                sets.append(frozenset((ds or set(range(1, 7))) & span | (ds - set(range(1, 7)))))
+                dofs.append(ds)
+            # a card of rotations only of shell/beam nodes makes no ccx coupling: its rotations
+            # are tied to the node's own DOFs 4-6 (_ties_beside) or to a ROT NODE (_plan_ties_refs)
+            keep = [k for k, (ms, ds) in enumerate(zip(members, dofs))
+                    if not (self._mechanical and ds and ds <= {4, 5, 6} and ms and
+                            all(n in self._rot_nodes for n in ms))]
+            group, members, dofs = ([x[k] for k in keep] for x in (group, members, dofs))
+            if len(group) < 2:
+                continue
+            span = set(range(1, 7)) if any(n in self._rot_nodes for ms in members for n in ms) \
+                else {1, 2, 3}
+            sets = [frozenset((ds or set(range(1, 7))) & span | (ds - set(range(1, 7)))) for ds in dofs]
             if len(set(sets)) > 1 or len({(b.param("ORIENTATION") or "").strip().upper()
                                           for _, b in group}) > 1:
                 mixed.append(ref)
@@ -27497,10 +27509,14 @@ class _Constraints:
         self.emit.last_coupling = self._coupling_plan.get(id(b))
         self.emit.last_planar = id(b) in self._planar_kin
         kind = (self.emit.last_coupling or {}).get("kind")
-        pre, dropped = self._influence_surface(b, params, kind not in ("rb", "rbk", "kdyn"))
+        beside = bool((self.emit.last_coupling or {}).get("ties_only"))
+        pre, dropped = self._influence_surface(b, params, kind not in ("rb", "rbk", "kdyn") and not beside)
         if dropped:
             self.emit.last_coupling = {"commented": True}   # (and its *KINEMATIC)
             return dropped
+        if beside:
+            return self._ties_beside_lines(b, self.emit.last_coupling)
+        self._warn_ties_refused(b)
         if kind in ("rb", "rbk"):
             return self._coupling_as_rigid_body(self.emit.last_coupling)
         if kind == "kdyn":
@@ -28464,6 +28480,46 @@ class _Constraints:
                                 "ref node by *EQUATION)." if ties else ")."), once=True)
         return [emit_keyword("KINEMATIC", b.params)] + lines + ties
 
+    def _ties_beside_lines(self, b: Block, plan: dict) -> List[str]:
+        """A kinematic coupling of rotations only of shell/beam nodes on a reference node that a
+        coupling of translations (ccx's *KINEMATIC) shares (_ties_beside): the card commented
+        out, the nodes' knot rotations tied to the node's DOFs 4-6, which carry that coupling's
+        rotation (_rotation_ties)."""
+        if b.keyword == "COUPLING":
+            self.emit.last_coupling = {"commented": True}       # (and its *KINEMATIC)
+        groups = plan.get("groups") or [(plan["members"], plan["dofs"])]
+        ties = self._rotation_ties_per_member(groups, plan["ref"], 0, plan["frame"])
+        self._warn_modal_ties(ties)
+        return self._comment_out(
+            "Kinematic coupling of rotations only of shell/beam nodes on a reference node that a "
+            "coupling of translations shares -> *EQUATION ties theta(node) = theta(ref) of each "
+            "coupled rotation, between each node's knot and the reference node's DOFs 4-6, which "
+            "carry ccx's coupling rotation there (as a rotation line beside a translation line is "
+            "tied); the card itself is left out (ccx's *KINEMATIC couples translations only). "
+            "Exact.", [emit_keyword(b.keyword, b.params)] + list(b.data), False, warn=False) + ties
+
+    def _warn_ties_refused(self, b: Block) -> None:
+        """Warn of a kinematic coupling of rotations only of shell/beam nodes left out because
+        another constraint uses its reference node's rotation (_plan_ties_refs)."""
+        why = self._kin_ties_refused.get(id(b))
+        if why:
+            self.report.warn(f"Kinematic coupling of rotations only of shell/beam nodes whose "
+                             f"reference node's rotation {why} also uses: the rotation ties to a "
+                             f"ROT NODE would turn apart from it, so the rotations are NOT coupled "
+                             f"(the line is dropped) — verify.", once=True)
+
+    def _warn_modal_ties(self, ties: List[str]) -> None:
+        """Warn of rotation ties of a kinematic coupling of rotations only (_kin_dynamic_cards,
+        _ties_beside_lines) in a deck with a *MODAL DYNAMIC step: each eliminates a knot's
+        rotation, on which ccx 2.23 crashes at random in that step."""
+        if ties and "MODAL DYNAMIC" in self.steps.procs and self._mechanical:
+            self.report.warn("Kinematic coupling of rotations only of shell/beam nodes in a deck with a "
+                             "*MODAL DYNAMIC step: its rotation ties eliminate DOFs of the nodes' knots, "
+                             "on which ccx 2.23 crashes at random in that step (heap corruption; probed: "
+                             "12 of 30 runs, exit 134 / 139; none of 30 without the ties). No ccx form "
+                             "avoids it (ccx's RIGID MPCs need the knots): rerun a run that crashes, and "
+                             "compare two that finish.", once=True)
+
     def _note_planar_kinematic(self) -> None:
         self.report.note("Kinematic coupling of 2-D (plane/axisymmetric) nodes: DOFs above 2 left "
                          "out of the ccx *KINEMATIC — such nodes have no DOF 3 in Abaqus, and ccx "
@@ -28737,7 +28793,8 @@ class _Constraints:
                     plan.get("kind") not in (None, "kin") or cg[0] not in self.geom.nodes:
                 continue
             top = 2 if id(b) in self._planar_kin else 3
-            ref, groups = cg[0], [(ns, ds) for ns, ds in cg[1] if any(d <= top for d in ds)]
+            ref, groups = cg[0], [(ns, ds) for ns, ds in cg[1] if any(d <= top for d in ds)
+                                  or plan.get("ties_only")]
             if not groups:                          # (no coupling written)
                 continue
             frame = self._coupling_frame(b)
@@ -28961,6 +29018,51 @@ class _Constraints:
         basis = null_space(rows)
         axes = sum(1 for k in range(3) if sum(q[k] ** 2 for q in basis) > 1.0 - 1e-9)
         return basis if len(basis) > axes else []
+
+    def _plan_ties_refs(self, blocks: List[Block], structural: set) -> Tuple[set, set]:
+        """Reference nodes (not shell/beam/membrane nodes) whose every kinematic coupling ties
+        rotations only (_kin_ties_only), which _plan_kinematic_rot_nodes gives a ROT NODE (the
+        'ties' form of _kin_dynamic_cards), where nothing else uses the node's rotation in a way
+        that ROT NODE cannot carry: BCs, moments, *EQUATION terms and connector rows move there
+        (``_rb_rot``), a rigid body, *MPC, distributing coupling, spring or rotary inertia on the
+        node would keep a rotation of its own (silently wrong: the coupled nodes turned apart
+        from it) — such a coupling is left as it was, its reason in ``_kin_ties_refused``
+        (handle_kinematic, handle_coupling warn of it).  One beside a coupling of translations
+        on the node ties to the node's DOFs 4-6 instead (_plan_rigid_couplings, 'ties_only').
+        Returns (those reference nodes, those left as they were)."""
+        per: Dict[int, bool] = {}
+        ids: Dict[int, List[int]] = {}
+        for i, b in enumerate(blocks):
+            cg = self._coupling_groups(blocks, i)
+            if cg is None or not cg[1] or cg[0] in structural or cg[0] not in self.geom.nodes:
+                continue
+            only = self._kin_ties_only(cg[0], cg[1], self._coupling_frame(b))
+            per[cg[0]] = per.get(cg[0], True) and only
+            ids.setdefault(cg[0], []).append(id(b))
+        refs = {ref for ref, only in per.items() if only}
+        if not refs:
+            return refs, set()
+        users = self._rotation_users(blocks)
+        bodies = {n for bs in self._mpc_bodies.values() for body in bs for n in [body["ref"]] + list(body["members"])}
+        what = {"rigid": "a *RIGID BODY", "mpc": "an *MPC", "distributing": "a distributing coupling",
+                "spring": "a spring, dashpot or rotary inertia", "connector": "a rigid connector (BEAM, WELD)"}
+        out: set = set()
+        for ref in refs:
+            # (a ROTARYI there is left out with its card, reduced physics: it acts on nothing)
+            kinds = {k for k, key in users.get(ref, ()) if not (k == "spring" and str(
+                self.geom.elements.get(key, ("",))[0]).upper().startswith("ROTARYI"))} - \
+                {"bc", "load", "equation", "kinematic"}
+            if "connector" in kinds and ref not in bodies:
+                kinds.discard("connector")          # (its rows read the ROT NODE: _rb_rot)
+            if ref in bodies and not kinds:
+                kinds.add("connector")              # (the body of a rigid connector, *MPC BEAM)
+            if kinds:
+                why = ", ".join(what.get(k, k) for k in sorted(kinds))
+                for c in ids[ref]:
+                    self._kin_ties_refused[c] = why
+                continue
+            out.add(ref)
+        return out, refs - out
 
     def _plan_kinematic_twists(self, blocks: List[Block], next_id: int, structural: set) -> int:
         """Kinematic couplings whose reference node has a free rotation off the global axes
@@ -30216,6 +30318,8 @@ class _Constraints:
         convertible: set = set()             # couplings of all translations, 3-D members
         # ref -> (id, its members are plain, it constrains anything: a ROT NODE is needed)
         dyn: "OrderedDict[int, List[Tuple[int, bool, bool]]]" = OrderedDict()
+        # refs whose couplings all tie rotations (a ROT NODE), and those left as they were
+        ties, refused = self._plan_ties_refs(blocks, structural)
 
         def add_dyn(b: Block, ref: int, groups: List[Tuple[List[int], set]], members: List[int]) -> None:
             frame = self._coupling_frame(b)
@@ -30223,7 +30327,7 @@ class _Constraints:
                 (dynamic and not any(n in structural or n in self._plane_only for n in members)) or
                 ((self._linear_rigid or ref in self._kin_eq_refs or ref in self._kin_twist_eq) and
                  all(self._kin_line_form(ref, ns, ds, frame) in ("eq", "ties") for ns, ds in groups)) or
-                self._kin_ties_only(ref, groups, frame))
+                (ref not in refused and self._kin_ties_only(ref, groups, frame)))
             dyn.setdefault(ref, []).append((id(b), plain, plain and any(
                 self._kin_line_form(ref, ns, ds, frame) in ("rb", "eq", "ties") for ns, ds in groups)))
         for i, b in enumerate(blocks):
@@ -30235,8 +30339,7 @@ class _Constraints:
             if not groups:                     # a card handle_coupling comments out
                 continue
             members = [n for ns, _ in groups for n in ns]
-            if dynamic or self._linear_rigid or ref in self._kin_eq_refs or \
-                    self._kin_ties_only(ref, groups, self._coupling_frame(b)):
+            if dynamic or self._linear_rigid or ref in self._kin_eq_refs or ref in ties:
                 add_dyn(b, ref, groups, members)
             if b.keyword == "KINEMATIC COUPLING" or ref not in self._transformed or \
                     ref in self._rb_rot or isinstance(self._local_axes(ref), str):
@@ -31368,6 +31471,11 @@ class _Constraints:
                                                   "ref": ref, "dofs": dofs, "frame": frame,
                                                   "rot": self._kin_rb[id(b)], "members": members}
                     continue
+                if self._ties_beside(ref, [(members, dofs)], frame, kin, structural):
+                    knots += [n for n in members if n in self._rot_nodes]
+                    self._coupling_plan[id(b)] = {"kind": "kin", "ties_only": True, "ref": ref,
+                                                  "members": members, "dofs": dofs, "frame": frame}
+                    continue
                 if not dofs & {1, 2, 3} or not any(n in structural for n in members + [ref]):
                     continue
                 if ref not in structural:
@@ -31393,6 +31501,12 @@ class _Constraints:
                                     else lambda ns, ds: False)
                     self._coupling_plan[id(b)] = {"kind": "kdyn", "ref": ref, "groups": cg[1],
                                                   "rot": self._kin_rb[id(b)]}
+                    continue
+                if self._ties_beside(ref, cg[1], self._coupling_frame(b), kin, structural):
+                    knots += [n for n in members if n in self._rot_nodes]
+                    self._coupling_plan[id(b)] = {"kind": "kin", "ties_only": True, "ref": ref,
+                                                  "groups": cg[1], "members": members,
+                                                  "frame": self._coupling_frame(b)}
                     continue
                 if not any(ds & {1, 2, 3} for _, ds in cg[1]) or \
                         not any(n in structural for n in members + [ref]):
@@ -31447,6 +31561,16 @@ class _Constraints:
                              f"shell/beam node in an *EQUATION, so the {len(conn)} node(s) whose "
                              f"rotations a connector constrains got force-free knot beams too "
                              f"(elset/material {KNOT_SET}), which give them real rotations.")
+
+    def _ties_beside(self, ref: Optional[int], groups: Sequence[Tuple[Sequence[int], set]],
+                     frame: Union[None, str, Tuple[Vec, Vec, Vec]], kin: set, structural: set) -> bool:
+        """Whether a kinematic coupling of rotations only of shell/beam nodes (_kin_ties_only) on
+        ``ref`` shares that node with a coupling of translations ccx's *KINEMATIC writes (``kin``,
+        _kinematic_refs): its rotations are then tied to the node's DOFs 4-6, which carry that
+        coupling's rotation, as a rotation line beside a translation line is — not to a ROT NODE
+        of their own, which would turn apart from it (_plan_ties_refs)."""
+        return ref in kin and ref not in structural and bool(groups) and \
+            self._kin_ties_only(ref, groups, frame)
 
     def _add_knot_beams(self, nodes: Sequence[int], blocks: List[Block],
                         along: Optional[Vec] = None) -> None:
@@ -31844,7 +31968,7 @@ class _Constraints:
                     emit = body_emit(ref, self._coupling_plan[id(b)]["rot"], lines[0][0]) if rb \
                         else "kin"
                 else:
-                    tied = any(ds & {1, 2, 3} for _, ds in lines) or id(b) in self._kin_dyn
+                    tied = any(ds & {1, 2, 3} for _, ds in lines) or id(b) in self._kin_dyn or plan == "kin"
                     emit = "kin"
             # a coupling written without ccx's *KINEMATIC (_kin_dynamic_cards): each line as
             # _kin_form says, the ones it leaves out constraining nothing
@@ -32893,6 +33017,7 @@ class _Constraints:
                 self._warn_finite_rigid(local)
         out += self._twin_lines(rows) + self._linear_rigid_lines(ref, rot, rows) + ties
         if forms == {"ties"} and ties:
+            self._warn_modal_ties(ties)
             self.report.note("Kinematic coupling of rotations only (DOFs 4-6) of shell/beam nodes: "
                              "ccx's *KINEMATIC couples translations only -> *EQUATION ties "
                              "theta(node) = theta(ref) of each coupled rotation, between each "
@@ -32950,9 +33075,12 @@ class _Constraints:
         none = ("Kinematic coupling of only rotational DOFs (4..6) of nodes without rotations: "
                 "ccx couples translations only (and its *KINEMATIC would keep a *DYNAMIC step from "
                 "solving); commented out — rotations are NOT coupled.")
+        untied = ("Kinematic coupling of rotations only of shell/beam nodes whose rotations could "
+                  "not be tied (see the warning above: a *TRANSFORM on a node, an ORIENTATION's axes "
+                  "not known or under NLGEOM); commented out — rotations are NOT coupled.")
         if not out:
             plan["commented"] = True
-            return self._commented(b, drop if "drop" in forms else none,
+            return self._commented(b, drop if "drop" in forms else none if "none" in forms else untied,
                                    reduces=what if "drop" in forms else "*KINEMATIC rotation-only coupling")
         if "drop" in forms:
             self.report.warn(drop, once=True)
@@ -45062,6 +45190,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         # equations), written without ccx's *KINEMATIC (_kin_form; ROT NODE None where all are
         # left out); id(*COUPLING / *KINEMATIC COUPLING)
         self._kin_dyn: set = set()
+        self._kin_ties_refused: Dict[int, str] = {}  # rotation-only couplings left out: why
         # *RIGID BODY reference nodes that a kinematic coupling (ccx's own) shares: the body's ROT
         # NODE follows the node's DOFs 4-6 (_plan_rigid_couplings)
         self._rb_follow: set = set()

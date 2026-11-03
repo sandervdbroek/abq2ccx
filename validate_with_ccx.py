@@ -9337,6 +9337,29 @@ def krot_beams_deck(lines="4, 6", nlgeom=False, moment=0.0):
     return "\n".join(out) + "\n"
 
 
+
+def krot_shared_deck():
+    """Two S4 strips 1 x 0.2 (8 x 2 elements, thickness 0.01, E 1e5, nu 0.3), A at y 0-0.2 and B
+    at y 0.4-0.6, clamped at x = 0; A's tip edge coupled to reference node 900 at (1, 0.3, 0) by
+    a *KINEMATIC of DOFs 4-6, B's last two node columns (set TB) by one of DOFs 1-3; a moment
+    about y on 900 turns both."""
+    nid = lambda s, i, j: 100 * s + 9 * j + i + 1
+    out = ["*NODE, NSET=ALLN"] + [f"{nid(s, i, j)}, {i / 8!r}, {0.4 * s + 0.1 * j!r}, 0."
+                                  for s in (0, 1) for j in range(3) for i in range(9)]
+    out += ["*NODE", "900, 1., 0.3, 0.", "*ELEMENT, TYPE=S4, ELSET=E"]
+    out += [f"{100 * s + 8 * j + i + 1}, {nid(s, i, j)}, {nid(s, i + 1, j)}, {nid(s, i + 1, j + 1)}, "
+            f"{nid(s, i, j + 1)}" for s in (0, 1) for j in range(2) for i in range(8)]
+    out += ["*SHELL SECTION, ELSET=E, MATERIAL=M", "0.01", "*MATERIAL, NAME=M", "*ELASTIC", "1e5, 0.3",
+            "*NSET, NSET=ROOT", "1, 10, 19, 101, 110, 119", "*NSET, NSET=TA", "9, 18, 27",
+            "*NSET, NSET=TB", "108, 117, 126, 109, 118, 127",
+            "*SURFACE, TYPE=NODE, NAME=SA", "TA", "*SURFACE, TYPE=NODE, NAME=SB", "TB",
+            "*COUPLING, CONSTRAINT NAME=CA, REF NODE=900, SURFACE=SA", "*KINEMATIC", "4, 6",
+            "*COUPLING, CONSTRAINT NAME=CB, REF NODE=900, SURFACE=SB", "*KINEMATIC", "1, 3",
+            "*STEP", "*STATIC", "*BOUNDARY", "ROOT, 1, 6", "*CLOAD", "900, 5, 1e-3",
+            "*NODE PRINT, NSET=ALLN", "U", "*END STEP"]
+    return "\n".join(out) + "\n"
+
+
 Check = collections.namedtuple("Check", "name doc func needs")
 CHECKS = []                 # the registered checks, in the order validate runs them
 
@@ -20051,6 +20074,39 @@ def check_kinematic_rotation_only(ccx, env, tmp, shared):
                   f"({'8 elements along the arc and ' if nl else ''}the knot's rigid tip section; before: "
                   f"nothing coupled, the tips did not move)")
         failures += 0 if ok else 1
+    # beside a coupling of translations on the same reference node, a coupling of rotations only
+    # ties to that node's DOFs 4-6, which carry ccx's coupling rotation: vs the same model with
+    # that coupling as the *RIGID BODY it is in ccx (the same RIGID MPCs) on ROT NODE 999, the
+    # ties and the moment moved there
+    tag = "kinematic_rotation_only_shared"
+    u = run(krot_shared_deck(), tag)
+    ok = u is not None
+    if ok:
+        with open(os.path.join(tmp, f"{tag}.inp"), encoding="utf-8") as fh:
+            text = fh.read()
+        twin = text.replace("*COUPLING, CONSTRAINT NAME=CB, REF NODE=900, SURFACE=SB\n*KINEMATIC\n1, 3\n",
+                            "*NODE\n999, 1., 0.3, 0.\n*RIGID BODY, NSET=TB, REF NODE=900, ROT NODE=999\n")
+        twin = re.sub(r"(\d+), ([456]), 1\., 900, ([456]), -1\.",
+                      lambda m: f"{m.group(1)}, {m.group(2)}, 1., 999, {int(m.group(3)) - 3}, -1.", twin)
+        twin = re.sub(r"\*CLOAD\n900, 5,", "*CLOAD\n999, 2,", twin)
+        ok = "ROT NODE=999" in twin and "999, 1, -1." in twin and "*CLOAD\n999, 2," in twin
+        inp = os.path.join(tmp, f"{tag}_twin.inp")
+        with open(inp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(twin)
+        d, status, _out = run_ccx(ccx, env, inp)
+        ref = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        ok = ok and bool(ref)
+        if ok:
+            err = apart(u, ref)
+            ok = err < 1e-9 and min(abs(u[27][2]), abs(u[127][2])) > 0.1 * max(abs(v[2]) for v in ref.values())
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (strip A's tip edge coupled in DOFs 4-6 and strip B's "
+                  f"end in DOFs 1-3 to one reference node, a moment on it): ccx solved, tips {u[27][2]:.5g} "
+                  f"and {u[127][2]:.5g}, {err:.1e} of max |u| from B's coupling as a *RIGID BODY with "
+                  f"A's ties on its ROT NODE (before: A tied to a ROT NODE of its own, which turned apart)")
+        else:
+            print(f"FAIL  {tag}: the twin did not solve ({status})")
+    failures += 0 if ok else 1
     return failures
 
 
