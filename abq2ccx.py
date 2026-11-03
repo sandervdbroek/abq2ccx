@@ -9710,6 +9710,9 @@ class _Mesh:
                 self.report.note(f"*TIE TYPE={v} dropped (not a ccx parameter).", once=True)
             elif k == "NO ROTATION":
                 pass                                # (below: moot where the master has none)
+            elif k == "TIED NSET" and v and v.strip() and not (b.has("CYCLIC SYMMETRY") or
+                                                                b.has("MULTISTAGE")):
+                pass                                # (below: _tied_nset_slave)
             else:
                 self.report.note(f"*TIE parameter {k} dropped (unsupported by ccx).", once=True)
         self.report.note("*TIE: in ccx the MASTER (independent, 2nd) surface must be element-based; "
@@ -9740,11 +9743,22 @@ class _Mesh:
                     f"dependent side of an equation'; probed), so the line is left out.",
                     [emit_keyword("TIE", params), line], False)
                 continue
+            tied = self._tied_nset_slave(f[0], master, b) if plain and b.param("TIED NSET") else None
+            if tied is not None and tied[0] == "":
+                out.append(f"** abq2ccx: *TIE {params.get('NAME') or ''}: no slave node of {f[0]} but "
+                           f"those of {master} is in its TIED NSET, so Abaqus ties none")
+                continue
+            card = b
+            if tied is not None:                    # (the set's nodes, reached by the tolerance)
+                f[0] = tied[0]
+                line = ", ".join(f)
+                card = Block(b.keyword, OrderedDict(b.params), b.data)
+                card.params["POSITION TOLERANCE"] = short_real(tied[2], 6)
             name, cards = self._membrane_node_surface(
                 f[0], "*TIE slave", exclude=set(self._surface_member_nodes(master))) \
                 if plain else (None, [])
             membrane = name is not None
-            shell = self._shell_tie_slave(f[0], master, b, False) if plain and not membrane else None
+            shell = self._shell_tie_slave(f[0], master, card, False) if plain and not membrane else None
             reach = None
             if shell is not None and shell[0] is None:
                 reach, shell = shell[2], None   # (the deck's surfaces, with a tolerance ccx reaches)
@@ -9766,13 +9780,13 @@ class _Mesh:
                 out.append(f"** abq2ccx: *TIE {params.get('NAME') or ''}: every slave node of {f[0]} is a "
                            f"node of {master}, which joins them already")
                 continue
-            if plain and not membrane and shell is None and name is None:
+            if plain and not membrane and shell is None and name is None and tied is None:
                 try:
                     given = pf(b.param("POSITION TOLERANCE") or "")
                 except ValueError:
                     given = None
                 name, cards = self._trimmed_tie_slave(f[0], master, reach if reach is not None else given,
-                                                      params.get("NAME") or "")
+                                                      f"*TIE {params.get('NAME') or ''}".rstrip())
             if name and shell is not None:
                 params["POSITION TOLERANCE"] = short_real(shell[2], 6)
                 line = ", ".join([name] + f[1:])
@@ -9782,6 +9796,9 @@ class _Mesh:
                 params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
                     b.param("POSITION TOLERANCE"), f[0], master, b, False), 6)
                 line = ", ".join([name] + f[1:])
+            elif tied is not None:                  # (the line names the set's node surface)
+                cards = tied[1]
+                params["POSITION TOLERANCE"] = short_real(tied[2], 6)
             if reach is not None:
                 params["POSITION TOLERANCE"] = short_real(reach, 6)
             out += cards + [emit_keyword("TIE", params), line]
@@ -9791,6 +9808,80 @@ class _Mesh:
                              once=True)
             self._reduces("*TIE, NO ROTATION")
         return out + comments
+
+    def _tied_nset_slave(self, slave: str, master: str, b: Block
+                         ) -> Optional[Tuple[str, List[str], float]]:
+        """*TIE ``b`` with TIED NSET: Abaqus ties the slave nodes in that set, whatever their
+        distance from the master — 'the position tolerance criterion is not used' ("Mesh tie
+        constraints"; _plan_rigid_ties reads it so too) — and none of the master's own nodes.
+        ccx has no such parameter (the base converter dropped it: every slave node tied, 54 %
+        to 5x off; a set beyond ccx's default tolerance tied nothing, singular).  -> (a node
+        surface of those nodes of ``slave``, its *SURFACE card, a POSITION TOLERANCE that
+        reaches each of them: their largest distance from the master's faces, 5 % more, at
+        least Abaqus' default tolerance), registered in self.surfaces, so the shell and
+        membrane forms of handle_tie take it as the slave; ("", [], 0) where the set holds
+        none of them.  ccx's ADJUST (default YES, as Abaqus') moves them onto the master.
+        Probed on 2.23 (C3D8 blocks, element and node slaves, S4 skin; on the master, 0.1
+        off with ADJUST=YES / NO; CPS4 / CPE4 / CAX4 strips): the blocks merged at those nodes
+        (moved onto the master), or tied by equations with ADJUST=NO, to 1e-6 (CAX4 3e-4, its
+        wedge).  But ccx moves a node of elements it expands (plane, axisymmetric, membrane,
+        beam) and not the solid it expands them to: such nodes off the master with ADJUST are
+        9-11 % off the nodes moved (CPS4 / CAX4), warned, reduced physics (shells:
+        _shell_tie_slave).  None where the surfaces or the set are not the deck's (an
+        undefined set: warned, the line kept)."""
+        nset = (b.param("TIED NSET") or "").strip()
+        sd, md = self.surfaces.get(slave.upper()), self.surfaces.get(master.upper())
+        if sd is None or md is None or md[0].startswith("NODE"):
+            return None
+        if nset.upper() not in self.geom.nsets:
+            self.report.warn(f"*TIE {b.param('NAME') or ''}: its TIED NSET {nset} is not a node set "
+                             f"of the deck (Abaqus stops on it); every slave node within the position "
+                             f"tolerance is tied — verify.", once=True)
+            return None
+        members, shared = set(self.geom.nset(nset)), set(self._surface_member_nodes(master))
+        chosen = [n for n in self._surface_member_nodes(slave)
+                  if n in members and n not in shared and n in self.geom.nodes]
+        if not chosen:
+            return "", [], 0.0
+        types: Dict[str, str] = {}
+        mf = [(e,) + self._facet(e, face, types) for token, face in md[1]
+              for e in self._resolve_elements(token) if e in self.geom.elements]
+        reach = self._mean_diagonal([self._face_points(e, face) for token, face in md[1]
+                                     for e in self._resolve_elements(token)
+                                     if e in self.geom.elements]) or 1.0
+        gaps = self._surface_gaps(chosen, mf, reach)
+        while any(not math.isfinite(g) for g, _i in gaps.values()) and reach < 1e6 * (self._model_span() or 1.0):
+            reach *= 8.0
+            gaps = self._surface_gaps(chosen, mf, reach)
+        far = max([g for g, _i in gaps.values() if math.isfinite(g)] or [0.0])
+        tol = max(1.05 * far, self._membrane_tie_tolerance(None, slave, master, b, False,
+                                                            node_based=sd[0].startswith("NODE")))
+        key = ("TIED", slave.upper(), master.upper(), nset.upper())
+        if key in self._mem_surfaces:
+            return self._mem_surfaces[key], [], tol
+        at = self._elements_at({n for n, (g, _i) in gaps.items() if g > 1e-6 * reach})
+        expanded = {e for es in at.values() for e in es
+                    if ccx_type(self.geom.elements[e][0]).startswith(PLANE_ELEM_PREFIXES + ("M3D",)) or
+                    ccx_type(self.geom.elements[e][0]) in BEAM_TYPES}
+        moved = [n for n in chosen if expanded.intersection(at.get(n, ()))]
+        if moved and (b.param("ADJUST") or "YES").strip().upper() != "NO":
+            self.report.warn(f"*TIE {b.param('NAME') or ''}, TIED NSET={nset}: {len(moved)} of its slave "
+                             f"node(s) (e.g. node {moved[0]}) lie off the master surface on plane, "
+                             f"axisymmetric, membrane or beam elements; Abaqus moves them onto it (ADJUST), "
+                             f"ccx 2.23 moves the node but not the solid it expands those elements to "
+                             f"(probed: CPS4 / CAX4 strips 11 % / 9 % off the nodes moved; ADJUST=NO "
+                             f"exact) — verify.", once=True)
+            self._reduces("*TIE, TIED NSET: slave nodes of expanded elements moved onto the master")
+        self._reserve_names()
+        name = self._fresh_name(f"{slave}_TIED")
+        self._mem_surfaces[key] = name
+        self.surfaces[name.upper()] = ("NODE", [(str(n), None) for n in chosen])
+        self.report.note(f"*TIE {b.param('NAME') or ''}, TIED NSET={nset} -> slave node surface {name} of "
+                         f"the {len(chosen)} node(s) of {slave} in that set (not on {master}), with a "
+                         f"POSITION TOLERANCE that reaches each of them: Abaqus ties exactly those "
+                         f"nodes, whatever their distance from the master (ccx has no TIED NSET)."
+                         f"{'' if moved else ' Exact.'}", once=True)
+        return name, [f"*SURFACE, NAME={name}, TYPE=NODE"] + [str(n) for n in chosen], tol
 
     def _surface_turns(self, surf: str) -> bool:
         """Whether surface ``surf`` lies on elements with rotations (conventional shells,
@@ -9812,22 +9903,24 @@ class _Mesh:
     def _trimmed_tie_slave(self, slave: str, master: str, tol: Optional[float], tie: str
                            ) -> Tuple[Optional[str], List[str]]:
         """A *TIE slave surface reaching far beyond its master (a whole plate face tied to a small
-        shroud) -> a surface of its faces (a node surface: its nodes) of which some node lies
-        within ``reach`` of a master node: (its name, its *SURFACE card), or (None, []) where
-        every face is within reach, none is, or the surfaces are of another kind (the slave
-        on solids or nodes, the master on faces the converter resolves, with S1-S6 / SPOS /
+        shroud; ``tie`` names the card: a *TIE, or a TIED *CONTACT PAIR, which the converter writes
+        as one: _contact_pair_lines) -> a surface of its faces (a node surface: its nodes) of which
+        some node lies within ``reach`` of a master node: (its name, its *SURFACE card), or (None,
+        []) where every face is within reach, none is, or the surfaces are of another kind (the
+        slave on solids or nodes, the master on faces the converter resolves, with S1-S6 / SPOS /
         SNEG labels).  ccx 2.23 prints 'no tied MPC generated ... no opposite master face' for
-        every node of the others (87541 of a plate's 89341 slave nodes, 15 MB of output) and
-        ties none of them; nor does Abaqus, which ties a slave node only within the position
-        tolerance of the master surface (Mesh tie constraints).  A slave node is within reach
-        when it lies in the bounding box of a master facet grown by the tolerance (``tol``: the
-        one written, or the deck's; none given: the facet's extent, beyond ccx's default, a
-        fraction of the element size), a tenth of the facet's extent (ccx's in-face tolerance at
-        its edges) and a shell master's half thickness and offset (ccx's expanded face): a point
-        within the tolerance of a facet lies in that box, so a node in none of them is tied by
-        neither code.  The master must be on solids or on conventional shells with a section
-        thickness (not NODAL THICKNESS: _shell_tie_unbounded): ccx expands membranes, plane and
-        axisymmetric elements and beams by thicknesses not bounded here.  Exact."""
+        every node of the others (87541 of a plate's 89341 slave nodes, 15 MB of output) and ties
+        none of them; nor does Abaqus, which ties a slave node only within the position tolerance
+        of the master surface (Mesh tie constraints; a tied pair: within its ADJUST zone).  A slave
+        node is within reach when it lies in the bounding box of a master facet grown by the
+        tolerance (``tol``: the one written, or the deck's; none given: the facet's extent, beyond
+        ccx's default, a fraction of the element size), a tenth of the facet's extent (ccx's
+        in-face tolerance at its edges) and a shell master's half thickness and offset (ccx's
+        expanded face): a point within the tolerance of a facet lies in that box, so a node in none
+        of them is tied by neither code.  The master must be on solids or on conventional shells
+        with a section thickness (not NODAL THICKNESS: _shell_tie_unbounded): ccx expands
+        membranes, plane and axisymmetric elements and beams by thicknesses not bounded here.
+        Exact."""
         sd, md = self.surfaces.get(slave.upper()), self.surfaces.get(master.upper())
         if not sd or not md or md[0].startswith("NODE"):
             return None, []
@@ -9914,7 +10007,7 @@ class _Mesh:
         self._reserve_names()
         name = self._fresh_name(f"{slave}_NEAR")
         self._mem_surfaces[cache_key] = name
-        self.report.note(f"*TIE {tie}: slave surface {slave} -> {name}, the {len(kept)} of its {total} "
+        self.report.note(f"{tie}: slave surface {slave} -> {name}, the {len(kept)} of its {total} "
                          f"{what}{'' if card == 'NODE' else ' with a node'} near master surface {master} (in a facet's bounding box "
                          f"grown by the position tolerance, a tenth of the facet and a shell's half "
                          f"thickness): ccx 2.23 prints 'no tied MPC generated' for every node of the "
@@ -12355,6 +12448,10 @@ class _Mesh:
                 if slave and shell is None:
                     params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
                         adj, f[0].strip(), f[1].strip(), b, True), 6)
+                if slave is None:                   # (the deck's surfaces: as a *TIE's)
+                    tol = params.get("POSITION TOLERANCE")
+                    slave, cards = self._trimmed_tie_slave(f[0].strip(), f[1].strip(),
+                                                           pf(tol) if tol else None, "*CONTACT PAIR, TIED")
                 out += cards + [emit_keyword("TIE", params), f"{slave or f[0]}, {f[1]}"]
             if out:
                 self.report.note("*CONTACT PAIR, TIED -> *TIE (same slave/master surfaces; ccx "
@@ -33136,6 +33233,58 @@ class _Constraints:
                              f"knots, 0.009 without) — verify.", once=True)
             self._reduces("knot beams for rotational BCs on circular-section beams")
 
+    def _plan_offset_solid_knots(self, blocks: List[Block]) -> None:
+        """Conventional shells with a section OFFSET whose nodes are also nodes of solids (a
+        skin merged with a solid's face, a shell edge on one): Abaqus joins the solid to the
+        shell's node, a point of its reference surface; ccx 2.23 ties a shared node that is
+        not a knot to the mean of its expanded shell's top and bottom nodes (gen3dconnect,
+        DOFs 0-3), the midsurface, whatever the offset — the plain merged model equals the one
+        with OFFSET 0.  Probed on a cantilever block with a skin (t 0.2 on 1 x 1, nu 0) on its
+        top (-0.5) or bottom (0.5) face: 11-12 % off in bending, 2 % in tension, 5 % in the
+        frequencies, against the skin as a layer of solids on the face.  A knot is joined to
+        the solid at its node, the reference point, with the shell's section rigid about it
+        (ccx's knot), so each such node gets a force-free knot beam (_add_knot_beams): the
+        layer of the shell's own expansion elements exactly (S4 / S4R: C3D8I / C3D8R, also
+        NLGEOM, frequencies and *DYNAMIC; S8R 7e-4 off a C3D20R layer).  Its rotation about
+        the normal is held (_hold_knot_drilling).  Not in a deck with an explicit step (the
+        massless knot beams stop ccx's explicit solver) or U1 beams (ccx stops on any B31
+        there): warned, reduced physics."""
+        if not self._mechanical or getattr(self.opt, "solid_dof", False):
+            return
+        offset: Dict[int, float] = {}
+        for b in blocks:
+            if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION"):
+                off = offset_fraction(b.param("OFFSET"))
+                for e in self.geom.elset((b.param("ELSET") or "").strip()):
+                    if off and e in self.geom.elements and ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS:
+                        offset[e] = off
+        if not offset:
+            return
+        solid = {n for e, (typ, conn) in self.geom.elements.items()
+                 if e not in self._qmem and ccx_type(typ).startswith("C3D") for n in conn}
+        need = sorted({n for e in offset for n in self.geom.elements[e][1] if n in solid} -
+                      set(self._knots))
+        if not need:
+            return
+        e0 = next(e for e in sorted(offset) if need[0] in self.geom.elements[e][1])
+        what = (f"{len(need)} node(s) of conventional shells with a section OFFSET (e.g. node "
+                f"{need[0]}, OFFSET={short_real(offset[e0], 4)}) are nodes of solids too: Abaqus "
+                f"joins the solid to the shell's reference surface, ccx 2.23 to the midsurface of a "
+                f"shell node that is no knot (probed: a skin merged with a block's face 11-12 % off "
+                f"in bending)")
+        if self._explicit_deck or self._u1:
+            why = ("they stop ccx's explicit solver" if self._explicit_deck else
+                   "ccx stops on them in a model with U1 beams")
+            self.report.warn(f"{what}. The knot beams that join it at the node were not added: "
+                             f"{why} — verify.", once=True)
+            self._reduces("shell OFFSET at nodes shared with solids (ccx joins the midsurface)")
+            return
+        self._add_knot_beams(need, blocks)
+        self.report.note(f"{what}; each got a force-free knot beam (elset/material {KNOT_SET}, no "
+                         f"density), which joins the solid at the node with the shell's section rigid "
+                         f"about it (probed: the skin as a layer of its expansion elements exactly).",
+                         once=True)
+
     def _plan_modal_knots(self, blocks: List[Block]) -> None:
         """ccx 2.23's modal procedures on shell/beam nodes that are not knots (probed on S4
         strips and a B32R column, against a superposition of ccx's own modes that matches a
@@ -43228,10 +43377,11 @@ class _PostPasses:
     def _hold_knot_drilling(self, blocks: List[Block], deck: EmittedDeck) -> EmittedDeck:
         """The drilling rotation of a converter knot beam's knot on a smooth shell node — one
         that ccx 2.23 would make no knot by itself (one group of shells, _ccx_knot's test),
-        with no other element, where no *EQUATION holds a part of its turn about the normal
-        (none names its rotations, or each that does holds a direction normal to it: a
-        coupling of some rotations about axes in the shell's plane) — in the steps where no
-        *BOUNDARY holds a part of that turn either.
+        with no other element but solids (no rotations: _plan_offset_solid_knots), where no
+        *EQUATION holds a part of its turn about the normal (none names its rotations, or
+        each that does holds a direction normal to it: a coupling of some rotations about
+        axes in the shell's plane) — in the steps where no *BOUNDARY holds a part of that
+        turn either.
         The knot's rotation about the shell normal moves neither the shell's expanded nodes
         (they lie on the normal) nor anything the force-free knot beam holds, so it has no
         stiffness: ccx's solution then depends on round-off (probed: a fixed-fixed S4 beam
@@ -43300,8 +43450,9 @@ class _PostPasses:
         loose: List[int] = []                   # (no form: an equation in a *MODAL DYNAMIC deck)
         mixed: List[int] = []                   # (no form: held by a BC in some steps only)
         for n in sorted(knots - set(self._transformed)):
-            own = [e for e in at.get(n, ()) if e not in beams]
-            if not own or any(ccx_type(self.geom.elements[e][0]) not in SHEET_SHELLS for e in own) or \
+            types = {e: ccx_type(self.geom.elements[e][0]) for e in at.get(n, ()) if e not in beams}
+            own = [e for e, t in types.items() if t in SHEET_SHELLS]
+            if not own or any(t not in SHEET_SHELLS and not t.startswith("C3D") for t in types.values()) or \
                     len({sections.get(e) for e in own}) > 1 or None in {sections.get(e) for e in own}:
                 continue
             normals = [self._shell_node_normal(e, n) for e in own]
@@ -45815,6 +45966,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_late_op_new(blocks)          # after _plan_load_cases
         self._plan_modal_starts(blocks)
         self._plan_modal_knots(blocks)          # before _plan_op_new_rotations: its knots stay knots
+        self._plan_offset_solid_knots(blocks)   # likewise
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_transformed_corners(blocks)      # after it: its 'keep' nodes

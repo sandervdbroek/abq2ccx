@@ -8,6 +8,42 @@ From 1.6.0 on, each version opens with an overview in plain language (what now c
 gives more correct answers, what changed in using the converter), followed by the detailed
 entries. The GitHub release notes use the same section.
 
+## Unreleased
+
+### Overview
+
+* **More correct answers.** A shell with a section offset whose nodes are also nodes of a solid
+  (a skin merged with a block's face) is now joined to the solid at its reference surface, as in
+  Abaqus: ccx joined the shell's midsurface, 11 % off in bending for a skin of a fifth of the
+  block's depth, without a message. A `*TIE` with `TIED NSET` now ties exactly the slave nodes
+  of that set, as Abaqus does; the parameter was dropped, so every slave node was tied (or,
+  beyond ccx's default tolerance, none).
+* **Leaner tie output.** Tied contact pairs get the slave-surface trimming that `*TIE` got in
+  1.7.0: the same answers without a ccx warning for every slave node away from the master.
+
+### Details
+
+* **Offset shells on solid nodes** — ccx 2.23 ties a shell node that it shares with a solid to
+  the mean of the node's expanded top and bottom, the midsurface, whatever the section's
+  `OFFSET`; Abaqus joins the solid to the node, a point of the reference surface. Each such
+  node of a shell with a nonzero `OFFSET` now gets a force-free knot beam, which makes it a
+  knot: the solid is joined at the node and the shell's section turns rigidly about it, its
+  rotation about the normal held. Probed: the skin as a layer of the shell's own expansion
+  elements exactly (S4, S4R; also NLGEOM, frequencies, dynamics), S8R within 7e-4
+  (`validate_with_ccx.py tie_leftovers_offset_top` / `_bot`; before 11 % off). In a deck with an
+  explicit step or U1 beams, which stop ccx with knot beams, it is warned as reduced physics.
+* **`*TIE, TIED NSET`** — the line's slave becomes a node surface of the slave nodes in the set
+  (none of the master's), with a `POSITION TOLERANCE` that reaches each of them: Abaqus ties
+  those nodes whatever their distance from the master, and ccx's `ADJUST` moves them onto it as
+  Abaqus' does. A set with no slave node ties nothing (a comment); an undefined one is warned.
+  `validate_with_ccx.py tie_leftovers_nset` / `_nset_skin` / `_nset_plane`: the set's nodes
+  merged (tied by equations with `ADJUST=NO`), exactly. On plane, axisymmetric, membrane or beam
+  elements ccx's `ADJUST` moves a node but not the solid it expands the element to (9-11 % off),
+  so a set node off the master there is warned as reduced physics unless `ADJUST=NO`.
+* **Tied contact pairs trimmed** — a `*CONTACT PAIR, TIED` on deformable surfaces, written as a
+  `*TIE`, gets the `*TIE`'s trimmed slave surface (`validate_with_ccx.py
+  tie_leftovers_pair_trimmed`: the same answer, 16 'no tied MPC' warnings instead of 112).
+
 ## 1.7.0 (November 2026)
 
 ### Overview
