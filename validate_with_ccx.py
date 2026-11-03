@@ -9256,6 +9256,87 @@ def knot_drilling_deck(modal=True, nx=30, ny=10):
     return out
 
 
+
+def krot_strip_deck(lines="4, 6", nlgeom=False, moment=None, rot=None, given=False, legacy=False,
+                    ref_bcs=(), tilt=0.0):
+    """An S4 strip 1 x 0.2 (8 x 2 elements, thickness 0.01, E 1e5, nu 0: cylindrical bending)
+    clamped at x = 0, its tip edge (nodes 9, 18, 27) coupled to reference node 900 at its middle
+    by a *KINEMATIC of ``lines`` ('4, 6', or several joined by ';'; ``legacy``: a *KINEMATIC
+    COUPLING card); ``moment``: (DOF, value) on node 900; ``rot``: rotations (DOFs 4-6) given on
+    900, or (``given``) on the tip edge itself without a coupling; ``ref_bcs``: DOFs of 900
+    held; ``tilt``: the whole model turned that many radians about x (moment and rotations
+    with it)."""
+    c, s = math.cos(tilt), math.sin(tilt)
+    turn = lambda v: (v[0], c * v[1] - s * v[2], s * v[1] + c * v[2])
+    nid = lambda i, j: 9 * j + i + 1
+    pts = {nid(i, j): (i / 8, 0.1 * j, 0.0) for j in range(3) for i in range(9)}
+    pts[900] = (1.0, 0.1, 0.0)
+    out = ["*NODE, NSET=ALLN"] + [f"{n}, " + ", ".join(f"{x:.15g}" for x in turn(p)) for n, p in pts.items()]
+    out += ["*ELEMENT, TYPE=S4, ELSET=E"] + [f"{8 * j + i + 1}, {nid(i, j)}, {nid(i + 1, j)}, "
+                                            f"{nid(i + 1, j + 1)}, {nid(i, j + 1)}" for j in range(2) for i in range(8)]
+    out += ["*SHELL SECTION, ELSET=E, MATERIAL=M", "0.01", "*MATERIAL, NAME=M", "*ELASTIC", "1e5, 0.",
+            "*NSET, NSET=ROOT", "1, 10, 19", "*NSET, NSET=TIP", "9, 18, 27"]
+    dofs = [x.strip() for x in lines.split(";")]
+    if legacy:
+        out += ["*KINEMATIC COUPLING, REF NODE=900"] + [f"TIP, {d}" for d in dofs]
+    elif not given:
+        out += ["*SURFACE, TYPE=NODE, NAME=ST", "TIP",
+                "*COUPLING, CONSTRAINT NAME=C, REF NODE=900, SURFACE=ST", "*KINEMATIC"] + dofs
+    out += ["*STEP" + (", NLGEOM, INC=1000" if nlgeom else ""), "*STATIC",
+            "0.05, 1., 1e-6, 0.05" if nlgeom else "1., 1.", "*BOUNDARY", "ROOT, 1, 6"]
+    out += [f"900, {d}, {d}" for d in ref_bcs]
+    if rot is not None:
+        out += [f"{'TIP' if given else 900}, {k}, {k}, {v!r}" for k, v in zip((4, 5, 6), turn(rot))]
+    if moment is not None:
+        m = turn(tuple(moment[1] if k == moment[0] else 0.0 for k in (4, 5, 6)))
+        out += ["*CLOAD"] + [f"900, {k}, {v!r}" for k, v in zip((4, 5, 6), m) if v]
+    return "\n".join(out + ["*NODE PRINT, NSET=ALLN", "U", "*END STEP"]) + "\n"
+
+
+def krot_free_strip_deck(theta, nlgeom, legacy=False):
+    """A free S4 strip 1 x 0.2 (8 x 2 elements) whose every node a *KINEMATIC of DOFs 4-6 couples
+    to reference node 900, which is turned by the rotation vector ``theta``, pinned at node 1
+    (0, 0, 0) and node 23 (0.5, 0.2, 0), which lie on its axis: the strip turns rigidly,
+    u = (R - I) x (linear: theta x x)."""
+    nid = lambda i, j: 9 * j + i + 1
+    out = ["*NODE, NSET=ALLN"] + [f"{nid(i, j)}, {i / 8!r}, {0.1 * j!r}, 0." for j in range(3) for i in range(9)]
+    out += ["*NODE", "900, 0.5, 0.1, 0.", "*ELEMENT, TYPE=S4, ELSET=E"]
+    out += [f"{8 * j + i + 1}, {nid(i, j)}, {nid(i + 1, j)}, {nid(i + 1, j + 1)}, {nid(i, j + 1)}"
+            for j in range(2) for i in range(8)]
+    out += ["*SHELL SECTION, ELSET=E, MATERIAL=M", "0.01", "*MATERIAL, NAME=M", "*ELASTIC", "1e5, 0.3"]
+    out += ["*KINEMATIC COUPLING, REF NODE=900", "ALLN, 4, 6"] if legacy else \
+        ["*SURFACE, TYPE=NODE, NAME=ST", "ALLN", "*COUPLING, CONSTRAINT NAME=C, REF NODE=900, SURFACE=ST",
+         "*KINEMATIC", "4, 6"]
+    out += ["*STEP" + (", NLGEOM, INC=1000" if nlgeom else ""), "*STATIC",
+            "0.05, 1., 1e-6, 0.05" if nlgeom else "1., 1.", "*BOUNDARY", "1, 1, 3", "23, 1, 3"]
+    out += [f"900, {k}, {k}, {v!r}" for k, v in zip((4, 5, 6), theta)]
+    return "\n".join(out + ["*NODE PRINT, NSET=ALLN", "U", "*END STEP"]) + "\n"
+
+
+def krot_beams_deck(lines="4, 6", nlgeom=False, moment=0.0):
+    """Two B31 cantilevers 1 long (8 elements each) along x at y = 0 and 0.5, RECT 0.1 x 0.1 and
+    0.1 x 0.2 (bending about z: I 1/12e-4 and 2/3e-4), E 1e5, clamped at x = 0, their tips
+    (nodes 9, 18) coupled to reference node 900 between them by a *KINEMATIC of ``lines``, and a
+    moment about z on 900: both tips turn by theta = M L / (E (I1 + I2)), u_y = theta L / 2
+    (NLGEOM: the arc, L (1 - cos theta) / theta)."""
+    out = ["*NODE, NSET=ALLN"]
+    for b, y in enumerate((0.0, 0.5)):
+        out += [f"{9 * b + i + 1}, {i / 8!r}, {y}, 0." for i in range(9)]
+    out += ["*NODE", "900, 1., 0.25, 0."]
+    for b in range(2):
+        out += [f"*ELEMENT, TYPE=B31, ELSET=B{b + 1}"] + [f"{8 * b + i + 1}, {9 * b + i + 1}, {9 * b + i + 2}"
+                                                         for i in range(8)]
+    out += ["*BEAM SECTION, ELSET=B1, MATERIAL=M, SECTION=RECT", "0.1, 0.1", "0., 0., -1.",
+            "*BEAM SECTION, ELSET=B2, MATERIAL=M, SECTION=RECT", "0.1, 0.2", "0., 0., -1.",
+            "*MATERIAL, NAME=M", "*ELASTIC", "1e5, 0.3", "*NSET, NSET=TIPS", "9, 18",
+            "*SURFACE, TYPE=NODE, NAME=ST", "TIPS", "*COUPLING, CONSTRAINT NAME=C, REF NODE=900, SURFACE=ST",
+            "*KINEMATIC"] + [x.strip() for x in lines.split(";")]
+    out += ["*STEP" + (", NLGEOM, INC=1000" if nlgeom else ""), "*STATIC",
+            "0.05, 1., 1e-6, 0.05" if nlgeom else "1., 1.", "*BOUNDARY", "1, 1, 6", "10, 1, 6",
+            "*CLOAD", f"900, 6, {moment!r}", "*NODE PRINT, NSET=TIPS", "U", "*END STEP"]
+    return "\n".join(out) + "\n"
+
+
 Check = collections.namedtuple("Check", "name doc func needs")
 CHECKS = []                 # the registered checks, in the order validate runs them
 
@@ -19838,6 +19919,138 @@ def check_t123(ccx, env, tmp, shared):
               f"released by OP=NEW in an NLGEOM step and pulled): tip u3 {runs[0][9][2]:.6g} (the step alone "
               f"{runs[1][9][2]:.6g}, {err:.1e} off; the knots differ; before: ccx stopped)")
     failures += 0 if ok else 1
+    return failures
+
+
+@check("kinematic_rotation_only",
+       "a *KINEMATIC of rotations only on shell / beam nodes: knot ties to a ROT NODE")
+def check_kinematic_rotation_only(ccx, env, tmp, shared):
+    # --- a *KINEMATIC of rotations only on shell / beam nodes (before: the line dropped, the
+    # rotations not coupled, reduced physics): each node's knot tied to a ROT NODE that carries
+    # the reference node's rotation ---
+    failures = 0
+
+    def run(text, tag, reduced=()):
+        """{node: u} of ``text`` converted and solved with exactly the ``reduced`` physics, or
+        None (FAIL printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        _rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        u = dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if not u or sorted(conv.reduced_physics) != sorted(reduced):
+            print(f"FAIL  {tag}: " + (f"no results ({status})" if not u else
+                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+            return None
+        return u
+
+    def apart(u, ref, nodes=None):
+        """max |u - ref| over ``nodes`` (all of ref's) over max |ref|."""
+        nodes = [n for n in ref if n != 900] if nodes is None else nodes
+        return ccx_ratio(max(math.dist(u.get(n, (math.inf,) * 3), ref[n]) for n in nodes),
+                         max(math.hypot(*ref[n]) for n in nodes))
+
+    # a free strip turned rigidly by the rotation vector of its reference node, about an axis
+    # through its two pinned nodes: u = (R - I) x, R by Rodrigues' formula (the ROT NODE's
+    # DOFs carry ccx's knot rotation vector)
+    ax = (0.5, 0.2, 0.0)
+    for nl, phi in ((False, 1e-3), (True, 0.8)):
+        th = tuple(phi * a / math.hypot(*ax) for a in ax)
+        k = tuple(t / phi for t in th)
+        for legacy in (False, True):
+            tag = f"kinematic_rotation_only_rigid_{'nlgeom' if nl else 'linear'}{'_legacy' if legacy else ''}"
+            u = run(krot_free_strip_deck(th, nl, legacy), tag)
+            ok = u is not None
+            if ok:
+                ref = {}
+                for n in range(1, 28):
+                    x = ((n - 1) % 9 / 8, 0.1 * ((n - 1) // 9), 0.0)
+                    if nl:      # x cos + (k x x) sin + k (k . x)(1 - cos), less x
+                        kx = (k[1] * x[2] - k[2] * x[1], k[2] * x[0] - k[0] * x[2], k[0] * x[1] - k[1] * x[0])
+                        kd = sum(a * b for a, b in zip(k, x))
+                        ref[n] = tuple(x[i] * (math.cos(phi) - 1) + kx[i] * math.sin(phi) +
+                                       k[i] * kd * (1 - math.cos(phi)) for i in range(3))
+                    else:
+                        ref[n] = (th[1] * x[2] - th[2] * x[1], th[2] * x[0] - th[0] * x[2],
+                                  th[0] * x[1] - th[1] * x[0])
+                err = apart(u, ref)
+                moved = min(math.hypot(*u[n]) for n in (9, 27)) / max(math.hypot(*v) for v in ref.values())
+                ok = err < 1e-6 and moved > 0.3
+                print(f"{'PASS' if ok else 'FAIL'}  {tag} (a free S4 strip, every node a *KINEMATIC "
+                      f"{'COUPLING ' if legacy else ''}of DOFs 4-6 to a reference node turned by a rotation "
+                      f"vector of {phi:g} rad off the axes, pinned at two nodes on its axis): ccx solved, "
+                      f"27 nodes at the rigid turn (R - I) x to {err:.1e} of max |u|, the far corners "
+                      f"moved {moved:.2f} of it (before: nothing coupled, the strip did not turn)")
+            failures += 0 if ok else 1
+    # a cantilever strip's tip edge coupled in rotation to its reference node: turned there vs
+    # the same turn given on the edge nodes themselves; a moment there vs cylindrical bending
+    # (nu 0), with the reference node free (its turn about the normal held: it moves only the
+    # knots' drilling rotations) and with the deck holding DOFs 4 and 6 — the same answer
+    for nl, th in ((False, 0.01), (True, 0.5)):
+        tag = f"kinematic_rotation_only_turned_{'nlgeom' if nl else 'linear'}"
+        u = run(krot_strip_deck(nlgeom=nl, rot=(0.0, th, 0.0)), tag)
+        ref = run(krot_strip_deck(nlgeom=nl, rot=(0.0, th, 0.0), given=True), tag + "_given")
+        ok = bool(u and ref)
+        if ok:
+            err = apart(u, ref)
+            ok = err < (1e-6 if nl else 1e-9) and min(math.hypot(*u[n]) for n in (9, 18, 27)) > 0.4 * th
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (an S4 cantilever strip's tip edge coupled in "
+                  f"DOFs 4-6 to a reference node turned {th:g} rad): ccx solved, its 27 nodes "
+                  f"{err:.1e} of max |u| from the strip whose tip edge is turned itself, the tip "
+                  f"moved {u[18][2]:.4g}")
+        failures += 0 if ok else 1
+        m = th * 1e5 * 0.2 * 0.01 ** 3 / 12
+        tag = f"kinematic_rotation_only_moment_{'nlgeom' if nl else 'linear'}"
+        u = run(krot_strip_deck(nlgeom=nl, moment=(5, m)), tag)
+        held = run(krot_strip_deck(nlgeom=nl, moment=(5, m), ref_bcs=(4, 6)), tag + "_held")
+        ok = bool(u and held)
+        if ok:
+            exact = (math.sin(th) / th - 1, 0.0, -(1 - math.cos(th)) / th) if nl else (0.0, 0.0, -th / 2)
+            err = apart(u, {n: exact for n in (9, 18, 27)})
+            gauge = apart(u, held)
+            ok = err < (1e-3 if nl else 1e-9) and gauge < 1e-12
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (the strip, a moment about y on the free reference "
+                  f"node, nu 0: cylindrical bending by {th:g} rad): ccx solved, the tip edge "
+                  f"{u[18][2]:.6g}, {err:.1e} of it from the closed form "
+                  f"{'(the arc: 8 elements)' if nl else ''}; the same strip with the reference node's "
+                  f"DOFs 4 and 6 held {gauge:.1e} from it (before: nothing coupled, the tip did not move)")
+        failures += 0 if ok else 1
+        # the strip turned 30 deg about x: the turn about its oblique normal held by an *EQUATION
+        tag = f"kinematic_rotation_only_tilted_{'nlgeom' if nl else 'linear'}"
+        u = run(krot_strip_deck(nlgeom=nl, moment=(5, m), tilt=math.radians(30)), tag)
+        flat = run(krot_strip_deck(nlgeom=nl, moment=(5, m)), tag + "_flat")
+        ok = bool(u and flat)
+        if ok:
+            c, s = math.cos(math.radians(30)), math.sin(math.radians(30))
+            err = apart(u, {n: (v[0], c * v[1] - s * v[2], s * v[1] + c * v[2]) for n, v in flat.items()})
+            ok = err < 1e-6
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (the moment-loaded strip turned 30 deg about x, "
+                  f"so the held turn about its normal is an *EQUATION): ccx solved, {err:.1e} of max |u| "
+                  f"from the flat strip's answer turned the same way")
+        failures += 0 if ok else 1
+    # two B31 cantilevers whose tips a coupling of DOFs 4-6 (or 6 alone) turns alike, under a
+    # moment about z on the reference node: theta = M L / (E (I1 + I2)) at both tips (ccx's knot
+    # holds the tip section rigid: 4e-4 stiffer here)
+    i_sum = 0.1 * 0.1 ** 3 / 12 + 0.1 * 0.2 ** 3 / 12
+    for nl, th, lines, tol in ((False, 0.01, "4, 6", 1e-3), (False, 0.01, "6, 6", 1e-3),
+                               (True, 0.5, "4, 6", 1e-2)):
+        tag = f"kinematic_rotation_only_beams_{'nlgeom' if nl else 'linear'}_{lines.replace(', ', '')}"
+        u = run(krot_beams_deck(lines, nl, th * 1e5 * i_sum), tag)
+        ok = u is not None
+        if ok:
+            exact = (math.sin(th) / th - 1, (1 - math.cos(th)) / th, 0.0) if nl else (0.0, th / 2, 0.0)
+            err = apart(u, {9: exact, 18: exact})
+            ok = err < tol
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} (two B31 cantilevers of different stiffness, their "
+                  f"tips coupled in DOF{'s 4-6' if lines == '4, 6' else ' 6'} to a reference node with a moment about z "
+                  f"for {th:g} rad): ccx solved, tips at ({u[9][0]:.5g}, {u[9][1]:.5g}) and "
+                  f"({u[18][0]:.5g}, {u[18][1]:.5g}), {err:.1e} of max |u| from the closed form "
+                  f"({'8 elements along the arc and ' if nl else ''}the knot's rigid tip section; before: "
+                  f"nothing coupled, the tips did not move)")
+        failures += 0 if ok else 1
     return failures
 
 

@@ -5118,6 +5118,43 @@ def test_kinematic_rotation_lines():
     assert "couples no translational DOF" in rep.text() and "per DOF range" not in rep.text()
 
 
+def test_kinematic_rotation_only_lines_on_shell_nodes():
+    # a coupling of rotations only of shell/beam nodes: no ccx *KINEMATIC (it couples
+    # translations only); each knotted node's rotations are tied to DOFs 1-3 of a ROT NODE that
+    # carries the reference node's rotation, where its moments and rotational BCs go
+    step = "*Step\n*Static\n*Boundary\n1,1,6\n4,1,6\n*Cload\n100,5,2.\n*End Step\n"
+    native = S4 + ("*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, "
+                   "surface=RS\n*Kinematic\n4, 6\n")
+    for deck in (native, S4 + "*Kinematic Coupling, ref node=100\nR, 4, 6\n"):
+        body, conv, rep = convert_str(deck + step)
+        rot = conv._rb_rot[100]
+        assert {5, 6} <= set(conv._knots) and not any(l.startswith("*COUPLING") for l in _live(body))
+        assert sorted(_equations(body)) == sorted(f"{n},{k},1.,{rot},{k - 3},-1."
+                                                  for n in (5, 6) for k in (4, 5, 6))
+        assert f"*CLOAD\n{rot}, 2, 2." in body
+        # the turn about the shells' normal reaches only the knots' drilling rotations: held
+        assert f"{rot},3,3" in _bc_lines(body) and "common normal" in rep.text()
+        assert not rep.reduced and "NOT coupled" not in rep.text()
+    # the deck holding that rotation itself: no hold; a moment about the normal is lost (warned)
+    body, conv, rep = convert_str(native + step.replace("4,1,6\n", "4,1,6\n100,6,6\n"))
+    assert _bc_lines(body).count(f"{conv._rb_rot[100]},3,3") == 1 and not rep.reduced
+    _, _, rep = convert_str(native + step.replace("100,5,2.", "100,6,2."))
+    assert rep.reduced == ["moment about the shell normal on a rotation-only coupling"]
+    # one rotation: one tie per node; under NLGEOM some rotations (not all three) are reduced
+    body, conv, rep = convert_str(native.replace("4, 6\n", "5, 5\n") + step)
+    assert sorted(_equations(body)) == [f"{n},5,1.,{conv._rb_rot[100]},2,-1." for n in (5, 6)]
+    assert not rep.reduced
+    _, _, rep = convert_str(native.replace("4, 6\n", "5, 5\n") + step.replace("*Step", "*Step, nlgeom"))
+    assert rep.reduced == ["kinematic coupling of some rotations under NLGEOM (axes not turned)"]
+    _, _, rep = convert_str(native + step.replace("*Step", "*Step, nlgeom"))
+    assert not rep.reduced
+    # beside a translation line the rotations are tied to the reference node's own DOFs 4-6,
+    # which carry ccx's coupling rotation: no warning
+    body, _, rep = convert_str(native.replace("4, 6\n", "1, 3\n4, 6\n") + step)
+    assert sorted(_equations(body)) == sorted(f"{n},{k},1.,100,{k},-1." for n in (5, 6) for k in (4, 5, 6))
+    assert "NOT coupled" not in rep.text() and not rep.reduced
+
+
 def _bc_lines(body):
     """The *BOUNDARY data lines of a converted deck, blanks removed."""
     out, inside = [], False

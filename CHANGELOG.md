@@ -8,6 +8,28 @@ From 1.6.0 on, each version opens with an overview in plain language (what now c
 gives more correct answers, what changed in using the converter), followed by the detailed
 entries. The GitHub release notes use the same section.
 
+## Unreleased
+
+### Overview
+
+* **More correct answers.** A kinematic coupling of rotations only (`*KINEMATIC` lines such as
+  `4, 6`) on shell or beam nodes now couples them. The line was dropped, so those rotations
+  stayed free and a moment or rotation on the reference node reached nothing.
+
+### Details
+
+* **Kinematic couplings of rotations only** — a `*COUPLING` + `*KINEMATIC` or a `*KINEMATIC
+  COUPLING` whose lines hold only rotations (DOFs 4-6) of shell/beam nodes becomes `*EQUATION`
+  ties θ(node) = θ(reference node) between each node's knot and a `ROT NODE` that carries the
+  reference node's rotation (its rotational BCs, moments and equation terms move there). Where
+  the members are flat shells, the reference node's turn about their normal moves only the
+  knots' drilling rotations and is held (ccx did not converge on it under NLGEOM); a moment
+  about that normal is warned. A rotation line beside a translation line no longer reports its
+  rotations as not coupled (they were tied already). Under NLGEOM a coupling of some rotations,
+  not all three, is warned as reduced physics: Abaqus turns the coupled axes with the reference
+  node. `validate_with_ccx.py kinematic_rotation_only`: a strip turned rigidly by a rotation
+  vector, twins and closed forms, linear and NLGEOM.
+
 ## 1.7.0 (November 2026)
 
 ### Overview
