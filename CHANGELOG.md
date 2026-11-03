@@ -21,15 +21,17 @@ entries. The GitHub release notes use the same section.
 * **`*BOUNDARY, FIXED` on `*TRANSFORM` translations moved by loads** — where the held value is
   unknown, the node now gets a helper node without a `*TRANSFORM`, tied to its local DOFs by
   `*EQUATION`s, and FIXED goes on the helper. Every `*BOUNDARY` on the node's translations is
-  written on the helper: ccx drops the equations when a `*BOUNDARY, OP=NEW` step gives a BC on
-  another of its local DOFs again. Exact against the model turned into the node's axes
-  (`validate_with_ccx.py fixed_helper`: a cube with `*FREQUENCY` and restore steps, an S4
-  plate). Not where the node has rotational BCs or other constraints, elements other than
-  solids, plane elements, S3/S4/S4R or B31 (shells and beams: no `*DYNAMIC` step), an initial
-  velocity, or in decks with explicit or modal dynamics: those keep the warning. In an implicit
-  `*DYNAMIC` step the value is right, but ccx's response to a BC that stops a moving DOF along
-  an oblique axis differs from one along a global axis (3-14 % on one C3D8, as with ccx's own
-  BCs on transformed nodes): warned.
+  written on the helper: with a BC of the node's own on another local DOF, a later
+  `*BOUNDARY, OP=NEW` step leaves ccx's equations unmet. Exact against the model turned into the
+  node's axes (`validate_with_ccx.py fixed_helper`: a cube with `*FREQUENCY` and restore steps,
+  an S4 plate). Not where the node has rotational BCs or other constraints, elements other than
+  solids, CPS3/CPS4/CPS4R, CPE3/CPE4/CPE4R, S3/S4/S4R or B31/B31R (shells and beams: not knots,
+  no `*DYNAMIC` step), an initial velocity, a converter midside node next to it or a
+  `*TRANSFORM` inside a step, or in decks with explicit or modal dynamics: those keep the
+  warning. In an implicit `*DYNAMIC` step the held value is right, but ccx answers a BC that
+  stops a moving DOF along an oblique axis otherwise than one along a global axis, as with its
+  own BCs on transformed nodes (one C3D8: the model 3-21 % of its peak displacement off, the
+  node's free local DOFs up to 38 %): warned as reduced physics.
 
 ## 1.7.0 (November 2026)
 

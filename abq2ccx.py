@@ -44549,9 +44549,9 @@ class _PostPasses:
         steps around it, S3 / S4 / S4R, CPS4; B31 against the value written by hand).  Every
         *BOUNDARY line on the node's translations, in every step, goes to its helper
         (_fixed_helper_nodes, after the passes that write BCs): another one on such a DOF would
-        be a second constraint on that direction, whose cascade pivot vanishes, and one on
-        another local DOF, given again in a step with *BOUNDARY, OP=NEW, makes ccx drop the
-        helper's equations (probed: the node then moves off the held helper).  The base-state
+        be a second constraint on that direction, whose cascade pivot vanishes, and with one on
+        another local DOF a later step with *BOUNDARY, OP=NEW leaves the helper's equations
+        unmet in ccx (probed: the node then moves off the held helper).  The base-state
         restore reads such a DOF as one FIXED holds (_fixed_holds), as on a node without a
         *TRANSFORM.  Not where the node has BCs on its rotations or other constraints
         (equations, rigid bodies, couplings, ties, *MPCs), elements not probed, a knot (a shell
@@ -44561,8 +44561,9 @@ class _PostPasses:
         in a deck with explicit or modal dynamics: there the FIXED stays, warned, with reduced
         physics.  In an implicit *DYNAMIC step the held value is right, but ccx answers a BC
         that stops a moving DOF along an oblique axis otherwise than one along a global axis,
-        its own BCs on a *TRANSFORM node too (probed: 3-14 % on one C3D8 against the turned
-        model, at any time increment): warned."""
+        its own BCs on a *TRANSFORM node too (probed on one C3D8 against the turned model: the
+        model 3-21 % of its peak displacement off, about 10 % at a tenth of the time increment,
+        the node's free local DOFs up to 38 %): warned, with reduced physics."""
         self._fixed_helper = set()
         cands = self._fixed_unknown
         if not cands:
@@ -44640,8 +44641,8 @@ class _PostPasses:
                 why.setdefault(n, "other constraints on it (equations, rigid bodies, couplings, "
                                   "ties or *MPCs)")
         # every *BOUNDARY line on the nodes left can move (a set the converter cannot read: on all):
-        # on all their translations that have one (ccx 2.23 lets a *BOUNDARY, OP=NEW step that
-        # gives a BC on another local DOF of the node again drop the helper's equations;
+        # on all their translations that have one (with a BC of its own on another local DOF,
+        # a later *BOUNDARY, OP=NEW step leaves the helper's equations unmet in ccx 2.23;
         # probed), none on their rotations (ccx's MPCs too)
         held: Dict[int, set] = {n: {d for m, d, _ in cands if m == n} for n in nodes}
         for c in deck.cards:
@@ -44672,24 +44673,30 @@ class _PostPasses:
                 taken.add(g)
         moved = sorted({(n, d) for n in nodes if n not in why for d in held[n]})
         self._fixed_helper = set(moved)
-        if moved:
-            some = list(dict.fromkeys(f"node {n} DOF {d}" for n, d, _ in cands if n not in why))
+        how = ("held through a helper node at the node without a *TRANSFORM, tied to its local DOFs "
+               "by *EQUATIONs, FIXED on the helper (ccx 2.23 holds a transformed node's global "
+               "component instead; probed); every *BOUNDARY on the node's translations is written "
+               "on the helper")
+        done = [(n, d, s) for n, d, s in cands if n not in why]
+        static = list(dict.fromkeys(f"node {n} DOF {d}" for n, d, s in done
+                                    if steps[s - 1].proc != "DYNAMIC"))
+        if static:
             self.report.note(f"*BOUNDARY, FIXED on translations of nodes with a *TRANSFORM whose "
                              f"value at the end of the previous step the converter does not know "
-                             f"({', '.join(some[:4])}{', ...' if len(some) > 4 else ''}): held through "
-                             f"a helper node at the node without a *TRANSFORM, tied to its local DOFs "
-                             f"by *EQUATIONs, FIXED on the helper (ccx 2.23 holds a transformed "
-                             f"node's global component instead; probed); every *BOUNDARY on the node's "
-                             f"translations is written on the helper. Exact.", once=True)
-            dyn_at = sorted({s for n, d, s in cands if (n, d) in moved and steps[s - 1].proc == "DYNAMIC"})
-            if dyn_at:
-                self.report.warn(f"*BOUNDARY, FIXED on translations of nodes with a *TRANSFORM in "
-                                 f"*DYNAMIC step(s) {', '.join(map(str, dyn_at))}, held through a "
-                                 f"helper node at the right value: but ccx 2.23 answers a BC that "
-                                 f"stops a moving DOF along an oblique axis otherwise than one along "
-                                 f"a global axis, as with its own BCs on a *TRANSFORM node (probed: "
-                                 f"3-14 % on one C3D8 against the model turned into the node's axes, "
-                                 f"at any time increment).", once=True)
+                             f"({', '.join(static[:4])}{', ...' if len(static) > 4 else ''}): {how}. "
+                             f"Exact.", once=True)
+        dyn_at = [f"node {n} DOF {d} (step {s})" for n, d, s in done if steps[s - 1].proc == "DYNAMIC"]
+        if dyn_at:
+            self.report.warn(f"*BOUNDARY, FIXED on translations of nodes with a *TRANSFORM in implicit "
+                             f"*DYNAMIC steps ({', '.join(dyn_at[:4])}{', ...' if len(dyn_at) > 4 else ''}"
+                             f"), moved by loads: {how}, so the held value is right, but ccx 2.23 "
+                             f"answers a BC that stops a moving DOF along an oblique axis otherwise "
+                             f"than one along a global axis, as with its own BCs on a *TRANSFORM node "
+                             f"(probed on one C3D8 against the model turned into the node's axes: the "
+                             f"model 3-21 % of its peak displacement off, about 10 % at a tenth of the "
+                             f"time increment, the node's free local DOFs up to 38 %).", once=True)
+            self._reduces("*BOUNDARY, FIXED on *TRANSFORM translations in an implicit *DYNAMIC step "
+                          "(ccx 2.23 answers a BC along an oblique axis otherwise)")
         left = [f"node {n} DOF {d} (step {s})" for n, d, s in cands if n in why]
         if left:
             first = next(why[n] for n, _, _ in cands if n in why)

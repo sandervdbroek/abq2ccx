@@ -24855,12 +24855,16 @@ def test_fixed_unknown_transformed_translations_through_helper_nodes():
                                 "*Step\n*Frequency\n2\n*End Step\n*Step\n*Static\n*Cload\n6, 1, 1.\n"
                                 "*End Step\n")
     assert "\n9, 2, 2\n" in _step(body, 4) and "7, 2, 2" not in body and not conv.reduced_physics
-    # in an implicit *DYNAMIC step: held, warned (ccx's response to stopping an oblique DOF)
+    # in an implicit *DYNAMIC step: held, warned with reduced physics (ccx's response to
+    # stopping a DOF along an oblique axis), no "Exact." note
     dyn = "*Step\n*Dynamic\n0.1, 1.\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Dynamic\n0.1, 1.\n" \
         "*Boundary, fixed\n7, 2, 2\n*End Step\n"
     body, conv, rep = convert_str(FIXED_TR_HEX + dyn)
-    assert "*BOUNDARY, FIXED\n9, 2, 2\n" in _step(body, 2) and not conv.reduced_physics
-    assert "*DYNAMIC step(s) 2, held through a helper node" in rep.text()
+    assert "*BOUNDARY, FIXED\n9, 2, 2\n" in _step(body, 2)
+    assert "*DYNAMIC steps (node 7 DOF 2 (step 2)), moved by loads: held through a helper node" in rep.text()
+    assert "is written on the helper. Exact." not in rep.text()
+    assert conv.reduced_physics == ["*BOUNDARY, FIXED on *TRANSFORM translations in an implicit *DYNAMIC "
+                                    "step (ccx 2.23 answers a BC along an oblique axis otherwise)"]
     # not where the node has other constraints, an initial velocity, or in explicit decks:
     # FIXED kept, warned
     two = "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n" + s3
