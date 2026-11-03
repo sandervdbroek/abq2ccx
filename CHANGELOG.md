@@ -28,7 +28,9 @@ entries. The GitHub release notes use the same section.
   along the normal, which moves nothing while the rotations are small or nothing acts on the
   knot's rotation (probed: the same answers as `n . theta = 0` in static, `*BUCKLE`,
   `*FREQUENCY` and `*MODAL DYNAMIC` steps, and under `NLGEOM` with forces only; ccx writes no
-  rotations). It replaces the equation, which ccx 2.23's `*MODAL DYNAMIC` step crashed on at
+  rotations). Eigenvalue and modal steps after a step ccx solves nonlinearly are not right with
+  it off the axes (frequencies squared 0.3-1.0 % low on a strip bent 0.45 rad), nor with the
+  equation, which ccx gets wrong there too: warned, as the equation was. It replaces the equation, which ccx 2.23's `*MODAL DYNAMIC` step crashed on at
   random (26 of 100 runs; the BC: none of 100), which would act in every step where BCs hold
   the knot in some (ccx stops on a BC on its dependent DOF), and which ccx misreads on a node
   with a `*TRANSFORM` (ccx reads a rotational BC on a knot about the global axes there). So

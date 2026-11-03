@@ -43267,6 +43267,7 @@ class _PostPasses:
         eliminates a knot's DOF (probed: 26 of 100 runs, exit -6 / -10 / -11; the *BOUNDARY:
         none of 100; _warn_modal_knot_mpcs); elsewhere warned."""
         knots = set(self._knots)
+        self._knot_gauges = []
         if not knots or getattr(self.opt, "solid_dof", False):
             return deck
         beams = set(self.geom.elsets.get(KNOT_SET, ()))
@@ -43376,6 +43377,7 @@ class _PostPasses:
                     for t, h, s in zip(turned, held, phases))
             if picks and not drilled and not finite:
                 bcs.append((n, picks[0]))       # (terms: the largest component first)
+                self._knot_gauges.append(n)
             elif any(held) or not picks:
                 mixed.append(n)
             elif modal:
@@ -44461,14 +44463,37 @@ class _PostPasses:
         another node's DOF and only names the knot's is exact, and so are SPCs on a knot.
         ccx takes *EQUATION as model data only (an *EQUATION, REMOVE in the step frees the
         knot again), so no ccx form keeps the constraint there.  After _settle_dependents:
-        the eliminated terms as written."""
+        the eliminated terms as written.
+        Likewise a knot whose drilling rotation _hold_knot_drilling holds by a *BOUNDARY on a
+        global rotation off its normal (_knot_gauges): ccx linearizes the knot's finite-rotation
+        MPCs about the turned state, where the BC's share along the normal changes the knot's
+        stiffness (PR #9 review: a strip off the axes bent 0.45 rad under NLGEOM by forces,
+        omega^2 of its *FREQUENCY step 0.3-1.0 % low by orientation, its *STEADY STATE
+        DYNAMICS tip 3 % off; n . theta = 0 gives the same low values, ccx's equations on knots
+        being wrong there; normals along an axis exact)."""
         first, why, eig = self._eigen_after_solver()
         if not eig or not self._mechanical:
             return
         hit = self._knot_mpc_dependents(blocks, deck)
+        gauged = [n for n in self._knot_gauges if n not in hit]
+        procs = dedup(f"*{self.steps.steps[s - 1].proc}" for s in eig)
+        if gauged:
+            self.report.warn(f"{' / '.join(procs)} step(s) {', '.join(map(str, eig))} after step {first} "
+                             f"({why}, which ccx 2.23 runs through its nonlinear solver), with "
+                             f"{len(gauged)} knot(s) of the converter's knot beams on shell nodes whose "
+                             f"normal is off the global axes (e.g. node {gauged[0]}), held about the "
+                             f"normal by a *BOUNDARY on a global rotation: once the knot has turned, ccx "
+                             f"linearizes its rotation constraints about that state, where the BC's share "
+                             f"along the normal changes the knot's stiffness, and ccx's n . theta = 0 is "
+                             f"wrong there too "
+                             f"(probed: a strip bent 0.45 rad, its frequencies squared 0.3-1.0 % low, a "
+                             f"steady-state response 3 % off). Those eigenvalues, modes and later linear "
+                             f"results are not the deck's; the steps before are exact. Run those steps "
+                             f"before step {first}, or in an analysis of their own.", once=True)
+            self._reduces("knot drilling holds off the global axes wrong in the eigenvalue / modal "
+                          "steps after a step ccx runs through its nonlinear solver")
         if not hit:
             return
-        procs = dedup(f"*{self.steps.steps[s - 1].proc}" for s in eig)
         self.report.warn(f"{' / '.join(procs)} step(s) {', '.join(map(str, eig))} after step {first} "
                          f"({why}, which ccx 2.23 runs through its nonlinear solver), in a model "
                          f"whose equations or rigid constraints eliminate a DOF of {len(hit)} knot(s) "
@@ -45014,6 +45039,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._rot_mode: Dict[int, str] = {}
         self._rot_lines: Dict[Tuple[int, int], Union[List[str], str]] = {}
         self._untr: set = set()                     # nodes out of their *TRANSFORM (_plan_transformed_corners)
+        self._knot_gauges: List[int] = []           # knots held by a BC off the normal (_hold_knot_drilling)
         # beam nodes given a *TRANSFORM along their section axes (_plan_beam_section_axes): node ->
         # (n1, n2, beam axis); they are in _untr too (their cards in local components)
         self._sect_axes: Dict[int, Tuple[Vec, Vec, Vec]] = {}

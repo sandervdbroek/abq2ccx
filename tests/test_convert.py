@@ -26612,6 +26612,17 @@ def test_knot_drilling_rotation_held_on_shell_nodes():
         assert {d for _, d, _ in rows[0]} == {5, 6}
     body, _, _ = convert_str(first("*Cload\n3, 4, 0.01\n", nlgeom=False))
     assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not _equation_terms(body)
+    # forces alone under NLGEOM keep the BC, but the eigenvalue / modal steps after that step
+    # are not right with it (nor with the equation: probed, omega^2 0.3-1.0 % low): warned;
+    # along an axis exact
+    body, conv, rep = convert_str(first("*Cload\n3, 3, 0.01\n"))
+    assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and conv._knot_gauges == [3]
+    assert "held about the normal by a *BOUNDARY on a global rotation" in rep.text()
+    assert ("knot drilling holds off the global axes wrong in the eigenvalue / modal steps after a step "
+            "ccx runs through its nonlinear solver") in conv.reduced_physics
+    body, conv, rep = convert_str(strip().replace("*Step\n*Frequency", "*Step, nlgeom\n*Static\n*Cload\n"
+                                                  "3, 3, 0.01\n*End Step\n*Step\n*Frequency", 1))
+    assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not conv._knot_gauges and not conv.reduced_physics
     body, conv, rep = convert_str(first("*Cload\n3, 4, 0.01\n", last="*Modal Dynamic\n1e-4, 0.01"))
     assert hold not in body and "a step ccx solves with finite rotations" in rep.text()
     assert "knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)" in \
