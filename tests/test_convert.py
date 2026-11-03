@@ -1170,6 +1170,50 @@ def test_tie_slave_surface_trimmed_to_the_faces_near_its_master():
     assert kept and kept.group(1).split() == ["170", "171", "172", "181", "182", "183", "192", "193", "194"]
     assert "the 9 of its 121 nodes near master surface BLOCKBASE" in rep.text()      # (those under the block)
 
+    # repeated ties reuse the trimmed surface instead of rebuilding it
+    repeated = text.replace("*Tie, name=BlockOnPlate, adjust=no\n",
+                            "*Tie, name=BlockOnPlate, adjust=no\n"
+                            "PLATETOP, BLOCKBASE\n"
+                            "*Tie, name=BlockOnPlateAgain, adjust=no\n")
+    body, conv, rep = convert_str(repeated)
+    assert body.count("*SURFACE, NAME=PLATETOP_NEAR, TYPE=ELEMENT") == 1
+    assert "PLATETOP_NEAR, BLOCKBASE" in body
+    assert body.count("PLATETOP_NEAR, BLOCKBASE") == 2
+
+    # an unbounded membrane expansion is not trimmed using its reference-face coordinates
+    membrane = text.replace("*Element, type=C3D8, elset=PLATE\n",
+                            "2001, 49.5, 49.5, 10.\n2002, 50.5, 49.5, 10.\n"
+                            "2003, 50.5, 50.5, 10.\n2004, 49.5, 50.5, 10.\n"
+                            "*Element, type=C3D8, elset=PLATE\n")
+    membrane = membrane.replace("*Elset, elset=BLOCKBOTTOM, generate\n",
+                                "*Element, type=M3D4, elset=MEMMASTER\n"
+                                "2000, 2001, 2002, 2003, 2004\n"
+                                "*Membrane Section, elset=MEMMASTER, material=STEEL\n20.\n"
+                                "*Elset, elset=BLOCKBOTTOM, generate\n")
+    membrane = membrane.replace("BLOCKBOTTOM, S1\n", "MEMMASTER, SPOS\n")
+    body, conv, rep = convert_str(membrane)
+    assert "*SURFACE, NAME=PLATETOP_NEAR" not in body
+    assert "PLATETOP, BLOCKBASE" in body
+    assert "MEMMASTER, SPOS" in body
+
+    nodal_shell = membrane.replace("*Element, type=M3D4, elset=MEMMASTER\n",
+                                  "*Element, type=S4, elset=MEMMASTER\n")
+    nodal_shell = nodal_shell.replace("*Membrane Section, elset=MEMMASTER, material=STEEL\n20.\n",
+                                      "*Nodal Thickness\n2001, 20.\n2002, 20.\n2003, 20.\n2004, 20.\n"
+                                      "*Shell Section, elset=MEMMASTER, material=STEEL, "
+                                      "nodal thickness\n0.1\n")
+    body, conv, rep = convert_str(nodal_shell)
+    assert "*SURFACE, NAME=PLATETOP_NEAR" not in body
+    assert "PLATETOP, BLOCKBASE" in body
+
+    # an undefined node on a slave face leaves the original surface and does not raise KeyError
+    undefined = text.replace("1, 1, 2, 13, 12, 122, 123, 134, 133\n",
+                             "1, 1, 2, 13, 12, 999999, 123, 134, 133\n")
+    body, conv, rep = convert_str(undefined)
+    assert "*SURFACE, NAME=PLATETOP_NEAR" not in body
+    assert "PLATETOP, BLOCKBASE" in body
+    assert "undefined node" in rep.text()
+
 
 def test_quoted_names_with_commas_written_with_underscores():
     # ccx splits a card at every comma, quotes or not: ELSET="PLATE, A" is set "PLATE plus an

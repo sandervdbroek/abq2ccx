@@ -9829,9 +9829,9 @@ class _Mesh:
         sd, md = self.surfaces.get(slave.upper()), self.surfaces.get(master.upper())
         if not sd or not md or md[0].startswith("NODE"):
             return None, []
-        key = ("TRIM", slave.upper(), master.upper(), tol)
-        if key in self._mem_surfaces:
-            return self._mem_surfaces[key], []
+        cache_key = ("TRIM", slave.upper(), master.upper(), tol)
+        if cache_key in self._mem_surfaces:
+            return self._mem_surfaces[cache_key], []
         xyz, types = self.geom.nodes, {}
         label = re.compile(r"S[1-6]|SPOS|SNEG").fullmatch
         mfaces: List[Tuple[int, List[int]]] = []
@@ -9851,6 +9851,11 @@ class _Mesh:
         # edges) and a shell master's half thickness and offset (ccx's expanded face)
         boxes: List[Tuple[Vec, Vec]] = []
         for e, ns in mfaces:
+            typ = ccx_type(self.geom.elements[e][0])
+            if not typ.startswith("C3D") and (typ not in SHEET_SHELLS or
+                                               e not in self._shell_sec or
+                                               e in self._shell_tie_unbounded):
+                return None, []
             ps = [xyz[n] for n in ns]
             lo = tuple(min(p[k] for p in ps) for k in range(3))
             hi = tuple(max(p[k] for p in ps) for k in range(3))
@@ -9865,8 +9870,9 @@ class _Mesh:
         grid: Dict[Tuple[int, int, int], List[int]] = {}
         for i, (l, h) in enumerate(boxes):
             (a0, a1, a2), (b0, b1, b2) = cell(l), cell(h)
-            for key in itertools.product(range(a0, b0 + 1), range(a1, b1 + 1), range(a2, b2 + 1)):
-                grid.setdefault(key, []).append(i)
+            for grid_key in itertools.product(range(a0, b0 + 1), range(a1, b1 + 1),
+                                              range(a2, b2 + 1)):
+                grid.setdefault(grid_key, []).append(i)
         near: Dict[int, bool] = {}
 
         def close(n: int) -> bool:
@@ -9883,6 +9889,7 @@ class _Mesh:
             what, card = "nodes", "NODE"
         else:
             kept, total = [], 0
+            faces = []
             for token, face in sd[1]:
                 lab = (face or "").upper()
                 if not re.fullmatch(r"S[1-6]", lab):
@@ -9891,15 +9898,20 @@ class _Mesh:
                     info = self.geom.elements.get(e)
                     if info is None or not ccx_type(info[0]).startswith("C3D"):
                         return None, []
+                    ns = self._face_nodes(e, face, types)
+                    if not ns or any(n not in xyz for n in ns):
+                        return None, []
                     total += 1
-                    if any(close(n) for n in self._face_nodes(e, face, types)):
-                        kept.append(f"{e}, {lab}")
+                    faces.append((e, lab, ns))
+            for e, lab, ns in faces:
+                if any(close(n) for n in ns):
+                    kept.append(f"{e}, {lab}")
             what, card = "faces", "ELEMENT"
         if not kept or len(kept) == total:
             return None, []
         self._reserve_names()
         name = self._fresh_name(f"{slave}_NEAR")
-        self._mem_surfaces[key] = name
+        self._mem_surfaces[cache_key] = name
         self.report.note(f"*TIE {tie}: slave surface {slave} -> {name}, the {len(kept)} of its {total} "
                          f"{what}{'' if card == 'NODE' else ' with a node'} near master surface {master} (in a facet's bounding box "
                          f"grown by the position tolerance, a tenth of the facet and a shell's half "
@@ -13076,9 +13088,18 @@ class _Mesh:
         -0.5) from its *SHELL SECTION / *SHELL GENERAL SECTION (a layup: its plies' sum, a
         SYMMETRIC one mirrored)."""
         out: Dict[int, Tuple[float, float]] = {}
+        self._shell_tie_unbounded = set()
         for b in blocks:
             if b.keyword not in ("SHELL SECTION", "SHELL GENERAL SECTION"):
                 continue
+            members = self.geom.elset((b.param("ELSET") or "").strip())
+            for e in members:
+                typ = self.geom.elements.get(e, ("", []))[0].upper()
+                if typ in SHELL_TYPES and not typ.startswith(("SC", "SFM")):
+                    if b.has("NODAL THICKNESS"):
+                        self._shell_tie_unbounded.add(e)
+                    else:
+                        self._shell_tie_unbounded.discard(e)
             recs = [r for r in merged_data_records(b) if any(x for x in r)]
             try:
                 t = sum(pf(t) for t, _m, _o in self._section_layers(b)) if b.has("COMPOSITE") else \
@@ -13088,7 +13109,7 @@ class _Mesh:
             off = offset_fraction(b.param("OFFSET")) or 0.0
             if t <= 0:
                 continue
-            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+            for e in members:
                 typ = self.geom.elements.get(e, ("", []))[0].upper()
                 if typ in SHELL_TYPES and not typ.startswith(("SC", "SFM")):
                     out[e] = (t, off)
@@ -44991,6 +45012,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._sc_hyper: set = set()
         self._section_thick: Dict[int, float] = {}  # plane element -> section thickness
         self._shell_sec: Dict[int, Tuple[float, float]] = {}    # shell -> (thickness, OFFSET); decks with ties
+        self._shell_tie_unbounded: set = set()      # shell -> NODAL THICKNESS, not bounded by _shell_sec
         self._beam_n1: Dict[int, Optional[Vec]] = {}    # beam -> approximate n1 of its section
         self._deck_cloads: Dict[Tuple[int, int], set] = {}   # deck *CLOAD (node, DOF) -> _cload_amp
         # tractions carried into an NLGEOM step as pressures (_plan_carried_tractions): step ->
