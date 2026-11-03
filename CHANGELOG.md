@@ -12,6 +12,10 @@ entries. The GitHub release notes use the same section.
 
 ### Overview
 
+* **Leaner tie output.** A `*TIE` whose slave surface reaches far beyond its master (a whole plate
+  tied to a small shroud) is written with only the slave faces near the master: ccx printed a
+  warning for every other slave node (87522 of them, 15 MB of output, for one shaker model) and
+  tied none of them, as Abaqus does not either. The answers are unchanged.
 * **Fewer ccx failures.** Models whose part, instance, material or set names hold a comma (as
   CAD imports often name parts) now run: ccx read such a name only up to the comma, so sets of
   different parts merged and ccx stopped, or silently used one part's section for another's. A
@@ -29,6 +33,15 @@ entries. The GitHub release notes use the same section.
 
 ### Details
 
+* **`*TIE` slave surfaces trimmed** — ccx 2.23 ties only the slave nodes it finds a master face
+  for within the position tolerance, and prints 'no tied MPC generated ... no opposite master
+  face' for every other one; Abaqus ties none beyond the tolerance either. A tie whose slave
+  surface (on solid elements, or a node surface) has faces with no node within reach of a
+  master node now uses a surface of the others: the reach is the tolerance plus 1.5 times the
+  master's largest facet extent (no tolerance given: one extent more), plus a shell master's
+  half thickness and offset, beyond which no point of the master surface can be within the
+  tolerance (`validate_with_ccx.py tie_slave_trimmed`: the same answer, 40 warnings instead
+  of 112). The deck's own surface stays for other cards.
 * **Names with a comma** — Abaqus reads a comma inside a quoted name as part of the name
   (`*Part, name="COLD PLATE, ASSY-11"`); ccx 2.23 splits a card at every comma, quotes or not,
   and read `ELSET="PLATE, A"` as set `"PLATE` plus an unknown parameter. Names that agree up to

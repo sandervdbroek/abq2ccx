@@ -1143,6 +1143,33 @@ def test_flattened_set_names_made_unique():
     assert "names collide within CalculiX's 80-character name limit" in rep.text()
 
 
+def test_tie_slave_surface_trimmed_to_the_faces_near_its_master():
+    # a whole plate top tied to a small block on its middle: ccx prints 'no tied MPC generated'
+    # for every slave node away from the block and ties none (nor does Abaqus): the tie gets a
+    # surface of the slave faces with a node within reach of a master node (the tolerance plus
+    # 1.5 facet extents; none given: one extent more), the deck's surface stays as it is
+    # (validate_with_ccx.py tie_slave_trimmed: the same answer, 40 warnings instead of 112)
+    path = os.path.join(EXAMPLES, "tie_slave_trimmed.inp")
+    text = open(path, encoding="utf-8").read()
+    body, conv, rep = convert_str(text)
+    faces = re.search(r"\*SURFACE, NAME=PLATETOP_NEAR, TYPE=ELEMENT\n((?:\d+, S2\n)+)", body)
+    assert faces and len(faces.group(1).splitlines()) == 36, body[:200]
+    assert "*TIE, NAME=BlockOnPlate, ADJUST=no\nPLATETOP_NEAR, BLOCKBASE\n" in body
+    assert re.search(r"\*SURFACE, (?:TYPE=ELEMENT, )?NAME=PLATETOP", body)
+    assert "slave surface PLATETOP -> PLATETOP_NEAR, the 36 of its 100 faces within 17.68 of master" in rep.text()
+    assert not conv.reduced_physics
+    # every slave face within reach: the deck's surface stays
+    body, conv, rep = convert_str(text.replace("adjust=no", "adjust=no, position tolerance=1000."))
+    assert "_NEAR" not in body and "PLATETOP, BLOCKBASE" in body
+    # a node surface: its nodes within reach
+    node = text.replace("*Surface, type=ELEMENT, name=PLATETOP\nPLATE, S2\n",
+                        "*Nset, nset=TOPN, generate\n122, 242, 1\n*Surface, type=NODE, name=PLATETOP\nTOPN, 1.\n")
+    body, conv, rep = convert_str(node)
+    kept = re.search(r"\*SURFACE, NAME=PLATETOP_NEAR, TYPE=NODE\n((?:\d+\n)+)", body)
+    assert kept and 9 < len(kept.group(1).splitlines()) < 121, body[:200]
+    assert "the %d of its 121 nodes" % len(kept.group(1).splitlines()) in rep.text()
+
+
 def test_quoted_names_with_commas_written_with_underscores():
     # ccx splits a card at every comma, quotes or not: ELSET="PLATE, A" is set "PLATE plus an
     # unknown parameter, so names that agree up to the comma become one set (here a solid and

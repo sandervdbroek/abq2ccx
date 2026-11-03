@@ -12144,6 +12144,47 @@ def check_ssd_prestressed_bar(ccx, env, tmp, shared):
     return failures + (0 if ok else 1)
 
 
+@check("tie_slave_trimmed", "a *TIE slave surface far larger than its master, trimmed")
+def check_tie_slave_trimmed(ccx, env, tmp, shared):
+    # --- a *TIE slave surface trimmed to the faces near its master --------------------------------
+    # A 20 x 20 block tied onto the middle of a 100 x 100 plate whose whole top face is the slave
+    # surface.  ccx ties only the slave nodes opposite the block and prints 'no tied MPC
+    # generated' for every other one; abq2ccx ties the plate through a surface of the slave
+    # faces within reach of the block.  The answer must be the deck's: exactly that of the same
+    # deck with POSITION TOLERANCE=1000 (every face within reach: nothing trimmed, the nodes
+    # off the block have no master face opposite them at any tolerance), with fewer warnings.
+    failures = 0
+    text = open(os.path.join(EXAMPLES, "tie_slave_trimmed.inp"), encoding="utf-8").read()
+    wide = text.replace("adjust=no", "adjust=no, position tolerance=1000.")
+    assert wide != text
+    res = {}
+    for kind, deck in (("trimmed", text), ("whole", wide)):
+        src = os.path.join(tmp, f"tie_trim_{kind}_src.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        inp = os.path.join(tmp, f"tie_trim_{kind}.inp")
+        convert(src, inp)
+        written = open(inp, encoding="utf-8").read()
+        d, status, out = run_ccx(ccx, env, inp)
+        res[kind] = (dat_displacements(os.path.join(d, "job.dat")) if status == "solved" else {},
+                     out.count("no tied MPC"), "PLATETOP_NEAR" in written)
+        shutil.rmtree(d, ignore_errors=True)
+    (a, wa, ta), (b, wb, tb) = res["trimmed"], res["whole"]
+    nodes = sorted(set(a) & set(b))
+    if len(nodes) == 25:
+        scale = max(abs(x) for n in nodes for x in b[n])
+        err = ccx_ratio(max(abs(x - y) for n in nodes for x, y in zip(a[n], b[n])), scale)
+        ok = err < 1e-12 and scale > 1e-4 and ta and not tb and wa < wb
+        print(f"{'PASS' if ok else 'FAIL'}  tie_slave_trimmed (slave faces near the master only): 25 "
+              f"block nodes vs the untrimmed tie, max difference {err:.1e} of max |u| {scale:.4f}; "
+              f"'no tied MPC' warnings {wa} instead of {wb}")
+        failures += 0 if ok else 1
+    else:
+        print(f"FAIL  tie_slave_trimmed: did not solve ({len(a)} / {len(b)} nodes printed)")
+        failures += 1
+    return failures
+
+
 @check("assembly_rotated_instances",
        "assembly flattening: a turned instance against the same model written flat")
 def check_assembly_rotated_instances(ccx, env, tmp, shared):

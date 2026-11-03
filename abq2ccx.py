@@ -9709,6 +9709,13 @@ class _Mesh:
                 out.append(f"** abq2ccx: *TIE {params.get('NAME') or ''}: every slave node of {f[0]} is a "
                            f"node of {master}, which joins them already")
                 continue
+            if plain and not membrane and shell is None and name is None:
+                try:
+                    given = pf(b.param("POSITION TOLERANCE") or "")
+                except ValueError:
+                    given = None
+                name, cards = self._trimmed_tie_slave(f[0], master, reach if reach is not None else given,
+                                                      params.get("NAME") or "")
             if name and shell is not None:
                 params["POSITION TOLERANCE"] = short_real(shell[2], 6)
                 line = ", ".join([name] + f[1:])
@@ -9744,6 +9751,99 @@ class _Mesh:
         return any(ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS or
                    (ccx_type(self.geom.elements[e][0]) in BEAM_TYPES and
                     not self.geom.elements[e][0].upper().startswith(("T2D", "T3D"))) for e in es)
+
+    def _trimmed_tie_slave(self, slave: str, master: str, tol: Optional[float], tie: str
+                           ) -> Tuple[Optional[str], List[str]]:
+        """A *TIE slave surface reaching far beyond its master (a whole plate face tied to a small
+        shroud) -> a surface of its faces (a node surface: its nodes) of which some node lies
+        within ``reach`` of a master node: (its name, its *SURFACE card), or (None, []) where
+        every face is within reach, none is, or the surfaces are of another kind (the slave
+        on solids or nodes, the master on faces the converter resolves, with S1-S6 / SPOS /
+        SNEG labels).  ccx 2.23 prints 'no tied MPC generated ... no opposite master face' for
+        every node of the others (87522 of a plate's 89341 slave nodes, 15 MB of output) and
+        ties none of them; nor does Abaqus, which ties a slave node only within the position
+        tolerance of the master surface (Mesh tie constraints).  ``reach`` is the tolerance
+        (``tol``: the one written, or the deck's; none given: the master's largest facet extent,
+        beyond ccx's default, a fraction of the element size) plus 1.5 times that extent, plus
+        the half thickness and offset of a master shell, which ccx expands to faces that far
+        off: every point of a master facet lies within one extent of each node of it (the half
+        more covers ccx's in-face tolerance at a facet's edge), and of an expanded shell face
+        within that and the offset, so a slave node farther than ``reach`` from every master
+        node lies farther than the tolerance from the master surface.  Exact."""
+        sd, md = self.surfaces.get(slave.upper()), self.surfaces.get(master.upper())
+        if not sd or not md or md[0].startswith("NODE"):
+            return None, []
+        key = ("TRIM", slave.upper(), master.upper(), tol)
+        if key in self._mem_surfaces:
+            return self._mem_surfaces[key], []
+        xyz, types = self.geom.nodes, {}
+        label = re.compile(r"S[1-6]|SPOS|SNEG").fullmatch
+        mfaces: List[Tuple[int, List[int]]] = []
+        for token, face in md[1]:
+            if not label((face or "").upper()):
+                return None, []
+            for e in self._resolve_elements(token):
+                ns = self._face_nodes(e, face, types)
+                if not ns or any(n not in xyz for n in ns):
+                    return None, []
+                mfaces.append((e, ns))
+        if not mfaces:
+            return None, []
+
+        def extent(ns: List[int]) -> float:
+            ps = [xyz[n] for n in ns]
+            return math.sqrt(sum((max(p[k] for p in ps) - min(p[k] for p in ps)) ** 2 for k in range(3)))
+        shell = max((t * (0.5 + abs(off)) for e, _ns in mfaces
+                     for t, off in [self._shell_sec.get(e, (0.0, 0.0))]), default=0.0)
+        size = max(extent(ns) for _e, ns in mfaces)
+        reach = (tol if tol is not None else size) + 1.5 * size + shell
+        if not reach > 0.0:
+            return None, []
+        cell = lambda p: (math.floor(p[0] / reach), math.floor(p[1] / reach), math.floor(p[2] / reach))
+        grid: Dict[Tuple[int, int, int], List[Vec]] = {}
+        for n in {n for _e, ns in mfaces for n in ns}:
+            grid.setdefault(cell(xyz[n]), []).append(xyz[n])
+        r2, near = reach * reach, {}
+
+        def close(n: int) -> bool:
+            if n not in near:
+                p, (i, j, k) = xyz[n], cell(xyz[n])
+                near[n] = any((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2 <= r2
+                              for di in (-1, 0, 1) for dj in (-1, 0, 1) for dk in (-1, 0, 1)
+                              for q in grid.get((i + di, j + dj, k + dk), ()))
+            return near[n]
+        if sd[0].startswith("NODE"):
+            nodes = dedup(n for token, _f in sd[1] for n in self._resolve_nodes(token))
+            if any(n not in xyz for n in nodes):
+                return None, []
+            kept, total = [str(n) for n in nodes if close(n)], len(nodes)
+            what, card = "nodes", "NODE"
+        else:
+            kept, total = [], 0
+            for token, face in sd[1]:
+                lab = (face or "").upper()
+                if not re.fullmatch(r"S[1-6]", lab):
+                    return None, []
+                for e in self._resolve_elements(token):
+                    info = self.geom.elements.get(e)
+                    if info is None or not ccx_type(info[0]).startswith("C3D"):
+                        return None, []
+                    total += 1
+                    if any(close(n) for n in self._face_nodes(e, face, types)):
+                        kept.append(f"{e}, {lab}")
+            what, card = "faces", "ELEMENT"
+        if not kept or len(kept) == total:
+            return None, []
+        self._reserve_names()
+        name = self._fresh_name(f"{slave}_NEAR")
+        self._mem_surfaces[key] = name
+        self.report.note(f"*TIE {tie}: slave surface {slave} -> {name}, the {len(kept)} of its {total} "
+                         f"{what} within {short_real(reach, 4)} of master surface {master} (the "
+                         f"position tolerance plus 1.5 times its largest facet, plus a shell's half "
+                         f"thickness): ccx 2.23 prints 'no tied MPC generated' for every node of the "
+                         f"others and ties none of them, nor does Abaqus (beyond the position "
+                         f"tolerance). Exact.")
+        return name, [f"*SURFACE, NAME={name}, TYPE={card}"] + kept
 
     def _shared_tie_slave(self, slave: str, master: str) -> Tuple[Optional[str], List[str]]:
         """A *TIE slave surface ``slave`` that shares nodes with the faces of ``master``: ccx
