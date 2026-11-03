@@ -26794,6 +26794,239 @@ def test_knot_drilling_held_where_op_new_releases_a_clamp():
     assert "knot drilling rotations without stiffness (rotational BCs in some steps only)" in conv.reduced_physics
 
 
+CREEP_SHELL_FLAG = ("creeping *SHELL SECTION (ccx 2.23 integrates it through the thickness at its "
+                    "brick's Gauss points, not at the section's points)")
+
+
+def test_creeping_shells_and_inelastic_continuum_shells_flagged():
+    # ccx 2.23 integrates an expanded shell's section through the thickness at its brick's 2 / 3
+    # Gauss points, and runs a continuum shell as one C3D8I / C3D6 solid (2 Gauss points there),
+    # Abaqus at the section's 5 Simpson points: in Norton creep bending 0.71 / 0.52 times the
+    # exact steady rate at n 3 / 5 (probed), plastic 1.155 times the limit load; linear creep exact
+    visco = "*Step\n*Visco, cetol=1e-3\n0.1, 1.\n*Cload\n5, 3, -1e-3\n6, 3, -1e-3\n*End Step\n"
+    creep = (S4 + "*Creep\n1e-6, 3., 0.\n*Boundary\n1, 1, 6\n4, 1, 6\n" + visco)
+    _, conv, rep = convert_str(creep)
+    assert CREEP_SHELL_FLAG in conv.reduced_physics
+    assert ("*SHELL SECTION of a creeping material (1 section(s): ELSET=E; 2 elements, S4): ccx 2.23 "
+            "integrates an expanded shell's section through the thickness at its brick's Gauss points "
+            "(2 on S4), Abaqus at the section's 5 Simpson points") in rep.text()
+    # linear creep (n = 1), or no step that creeps: nothing to flag
+    assert CREEP_SHELL_FLAG not in convert_str(creep.replace("1e-6, 3., 0.", "1e-6, 1., 0."))[1].reduced_physics
+    static = creep.replace("*Visco, cetol=1e-3\n0.1, 1.\n", "*Static\n")
+    assert CREEP_SHELL_FLAG not in convert_str(static)[1].reduced_physics
+    # a material both plastic and creeping keeps the plastic section's flag only
+    both = creep.replace("*Creep\n", "*Plastic\n1., 0.\n*Creep\n")
+    _, conv, _ = convert_str(both)
+    assert PLASTIC_SHELL_FLAG in conv.reduced_physics and CREEP_SHELL_FLAG not in conv.reduced_physics
+    # judged on the shells as written (code review): --approximate's S8R for an S4R wider than 6
+    # thicknesses (2 points, not the S4R's 1), and its S6 for an S3 (3 points, which a deck's own
+    # Gauss rule of 2 does not match)
+    s4r = creep.replace("type=S4,", "type=S4R,")
+    _, conv, rep = convert_str(s4r, approximate=True)
+    msg = next(m for _, m in rep.entries if m.startswith("*SHELL SECTION of a creeping material"))
+    assert CREEP_SHELL_FLAG in conv.reduced_physics and "(2 on S8R)" in msg and "S4R" not in msg
+    gauss2 = s4r.replace("*Shell Section,elset=E,material=M\n0.1\n",
+                         "*Shell Section,elset=E,material=M, section integration=GAUSS\n0.1, 2\n")
+    assert CREEP_SHELL_FLAG in convert_str(gauss2)[1].reduced_physics            # S4R: 1 point
+    assert CREEP_SHELL_FLAG not in convert_str(gauss2, approximate=True)[1].reduced_physics
+    s3 = gauss2.replace("*Element,type=S4R,elset=E\n1,1,2,3,4\n2,2,5,6,3\n",
+                        "*Element,type=S3,elset=E\n1,1,2,3\n2,1,3,4\n3,2,5,6\n4,2,6,3\n")
+    assert CREEP_SHELL_FLAG not in convert_str(s3)[1].reduced_physics            # S3: 2 points
+    _, conv, rep = convert_str(s3, approximate=True)
+    assert CREEP_SHELL_FLAG in conv.reduced_physics and "(3 on S6)" in rep.text()
+    # continuum shells of a plastic or creeping material
+    sc = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,0.1\n6,1,0,0.1\n7,1,1,0.1\n8,0,1,0.1\n"
+          "*Element, type=SC8R, elset=E\n1, 1,2,3,4,5,6,7,8\n*Shell Section, elset=E, material=M{sec}\n"
+          "0.1{pts}\n*Material, name=M\n*Elastic\n1000., 0.3\n{opt}*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n"
+          "8, 1, 3\n*Step\n{proc}*Cload\n2, 3, -1e-3\n*End Step\n")
+    for opt, proc, what in (("*Plastic\n1., 0.\n", "*Static\n", "plastic"),
+                            ("*Creep\n1e-6, 3., 0.\n", "*Visco, cetol=1e-3\n0.1, 1.\n", "creeping")):
+        _, conv, rep = convert_str(sc.format(sec="", pts="", opt=opt, proc=proc))
+        assert f"{what} continuum shells SC6R / SC8R (ccx 2.23 integrates them through the thickness at " \
+               f"2 Gauss points, not at the section's points)" in conv.reduced_physics
+        assert f"Continuum shells (SC6R / SC8R) of a {what} material (1 section(s): ELSET=E; 1 elements, " \
+               f"one through the thickness): ccx 2.23 runs each as one C3D8I / C3D6 solid through the " \
+               f"thickness" in rep.text()
+        # 2 Gauss points asked for: the deck's own rule
+        _, conv, _ = convert_str(sc.format(sec=", section integration=GAUSS", pts=", 2", opt=opt, proc=proc))
+        assert not any("continuum shells SC6R" in r for r in conv.reduced_physics)
+        # two stacked through the thickness: 4 Gauss points, the fully plastic moment exact
+        # (code review: C3D8I in pure bending 1.1547 / 1.0000 times it on 1 / 2 elements)
+        two = sc.format(sec="", pts="", opt=opt, proc=proc).replace(
+            "8,0,1,0.1\n", "8,0,1,0.1\n9,0,0,0.2\n10,1,0,0.2\n11,1,1,0.2\n12,0,1,0.2\n").replace(
+            "1, 1,2,3,4,5,6,7,8\n", "1, 1,2,3,4,5,6,7,8\n2, 5,6,7,8,9,10,11,12\n")
+        assert not any("continuum shells SC6R" in r for r in convert_str(two)[1].reduced_physics)
+    # a composite shell section whose creeping layer the middle crosses
+    comp = creep.replace("*Shell Section,elset=E,material=M\n0.1\n",
+                         "*Shell Section,elset=E,composite\n0.03, 3, M\n0.04, 3, M\n0.03, 3, M\n")
+    _, conv, rep = convert_str(comp)
+    assert ("creeping composite *SHELL SECTION with a layer through the middle (ccx 2.23 integrates it at "
+            "2 Gauss points, Abaqus at its Simpson points)") in conv.reduced_physics
+    assert "Composite *SHELL SECTION with a creeping layer the middle of the section crosses" in rep.text()
+
+
+def test_plastic_continuum_shell_composites_with_a_middle_layer_flagged():
+    # composite continuum shells run as one C3D8I per ply, 2 Gauss points each, Abaqus at each
+    # layer's 3 Simpson points: fully plastic they part on the layer the middle crosses only
+    # (1 and 3 equal layers flagged, 2 not)
+    sc = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,0.1\n6,1,0,0.1\n7,1,1,0.1\n8,0,1,0.1\n"
+          "*Element, type=SC8R, elset=E\n1, 1,2,3,4,5,6,7,8\n*Shell Section, elset=E, composite\n{lay}"
+          "*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n1., 0.\n*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n"
+          "8, 1, 3\n*Step\n*Static\n*Cload\n2, 3, -1e-3\n*End Step\n")
+    flag = ("plastic composite *SHELL SECTION with a layer through the middle (ccx 2.23 integrates it at "
+            "2 Gauss points, Abaqus at its Simpson points)")
+    for lay, flagged in (("0.1, 3, M\n", True), ("0.05, 3, M\n0.05, 3, M\n", False),
+                         ("0.03, 3, M\n0.04, 3, M\n0.03, 3, M\n", True)):
+        body, conv, rep = convert_str(sc.format(lay=lay))
+        assert "TYPE=C3D8I" in body and (flag in conv.reduced_physics) == flagged, lay
+        assert ("Composite *SHELL SECTION with a plastic layer the middle" in rep.text()) == flagged
+
+
+def test_stabilize_dropped_from_visco_and_coupled_steps():
+    # Abaqus' automatic stabilization (STABILIZE, FACTOR, ALLSDTOL, CONTINUE) on *VISCO and
+    # *COUPLED TEMPERATURE-DISPLACEMENT: ccx has none and ignores the parameters ('parameter not
+    # recognized'); dropped, and reduced physics where ccx iterates the step (as on *STATIC)
+    deck = HEX + ("*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n{mat}"
+                  "*CONDUCTIVITY\n1.\n*SPECIFIC HEAT\n1.\n*DENSITY\n1.\n*EXPANSION\n1e-5\n*BOUNDARY\n"
+                  "1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*STEP\n{proc}\n0.1, 1.\n*CLOAD\n7, 3, 1.\n*END STEP\n")
+    creep = "*CREEP\n1e-9, 3., 0.\n"
+    for mat, proc, card, flagged in (
+            (creep, "*VISCO, CETOL=1e-3, STABILIZE=2e-4", "*VISCO, CETOL=1e-3\n", True),
+            (creep, "*VISCO, CETOL=1e-3, STABILIZE, FACTOR=1e-3", "*VISCO, CETOL=1e-3\n", True),
+            ("", "*VISCO, CETOL=1e-3, STABILIZE", "*VISCO, CETOL=1e-3\n", False),     # ccx: linear
+            (creep, "*VISCO, CETOL=1e-3, STABILIZE=0.", "*VISCO, CETOL=1e-3\n", False),
+            ("", "*COUPLED TEMPERATURE-DISPLACEMENT, STABILIZE, ALLSDTOL=0.05",
+             "*COUPLED TEMPERATURE-DISPLACEMENT\n", True),
+            ("", "*COUPLED TEMPERATURE-DISPLACEMENT, STEADY STATE, STABILIZE=1e-4, CONTINUE=YES",
+             "*COUPLED TEMPERATURE-DISPLACEMENT, STEADY STATE\n", True)):
+        text = deck.format(mat=mat, proc=proc)
+        if "COUPLED" in proc:
+            text = text.replace("TYPE=C3D8,", "TYPE=C3D8T,")
+        body, conv, rep = convert_str(text)
+        assert card in body and "STABILIZE" not in _step(body, 1), proc
+        kw = proc.split(",")[0]
+        assert f"{kw} STABILIZE dropped: ccx has no automatic (viscous) stabilization" in rep.text()
+        assert (f"{kw} automatic stabilization (STABILIZE) dropped in a nonlinear step" in
+                conv.reduced_physics) == flagged, proc
+        assert (f"{kw}, STABILIZE in step 1, which ccx runs through its nonlinear solver" in rep.text()) == flagged
+
+
+def test_model_change_strain_free_add_in_a_linear_step_warned():
+    # ccx 2.23 adds elements strain free (ADD without a value, as in Abaqus, or ADD=STRAIN FREE)
+    # only in a step it runs nonlinearly and stops otherwise ('a strain-free addition of elements
+    # ... is only possible for nonlinear calculations'; probed: linear *STATIC and elastic *VISCO
+    # stop; ADD=WITH STRAIN, NLGEOM, a plastic or creeping material, *DYNAMIC, heat transfer run)
+    two = ("*NODE\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,1\n6,1,0,1\n7,1,1,1\n8,0,1,1\n9,2,0,0\n"
+           "10,2,1,0\n11,2,0,1\n12,2,1,1\n*ELEMENT, TYPE=C3D8, ELSET=E1\n1,1,2,3,4,5,6,7,8\n*ELEMENT, "
+           "TYPE=C3D8, ELSET=E2\n2,2,9,10,3,6,11,12,7\n*ELSET, ELSET=ALL\nE1, E2\n*MATERIAL, NAME=M\n"
+           "*ELASTIC\n1000., 0.3\n{mat}*SOLID SECTION, ELSET=ALL, MATERIAL=M\n*BOUNDARY\n1, 1, 3\n4, 1, 3\n"
+           "5, 1, 3\n8, 1, 3\n*STEP\n*STATIC\n*MODEL CHANGE, REMOVE\nE2\n*END STEP\n{head}\n{proc}"
+           "*MODEL CHANGE, {add}\nE2\n*BOUNDARY\n9, 1, 1, 0.01\n*END STEP\n")
+    warn = "which ccx 2.23 reads as linear"
+    for mat, head, proc, add, warned in (
+            ("", "*STEP", "*STATIC\n", "ADD", True),
+            ("", "*STEP", "*STATIC\n", "ADD=STRAIN FREE", True),
+            ("", "*STEP", "*STATIC\n", "ADD=WITH STRAIN", False),
+            ("", "*STEP, NLGEOM", "*STATIC\n", "ADD", False),
+            ("*PLASTIC\n1e6, 0.\n", "*STEP", "*STATIC\n", "ADD", False),
+            ("", "*STEP", "*VISCO, CETOL=1e-3\n0.1, 1.\n", "ADD", True),
+            ("*CREEP\n1e-9, 3., 0.\n", "*STEP", "*VISCO, CETOL=1e-3\n0.1, 1.\n", "ADD", False),
+            ("*DENSITY\n1e-9\n", "*STEP", "*DYNAMIC\n0.1, 1.\n", "ADD", False)):
+        _, _, rep = convert_str(two.format(mat=mat, head=head, proc=proc, add=add))
+        assert (warn in rep.text()) == warned, (head, proc, add)
+    _, _, rep = convert_str(two.format(mat="", head="*STEP", proc="*STATIC\n", add="ADD"))
+    assert "*MODEL CHANGE, ADD (strain free) in step(s) 2, which ccx 2.23 reads as linear" in rep.text()
+    # code review: a *FREQUENCY step turns ccx's flag off, a plastic model's next *STATIC stops;
+    # a plane *MPC (ccx: a nonlinear calculation) runs (both probed)
+    freq = two.format(mat="*PLASTIC\n1e6, 0.\n*DENSITY\n1e-9\n", head="*STEP", proc="*STATIC\n", add="ADD")
+    freq = freq.replace("*END STEP\n*STEP\n", "*END STEP\n*STEP\n*FREQUENCY\n2\n*END STEP\n*STEP\n", 1)
+    _, _, rep = convert_str(freq)
+    assert "in step(s) 3, which ccx 2.23 reads as linear" in rep.text() and "a *FREQUENCY / *BUCKLE" in rep.text()
+    mpc = two.format(mat="", head="*STEP", proc="*STATIC\n", add="ADD").replace(
+        "*BOUNDARY\n1, 1, 3", "*MPC\nPLANE, 2, 1, 5, 6\n*BOUNDARY\n1, 1, 3", 1)
+    assert warn not in convert_str(mpc)[2].text()
+
+
+def test_general_contact_flush_faces_warned():
+    # --approximate's node-to-surface pairs between bodies whose faces end flush (a lid on a block
+    # of the same footprint, stacked blocks, a conformal mesh line right under a block's edge):
+    # the slave nodes on the master's edges, which ccx 2.23 can miss (probed: 81 % of a
+    # hand-written pair's force, 12 % with the coarser slave mesh, three stacked blocks 87 % of
+    # the exact force); a lid inset from the block's edge with no node under that edge is not
+    tail = ("*CONTACT\n*CONTACT INCLUSIONS, ALL EXTERIOR\n*BOUNDARY\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+            "*STEP\n*STATIC\n*BOUNDARY\n{top}, 3, 3, -0.01\n*END STEP\n")
+    flag = ("general contact where two bodies' faces end flush (ccx's node-to-surface contact can miss "
+            "the slave nodes on the master's edges)")
+    for origins, flagged in (([(0, 0, 0), (0, 0, 1)], True),           # the same footprint
+                             ([(0, 0, 0), (0.5, 0, 1)], True),         # flush along one side
+                             ([(0, 0, 0), (0.1, 0.1, 1)], False),      # inset, no node under its edge
+                             ([(0, 0, 0), (0, 0, 1), (0, 0, 2)], True)):     # three stacked
+        top = 8 * len(origins) - 3
+        _, conv, rep = convert_str(_cubes(origins, tail.format(top=top)), approximate=True)
+        assert (flag in conv.reduced_physics) == flagged, origins
+        assert ("lie on an edge where their master's faces end" in rep.text()) == flagged
+    _, conv, rep = convert_str(_cubes([(0, 0, 0), (0, 0, 1)], tail.format(top=13)), approximate=True)
+    assert "*CONTACT (--approximate): 4 slave node(s) of the generated pairs (node 5, ...)" in rep.text()
+    # without --approximate there are no pairs, and nothing to warn of
+    _, conv, rep = convert_str(_cubes([(0, 0, 0), (0, 0, 1)], tail.format(top=13)))
+    assert flag not in conv.reduced_physics and "lie on an edge" not in rep.text()
+
+
+def test_s8r_strips_written_as_s8_under_approximate():
+    # task 159: --approximate writes the drifting S8R strips (_plan_s8r_strips) as S8, ccx's C3D20
+    # expansion without the zero-energy mode (probed: NLGEOM steps on S8's linear answer to 2e-6;
+    # a stiffer element: a 4 x 1 strip bends 2-7 % less); composite and plastic or creeping
+    # sections stay S8R and flagged
+    def strip(width, mat="", sec="*Shell Section, elset=E, material=M\n0.1\n", nlgeom=True):
+        pts = {}
+        for i in range(5):
+            for j in range(2 * width + 1):
+                if not (i % 2 == 1 and j % 2 == 1):
+                    pts[(i, j)] = len(pts) + 1
+        els = [[pts[(2 * a + i, 2 * b + j)] for i, j in ((0, 0), (2, 0), (2, 2), (0, 2), (1, 0), (2, 1),
+                                                         (1, 2), (0, 1))]
+               for a in range(2) for b in range(width)]
+        return ("*Node\n" + "".join(f"{n}, {0.5 * i}, {0.5 * j / width}, 0.\n" for (i, j), n in pts.items()) +
+                "*Element, type=S8R, elset=E\n" + "".join(f"{k}, " + ", ".join(map(str, c)) + "\n"
+                                                          for k, c in enumerate(els, 1)) +
+                sec + "*Material, name=M\n*Elastic\n1000., 0.3\n" + mat + "*Boundary\n" +
+                "".join(f"{n}, 1, 6\n" for (i, j), n in pts.items() if i == 0) +
+                f"*Step{', nlgeom' if nlgeom else ''}\n*Static\n*Cload\n" +
+                "".join(f"{n}, 3, 1e-4\n" for (i, j), n in pts.items() if i == 4) + "*End Step\n")
+    flag = "S8R strips one element wide in a step ccx iterates (C3D20R zero-energy mode)"
+    body, conv, rep = convert_str(strip(1), approximate=True)
+    assert "*ELEMENT, TYPE=S8\n" in body and "S8R" not in "".join(_live(body))
+    assert flag not in conv.reduced_physics and \
+        "--approximate: S8R strips one element wide written as S8" in conv.reduced_physics
+    assert "[APPROX] S8R strips one element wide written as S8: 2 S8R element(s) (e.g. element 1) have two " \
+        "opposite edges" in rep.text()
+    # as written: warned, naming the cure
+    _, conv, rep = convert_str(strip(1))
+    assert flag in conv.reduced_physics and "Rerun with --approximate to write them as S8" in rep.text()
+    # two elements across, or no step ccx iterates: S8R stays, nothing to say
+    for deck in (strip(2), strip(1, nlgeom=False)):
+        body, conv, rep = convert_str(deck, approximate=True)
+        assert "TYPE=S8R" in body and "S8R strips" not in rep.text()
+    # a composite section (ccx: S8R / S6 only) and a creeping material stay S8R, flagged; without
+    # --approximate they are not told it would cure them (code review)
+    comp = strip(1, sec="*Shell Section, elset=E, composite\n0.05, 3, M\n0.05, 3, M\n")
+    creep = strip(1, mat="*Creep\n1e-9, 3., 0.\n").replace("*Static\n", "*Visco, cetol=1e-3\n0.1, 1.\n")
+    for deck in (comp, creep):
+        body, conv, rep = convert_str(deck, approximate=True)
+        assert "TYPE=S8R" in body and flag in conv.reduced_physics
+        assert "Left as S8R: their composite section" in rep.text()
+        _, conv, rep = convert_str(deck)
+        assert flag in conv.reduced_physics and "Rerun with --approximate" not in rep.text()
+        assert "--approximate keeps them as S8R (their composite section" in rep.text()
+    # linear creep: S8 (exact there); a strip of a *RIGID BODY: no stiffness, nothing to do
+    lin = creep.replace("1e-9, 3., 0.", "1e-9, 1., 0.")
+    assert "*ELEMENT, TYPE=S8\n" in convert_str(lin, approximate=True)[0]
+    rigid = strip(1).replace("*Boundary\n", "*Node\n99, 0., 0., 1.\n*Rigid Body, ref node=99, elset=E\n"
+                                            "*Boundary\n99, 1, 6\n", 1)
+    body, conv, rep = convert_str(rigid, approximate=True)
+    assert "TYPE=S8R" in body and "S8R strips" not in rep.text()
+
+
 if __name__ == "__main__":
     import inspect
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
