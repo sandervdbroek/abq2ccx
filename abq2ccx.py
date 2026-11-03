@@ -1014,9 +1014,10 @@ def report_width() -> int:
 
 
 def wrap_for_terminal(text: str, width: int, first: str = "", rest: str = "") -> List[str]:
-    """``text`` wrapped for a terminal ``width`` columns wide, one column short of it: the
-    Windows console moves to the next line when a line fills its last column, so the line
-    break after such a line left a blank line inside the paragraph.  Long words (a path, a set
+    """``text`` wrapped for a terminal ``width`` columns wide, one column short of it: a line
+    that fills a terminal's last column wraps there by itself, and Windows Terminal (120
+    columns by default) then lost the line break after it, so the next line ran on from it
+    ('... NUMBER INTERVAL / TIME    INTERVAL / TIME POINTS ...').  Long words (a path, a set
     name) stay whole."""
     return textwrap.wrap(text, width - 1, initial_indent=first, subsequent_indent=rest,
                          break_long_words=False, break_on_hyphens=False) or [first.rstrip()]

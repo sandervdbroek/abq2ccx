@@ -20063,8 +20063,8 @@ def test_terminal_report_is_grouped_numbered_wrapped_and_versioned():
     assert text.startswith("Reduced physics (ccx solves another model than the deck):\n"
                            "  - element STRI65 -> S6\n\nWarnings (1, and the reduced-physics summary above)\n"
                            "  1. deck.inp:12\n     A warning about something that matters, long enough to\n"), text
-    # one column short of the width: the Windows console wraps a line that fills the last
-    # column by itself, and the line break after it left a blank line in the paragraph
+    # one column short of the width: a line that fills the terminal's last column wraps there
+    # by itself, and Windows Terminal then lost the line break after it (the next line ran on)
     assert all(len(line) < 60 for line in text.splitlines()), text
     assert "  - deck.inp:40\n    Output variables AR1, AR2, TA1 dropped from *NODE PRINT\n    (not a ccx label there).\n" in text, text
     assert "    Output variable U3 -> U (CalculiX naming).\n" in text and "  - A note without a place.\n" in text
