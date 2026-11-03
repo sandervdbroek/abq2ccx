@@ -9895,30 +9895,49 @@ class _Mesh:
 
     def _beyond_master(self, nodes: Sequence[int], facets: Sequence[Tuple[int, List[int], int]],
                        tol: float) -> List[int]:
-        """The nodes of ``nodes`` that project onto no facet of ``facets`` (_facet: element,
-        nodes, corners) within ``tol`` of it — its triangles (a quadrilateral split along a
-        diagonal) or its segment, with 1 % of the facet's size to spare.  ccx 2.23 ties a node
-        only to a master face opposite it, its projection inside the face within 2.5 % of the
-        element size ('no tied MPC generated ... no opposite master face', gentiedmpc), where
-        Abaqus measures to the nearest point of the master, an edge too ("Mesh tie
-        constraints")."""
+        """The nodes of ``nodes`` beyond the edge of the master ``facets`` (_facet: element,
+        nodes, corners) — that project onto no facet within ``tol`` of it (its triangles, a
+        quadrilateral split along a diagonal, or its segment; 1 % of the facet's size to
+        spare), the nearest point of the master lying on an edge of one facet only (a corner of
+        one segment), its perimeter.  ccx 2.23 ties a node only to a master face opposite it
+        ('no tied MPC generated ... no opposite master face', gentiedmpc), where Abaqus measures
+        to the nearest point of the master, an edge too ("Mesh tie constraints"); across an
+        edge two facets share, ccx's search splits the gap between them along the plane that
+        bisects them, so a node above a convex ridge still has an opposite face (probed: a
+        ring of 5 deg facets ties every node but those at its two ends).  So a node is beyond
+        where its projection onto the plane of the nearest facet lies outside (by 1 % of the
+        facet) an edge of that facet that no other facet has."""
         pts = self.geom.nodes
-        items: List[Tuple[List[float], List[float], float, List[Tuple[Vec, ...]]]] = []
+        items: List[Tuple[List[float], List[float], float, List[Tuple[Vec, ...]],
+                          List[Tuple[frozenset, Tuple[Vec, ...]]], List[Vec]]] = []
+        count: Dict[frozenset, int] = {}
         for _e, fn, c in facets:
             ps = [pts.get(n) for n in fn[:c]]
             if c < 2 or len(ps) < c or any(p is None for p in ps):
                 continue
             parts: List[Tuple[Vec, ...]] = [(ps[0], ps[1])] if c == 2 else \
                 [(ps[0], ps[1], ps[2])] + ([(ps[0], ps[2], ps[3])] if c == 4 else [])
+            # its edges (a segment's: its two ends), each with the facets that have it counted
+            rim = [(frozenset([fn[k]]), (ps[k],)) for k in range(2)] if c == 2 else \
+                [(frozenset([fn[k], fn[(k + 1) % c]]), (ps[k], ps[(k + 1) % c])) for k in range(c)]
+            for key, _ends in rim:
+                count[key] = count.get(key, 0) + 1
             items.append(([min(p[k] for p in ps) - tol for k in range(3)],
                           [max(p[k] for p in ps) + tol for k in range(3)],
-                          max(math.dist(a, q) for a in ps for q in ps), parts))
-        cell = max([hi[k] - lo[k] for lo, hi, _s, _p in items for k in range(3)] or [0.0]) or 1.0
+                          max(math.dist(a, q) for a in ps for q in ps), parts, rim, ps))
+        cell = max([it[1][k] - it[0][k] for it in items for k in range(3)] or [0.0]) or 1.0
         grid: Dict[Tuple[int, ...], List[int]] = {}
-        for i, (lo, hi, _s, _p) in enumerate(items):
-            for key in itertools.product(*[range(math.floor(lo[k] / cell), math.floor(hi[k] / cell) + 1)
+        for i, it in enumerate(items):
+            for key in itertools.product(*[range(math.floor(it[0][k] / cell), math.floor(it[1][k] / cell) + 1)
                                            for k in range(3)]):
                 grid.setdefault(key, []).append(i)
+
+        def nearest(p: Vec, part: Tuple[Vec, ...]) -> Vec:
+            if len(part) == 2:
+                ab = vsub(part[1], part[0])
+                t = vdot(vsub(p, part[0]), ab) / vdot(ab, ab) if vdot(ab, ab) else 0.0
+                return vadd(part[0], vscale(ab, min(1.0, max(0.0, t))))
+            return closest_on_triangle(p, *part)
 
         def off(p: Vec, part: Tuple[Vec, ...]) -> float:
             """How far the projection of ``p`` onto the plane (line) of ``part`` lies outside it."""
@@ -9931,12 +9950,35 @@ class _Mesh:
                 return math.inf
             d = vsub(p, closest_on_triangle(p, *part))
             return vnorm(vsub(d, vscale(nrm, vdot(d, nrm) / vdot(nrm, nrm))))
+        def outside(p: Vec, i: int) -> List[frozenset]:
+            """The edges of facet ``i`` whose outer side the projection of ``p`` lies on."""
+            _lo, _hi, size, _parts, rim, ps = items[i]
+            if len(ps) == 2:
+                ab = vsub(ps[1], ps[0])
+                t = vdot(vsub(p, ps[0]), ab) / vdot(ab, ab) if vdot(ab, ab) else 0.0
+                return [key for key, _e in rim[:1] if t * vnorm(ab) < -0.01 * size] + \
+                    [key for key, _e in rim[1:] if (t - 1.0) * vnorm(ab) > 0.01 * size]
+            nrm = vunit(vcross(vsub(ps[2], ps[0]), vsub(ps[3], ps[1])) if len(ps) == 4 else
+                        vcross(vsub(ps[1], ps[0]), vsub(ps[2], ps[0])))
+            mid = vscale(functools.reduce(vadd, ps), 1.0 / len(ps))
+            keys = []
+            for key, (a, b) in rim:
+                w = vunit(vcross(vsub(b, a), nrm))
+                if vdot(w, vsub(mid, a)) > 0.0:
+                    w = vscale(w, -1.0)
+                if vdot(w, vsub(p, a)) > 0.01 * size:
+                    keys.append(key)
+            return keys
         out = []
         for n in nodes:
             p = pts[n]
-            if not any(all(items[i][0][k] <= p[k] <= items[i][1][k] for k in range(3)) and
-                       any(off(p, part) <= 0.01 * items[i][2] for part in items[i][3])
-                       for i in grid.get(tuple(math.floor(p[k] / cell) for k in range(3)), [])):
+            near = [i for i in grid.get(tuple(math.floor(p[k] / cell) for k in range(3)), [])
+                    if all(items[i][0][k] <= p[k] <= items[i][1][k] for k in range(3))]
+            if any(off(p, part) <= 0.01 * items[i][2] for i in near for part in items[i][3]):
+                continue
+            best = min(near, key=lambda i: min(math.dist(p, nearest(p, part)) for part in items[i][3]),
+                       default=None)
+            if best is None or any(count[key] == 1 for key in outside(p, best)):
                 out.append(n)
         return out
 

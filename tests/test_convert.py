@@ -1291,6 +1291,31 @@ def test_tie_tied_nset_ties_the_sets_slave_nodes_whatever_their_distance():
     assert "SL_TIED, MA" in body and "2 of its slave node(s) (e.g. node 23) have no master face" in rep.text()
     assert conv.reduced_physics == ["*TIE, TIED NSET: slave nodes beyond the master's edge left untied"]
     assert "in that set (not on MA)" in rep.text() and "TIED NSET). Exact." not in rep.text()
+    # a convex ring master of 10 deg facets: a node above a ridge two facets share has a face
+    # opposite it in ccx (its search bisects the ridge), so only the slave nodes past the ring's
+    # two ends, and those at its end angles (0.5 off radially, past the end edge in the facet's
+    # plane), are beyond: ccx's own untied nodes, 2001-2002, 2011-2012, 2061-2062, 2071-2072
+    nodes, els = [], []
+    for k, deg in enumerate(range(-10, 70, 10)):
+        c, s_ = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+        for j, r in enumerate((9.0, 10.0, 10.5, 11.5)):
+            for h in (0, 1):
+                nodes.append(f"{1000 * j + 10 * k + h + 1}, {r * c:.12g}, {r * s_:.12g}, {h}.")
+    ring = lambda j, k: [1000 * j + 10 * k + h + 1 for h in (0, 1)]                    # noqa: E731
+    for k in range(7):
+        for j, base in ((0, 1), (2, 101)):
+            if j == 0 and k in (0, 6):
+                continue                            # (the master spans 0-50 deg, the slave -10-60)
+            quad = (ring(j, k), ring(j + 1, k), ring(j + 1, k + 1), ring(j, k + 1))   # (inner, outer)
+            els.append(f"{base + k}, " + ", ".join(str(c[h]) for h in (0, 1) for c in quad))
+    deck = ("*NODE\n" + "\n".join(nodes) + "\n*ELEMENT, TYPE=C3D8, ELSET=ALL\n" + "\n".join(els) +
+            "\n*ELSET, ELSET=MB\n" + ", ".join(str(1 + k) for k in range(1, 6)) + "\n*ELSET, ELSET=SB\n" +
+            ", ".join(str(101 + k) for k in range(7)) + "\n*SURFACE, NAME=MA\nMB, S4\n*SURFACE, NAME=SL\nSB, S6\n"
+            "*NSET, NSET=TN\n" + "\n".join(f"{2000 + 10 * k + h + 1}" for k in range(8) for h in (0, 1)) +
+            "\n*SOLID SECTION, ELSET=ALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+            "*TIE, NAME=GLUE, TIED NSET=TN, ADJUST=NO\nSL, MA\n*STEP\n*STATIC\n*END STEP\n")
+    body, conv, rep = convert_str(deck)
+    assert "SL_TIED, MA" in body and "8 of its slave node(s) (e.g. node 2011) have no master face" in rep.text()
 
 
 def test_tie_tied_nset_of_an_instance():
