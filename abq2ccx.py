@@ -58,10 +58,10 @@ import signal
 import stat
 import subprocess
 import sys
-import textwrap
 import threading
 import time
 import traceback
+import unicodedata
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
@@ -1024,10 +1024,26 @@ def wrap_for_terminal(text: str, width: int, first: str = "", rest: str = "") ->
     """``text`` wrapped for a terminal ``width`` columns wide, one column short of it: a line
     that fills a terminal's last column wraps there by itself, and Windows Terminal (120
     columns by default) then lost the line break after it, so the next line ran on from it
-    ('... NUMBER INTERVAL / TIME    INTERVAL / TIME POINTS ...').  Long words (a path, a set
-    name) stay whole."""
-    return textwrap.wrap(text, width - 1, initial_indent=first, subsequent_indent=rest,
-                         break_long_words=False, break_on_hyphens=False) or [first.rstrip()]
+    ('... NUMBER INTERVAL / TIME    INTERVAL / TIME POINTS ...').  Widths are counted in the
+    terminal's cells (terminal_cells), so a path with CJK characters stays one column short
+    too; long words (a path, a set name) stay whole, the blanks between words as they are."""
+    limit, out, cur, gap, words = width - 1, [], first, "", False
+    for tok in re.findall(r" +|[^ ]+", re.sub(r"\s", " ", text.expandtabs())):
+        if tok[0] == " ":
+            gap = tok if words else ""          # (a line starts at its first word)
+        elif words and terminal_cells(cur + gap + tok) > limit:
+            out.append(cur)
+            cur, gap = rest + tok, ""
+        else:
+            cur, gap, words = cur + gap + tok, "", True
+    return out + [cur] if words else [first.rstrip()]
+
+
+def terminal_cells(text: str) -> int:
+    """The columns ``text`` takes in a terminal: two for a wide (East Asian) character, none
+    for a combining mark, one for any other."""
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF"
+               else 1 for c in text)
 
 
 def _wrap(text: str, width: int) -> List[str]:

@@ -26,7 +26,9 @@ entries. The GitHub release notes use the same section.
   a long path moving to an indented next line. The instance map, which keeps each 'old -> new'
   pair on one line, counted the pair's ' -> ' as one character while wrapping, so its lines ran
   3 characters per pair past the width (80 at 80 columns): it counts all four now, in the deck's
-  header too, where a line can break one pair earlier. `__version__` is 1.7.1.dev0.
+  header too, where a line can break one pair earlier. Widths are counted in terminal cells, not
+  characters: a path with CJK characters (two cells each) no longer runs a line past the edge.
+  `__version__` is 1.7.1.dev0.
 
 ## 1.7.0 (November 2026)
 

@@ -20133,6 +20133,24 @@ def test_report_width_reads_columns_then_stderrs_terminal():
             assert A.report_width() == 100
         finally:
             sys.stderr = err
+
+        class Tty(io.StringIO):
+            def __init__(self, fd):
+                super().__init__()
+                self.fd = fd
+
+            def fileno(self):
+                return self.fd
+        asked, size = [], os.get_terminal_size              # stdout on 7, stderr on 9: 9 asked
+        streams = sys.stdout, sys.stderr
+        os.get_terminal_size = lambda fd=1: asked.append(fd) or os.terminal_size((90, 24))
+        sys.stdout, sys.stderr = Tty(7), Tty(9)
+        try:
+            assert A.report_width() == 90
+        finally:
+            sys.stdout, sys.stderr = streams
+            os.get_terminal_size = size
+        assert asked == [9], asked
     finally:
         if saved is None:
             os.environ.pop("COLUMNS", None)
@@ -20140,6 +20158,16 @@ def test_report_width_reads_columns_then_stderrs_terminal():
             os.environ["COLUMNS"] = saved
     lines = A.wrap_for_terminal("a " * 100, 60, "  - ", "    ")
     assert max(map(len, lines)) == 59 and lines[0].startswith("  - a a")
+    # counted in terminal cells: a CJK character takes two (a path of 模型 at width 120 took 138
+    # columns in 98 characters), a combining mark none; blanks between words kept, long words whole
+    assert A.terminal_cells("模型 ab") == 7 and A.terminal_cells("e\u0301") == 1
+    deck = "/tmp/" + "模型" * 10 + "/a"                   # 78 characters, but 118 cells: breaks
+    lines = A.wrap_for_terminal(f"wrote {deck}_ccx.inp from {deck}.inp", 80, "", "    ")
+    assert lines == [f"wrote {deck}_ccx.inp from", f"    {deck}.inp"], lines
+    assert [A.terminal_cells(x) for x in lines] == [66, 55]
+    assert A.wrap_for_terminal(f"x {deck}{deck}", 60, "", "    ") == ["x", f"    {deck}{deck}"]
+    assert A.wrap_for_terminal("TIME    INTERVAL  x", 60) == ["TIME    INTERVAL  x"]
+    assert A.wrap_for_terminal("", 60, "  - ") == ["  -"] and A.wrap_for_terminal("  a  ", 60) == ["a"]
 
 
 def _still_runs(pid):
