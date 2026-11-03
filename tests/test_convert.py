@@ -6348,7 +6348,8 @@ def test_rotated_instance_turns_gaps_dashpots_and_constraint_axes():
     assert "*COUPLING, CONSTRAINT NAME=I_C, REF NODE=9, SURFACE=I_TOP\n*DISTRIBUTING\n1, 3\n4, 4\n6, 6\n" in body
     assert "*DASHPOT, ELSET=I_D1\n10.\n" in body                # (the DOF line goes: _plan_dashpots)
     assert "*EQUATION\n1\n13, 3, 1\n*EQUATION\n2\n13, 2, 1, 12, 2, -1\n" in body   # ground node on z
-    assert conv.geom.nodes[13] == (3.0, 0.0, -math.sqrt(14.0)) and conv.geom.elements[3] == ("DASHPOTA", [12, 13])
+    assert conv.geom.nodes[13] == (3.0, 0.0, -A.Converter.LINE_REACH * math.sqrt(14.0)) and \
+        conv.geom.elements[3] == ("DASHPOTA", [12, 13])
     assert "couplings of some DOFs and DASHPOT1 elements are turned with it" in rep.text()
     # 30 degrees about z: the instance's axes; the gap's direction cosines turned, its area kept
     moment = ROT_TAIL + "*Step\n*Static\n*Cload\nI.9, 4, 1.\n*End Step\n"     # (node 9's rotation used)
@@ -6395,7 +6396,7 @@ def test_dashpot1_to_a_ground_node_on_its_line():
             "*Element, type=MASS, elset=EM\n14, 1\n*Mass, elset=EM\n1.\n"
             "*Step, nlgeom\n*Dynamic\n0.1, 1.\n*Cload\n1, 1, 1.\n*End Step\n")
     body, conv, rep = convert_str(deck)
-    span = math.sqrt(5.0)
+    span = A.Converter.LINE_REACH * math.sqrt(5.0)      # (a *DYNAMIC deck: 100 spans)
     assert conv.geom.elements[11] == ("DASHPOTA", [1, 4])
     assert all(abs(a - b) < 1e-12 for a, b in zip(conv.geom.nodes[4], (-0.6 * span, -0.8 * span, 0.0)))
     # u_4 . v = 0, u_4 . w = u_1 . w for the two w normal to v = (0.6, 0.8, 0)
@@ -6590,10 +6591,17 @@ def test_rotational_springs_act_through_helper_nodes():
     (h, g), h2 = conv.geom.elements[31][1], conv.geom.elements[32][1][0]
     assert conv.geom.elements[31][0] == conv.geom.elements[32][0] == "SPRINGA"
     assert conv.geom.nodes[h] == conv.geom.nodes[3] and conv.geom.nodes[g][0] < 0.0
-    rows = _equation_terms(body)
+    # (u_h = s theta, s = span / 100, and k / s^2: h meets its held node a span away only at
+    # 100 rad — ccx's SPRINGA takes its current length under NLGEOM and in *DYNAMIC)
+    s = conv._model_span() / A.Converter.SPRING_TURNS
+    rows = [r[:1] + [(n, d, round(c / s, 9)) for n, d, c in r[1:]] if r[0][0] in (h, h2) else r
+            for r in _equation_terms(body)]
     assert [(h, 1, 1.0), (3, 5, -1.0)] in rows and [(h, 2, 1.0)] in rows and [(g, 3, 1.0)] in rows
-    assert [(h2, 1, 1.0), (3, 5, -1.0), (13, 6, 1.0)] in rows        # (u_h = theta_3y - theta_13z)
-    assert {3, 13} <= set(conv._knots) and "*SPRING, ELSET=K1\n1.\n*SPRING, ELSET=K2\n2.\n" in body
+    assert [(h2, 1, 1.0), (3, 5, -1.0), (13, 6, 1.0)] in rows        # (u_h = s (theta_3y - theta_13z))
+    k1 = [float(x) for x in body.split("*SPRING, ELSET=K1\n")[1].split("\n")[:1]][0]
+    assert {3, 13} <= set(conv._knots) and abs(k1 * s * s - 1.0) < 1e-9
+    assert A.Converter._scaled_spring_line("-100., -1., 20.", 0.5, True) == "-200.,-0.5, 20." and \
+        A.Converter._scaled_spring_line("x, 1.", 0.5, True) == "x, 1."
     assert "on rotations (DOFs 4-6), which ccx 2.23's springs ignore" in rep.text() and not conv.reduced_physics
     # a rigid body's reference node: on its ROT NODE (the deck's node, on an element, is a member
     # of the body and the reference point a new node: its rotation is the body's)
@@ -6605,7 +6613,9 @@ def test_rotational_springs_act_through_helper_nodes():
     body, conv, rep = convert_str(deck)
     h = conv.geom.elements[31][1][0]
     rot = next(r for ref, r in conv._rb_rot.items())
-    assert [(h, 1, 1.0), (rot, 3, -1.0)] in _equation_terms(body) and not conv.reduced_physics
+    s = conv._model_span() / A.Converter.SPRING_TURNS
+    row = next(r for r in _equation_terms(body) if r[0] == (h, 1, 1.0))
+    assert len(row) == 2 and row[1][:2] == (rot, 3) and abs(row[1][2] + s) < 1e-9 * s and not conv.reduced_physics
     # a node without rotations in ccx (a solid's, a free one): left out, nothing else stiffens
     # that DOF in Abaqus; NLGEOM: left out unless --approximate
     body, conv, rep = convert_str(deck.replace("31, 100\n", "31, 5\n").replace("100, 0.5", "5, 3., 0., 0.\n100, 0.5"))
@@ -6682,13 +6692,19 @@ def test_kinematic_coupling_member_masses_get_a_tetrahedron():
     deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n10, 0.5, 1., 0.\n100, 0.5, 0.5, 0.\n*Element, type=T3D2, "
             "elset=T\n1, 1, 2\n*Element, type=MASS, elset=PM\n5, 10\n*Mass, elset=PM\n5.\n*Material, name=M\n"
             "*Elastic\n100., 0.\n*Density\n1.\n*Solid Section, elset=T, material=M\n0.01\n"
-            "*Kinematic Coupling, ref node=100\n10, 1, 3\n2, 1, 3\n*Boundary\n1, 1, 3\n2, 2, 3\n"
-            "*Step\n*Frequency\n2\n*End Step\n")
+            "*Kinematic Coupling, ref node=100\n10, 1, 3\n2, 1, 3\n*Boundary\n1, 1, 3\n100, 2, 6\n"
+            "*Step\n*Frequency\n1\n*End Step\n")
     body, conv, rep = convert_str(deck)
     tet = next(c for t, c in conv.geom.elements.values() if t == "C3D4")
     assert tet[0] == 10 and all(f"\n{m}\n" in body.split("*COUPLING")[0].split("*SURFACE, TYPE=NODE")[-1] + "\n"
                                 for m in tet[1:])
     assert "massless tetrahedron" in rep.text() and not conv.reduced_physics
+    # (well-posed: the body moves along x on the truss; ccx 2.23 runs it, f 0.07115)
+    # in a deck with a *DYNAMIC step the coupling's dynamic form takes the new nodes as a group
+    body, conv, rep = convert_str(deck.replace("*End Step\n", "*End Step\n*Step\n*Dynamic\n0.1, 1.\n*End Step\n"))
+    plan = next(p for p in conv._coupling_plan.values() if p.get("kind") == "kdyn")
+    tet = next(c for t, c in conv.geom.elements.values() if t == "C3D4")
+    assert tet[0] == 10 and (tet[1:], {1, 2, 3}) in plan["groups"]
 
 
 def test_rotated_instance_springs_on_transformed_nodes_and_anisotropic_masses():

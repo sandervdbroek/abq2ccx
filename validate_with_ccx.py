@@ -7009,6 +7009,29 @@ def spring_rotation_ref_deck():
                   "*NODE PRINT, NSET=PROBE\nU\n*END STEP\n")
 
 
+def spring_large_motion_deck(kind, sign):
+    """``kind`` "rot": an SI B31 cantilever 0.05 m long (4 elements, RECT 5 x 5 mm, steel), a
+    SPRING1 of 1000 on its tip's DOF 6, a tip moment of ``sign`` 110 (0.11 rad, past the model's
+    span read as radians): *DYNAMIC (ramped over 1 s, held to 2 s, no NLGEOM) and *STATIC NLGEOM
+    (--approximate).  "line": a node 0.01 from a held one (a soft truss between them, an *EQUATION
+    tying their DOF 3), on a SPRING1 of 100 on DOF 1 and pushed by ``sign`` 5 under NLGEOM: 0.05,
+    five spans."""
+    if kind == "line":
+        return ("*NODE\n1, 0., 0., 0.\n2, 0.01, 0., 0.\n*ELEMENT, TYPE=T3D2, ELSET=T\n1, 1, 2\n*MATERIAL, NAME=M\n"
+                "*ELASTIC\n1., 0.\n*SOLID SECTION, ELSET=T, MATERIAL=M\n1.e-9\n*ELEMENT, TYPE=SPRING1, ELSET=K\n"
+                "5, 2\n*SPRING, ELSET=K\n1\n100.\n*EQUATION\n2\n2, 3, 1., 1, 3, -1.\n*NSET, NSET=P\n2\n"
+                f"*BOUNDARY\n1, 1, 3\n2, 2, 2\n*STEP, NLGEOM\n*STATIC\n0.05, 1.\n*CLOAD\n2, 1, {5.0 * sign:g}\n"
+                "*NODE PRINT, NSET=P\nU\n*END STEP\n")
+    out = "*NODE\n" + "".join(f"{i + 1}, {0.0125 * i:g}, 0., 0.\n" for i in range(5))
+    out += ("*ELEMENT, TYPE=B31, ELSET=BEAM\n1, 1, 2\n2, 2, 3\n3, 3, 4\n4, 4, 5\n*ELEMENT, TYPE=SPRING1, "
+            "ELSET=RS\n100, 5\n*SPRING, ELSET=RS\n6\n1000.\n*MATERIAL, NAME=STEEL\n*ELASTIC\n2.1e11, 0.3\n"
+            "*DENSITY\n7800.\n*BEAM SECTION, ELSET=BEAM, MATERIAL=STEEL, SECTION=RECT\n0.005, 0.005\n0., 0., 1.\n"
+            "*NSET, NSET=TIP\n5\n*BOUNDARY\n1, 1, 6\n")
+    step = ("*AMPLITUDE, NAME=RAMP\n0., 0., 1., 1., 2., 1.\n*STEP, INC=2000\n*DYNAMIC\n0.01, 2.\n"
+            "*CLOAD, AMPLITUDE=RAMP\n") if kind == "dyn" else "*STEP, NLGEOM\n*STATIC\n0.05, 1.\n*CLOAD\n"
+    return out + step + f"5, 6, {110.0 * sign:g}\n*NODE PRINT, NSET=TIP\nU\n*END STEP\n"
+
+
 def spring_dependent_deck(twin=False):
     """Springs on DOFs that an MPC eliminates, in a *STATIC step (E 100, nu 0 unit cubes held at
     their bases): cube 1-8 with u5x = 0.5 u6x + u300x (a deck *EQUATION), u300x = 0.01 by a BC,
@@ -19985,6 +20008,26 @@ def check_spring_dofs_masses(ccx, env, tmp, shared):
     else:
         print(f"FAIL  spring_rotation_ref: {u}")
     failures += 0 if ok else 1
+    # past the span: a rotation of 0.11 rad on a 0.05 m model (the helper node, which moved the
+    # rotation read as a length, passed its held node: the force flipped, 2.199e-3 / -3.991e-3),
+    # and a constrained translational spring pushed five spans (0.07 for 0.05): +/- the same
+    for kind in ("dyn", "nl", "line"):
+        runs = [review_run(spring_large_motion_deck(kind, sg), f"spring_large_{kind}_{'p' if sg > 0 else 'm'}",
+                           dat_displacements, approximate=kind == "nl") for sg in (1, -1)]
+        node, k = (2, 0) if kind == "line" else (5, 1)
+        ok = all(runs) and all(node in r for r in runs)
+        if ok:
+            up, down = (r[node][k] for r in runs)
+            err = abs(up + down) / max(abs(up), 1e-30)
+            ok = err < 1e-6 and abs(up) > 1e-4 and (kind != "line" or abs(up - 0.05) < 1e-9)
+            print(f"{'PASS' if ok else 'FAIL'}  spring_large_{kind} ("
+                  + ("a constrained SPRING1 of 100 pushed by +/-5 under NLGEOM, five model spans"
+                     if kind == "line" else f"a rotational SPRING1 of 1000 at a 0.05 m cantilever's tip, "
+                     f"moments +/-110, {'*DYNAMIC' if kind == 'dyn' else '*STATIC NLGEOM --approximate'}")
+                  + f"): {up:.7g} / {down:.7g} ({err:.1e} off antisymmetric)")
+        else:
+            print(f"FAIL  spring_large_{kind}: {runs}")
+        failures += 0 if ok else 1
     # springs on DOFs an MPC eliminates, under a BC on its other DOFs (ccx 2.23's small-strain
     # solve dropped it: 8.78e-3 for 7.70e-3, 0.01 for 7.69e-3; a transformed node's SPRING2 0)
     runs = [review_run(spring_dependent_deck(tw), f"spring_dependent{'_twin' if tw else ''}",

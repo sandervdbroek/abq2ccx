@@ -10553,6 +10553,10 @@ class _Mesh:
                              f"it: the dashpot acts on Abaqus' relative velocity in the fixed "
                              f"directions, also under NLGEOM (validate_with_ccx.py dashpot2_dofs).")
 
+    # model spans between a line element's node and its held node where ccx takes current
+    # lengths (_line_element)
+    LINE_REACH = 100.0
+
     def _line_element(self, e: int, typ: str, n: int, v: Vec, far: List[Tuple[int, int, float]],
                       rows: List[List[Tuple[int, int, float]]]) -> None:
         """Element ``e`` as a ``typ`` (DASHPOTA / SPRINGA) from node ``n`` to a new node g a
@@ -10560,13 +10564,17 @@ class _Mesh:
         u_g . v = -``far`` (the terms of the other end's DOF, negated; none: ground) and
         u_g . w = u_n . w for the two w normal to v (a plane model's node: the one in its
         plane): the line n-g stays along v, so the element acts along v at any motion
-        (_plan_dashpots, _plan_springs).  g takes n's temperatures, and where a step solves
-        for them T_g = T_n (ccx gives the ground node one, and a free one stops ccx, probed:
-        exit 255)."""
+        (_plan_dashpots, _plan_springs) — until n passes g.  Where ccx takes the element's
+        current length (a step under NLGEOM, explicit or *DYNAMIC) that flips its force
+        (probed: a SPRING1 pushed five spans moved 0.07 for 0.05), so there g is LINE_REACH
+        spans away.  g takes n's temperatures, and where a step solves for them T_g = T_n
+        (ccx gives the ground node one, and a free one stops ccx, probed: exit 255)."""
         unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
         plane = n in self._plane_only
+        reach = self._model_span() * (self.LINE_REACH if any(
+            st.ccx_nlgeom or st.explicit or st.proc == "DYNAMIC" for st in self.steps) else 1.0)
         g = max(self.geom.nodes) + 1
-        self.geom.add_node(g, vsub(self.geom.nodes[n], vscale(v, self._model_span())))
+        self.geom.add_node(g, vsub(self.geom.nodes[n], vscale(v, reach)))
         self.geom.elements[e] = (typ, [n, g])
         w1 = vunit(vcross((0.0, 0.0, 1.0), v)) if plane else \
             vunit(vcross(v, unit[min(range(3), key=lambda k: abs(v[k]))]))
@@ -10587,6 +10595,10 @@ class _Mesh:
         if self._mpc_thermal:
             rows.append([(g, 11, 1.0), (n, 11, -1.0)])
 
+    # the rotation (radians) at which a rotational spring's helper node would reach its held node
+    # a model span away (_plan_springs)
+    SPRING_TURNS = 100.0
+
     def _plan_springs(self, blocks: List[Block]) -> None:
         """SPRING1 / SPRING2 elements that ccx 2.23 springs wrongly, rewritten — every element
         of their *SPRING card, which then loses its DOF line and ORIENTATION= (handle_spring).
@@ -10606,13 +10618,19 @@ class _Mesh:
           (warned where a small-strain step would mishandle it).
         * Rotations (DOFs 4-6): ccx's springs act on translations only (probed: a SPRING1 on
           DOF 5 of a beam tip changed nothing).  A helper node h whose DOF 1 an *EQUATION
-          ties to v . theta (less the second end's DOF for a SPRING2), held across it, gets a
-          SPRINGA to a held node a span away along -x — the rotation where ccx carries it: a
-          reference point's ROT NODE, DOFs 4-6 of a kinematic coupling's reference node, of a
-          U1 node or of a knot (a shell/beam node gets a knot beam).  Exact for small
-          rotations; under NLGEOM [APPROX] (--approximate), else the element is left out.  On
-          a node without rotations (a solid's, a free one) the element is left out: nothing
-          else stiffens that DOF in Abaqus.
+          ties to s v . theta (less the second end's DOF for a SPRING2; s = model span /
+          SPRING_TURNS), held across it, gets a SPRINGA of k / s^2 (the card's values scaled,
+          handle_spring) to a held node a span away along -x — the same moment.  The scale
+          keeps h from the held node up to SPRING_TURNS radians: ccx's SPRINGA takes its
+          current length under NLGEOM and in *DYNAMIC, and with u_h = theta its force flipped
+          where a rotation passed the span (probed: 0.11 rad on a 0.05 m model).  The rotation
+          is taken where ccx carries it: a reference point's ROT NODE, DOFs 4-6 of a kinematic
+          coupling's reference node, of a U1 node or of a knot (a shell/beam node gets a knot
+          beam, which holds a beam section rigid at the node: 0.03 % stiffer on a 4-element
+          cantilever, 3 % on one element, probed).  Exact for small rotations; under NLGEOM
+          [APPROX] (--approximate), else the element is left out.  On a node without rotations
+          (a solid's, a free one) the element is left out: nothing else stiffens that DOF in
+          Abaqus.
         The new nodes take the node's temperatures (T = T_n where a step solves for them)."""
         cards = []
         for b in blocks:
@@ -10752,13 +10770,14 @@ class _Mesh:
                 knots += pending
                 approx = approx or nl
                 n = ends[0][0]
+                s = self._spring_scale[id(b)] = self._model_span() / self.SPRING_TURNS
                 h = max(self.geom.nodes) + 1
                 self.geom.add_node(h, self.geom.nodes[n])
                 g = h + 1
                 self.geom.add_node(g, vsub(self.geom.nodes[n], (self._model_span(), 0.0, 0.0)))
                 self.geom.elements[e] = ("SPRINGA", [h, g])
-                self._spring_rows += [[(h, 1, 1.0)] + terms, [(h, 2, 1.0)], [(h, 3, 1.0)]] + \
-                    [[(g, k, 1.0)] for k in (1, 2, 3)]
+                self._spring_rows += [[(h, 1, 1.0)] + [(m, dd, s * c) for m, dd, c in terms],
+                                      [(h, 2, 1.0)], [(h, 3, 1.0)]] + [[(g, k, 1.0)] for k in (1, 2, 3)]
                 for x in (h, g):
                     self._tied_nodes.append((n, n, x, 0.0))
                     if self._mpc_thermal:
@@ -10808,7 +10827,9 @@ class _Mesh:
                              f"2.23's springs ignore (probed) -> a SPRINGA from a helper node whose DOF 1 "
                              f"an *EQUATION ties to the rotation (on the ROT NODE, the reference node's "
                              f"or a knot's DOFs 4-6), held across it, to a held node: exact for small "
-                             f"rotations (validate_with_ccx.py spring_rotation).", once=True)
+                             f"rotations (validate_with_ccx.py spring_rotation_*); a beam node's knot "
+                             f"holds its section rigid there, which stiffens a coarse beam a little "
+                             f"(probed: 3 % with one element, 0.03 % with four).", once=True)
         if approx:
             self.report.warn("[APPROX] Rotational SPRING1 / SPRING2 under NLGEOM written in their linear "
                              "form: exact for small rotations only.", once=True)
@@ -11370,8 +11391,10 @@ class _Mesh:
                                          "above): commented out.", [emit_keyword("SPRING", b.params)] +
                                          list(b.data), False, warn=False)
             params = OrderedDict((k, v) for k, v in b.params.items() if k != "ORIENTATION")
+            s = self._spring_scale.get(id(b))
+            data = [self._scaled_spring_line(ln, s, b.has("NONLINEAR")) if s else ln for ln in b.data[1:]]
             return self.passthrough(Block(b.keyword, params, [",".join(map(dotted_number, ln.split(",")))
-                                                              for ln in b.data[1:]]))
+                                                              for ln in data]))
         lines = list(b.data)
         first = 0
         if lines and dof_line(lines[0]):
@@ -11382,6 +11405,22 @@ class _Mesh:
                 first = 1                           # (SPRING1 / SPRING2 / a JOINTC's: its DOFs)
         lines[first:] = [",".join(map(dotted_number, ln.split(","))) for ln in lines[first:]]
         return self.passthrough(Block(b.keyword, b.params, lines))
+
+    @staticmethod
+    def _scaled_spring_line(ln: str, s: float, nonlinear: bool) -> str:
+        """A *SPRING data line of a rotational spring on _plan_springs' helper node, which moves
+        s theta: the stiffness over s^2, or a NONLINEAR line's force over s and its relative
+        displacement times s (the same moment at the same rotation); a line that does not read
+        as it is."""
+        f = ln.split(",")
+        try:
+            if nonlinear and len(f) >= 2 and f[0].strip() and f[1].strip():
+                f[0], f[1] = short_real(pf(f[0]) / s, 12), short_real(pf(f[1]) * s, 12)
+            elif not nonlinear and f[0].strip():
+                f[0] = short_real(pf(f[0]) / (s * s), 12)
+        except ValueError:
+            return ln
+        return ",".join(f)
 
     def _elset_types(self, b: Block) -> set:
         """The element types (upper case) of the elements in card ``b``'s ELSET."""
@@ -28704,8 +28743,8 @@ class _Constraints:
                 for members, ds in cg[1] if cg is not None else ():
                     if {1, 2, 3} <= ds and plan.get("kind") in (None, "kin"):
                         bodies.append((b, {"dofs": ds}, members))
-                    elif {1, 2, 3} <= ds and plan.get("kind") in ("rb", "rbk", "kdyn") and "members" in plan:
-                        bodies.append((None, plan, members))
+                    elif {1, 2, 3} <= ds and plan.get("kind") == "kdyn":     # (its form's groups)
+                        bodies.append((None, {"groups": plan["groups"], "dofs": ds}, members))
                 continue
             cg = self._coupling_groups(blocks, i) if b.keyword == "COUPLING" else None
             if cg is None or len(cg[1]) != 1 or not {1, 2, 3} <= cg[1][0][1] or \
@@ -28747,6 +28786,8 @@ class _Constraints:
                 card.data = list(card.data) + [f"{m}, {min(body['dofs'])}, {max(body['dofs'])}" for m in new]
             elif card is not None:
                 self._add_rigid_members(card, new)
+            elif "groups" in body:
+                body["groups"].append((new, set(body["dofs"])))
             else:
                 body["members"] = list(body["members"]) + new
         if done:
@@ -45391,6 +45432,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._free_mass_rows: List[List[Tuple[int, int, float]]] = []   # _plan_free_masses' held nodes
         self._spring_rows: List[List[Tuple[int, int, float]]] = []    # _plan_springs' new nodes
         self._spring_cards: set = set()         # ids of the *SPRING cards _plan_springs rewrote
+        self._spring_scale: Dict[int, float] = {}   # ... of rotations: their helpers' scale s
         self._mass_tets_left: set = set()       # MASS-only members _plan_member_mass_tets left as they are
         self._amass: Dict[int, Tuple[float, List[Tuple[str, float]]]] = {}   # _plan_anisotropic_masses
         self._amass_rows: List[List[Tuple[int, int, float]]] = []     # its nodes' *EQUATIONs

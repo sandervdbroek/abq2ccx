@@ -24,18 +24,24 @@ entries. The GitHub release notes use the same section.
 * **Rotational springs** — `SPRING1` / `SPRING2` on DOFs 4-6 become a helper node whose DOF 1 an
   `*EQUATION` ties to the rotation (a rigid body's ROT NODE, a kinematic coupling's or U1 node's
   DOFs 4-6, or a knot; a shell/beam node gets a knot beam), with a `SPRINGA` from it to a held
-  node: exact for small rotations; under NLGEOM `[APPROX]` (`--approximate`), else left out and
-  warned. On a node with no rotations in ccx the spring is left out (it carries no load).
+  node, scaled so that the helper reaches that node only past 100 radians: exact for small
+  rotations (a beam node's knot holds its section rigid there, so a coarse beam is a little
+  stiffer: 3 % with one element, 0.03 % with four); under NLGEOM `[APPROX]` (`--approximate`),
+  else left out and warned. On a node with no rotations in ccx the spring is left out (it carries
+  no load).
 * **Springs on constrained or transformed nodes** — a `SPRING1` / `SPRING2` on a node that a
   constraint names, or on a local DOF of a `*TRANSFORM` node, is a `SPRINGA` to a node that
   `*EQUATION`s keep on the DOF's line, also under NLGEOM. A rigid-body member in a deck with
-  NLGEOM keeps its spring (warned where a small-strain step would mishandle it).
+  NLGEOM keeps its spring (warned where a small-strain step would mishandle it). In a deck with an
+  NLGEOM, explicit or `*DYNAMIC` step that held node, and `DASHPOT1` / `DASHPOT2`'s, is 100 model
+  spans away (at one span, compressing one by more than a span flipped its force).
 * **Point masses** — a node on `MASS` elements alone that `*EQUATION`s tie gets a zero-stiffness
   `SPRINGA` to a held node where it needs one; one tied in some translations only, with the
   others free in a static step, is warned. A `*KINEMATIC COUPLING`'s mass-only members get the
   massless tetrahedron that `*COUPLING` members already got.
-* Validate check `spring_dofs_masses` (rotational springs against rigid levers and θ = M / k,
-  constrained springs against `SPRINGA` twins, point masses against zero-spring twins).
+* Validate check `spring_dofs_masses` (rotational springs against rigid levers and θ = M / k, and
+  at ±0.11 rad on a 0.05 m model; constrained springs against `SPRINGA` twins and pushed five
+  spans; point masses against zero-spring twins).
 
 ## 1.7.0 (November 2026)
 
