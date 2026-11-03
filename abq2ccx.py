@@ -959,8 +959,8 @@ class Report:
                 where = key[1] if len(key) == 3 else self.where.get(key[1], "")
                 text = (f"Output variable{'s' if len(vals) > 1 else ''} {', '.join(vals)} {key[2]}"
                         if len(key) == 3 else vals[0])
-                if where:
-                    out.append(head + where)
+                if where:                       # (a path with blanks can be long too)
+                    para(where, head, pad)
                     para(text, pad, pad)
                 else:
                     para(text, head, pad)
@@ -1026,9 +1026,11 @@ def wrap_for_terminal(text: str, width: int, first: str = "", rest: str = "") ->
     columns by default) then lost the line break after it, so the next line ran on from it
     ('... NUMBER INTERVAL / TIME    INTERVAL / TIME POINTS ...').  Widths are counted in the
     terminal's cells (terminal_cells), so a path with CJK characters stays one column short
-    too; long words (a path, a set name) stay whole, the blanks between words as they are."""
+    too; long words (a path, a set name) stay whole, the blanks between words as they are.
+    Only ASCII tabs and line breaks become blanks (as in textwrap): a no-break or ideographic
+    space in a path is part of its name, kept and not broken at."""
     limit, out, cur, gap, words = width - 1, [], first, "", False
-    for tok in re.findall(r" +|[^ ]+", re.sub(r"\s", " ", text.expandtabs())):
+    for tok in re.findall(r" +|[^ ]+", re.sub(r"[\n\r\v\f]", " ", text.expandtabs())):
         if tok[0] == " ":
             gap = tok if words else ""          # (a line starts at its first word)
         elif words and terminal_cells(cur + gap + tok) > limit:

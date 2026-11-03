@@ -20170,6 +20170,29 @@ def test_report_width_reads_columns_then_stderrs_terminal():
     assert A.wrap_for_terminal("", 60, "  - ") == ["  -"] and A.wrap_for_terminal("  a  ", 60) == ["a"]
 
 
+def test_terminal_report_keeps_unicode_blanks_and_wraps_deck_locations():
+    # only ASCII tabs and line breaks become blanks: a no-break or ideographic space in a path
+    # is part of its name (shown as '/tmp/my model.log', it named another file), kept whole
+    for path in ("/tmp/my\u00a0model.log", "/tmp/模型\u3000deck.inp", "/tmp/a\u2009b.inp"):
+        assert A.wrap_for_terminal(f"wrote {path}", 60) == [f"wrote {path}"], path
+    assert A.wrap_for_terminal("a\nb\r\nc\td", 60) == ["a b  c       d"]
+    # a warning's place in the deck is wrapped like its text: a 115-character path with blanks
+    # under '  1. ' filled the 120 columns (Windows Terminal then lost the line break)
+    where = "/home/user/Abaqus models/cold shaker v3/"
+    where += "a" * (115 - len(where) - len(".inp:12")) + ".inp:12"
+    rep = A.Report()
+    rep.warn("Something to check.", at=where)
+    rep.note("And a note.", at="/home/user/Abaqus models/cold shaker v3/a.inp:20")
+    for width in (60, 80, 100, 120):
+        lines = rep.console(width).splitlines()
+        assert all(A.terminal_cells(x) < width or " " not in x.strip() for x in lines), (width, lines)
+        at = lines.index("Notes (1)")
+        assert " ".join(x[5:] for x in lines[1:at - 2]) == where, lines   # (broken at blanks only)
+        assert "Something to check." in lines[at - 2] and lines[-1] == "    And a note.", lines
+        assert lines[1].startswith("  1. /home/user/Abaqus"), lines
+    assert len(where) == 115 and max(map(len, rep.console(120).splitlines())) < 120
+
+
 def _still_runs(pid):
     """Whether process ``pid`` still runs (a zombie does not), asked for up to 5 s."""
     import subprocess
