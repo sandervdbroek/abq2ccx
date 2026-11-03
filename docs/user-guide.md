@@ -136,6 +136,8 @@ a different model without saying so. With it, these reframings are made, each wi
   midside nodes;
 * a plastic `*SHELL SECTION` (ccx integrates it at 2 Gauss points through the thickness) → a
   composite of 2 equal layers, its linear shells `S8R` / `S6`;
+* `S8R` strips one element wide (two opposite free edges) in a model with a step ccx iterates,
+  where its `C3D20R`'s zero-energy mode drifts → `S8` (2–7 % stiffer on a strip of 4 elements);
 * `S4`, `S4R5`, `S4T` and `S4RT` shells collapsed to a triangle → `S3`, `S3R`, `S3T`, `S3RT`
   (a collapsed `S4R` is `S3R` without the option: exact);
 * a `*DAMPING` value the materials share but Abaqus does not apply to point masses, springs or
@@ -159,8 +161,10 @@ a different model without saying so. With it, these reframings are made, each wi
   pairs between the bodies that can meet (their exterior faces; the struck, yielding or finer
   body the slave, one line per slave body), without self-contact and edge-to-edge contact.
   Not yet where two bodies' faces end flush (a lid on a block of the same footprint, stacked
-  blocks): ccx pairs a slave node on the master's edge with its side face and misses most of
-  the contact (22 % of a hand-written pair's force in a probe); write that pair by hand.
+  blocks) or a conformal mesh line runs right under a block's edge, which the converter warns
+  of: ccx can miss the slave nodes on the master's edges
+  (probed: 81 % of a hand-written pair's force, 12 % with the coarser mesh the slave, three
+  stacked blocks 87 % of the exact force).
 
 ## `--abaqus-umat`
 

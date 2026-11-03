@@ -24941,14 +24941,17 @@ def test_base_restore_keeps_fixed_on_transforms_along_the_global_axes():
 def test_fixed_transformed_translations_held_at_local_values():
     # ccx 2.23 holds a FIXED translation of a *TRANSFORM node at its global displacement
     # component, read as the local value: the value the step finds it at instead (0 at rest,
-    # a BC's value, in the local axes); unknown: FIXED kept, warned
+    # a BC's value, in the local axes); unknown: through a helper node (_plan_fixed_helpers),
+    # which carries every *BOUNDARY on the node's translations (local u2's too)
     s1 = "*Step\n*Static\n*Boundary\n7, 2, 2, 0.01\n*Cload\n7, 1, 1.\n*End Step\n"
     body, conv, rep = convert_str(FIXED_TR_HEX + s1 + "*Step\n*Static\n*Boundary, op=NEW\nBOT, 1, 3\n"
                                   "*Boundary, fixed\n7, 1, 3\n*Cload, op=NEW\n6, 2, 1.\n*End Step\n")
-    assert "*BOUNDARY\n7, 2, 2, 0.01\n*BOUNDARY, FIXED\n7, 1, 1\n7, 3, 3\n" in _step(body, 2)
-    assert "node 7 DOF 1 (step 2), node 7 DOF 3 (step 2)): kept as FIXED" in rep.text()
-    assert conv.reduced_physics == ["*BOUNDARY, FIXED on *TRANSFORM translations held at the global "
-                                    "component (ccx 2.23)"]
+    assert "*BOUNDARY\n9, 2, 2, 0.01\n*BOUNDARY, FIXED\n9, 1, 1\n9, 3, 3\n" in _step(body, 2)
+    assert "*BOUNDARY\n9, 2, 2, 0.01\n" in _step(body, 1) and "7, 2, 2" not in body
+    assert "*NODE\n9, 1., 1., 1.\n*EQUATION\n2\n7, 1, 1., 9, 1, -1.\n2\n7, 2, 1., 9, 2, -1.\n2\n" \
+           "7, 3, 1., 9, 3, -1.\n*STEP" in body
+    assert "(node 7 DOF 1, node 7 DOF 3): held through a helper node" in rep.text()
+    assert not conv.reduced_physics
     body, conv, _ = convert_str(FIXED_TR_HEX + "*Boundary, fixed\n7, 1, 3\n*Step\n*Static\n*Boundary, "
                                 "fixed\nTOP, 1, 3\n*Cload\n6, 2, 1.\n*End Step\n")
     assert "*BOUNDARY\n7, 1, 1, 0.\n7, 2, 2, 0.\n7, 3, 3, 0.\n*STEP" in body      # model data: at rest
@@ -24959,8 +24962,8 @@ def test_fixed_transformed_translations_held_at_local_values():
     turned = FIXED_TR_HEX.replace("1., 1., 0.5, -1., 1., 1.", "0., 1., 0., -1., 0., 0.")
     body, conv, rep = convert_str(turned + "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Static\n"
                                   "*Boundary, fixed\n7, 1, 3\n*End Step\n")
-    assert "*BOUNDARY, FIXED\n7, 1, 3\n" in body and "held at their value" not in body
-    assert "node 7 DOF 2 (step 2)): kept" in rep.text() and "node 7 DOF 3" not in rep.text()
+    assert "*BOUNDARY, FIXED\n9, 1, 3\n" in body and "held at their value" not in body
+    assert "(node 7 DOF 1, node 7 DOF 2): held through" in rep.text() and "node 7 DOF 3" not in rep.text()
     body, conv, rep = convert_str(turned + "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Static\n"
                                   "*Boundary, fixed\n7, 3, 3\n*End Step\n")
     assert "*BOUNDARY, FIXED\n7, 3, 3\n" in body and "FIXED on translations" not in rep.text()
@@ -24986,6 +24989,58 @@ def test_fixed_transformed_translations_held_at_local_values():
     assert conv.reduced_physics == ["element B31 -> B32R (SECTION=PIPE needs a 3-node beam in ccx)"]
 
 
+def test_fixed_unknown_transformed_translations_through_helper_nodes():
+    # a FIXED translation of a *TRANSFORM node moved by loads: a helper node tied to the local
+    # DOF by an *EQUATION carries every *BOUNDARY on that DOF, in every step (another on the
+    # node would be a second constraint on that direction)
+    s1 = "*Step\n*Static\n*Boundary\nTOP, 2, 2, 0.05\n*Cload\n7, 1, 1.\n*End Step\n"
+    s2 = "*Step\n*Static\n*Boundary, op=NEW\nBOT, 1, 3\n*Cload, op=NEW\n6, 2, 1.\n*End Step\n"
+    s3 = "*Step\n*Static\n*Boundary, fixed\nN7, 2, 2\n*End Step\n"
+    body, conv, rep = convert_str(FIXED_TR_HEX + s1 + s2 + s3)
+    assert "*BOUNDARY\n5, 2, 2, 0.05\n6, 2, 2, 0.05\n9, 2, 2, 0.05\n8, 2, 2, 0.05\n" in _step(body, 1)
+    assert "*BOUNDARY, FIXED\n9, 2, 2\n" in _step(body, 3) and "7, 2, 2" not in body
+    assert "*EQUATION\n2\n7, 2, 1., 9, 2, -1.\n*STEP" in body and not conv.reduced_physics
+    # a *FREQUENCY step, then a general step: the base state's FIXED given again, on the helper
+    body, conv, _ = convert_str(FIXED_TR_HEX + "*Step\n*Static\n*Cload\n7, 2, 1.\n*End Step\n" + s3 +
+                                "*Step\n*Frequency\n2\n*End Step\n*Step\n*Static\n*Cload\n6, 1, 1.\n"
+                                "*End Step\n")
+    assert "\n9, 2, 2\n" in _step(body, 4) and "7, 2, 2" not in body and not conv.reduced_physics
+    # in an implicit *DYNAMIC step: held, warned with reduced physics (ccx's response to
+    # stopping a DOF along an oblique axis), no "Exact." note
+    dyn = "*Step\n*Dynamic\n0.1, 1.\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Dynamic\n0.1, 1.\n" \
+        "*Boundary, fixed\n7, 2, 2\n*End Step\n"
+    body, conv, rep = convert_str(FIXED_TR_HEX + dyn)
+    assert "*BOUNDARY, FIXED\n9, 2, 2\n" in _step(body, 2)
+    assert "*DYNAMIC steps (node 7 DOF 2 (step 2)), moved by loads: held through a helper node" in rep.text()
+    assert "is written on the helper. Exact." not in rep.text()
+    assert conv.reduced_physics == ["*BOUNDARY, FIXED on *TRANSFORM translations in an implicit *DYNAMIC "
+                                    "step (ccx 2.23 answers a BC along an oblique axis otherwise)"]
+    # not where the node has other constraints, an initial velocity, or in explicit decks:
+    # FIXED kept, warned
+    two = "*Step\n*Static\n*Cload\n7, 1, 1.\n*End Step\n" + s3
+    for extra, steps, why in (
+            ("*Node\n20, 2., 2., 2.\n*Equation\n2\n7, 3, 1., 20, 3, -1.\n", two, "other constraints on it"),
+            ("*Initial Conditions, type=velocity\n7, 1, 1.\n", two, "an initial velocity on it"),
+            ("", two.replace("*Static", "*Dynamic, explicit\n, 0.001"), "the deck has an explicit step")):
+        body, conv, rep = convert_str(FIXED_TR_HEX + extra + steps)
+        assert "*BOUNDARY, FIXED\nN7, 2, 2\n" in _step(body, 2) and "helper" not in body, why
+        assert f"does not apply there: {why}" in rep.text(), why
+        assert "*BOUNDARY, FIXED on *TRANSFORM translations held at the global component (ccx 2.23)" \
+            in conv.reduced_physics
+    # a shell node in a deck with *DYNAMIC steps (ccx may knot it): kept
+    shell = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, elset=P\n"
+             "1, 1, 2, 3, 4\n*Shell Section, elset=P, material=M\n0.1\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+             "*Density\n1.\n*Nset, nset=N3\n3\n*Transform, nset=N3\n1., 1., 0.5, -1., 1., 1.\n*Boundary\n1, 1, 6\n"
+             "4, 1, 6\n")
+    steps = "*Step\n*Static\n*Cload\n3, 3, 1.\n*End Step\n*Step\n*Static\n*Boundary, fixed\n3, 2, 2\n*End Step\n"
+    body, conv, _ = convert_str(shell + steps)
+    assert "*BOUNDARY, FIXED\n5, 2, 2\n" in _step(body, 2) and not conv.reduced_physics     # (static only)
+    body, conv, rep = convert_str(shell + steps + "*Step\n*Dynamic\n0.1, 1.\n*End Step\n")
+    assert "a shell or beam node that ccx may make a knot" in rep.text()
+    body, conv, rep = convert_str(shell + steps.replace("*Cload\n3, 3, 1.\n", "*Boundary\n3, 4, 4\n*Cload\n3, 3, 1.\n"))
+    assert "does not apply there: BCs on its rotations" in rep.text()
+
+
 def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
     # FIXED in a linear perturbation step holds the base state: 0, which a static perturbation
     # step's restore adds the base value to (a rotation was written as that value, then doubled)
@@ -24996,10 +25051,11 @@ def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
     sp = "*Step, perturbation\n*Static\n*Boundary, fixed\n7, 2, 2\n*Cload\n6, 2, 1.\n*End Step\n"
     body, _, _ = convert_str(FIXED_TR_HEX + "*Step\n*Static\n*Boundary\n7, 2, 2, 0.01\n*End Step\n" + sp)
     assert "*BOUNDARY\n7, 2, 2, 0.01\n" in _step(body, 2)
-    # (the base state leaves it free and it moved: unknown, FIXED kept)
+    # (the base state leaves it free and it moved: unknown, FIXED through a helper node, which
+    # holds the base state, as on a node without a *TRANSFORM)
     body, conv, _ = convert_str(FIXED_TR_HEX + "*Step\n*Static\n*Cload\n7, 2, 1.\n*End Step\n" + sp)
-    assert "*BOUNDARY, FIXED\n7, 2, 2\n" in _step(body, 2) and \
-        "*BOUNDARY, FIXED on *TRANSFORM translations held at the global component (ccx 2.23)" in conv.reduced_physics
+    assert "*BOUNDARY, FIXED\n9, 2, 2\n" in _step(body, 2) and \
+        conv.reduced_physics == ["*STEP, PERTURBATION static step after a general step"]
     shell = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, elset=P\n"
              "1, 1, 2, 3, 4\n*Shell Section, elset=P, material=M\n0.1\n*Material, name=M\n*Elastic\n1000., 0.3\n"
              "*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Static\n*Boundary\n2, 5, 5, 0.01\n3, 5, 5, 0.01\n*End Step\n"
@@ -26724,15 +26780,68 @@ def test_knot_drilling_rotation_held_on_shell_nodes():
                                        "5, 1, 6\n*End Step\n")
     assert "*BOUNDARY, OP=NEW" in _step(body, 3)
     assert "drilling rotations held again\n*BOUNDARY\n3, 6, 6\n" in _step(body, 3)
-    # a normal off the global axes: an *EQUATION; in a deck with a *MODAL DYNAMIC step, where
-    # ccx crashes at random on equations that eliminate a knot's rotation, none: warned
-    body, conv, _ = convert_str(strip(turn=30.0))
+    # a normal off the global axes: a *BOUNDARY on its largest global component, which only
+    # fixes how much of the rotation vector lies along the normal (probed: the same answers as
+    # n . theta = 0 in statics, *BUCKLE, *MODAL DYNAMIC; ccx crashes at random in *MODAL
+    # DYNAMIC on that equation, never on the BC), also in a *MODAL DYNAMIC deck and with a
+    # moment in the shell's plane
+    for kw in ({}, {"last": "*Modal Dynamic\n1e-4, 0.01"}, {"extra": "3, 4, 1.\n"}):
+        body, conv, rep = convert_str(strip(turn=30.0, **kw))
+        assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not _equation_terms(body), kw
+        assert not conv.reduced_physics and "may depend on round-off" not in rep.text()
+    # a moment about the normal, which the BC would turn partly into the shell's plane:
+    # n . theta = 0; in a *MODAL DYNAMIC deck (the equation crashes ccx there) or on a node
+    # with a *TRANSFORM (ccx misreads equation rotation terms there), none: warned
+    body, conv, _ = convert_str(strip("3, 6, 1.\n", turn=30.0))
     rows = [r for r in _equation_terms(body) if len(r) == 2 and r[0][0] == 3]
     assert len(rows) == 1 and {d for _, d, _ in rows[0]} == {5, 6} and not conv.reduced_physics
-    body, conv, rep = convert_str(strip(turn=30.0, last="*Modal Dynamic\n1e-4, 0.01"))
+    body, conv, rep = convert_str(strip("3, 6, 1.\n", turn=30.0, last="*Modal Dynamic\n1e-4, 0.01"))
     assert hold not in body and "crashes ccx's *MODAL DYNAMIC step at random" in rep.text()
     assert "knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)" in \
         conv.reduced_physics
+    # an unread moment value counts as one about the normal
+    body, conv, _ = convert_str(strip("3, 6, 1.5x\n", turn=30.0))
+    assert hold + "*BOUNDARY\n3, 6, 6" not in body and [r for r in _equation_terms(body) if r[0][0] == 3]
+    # (PR #9 review) where ccx turns the knot finitely (NLGEOM, its nonlinear solver), the BC's
+    # share along the normal changes a moment's or a rotational BC's work: R(theta + alpha n) is
+    # not R(theta) (probed: a strip off the axes bent by an in-plane moment under NLGEOM 10 %
+    # off, then ccx stopped; n . theta = 0 as the strip in the xy-plane, 1.6e-6): the equation
+    # under an in-plane moment or a BC about an in-plane axis in an NLGEOM step; a linear step's
+    # moment keeps the BC; in a *MODAL DYNAMIC deck warned
+    def first(card, nlgeom=True, **kw):
+        return strip(turn=30.0, **kw).replace("*Step\n*Frequency", "*Step" + (", nlgeom" if nlgeom else "") +
+                                              f"\n*Static\n{card}*End Step\n*Step\n*Frequency", 1)
+    for card in ("*Cload\n3, 4, 0.01\n", "*Boundary\n3, 4, 4\n*Cload\n3, 3, 0.1\n"):
+        body, conv, _ = convert_str(first(card))
+        rows = [r for r in _equation_terms(body) if r[0][0] == 3]
+        assert hold + "*BOUNDARY\n3, 6, 6" not in body and len(rows) == 1, card
+        assert {d for _, d, _ in rows[0]} == {5, 6}
+    body, _, _ = convert_str(first("*Cload\n3, 4, 0.01\n", nlgeom=False))
+    assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not _equation_terms(body)
+    # forces alone under NLGEOM keep the BC, but the eigenvalue / modal steps after that step
+    # are not right with it (nor with the equation: probed, omega^2 0.3-1.0 % low): warned;
+    # along an axis exact
+    body, conv, rep = convert_str(first("*Cload\n3, 3, 0.01\n"))
+    assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and conv._knot_gauges == [3]
+    assert "held about the normal by a *BOUNDARY on a global rotation" in rep.text()
+    assert ("knot drilling holds off the global axes wrong in the eigenvalue / modal steps after a step "
+            "ccx runs through its nonlinear solver") in conv.reduced_physics
+    body, conv, rep = convert_str(strip().replace("*Step\n*Frequency", "*Step, nlgeom\n*Static\n*Cload\n"
+                                                  "3, 3, 0.01\n*End Step\n*Step\n*Frequency", 1))
+    assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not conv._knot_gauges and not conv.reduced_physics
+    body, conv, rep = convert_str(first("*Cload\n3, 4, 0.01\n", last="*Modal Dynamic\n1e-4, 0.01"))
+    assert hold not in body and "a step ccx solves with finite rotations" in rep.text()
+    assert "knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)" in \
+        conv.reduced_physics
+    # a knot on a node with a *TRANSFORM: ccx reads a rotational BC there about the global axes
+    # (the knot's rotation node has no transform; probed exact), so it is held all the same
+    tr = "*Nset, nset=T\n3\n*Transform, nset=T\n1., 0., 0., 0., 0., 1.\n"
+    for turn in (0.0, 30.0):
+        body, conv, _ = convert_str(strip(turn=turn).replace("*Material", tr + "*Material"))
+        assert hold + "*BOUNDARY\n3, 6, 6\n*STEP" in body and not conv.reduced_physics
+    body, conv, rep = convert_str(strip("3, 6, 1.\n", turn=30.0).replace("*Material", tr + "*Material"))
+    assert hold not in body and "misreads *EQUATION terms on DOFs 4-6" in rep.text()
+    assert "knot drilling rotations without stiffness (*TRANSFORM nodes)" in conv.reduced_physics
     # a BC on the node's rotation about the normal in every step: left as it is; one in the
     # last step only leaves the steps before to the hold (and replaces it there), one about
     # another axis leaves that rotation free, so it is held all the same
@@ -26881,11 +26990,273 @@ def test_knot_drilling_held_where_op_new_releases_a_clamp():
             "*BOUNDARY\n9, 6, 6\n18, 6, 6\n") in _step(body, 2)
     assert "rotation about the shell normal held (by a *BOUNDARY) where no BC holds it" in rep.text()
     assert not other_reduced(conv)
-    # a normal off the global axes: the *EQUATION would act in step 1 too, where the clamp
-    # holds its dependent rotation (ccx stops on that): warned
+    # a normal off the global axes: the *BOUNDARY on its largest component, which the clamp
+    # holds in step 1 (an *EQUATION would act there too, where ccx stops on a BC on its
+    # dependent; probed: as converted before, ccx stopped, exit 201; held, the twin's answer)
     body, conv, rep = convert_str(strip(30.0))
-    assert "drilling rotations held" not in body and "with rotational BCs in some steps only" in rep.text()
+    assert "drilling rotations held again\n*BOUNDARY\n9, 6, 6\n18, 6, 6\n" in _step(body, 2)
+    assert "held (no stiffness acts on it)" not in body and not other_reduced(conv)
+    # steps that hold different rotations (5 in step 1, 6 in step 2, none in step 3): no one
+    # BC fits them all, warned
+    s = strip(30.0).replace("9, 1, 6\n18, 1, 6\n", "9, 5, 5\n18, 5, 5\n").replace(
+        "*Step, nlgeom", "*Step\n*Static\n*Boundary, op=NEW\n1, 1, 6\n10, 1, 6\n9, 6, 6\n18, 6, 6\n"
+        "*End Step\n*Step, nlgeom")
+    body, conv, rep = convert_str(s)
+    assert {9, 18} <= set(conv._knots) and "drilling rotations held" not in body
+    assert "held about different axes from step to step" in rep.text()
     assert "knot drilling rotations without stiffness (rotational BCs in some steps only)" in conv.reduced_physics
+
+
+def test_modal_dynamic_deck_with_mpcs_on_knots_warned():
+    # ccx 2.23 crashes at random in a *MODAL DYNAMIC step when an MPC eliminates a knot's DOF
+    # (probed: a kinematic coupling of a shell edge 11 of 60 runs, DOFs 1-3 only 14 of 60; SPCs
+    # on the knots none of 60): no ccx form avoids it for shell nodes, warned
+    why = "crashes at random in that step"
+    deck = (S4 + "*Density\n1e-3\n*Boundary\n1, 1, 6\n4, 1, 6\n*Surface, type=node, name=RS\nR\n"
+            "*Coupling, constraint name=C, ref node=100, surface=RS\n*Kinematic\n{dofs}"
+            "*Step\n*Frequency\n3\n*End Step\n*Step\n*{proc}\n*Cload\n100, 3, 1.\n*End Step\n")
+    for dofs in ("", "1, 3\n"):
+        _, conv, rep = convert_str(deck.format(dofs=dofs, proc="Modal Dynamic\n1e-4, 0.01"))
+        assert {5, 6} <= set(conv._knots) and why in rep.text() and not other_reduced(conv), dofs
+    _, conv, rep = convert_str(deck.format(dofs="", proc="Steady State Dynamics\n1., 10., 3"))
+    assert {5, 6} <= set(conv._knots) and why not in rep.text()
+    # knots the modal step's force makes, held by SPCs only: none
+    _, conv, rep = convert_str(S4 + "*Density\n1e-3\n*Boundary\n1, 1, 6\n4, 1, 6\n*Step\n*Frequency\n3\n"
+                               "*End Step\n*Step\n*Modal Dynamic\n1e-4, 0.01\n*Cload\n5, 3, 1.\n*End Step\n")
+    assert 5 in conv._knots and why not in rep.text()
+
+
+CREEP_SHELL_FLAG = ("creeping *SHELL SECTION (ccx 2.23 integrates it through the thickness at its "
+                    "brick's Gauss points, not at the section's points)")
+
+
+def test_creeping_shells_and_inelastic_continuum_shells_flagged():
+    # ccx 2.23 integrates an expanded shell's section through the thickness at its brick's 2 / 3
+    # Gauss points, and runs a continuum shell as one C3D8I / C3D6 solid (2 Gauss points there),
+    # Abaqus at the section's 5 Simpson points: in Norton creep bending 0.71 / 0.52 times the
+    # exact steady rate at n 3 / 5 (probed), plastic 1.155 times the limit load; linear creep exact
+    visco = "*Step\n*Visco, cetol=1e-3\n0.1, 1.\n*Cload\n5, 3, -1e-3\n6, 3, -1e-3\n*End Step\n"
+    creep = (S4 + "*Creep\n1e-6, 3., 0.\n*Boundary\n1, 1, 6\n4, 1, 6\n" + visco)
+    _, conv, rep = convert_str(creep)
+    assert CREEP_SHELL_FLAG in conv.reduced_physics
+    assert ("*SHELL SECTION of a creeping material (1 section(s): ELSET=E; 2 elements, S4): ccx 2.23 "
+            "integrates an expanded shell's section through the thickness at its brick's Gauss points "
+            "(2 on S4), Abaqus at the section's 5 Simpson points") in rep.text()
+    # linear creep (n = 1), or no step that creeps: nothing to flag
+    assert CREEP_SHELL_FLAG not in convert_str(creep.replace("1e-6, 3., 0.", "1e-6, 1., 0."))[1].reduced_physics
+    static = creep.replace("*Visco, cetol=1e-3\n0.1, 1.\n", "*Static\n")
+    assert CREEP_SHELL_FLAG not in convert_str(static)[1].reduced_physics
+    # a material both plastic and creeping keeps the plastic section's flag only
+    both = creep.replace("*Creep\n", "*Plastic\n1., 0.\n*Creep\n")
+    _, conv, _ = convert_str(both)
+    assert PLASTIC_SHELL_FLAG in conv.reduced_physics and CREEP_SHELL_FLAG not in conv.reduced_physics
+    # judged on the shells as written (code review): --approximate's S8R for an S4R wider than 6
+    # thicknesses (2 points, not the S4R's 1), and its S6 for an S3 (3 points, which a deck's own
+    # Gauss rule of 2 does not match)
+    s4r = creep.replace("type=S4,", "type=S4R,")
+    _, conv, rep = convert_str(s4r, approximate=True)
+    msg = next(m for _, m in rep.entries if m.startswith("*SHELL SECTION of a creeping material"))
+    assert CREEP_SHELL_FLAG in conv.reduced_physics and "(2 on S8R)" in msg and "S4R" not in msg
+    gauss2 = s4r.replace("*Shell Section,elset=E,material=M\n0.1\n",
+                         "*Shell Section,elset=E,material=M, section integration=GAUSS\n0.1, 2\n")
+    assert CREEP_SHELL_FLAG in convert_str(gauss2)[1].reduced_physics            # S4R: 1 point
+    assert CREEP_SHELL_FLAG not in convert_str(gauss2, approximate=True)[1].reduced_physics
+    s3 = gauss2.replace("*Element,type=S4R,elset=E\n1,1,2,3,4\n2,2,5,6,3\n",
+                        "*Element,type=S3,elset=E\n1,1,2,3\n2,1,3,4\n3,2,5,6\n4,2,6,3\n")
+    assert CREEP_SHELL_FLAG not in convert_str(s3)[1].reduced_physics            # S3: 2 points
+    _, conv, rep = convert_str(s3, approximate=True)
+    assert CREEP_SHELL_FLAG in conv.reduced_physics and "(3 on S6)" in rep.text()
+    # continuum shells of a plastic or creeping material
+    sc = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,0.1\n6,1,0,0.1\n7,1,1,0.1\n8,0,1,0.1\n"
+          "*Element, type=SC8R, elset=E\n1, 1,2,3,4,5,6,7,8\n*Shell Section, elset=E, material=M{sec}\n"
+          "0.1{pts}\n*Material, name=M\n*Elastic\n1000., 0.3\n{opt}*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n"
+          "8, 1, 3\n*Step\n{proc}*Cload\n2, 3, -1e-3\n*End Step\n")
+    for opt, proc, what in (("*Plastic\n1., 0.\n", "*Static\n", "plastic"),
+                            ("*Creep\n1e-6, 3., 0.\n", "*Visco, cetol=1e-3\n0.1, 1.\n", "creeping")):
+        _, conv, rep = convert_str(sc.format(sec="", pts="", opt=opt, proc=proc))
+        assert f"{what} continuum shells SC6R / SC8R (ccx 2.23 integrates them through the thickness at " \
+               f"2 Gauss points, not at the section's points)" in conv.reduced_physics
+        assert f"Continuum shells (SC6R / SC8R) of a {what} material (1 section(s): ELSET=E; 1 elements, " \
+               f"one through the thickness): ccx 2.23 runs each as one C3D8I / C3D6 solid through the " \
+               f"thickness" in rep.text()
+        # 2 Gauss points asked for: the deck's own rule
+        _, conv, _ = convert_str(sc.format(sec=", section integration=GAUSS", pts=", 2", opt=opt, proc=proc))
+        assert not any("continuum shells SC6R" in r for r in conv.reduced_physics)
+        # two stacked through the thickness: 4 Gauss points, the fully plastic moment exact
+        # (code review: C3D8I in pure bending 1.1547 / 1.0000 times it on 1 / 2 elements)
+        two = sc.format(sec="", pts="", opt=opt, proc=proc).replace(
+            "8,0,1,0.1\n", "8,0,1,0.1\n9,0,0,0.2\n10,1,0,0.2\n11,1,1,0.2\n12,0,1,0.2\n").replace(
+            "1, 1,2,3,4,5,6,7,8\n", "1, 1,2,3,4,5,6,7,8\n2, 5,6,7,8,9,10,11,12\n")
+        assert not any("continuum shells SC6R" in r for r in convert_str(two)[1].reduced_physics)
+    # a composite shell section whose creeping layer the middle crosses
+    comp = creep.replace("*Shell Section,elset=E,material=M\n0.1\n",
+                         "*Shell Section,elset=E,composite\n0.03, 3, M\n0.04, 3, M\n0.03, 3, M\n")
+    _, conv, rep = convert_str(comp)
+    assert ("creeping composite *SHELL SECTION with a layer through the middle (ccx 2.23 integrates it at "
+            "2 Gauss points, Abaqus at its Simpson points)") in conv.reduced_physics
+    assert "Composite *SHELL SECTION with a creeping layer the middle of the section crosses" in rep.text()
+
+
+def test_plastic_continuum_shell_composites_with_a_middle_layer_flagged():
+    # composite continuum shells run as one C3D8I per ply, 2 Gauss points each, Abaqus at each
+    # layer's 3 Simpson points: fully plastic they part on the layer the middle crosses only
+    # (1 and 3 equal layers flagged, 2 not)
+    sc = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,0.1\n6,1,0,0.1\n7,1,1,0.1\n8,0,1,0.1\n"
+          "*Element, type=SC8R, elset=E\n1, 1,2,3,4,5,6,7,8\n*Shell Section, elset=E, composite\n{lay}"
+          "*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n1., 0.\n*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n"
+          "8, 1, 3\n*Step\n*Static\n*Cload\n2, 3, -1e-3\n*End Step\n")
+    flag = ("plastic composite *SHELL SECTION with a layer through the middle (ccx 2.23 integrates it at "
+            "2 Gauss points, Abaqus at its Simpson points)")
+    for lay, flagged in (("0.1, 3, M\n", True), ("0.05, 3, M\n0.05, 3, M\n", False),
+                         ("0.03, 3, M\n0.04, 3, M\n0.03, 3, M\n", True)):
+        body, conv, rep = convert_str(sc.format(lay=lay))
+        assert "TYPE=C3D8I" in body and (flag in conv.reduced_physics) == flagged, lay
+        assert ("Composite *SHELL SECTION with a plastic layer the middle" in rep.text()) == flagged
+
+
+def test_stabilize_dropped_from_visco_and_coupled_steps():
+    # Abaqus' automatic stabilization (STABILIZE, FACTOR, ALLSDTOL, CONTINUE) on *VISCO and
+    # *COUPLED TEMPERATURE-DISPLACEMENT: ccx has none and ignores the parameters ('parameter not
+    # recognized'); dropped, and reduced physics where ccx iterates the step (as on *STATIC)
+    deck = HEX + ("*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n{mat}"
+                  "*CONDUCTIVITY\n1.\n*SPECIFIC HEAT\n1.\n*DENSITY\n1.\n*EXPANSION\n1e-5\n*BOUNDARY\n"
+                  "1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*STEP\n{proc}\n0.1, 1.\n*CLOAD\n7, 3, 1.\n*END STEP\n")
+    creep = "*CREEP\n1e-9, 3., 0.\n"
+    for mat, proc, card, flagged in (
+            (creep, "*VISCO, CETOL=1e-3, STABILIZE=2e-4", "*VISCO, CETOL=1e-3\n", True),
+            (creep, "*VISCO, CETOL=1e-3, STABILIZE, FACTOR=1e-3", "*VISCO, CETOL=1e-3\n", True),
+            ("", "*VISCO, CETOL=1e-3, STABILIZE", "*VISCO, CETOL=1e-3\n", False),     # ccx: linear
+            (creep, "*VISCO, CETOL=1e-3, STABILIZE=0.", "*VISCO, CETOL=1e-3\n", False),
+            ("", "*COUPLED TEMPERATURE-DISPLACEMENT, STABILIZE, ALLSDTOL=0.05",
+             "*COUPLED TEMPERATURE-DISPLACEMENT\n", True),
+            ("", "*COUPLED TEMPERATURE-DISPLACEMENT, STEADY STATE, STABILIZE=1e-4, CONTINUE=YES",
+             "*COUPLED TEMPERATURE-DISPLACEMENT, STEADY STATE\n", True)):
+        text = deck.format(mat=mat, proc=proc)
+        if "COUPLED" in proc:
+            text = text.replace("TYPE=C3D8,", "TYPE=C3D8T,")
+        body, conv, rep = convert_str(text)
+        assert card in body and "STABILIZE" not in _step(body, 1), proc
+        kw = proc.split(",")[0]
+        assert f"{kw} STABILIZE dropped: ccx has no automatic (viscous) stabilization" in rep.text()
+        assert (f"{kw} automatic stabilization (STABILIZE) dropped in a nonlinear step" in
+                conv.reduced_physics) == flagged, proc
+        assert (f"{kw}, STABILIZE in step 1, which ccx runs through its nonlinear solver" in rep.text()) == flagged
+
+
+def test_model_change_strain_free_add_in_a_linear_step_warned():
+    # ccx 2.23 adds elements strain free (ADD without a value, as in Abaqus, or ADD=STRAIN FREE)
+    # only in a step it runs nonlinearly and stops otherwise ('a strain-free addition of elements
+    # ... is only possible for nonlinear calculations'; probed: linear *STATIC and elastic *VISCO
+    # stop; ADD=WITH STRAIN, NLGEOM, a plastic or creeping material, *DYNAMIC, heat transfer run)
+    two = ("*NODE\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,0,0,1\n6,1,0,1\n7,1,1,1\n8,0,1,1\n9,2,0,0\n"
+           "10,2,1,0\n11,2,0,1\n12,2,1,1\n*ELEMENT, TYPE=C3D8, ELSET=E1\n1,1,2,3,4,5,6,7,8\n*ELEMENT, "
+           "TYPE=C3D8, ELSET=E2\n2,2,9,10,3,6,11,12,7\n*ELSET, ELSET=ALL\nE1, E2\n*MATERIAL, NAME=M\n"
+           "*ELASTIC\n1000., 0.3\n{mat}*SOLID SECTION, ELSET=ALL, MATERIAL=M\n*BOUNDARY\n1, 1, 3\n4, 1, 3\n"
+           "5, 1, 3\n8, 1, 3\n*STEP\n*STATIC\n*MODEL CHANGE, REMOVE\nE2\n*END STEP\n{head}\n{proc}"
+           "*MODEL CHANGE, {add}\nE2\n*BOUNDARY\n9, 1, 1, 0.01\n*END STEP\n")
+    warn = "which ccx 2.23 reads as linear"
+    for mat, head, proc, add, warned in (
+            ("", "*STEP", "*STATIC\n", "ADD", True),
+            ("", "*STEP", "*STATIC\n", "ADD=STRAIN FREE", True),
+            ("", "*STEP", "*STATIC\n", "ADD=WITH STRAIN", False),
+            ("", "*STEP, NLGEOM", "*STATIC\n", "ADD", False),
+            ("*PLASTIC\n1e6, 0.\n", "*STEP", "*STATIC\n", "ADD", False),
+            ("", "*STEP", "*VISCO, CETOL=1e-3\n0.1, 1.\n", "ADD", True),
+            ("*CREEP\n1e-9, 3., 0.\n", "*STEP", "*VISCO, CETOL=1e-3\n0.1, 1.\n", "ADD", False),
+            ("*DENSITY\n1e-9\n", "*STEP", "*DYNAMIC\n0.1, 1.\n", "ADD", False)):
+        _, _, rep = convert_str(two.format(mat=mat, head=head, proc=proc, add=add))
+        assert (warn in rep.text()) == warned, (head, proc, add)
+    _, _, rep = convert_str(two.format(mat="", head="*STEP", proc="*STATIC\n", add="ADD"))
+    assert "*MODEL CHANGE, ADD (strain free) in step(s) 2, which ccx 2.23 reads as linear" in rep.text()
+    # code review: a *FREQUENCY step turns ccx's flag off, a plastic model's next *STATIC stops;
+    # a plane *MPC (ccx: a nonlinear calculation) runs (both probed)
+    freq = two.format(mat="*PLASTIC\n1e6, 0.\n*DENSITY\n1e-9\n", head="*STEP", proc="*STATIC\n", add="ADD")
+    freq = freq.replace("*END STEP\n*STEP\n", "*END STEP\n*STEP\n*FREQUENCY\n2\n*END STEP\n*STEP\n", 1)
+    _, _, rep = convert_str(freq)
+    assert "in step(s) 3, which ccx 2.23 reads as linear" in rep.text() and "a *FREQUENCY / *BUCKLE" in rep.text()
+    mpc = two.format(mat="", head="*STEP", proc="*STATIC\n", add="ADD").replace(
+        "*BOUNDARY\n1, 1, 3", "*MPC\nPLANE, 2, 1, 5, 6\n*BOUNDARY\n1, 1, 3", 1)
+    assert warn not in convert_str(mpc)[2].text()
+
+
+def test_general_contact_flush_faces_warned():
+    # --approximate's node-to-surface pairs between bodies whose faces end flush (a lid on a block
+    # of the same footprint, stacked blocks, a conformal mesh line right under a block's edge):
+    # the slave nodes on the master's edges, which ccx 2.23 can miss (probed: 81 % of a
+    # hand-written pair's force, 12 % with the coarser slave mesh, three stacked blocks 87 % of
+    # the exact force); a lid inset from the block's edge with no node under that edge is not
+    tail = ("*CONTACT\n*CONTACT INCLUSIONS, ALL EXTERIOR\n*BOUNDARY\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n"
+            "*STEP\n*STATIC\n*BOUNDARY\n{top}, 3, 3, -0.01\n*END STEP\n")
+    flag = ("general contact where two bodies' faces end flush (ccx's node-to-surface contact can miss "
+            "the slave nodes on the master's edges)")
+    for origins, flagged in (([(0, 0, 0), (0, 0, 1)], True),           # the same footprint
+                             ([(0, 0, 0), (0.5, 0, 1)], True),         # flush along one side
+                             ([(0, 0, 0), (0.1, 0.1, 1)], False),      # inset, no node under its edge
+                             ([(0, 0, 0), (0, 0, 1), (0, 0, 2)], True)):     # three stacked
+        top = 8 * len(origins) - 3
+        _, conv, rep = convert_str(_cubes(origins, tail.format(top=top)), approximate=True)
+        assert (flag in conv.reduced_physics) == flagged, origins
+        assert ("lie on an edge where their master's faces end" in rep.text()) == flagged
+    _, conv, rep = convert_str(_cubes([(0, 0, 0), (0, 0, 1)], tail.format(top=13)), approximate=True)
+    assert "*CONTACT (--approximate): 4 slave node(s) of the generated pairs (node 5, ...)" in rep.text()
+    # without --approximate there are no pairs, and nothing to warn of
+    _, conv, rep = convert_str(_cubes([(0, 0, 0), (0, 0, 1)], tail.format(top=13)))
+    assert flag not in conv.reduced_physics and "lie on an edge" not in rep.text()
+
+
+def test_s8r_strips_written_as_s8_under_approximate():
+    # task 159: --approximate writes the drifting S8R strips (_plan_s8r_strips) as S8, ccx's C3D20
+    # expansion without the zero-energy mode (probed: NLGEOM steps on S8's linear answer to 2e-6;
+    # a stiffer element: a 4 x 1 strip bends 2-7 % less); composite and plastic or creeping
+    # sections stay S8R and flagged
+    def strip(width, mat="", sec="*Shell Section, elset=E, material=M\n0.1\n", nlgeom=True):
+        pts = {}
+        for i in range(5):
+            for j in range(2 * width + 1):
+                if not (i % 2 == 1 and j % 2 == 1):
+                    pts[(i, j)] = len(pts) + 1
+        els = [[pts[(2 * a + i, 2 * b + j)] for i, j in ((0, 0), (2, 0), (2, 2), (0, 2), (1, 0), (2, 1),
+                                                         (1, 2), (0, 1))]
+               for a in range(2) for b in range(width)]
+        return ("*Node\n" + "".join(f"{n}, {0.5 * i}, {0.5 * j / width}, 0.\n" for (i, j), n in pts.items()) +
+                "*Element, type=S8R, elset=E\n" + "".join(f"{k}, " + ", ".join(map(str, c)) + "\n"
+                                                          for k, c in enumerate(els, 1)) +
+                sec + "*Material, name=M\n*Elastic\n1000., 0.3\n" + mat + "*Boundary\n" +
+                "".join(f"{n}, 1, 6\n" for (i, j), n in pts.items() if i == 0) +
+                f"*Step{', nlgeom' if nlgeom else ''}\n*Static\n*Cload\n" +
+                "".join(f"{n}, 3, 1e-4\n" for (i, j), n in pts.items() if i == 4) + "*End Step\n")
+    flag = "S8R strips one element wide in a step ccx iterates (C3D20R zero-energy mode)"
+    body, conv, rep = convert_str(strip(1), approximate=True)
+    assert "*ELEMENT, TYPE=S8\n" in body and "S8R" not in "".join(_live(body))
+    assert flag not in conv.reduced_physics and \
+        "--approximate: S8R strips one element wide written as S8" in conv.reduced_physics
+    assert "[APPROX] S8R strips one element wide written as S8: 2 S8R element(s) (e.g. element 1) have two " \
+        "opposite edges" in rep.text()
+    # as written: warned, naming the cure
+    _, conv, rep = convert_str(strip(1))
+    assert flag in conv.reduced_physics and "Rerun with --approximate to write them as S8" in rep.text()
+    # two elements across, or no step ccx iterates: S8R stays, nothing to say
+    for deck in (strip(2), strip(1, nlgeom=False)):
+        body, conv, rep = convert_str(deck, approximate=True)
+        assert "TYPE=S8R" in body and "S8R strips" not in rep.text()
+    # a composite section (ccx: S8R / S6 only) and a creeping material stay S8R, flagged; without
+    # --approximate they are not told it would cure them (code review)
+    comp = strip(1, sec="*Shell Section, elset=E, composite\n0.05, 3, M\n0.05, 3, M\n")
+    creep = strip(1, mat="*Creep\n1e-9, 3., 0.\n").replace("*Static\n", "*Visco, cetol=1e-3\n0.1, 1.\n")
+    for deck in (comp, creep):
+        body, conv, rep = convert_str(deck, approximate=True)
+        assert "TYPE=S8R" in body and flag in conv.reduced_physics
+        assert "Left as S8R: their composite section" in rep.text()
+        _, conv, rep = convert_str(deck)
+        assert flag in conv.reduced_physics and "Rerun with --approximate" not in rep.text()
+        assert "--approximate keeps them as S8R (their composite section" in rep.text()
+    # linear creep: S8 (exact there); a strip of a *RIGID BODY: no stiffness, nothing to do
+    lin = creep.replace("1e-9, 3., 0.", "1e-9, 1., 0.")
+    assert "*ELEMENT, TYPE=S8\n" in convert_str(lin, approximate=True)[0]
+    rigid = strip(1).replace("*Boundary\n", "*Node\n99, 0., 0., 1.\n*Rigid Body, ref node=99, elset=E\n"
+                                            "*Boundary\n99, 1, 6\n", 1)
+    body, conv, rep = convert_str(rigid, approximate=True)
+    assert "TYPE=S8R" in body and "S8R strips" not in rep.text()
 
 
 if __name__ == "__main__":

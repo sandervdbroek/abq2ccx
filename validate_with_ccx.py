@@ -331,10 +331,11 @@ def dat_displacement(dat_path, node):
 
 
 # The element-formulation flags a check's vehicle may carry beside what the check is about:
-# ccx's C3D8 locking where the material keeps its volume, its S3 wedge, a plastic shell
-# section's 2 Gauss points through the thickness (Converter._plan_volume_locking,
-# _plan_s3_shells, _plan_plastic_shells)
-VEHICLE_FLAGS = ("element C3D8 of a ", "element S3 (", "plastic *SHELL SECTION")
+# ccx's C3D8 locking where the material keeps its volume, its S3 wedge, a plastic or creeping
+# shell section's (a continuum shell's too) 2 Gauss points through the thickness
+# (Converter._plan_volume_locking, _plan_s3_shells, _plan_plastic_shells, _flag_inelastic_shells)
+VEHICLE_FLAGS = ("element C3D8 of a ", "element S3 (", "plastic *SHELL SECTION", "creeping *SHELL SECTION",
+                 "plastic continuum shells", "creeping continuum shells", "plastic or creeping continuum shells")
 
 
 def other_reduced(conv):
@@ -8556,6 +8557,58 @@ def fixed_transform_deck(kind):
             hold + "*CLOAD, OP=NEW\n5, 1, 10.\n6, 3, -5.\n" + pr + "*END STEP\n")
 
 
+def fixed_helper_deck(kind):
+    """Decks of the helper-node check: *BOUNDARY, FIXED on translations of a node with an
+    oblique *TRANSFORM, moved by loads before (a value the converter does not know), and twins
+    turned into the node's local axes (x' = R^T x, the other nodes' loads turned the same way):
+    without a *TRANSFORM, where ccx's FIXED holds a DOF along a global axis exactly.
+
+    * cube / cube_twin: the C3D8 cube of fixed_transform_deck: step 1 prescribes node 7's local
+      u2 and loads the node, step 2 (*BOUNDARY, OP=NEW on the base) holds its local u1-u3 with
+      FIXED under other loads (u2 at its known value, u1 and u3 through the helper node), step
+      3 a *FREQUENCY step, step 4 other loads (the base state's FIXED given again);
+    * plate / plate_twin: a 2 x 2 S4 plate clamped along x = 0, its free corner node 9 loaded,
+      then its local u2 held with FIXED under other loads."""
+    twin = kind.endswith("_twin")
+    ax = _t133_axes("obl", (0., 0., 0.))
+
+    def turn(v):
+        return tuple(sum(e[k] * v[k] for k in range(3)) for e in ax) if twin else v
+
+    def nodes(xyz):
+        return "*NODE, NSET=ALLN\n" + "".join(f"{n}, " + ", ".join(f"{c:.15g}" for c in turn(x)) + "\n"
+                                              for n, x in sorted(xyz.items()))
+
+    def loads(own, ls, op=""):
+        out = "*CLOAD" + op + "\n"
+        for n, f in ls:
+            g = f if n == own else turn(f)          # (a load on the node is in its local axes)
+            out += "".join(f"{n}, {d + 1}, {g[d]:.15g}\n" for d in range(3) if g[d] != 0.0)
+        return out
+    tr = "" if twin else "*TRANSFORM, NSET=NN\n%g, %g, %g, %g, %g, %g\n" % (_T133_A + _T133_B)
+    pr = "*NODE PRINT, NSET=ALLN, GLOBAL=YES\nU\n"
+    if kind.startswith("cube"):
+        xyz = {1: (0, 0, 0), 2: (1, 0, 0), 3: (1, 1, 0), 4: (0, 1, 0), 5: (0, 0, 1), 6: (1, 0, 1),
+               7: (1, 1, 1), 8: (0, 1, 1)}
+        return ("*HEADING\nfixed helper, cube\n" + nodes(xyz) + "*ELEMENT, TYPE=C3D8, ELSET=E\n"
+                "1, 1, 2, 3, 4, 5, 6, 7, 8\n*NSET, NSET=BOT\n1, 2, 3, 4\n*NSET, NSET=NN\n7\n"
+                "*SOLID SECTION, ELSET=E, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n*DENSITY\n1.\n" +
+                tr + "*BOUNDARY\nBOT, 1, 3\n*STEP\n*STATIC\n*BOUNDARY\n7, 2, 2, 0.01\n" +
+                loads(7, [(6, (5., 0., 0.)), (7, (3., 0., -2.)), (8, (0., 5., 0.))]) + pr + "*END STEP\n"
+                "*STEP\n*STATIC\n*BOUNDARY, OP=NEW\nBOT, 1, 3\n*BOUNDARY, FIXED\n7, 1, 3\n" +
+                loads(7, [(5, (10., 0., 0.)), (6, (0., 0., -5.))], ", OP=NEW") + pr + "*END STEP\n"
+                "*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP\n*STATIC\n" +
+                loads(7, [(8, (0., 5., 0.)), (5, (0., 0., 4.))], ", OP=NEW") + pr + "*END STEP\n")
+    xyz = {1 + i + 3 * j: (float(i), float(j), 0.) for j in range(3) for i in range(3)}
+    return ("*HEADING\nfixed helper, plate\n" + nodes(xyz) + "*ELEMENT, TYPE=S4, ELSET=E\n1, 1, 2, 5, 4\n"
+            "2, 2, 3, 6, 5\n3, 4, 5, 8, 7\n4, 5, 6, 9, 8\n*NSET, NSET=NN\n9\n*SHELL SECTION, ELSET=E, "
+            "MATERIAL=M\n0.1\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n" + tr +
+            "*BOUNDARY\n1, 1, 6\n4, 1, 6\n7, 1, 6\n*STEP\n*STATIC\n" +
+            loads(9, [(9, (2., 1., -0.02)), (6, (1., 0., 0.01))]) + pr + "*END STEP\n*STEP\n*STATIC\n"
+            "*BOUNDARY, FIXED\n9, 2, 2\n" + loads(9, [(3, (0., 0., 0.02)), (6, (0.5, 2., 0.))], ", OP=NEW") +
+            pr + "*END STEP\n")
+
+
 def _t133_axes(kind, p):
     """The local axes 1, 2, 3 of fixed_transform_deck(kind)'s *TRANSFORM at point ``p``."""
     def unit(v):
@@ -9343,41 +9396,104 @@ def general_cload_modal_deck(modal, cload=True):
             f"*STEP\n{last}\n*DSLOAD\nTOP, P, 1.\n*NODE PRINT, NSET=NP\nU\n*END STEP\n")
 
 
-def released_knot_deck(twin=False):
+# a plane whose normal (0.6, -0.48, 0.64) is off every global axis: its axes e1, e2, n
+OBLIQUE_PLANE = ((0.8, 0.36, -0.48), (0.0, 0.8, 0.6), (0.6, -0.48, 0.64))
+
+
+def in_plane(plane, x, y):
+    """The point (x, y) of ``plane`` (its axes e1, e2, n; None: the global xy-plane)."""
+    e1, e2, _ = plane or ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), None)
+    return ", ".join(f"{x * a + y * b:.15g}" for a, b in zip(e1, e2))
+
+
+def along(plane, node, k, v):
+    """*CLOAD lines of the force ``v`` on ``node`` along axis ``k`` (0, 1, 2: e1, e2, n) of
+    ``plane`` (None: the global axes)."""
+    axis = (plane or ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))[k]
+    return "".join(f"{node}, {g + 1}, {v * c:.15g}\n" for g, c in enumerate(axis) if c)
+
+
+def released_knot_deck(twin=False, plane=None):
     """An S4 strip 0.8 x 0.1 (thickness 0.01, E 6e6) clamped at both ends in a first step; a
     second, NLGEOM step releases the far end by *BOUNDARY, OP=NEW and pulls it up by 0.1, its
     tip printed.  The converter puts knot beams on the clamped nodes (OP=NEW would break their
     rotational BCs in ccx).  ``twin``: the second step alone, its clamp the near end's
-    (code review R1-5)."""
-    nodes = "".join(f"{1 + i + 9 * j}, {0.1 * i:.15g}, {0.1 * j:.15g}, 0.\n" for j in range(2) for i in range(9))
+    (code review R1-5).  ``plane``: the strip in that plane (OBLIQUE_PLANE), pulled along its
+    normal."""
+    nodes = "".join(f"{1 + i + 9 * j}, {in_plane(plane, 0.1 * i, 0.1 * j)}\n" for j in range(2) for i in range(9))
     els = "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 11}, {i + 10}\n" for i in range(8))
     clamp = "1, 1, 6\n10, 1, 6\n"
     return ("*NODE\n" + nodes + "*ELEMENT, TYPE=S4, ELSET=E\n" + els + "*NSET, NSET=TIP\n9, 18\n"
             "*MATERIAL, NAME=M\n*ELASTIC\n6e6, 0.3\n*SHELL SECTION, ELSET=E, MATERIAL=M\n0.01\n"
             "*BOUNDARY\n" + clamp + ("" if twin else "9, 1, 6\n18, 1, 6\n*STEP\n*STATIC\n*END STEP\n") +
             "*STEP, NLGEOM\n*STATIC\n0.1, 1.\n" + ("" if twin else "*BOUNDARY, OP=NEW\n" + clamp) +
-            "*CLOAD\n9, 3, 0.05\n18, 3, 0.05\n*NODE PRINT, NSET=TIP\nU\n*END STEP\n")
+            "*CLOAD\n" + along(plane, 9, 2, 0.05) + along(plane, 18, 2, 0.05) +
+            "*NODE PRINT, NSET=TIP\nU\n*END STEP\n")
 
 
-def knot_drilling_deck(modal=True, nx=30, ny=10):
+def knot_buckle_deck(modal=True, plane=OBLIQUE_PLANE):
+    """An S4 cantilever 20 x 10 (4 x 2 elements, thickness 0.2) in ``plane``, its tip
+    compressed along the cantilever in a *BUCKLE step; ``modal``: a *FREQUENCY and a *MODAL
+    DYNAMIC step load the tip along the normal too (the converter puts knot beams there), the
+    tip printed."""
+    ids = {(i, j): 1 + i + 5 * j for j in range(3) for i in range(5)}
+    nodes = "".join(f"{ids[(i, j)]}, {in_plane(plane, 5. * i, 5. * j)}\n" for j in range(3) for i in range(5))
+    els = "".join(f"{i + 1 + 4 * j}, {ids[(i, j)]}, {ids[(i + 1, j)]}, {ids[(i + 1, j + 1)]}, "
+                  f"{ids[(i, j + 1)]}\n" for j in range(2) for i in range(4))
+    tip = [ids[(4, j)] for j in range(3)]
+    out = ("*NODE\n" + nodes + "*ELEMENT, TYPE=S4, ELSET=E\n" + els + "*NSET, NSET=FIX\n1, 6, 11\n"
+           "*NSET, NSET=TIP\n5, 10, 15\n*MATERIAL, NAME=M\n*ELASTIC\n210000., 0.3\n*DENSITY\n7.8e-9\n"
+           "*SHELL SECTION, ELSET=E, MATERIAL=M\n0.2\n*BOUNDARY\nFIX, 1, 6\n*STEP\n*BUCKLE\n4\n*CLOAD\n" +
+           "".join(along(plane, n, 0, -1.0) for n in tip) + "*END STEP\n")
+    if modal:
+        out += ("*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP\n*MODAL DYNAMIC\n1e-4, 0.002\n*CLOAD\n" +
+                "".join(along(plane, n, 2, 1.0) for n in tip) + "*NODE PRINT, NSET=TIP\nU\n*END STEP\n")
+    return out
+
+
+def knot_moment_deck(plane=None):
+    """An S4 cantilever strip 1 x 0.1 (10 elements, thickness 0.01, E 1.2e7, nu 0) in ``plane``
+    (None: the xy-plane), bent under NLGEOM by tip moments 0.05 about its in-plane axis e2
+    (about 0.5 rad), the tip printed; a *FREQUENCY and a *STEADY STATE DYNAMICS step then load
+    the tip along the normal, so the converter puts knot beams there (PR #9 review)."""
+    nodes = "".join(f"{1 + i + 11 * j}, {in_plane(plane, 0.1 * i, 0.1 * j)}\n" for j in range(2) for i in range(11))
+    els = "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 13}, {i + 12}\n" for i in range(10))
+    e2 = (plane or (None, (0.0, 1.0, 0.0)))[1]
+    moment = "".join(f"{n}, {4 + g}, {0.05 * c:.15g}\n" for n in (11, 22) for g, c in enumerate(e2) if c)
+    return ("*NODE\n" + nodes + "*ELEMENT, TYPE=S4, ELSET=E\n" + els + "*NSET, NSET=TIP\n11, 22\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n1.2e7, 0.\n*DENSITY\n1e-3\n*SHELL SECTION, ELSET=E, MATERIAL=M\n"
+            "0.01\n*BOUNDARY\n1, 1, 6\n12, 1, 6\n*STEP, NLGEOM\n*STATIC\n0.05, 1.\n*CLOAD\n" + moment +
+            "*NODE PRINT, NSET=TIP\nU\n*END STEP\n*STEP\n*FREQUENCY\n3\n*END STEP\n*STEP\n"
+            "*STEADY STATE DYNAMICS\n1., 10., 3\n*CLOAD\n" + along(plane, 11, 2, 1.0) + along(plane, 22, 2, 1.0) +
+            "*END STEP\n")
+
+
+def knot_drilling_deck(modal=True, nx=30, ny=10, transform=False, mid=None):
     """An S4 plate 1000 x 50, thickness 10, clamped at both ends, loaded across its width at
     one and two thirds of its length in a static step; ``modal``: a *FREQUENCY and a *STEADY
     STATE DYNAMICS step load the first line too, so the converter puts knot beams on those
-    nodes (ccx misapplies forces on plain shell nodes in modal steps)."""
+    nodes (ccx misapplies forces on plain shell nodes in modal steps).  ``transform``: that
+    line has a *TRANSFORM turned 90 deg about x (its local 3 = -y lies in the plate, so only a
+    hold read about the global axes holds the drilling rotation), its loads in its local
+    axes; ``mid`` (by default with ``transform``): the middle line printed instead of the
+    first."""
     ids = {(i, j): 1 + i + (nx + 1) * j for j in range(ny + 1) for i in range(nx + 1)}
     nodes = "".join(f"{ids[(i, j)]}, {1000. * i / nx}, {50. * j / ny}, 0.\n"
                     for j in range(ny + 1) for i in range(nx + 1))
     els = "".join(f"{i + 1 + nx * j}, {ids[(i, j)]}, {ids[(i + 1, j)]}, {ids[(i + 1, j + 1)]}, "
                   f"{ids[(i, j + 1)]}\n" for j in range(ny) for i in range(nx))
     line = lambda i: ", ".join(str(ids[(i, j)]) for j in range(ny + 1))
+    l1 = "L1, 2, 22.73\n" if transform else "L1, 3, 22.73\n"
     out = (f"*NODE, NSET=NALL\n{nodes}*ELEMENT, TYPE=S4, ELSET=E\n{els}*NSET, NSET=L1\n{line(nx // 3)}\n"
-           f"*NSET, NSET=L2\n{line(2 * nx // 3)}\n*NSET, NSET=ENDS\n{line(0)}, {line(nx)}\n"
+           f"*NSET, NSET=L2\n{line(2 * nx // 3)}\n*NSET, NSET=MID\n{line(nx // 2)}\n"
+           f"*NSET, NSET=ENDS\n{line(0)}, {line(nx)}\n" +
+           ("*TRANSFORM, NSET=L1\n1., 0., 0., 0., 0., 1.\n" if transform else "") +
            "*MATERIAL, NAME=M\n*ELASTIC\n210000., 0.3\n*DENSITY\n7.8e-9\n*SHELL SECTION, ELSET=E, MATERIAL=M\n"
-           "10.\n*BOUNDARY\nENDS, 1, 6\n*STEP\n*STATIC\n*CLOAD\nL1, 3, 22.73\nL2, 3, 22.73\n"
-           "*NODE PRINT, NSET=L1\nU\n*END STEP\n")
+           f"10.\n*BOUNDARY\nENDS, 1, 6\n*STEP\n*STATIC\n*CLOAD\n{l1}L2, 3, 22.73\n"
+           f"*NODE PRINT, NSET={'MID' if (transform if mid is None else mid) else 'L1'}\nU\n*END STEP\n")
     if modal:
         out += ("*STEP\n*FREQUENCY\n5\n*END STEP\n*STEP\n*STEADY STATE DYNAMICS\n1., 10., 3\n"
-                "*MODAL DAMPING\n1, 5, 0.02\n*CLOAD\nL1, 3, 22.73\n*END STEP\n")
+                f"*MODAL DAMPING\n1, 5, 0.02\n*CLOAD\n{l1}*END STEP\n")
     return out
 
 
@@ -19172,6 +19288,65 @@ def check_t133(ccx, env, tmp, shared):
     return failures
 
 
+@check("fixed_helper", "*BOUNDARY, FIXED on *TRANSFORM translations moved by loads: helper nodes")
+def check_fixed_helper(ccx, env, tmp, shared):
+    # --- *BOUNDARY, FIXED on *TRANSFORM translations whose value the converter does not know:
+    # a helper node tied to the local DOF, FIXED on it, against the model turned into the
+    # node's axes (ccx 2.23's own FIXED holds the global component there) ---
+    failures = 0
+    ax = _t133_axes("obl", (0., 0., 0.))
+
+    def local(u):
+        return tuple(sum(e[k] * u[k] for k in range(3)) for e in ax)
+
+    def solve(kind):
+        """(the displacement blocks, report text, reduced physics) of fixed_helper_deck(kind)
+        converted and solved, or None."""
+        src, inp = os.path.join(tmp, f"fh_{kind}_src.inp"), os.path.join(tmp, f"fh_{kind}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(fixed_helper_deck(kind))
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        blocks = dat_node_blocks(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if blocks is None:
+            print(f"FAIL  fixed_helper {kind}: did not solve ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+        return None if blocks is None else (blocks, rep.text(), conv.reduced_physics)
+    for kind, node, dofs, what in (
+            ("cube", 7, (1, 3), "a C3D8 cube, node 7's local u1-u3 held with FIXED (u2 at the value "
+                                "step 1 gave it, u1 and u3 moved by its loads), then a *FREQUENCY step "
+                                "and a step giving the base state again"),
+            ("plate", 9, (2,), "a 2 x 2 S4 plate, its free corner's local u2 held with FIXED after a "
+                               "step that loads the corner")):
+        got, ref = solve(kind), solve(kind + "_twin")
+        ok = bool(got and ref)
+        if ok:
+            # the static steps' blocks (the *FREQUENCY step prints its modes, of either sign)
+            pick = [0, 1, -1] if kind == "cube" else [0, 1]
+            a = [{n: local(u) for n, u in got[0][i].items()} for i in pick]
+            b = [ref[0][i] for i in pick]
+            ok = all(set(p) == set(q) for p, q in zip(a, b))
+            err = max(abs(x - y) for p, q in zip(a, b) for n in q for x, y in zip(p.get(n, ()), q[n])) \
+                if ok else math.inf
+            scale = max(abs(x) for q in b for u in q.values() for x in u)
+            held = max(abs(a[1][node][d - 1] - a[0][node][d - 1]) for d in dofs)
+            moved = max(abs(x - y) for n in b[1] for x, y in zip(b[1][n], b[0][n]))
+            # (ccx 2.23's FIXED held the global components at step 1: so far off)
+            before = max(abs(got[0][0][node][d - 1] - a[0][node][d - 1]) for d in dofs)
+            helper = "held through a helper node" in " ".join(got[1].split())
+            ok = ok and err <= 1e-5 * scale and held <= 1e-6 * scale and moved > 1e-3 and \
+                before > 1e-3 and helper and not got[2] and not ref[2]
+            print(f"{'PASS' if ok else 'FAIL'}  fixed_helper_{kind} ({what}): the model turned into the "
+                  f"node's axes, held there by ccx's FIXED along a global axis ({err:.1e} apart of "
+                  f"{scale:.3g}; the node held to {held:.1e}, the model moved {moved:.4g} in step 2; "
+                  f"before: held at step 1's global components, {before:.4g} off)")
+            if not helper or got[2]:
+                print("      helper node form not used, or reduced: " + "; ".join(got[2]))
+        failures += 0 if ok else 1
+    return failures
+
+
 @check("contact_property_tables", "contact property tables ccx reads otherwise than Abaqus")
 def check_contact_property_tables(ccx, env, tmp, shared):
     # --- contact property tables ccx reads otherwise than Abaqus -------------------------------
@@ -19745,6 +19920,34 @@ def check_t155(ccx, env, tmp, shared):
     return failures
 
 
+@check("s8r_strip_s8", "S8R strips one element wide written as S8 under --approximate")
+def check_s8r_strip_s8(ccx, env, tmp, shared):
+    # --- task 159: an S8R strip one element wide in an NLGEOM step (a load 1e-4 as large, so
+    # the answer is the linear one): as written it drifts along the C3D20R's zero-energy mode;
+    # --approximate writes S8 (C3D20), which keeps its own linear answer ---
+    review_run, same = shared["review_run"], shared["same"]
+
+    def small(text):
+        return re.sub(r"(?m)^(\d+, 3, )([0-9.eE+-]+)$", lambda m: f"{m.group(1)}{float(m.group(2)) * 1e-4:.8g}",
+                      text)
+    nl = small(t155_s8r_deck(1, False)).replace("*STEP\n", "*STEP, NLGEOM\n")
+    lin = {typ: small(t155_s8r_deck(1, False)).replace("TYPE=S8R", f"TYPE={typ}") for typ in ("S8R", "S8")}
+    runs = [review_run(nl, "s8r_strip_s8_nl", dat_node_blocks, approximate=True),
+            review_run(lin["S8"], "s8r_strip_s8_lin", dat_node_blocks),
+            review_run(nl, "s8r_strip_s8r_nl", dat_node_blocks),
+            review_run(lin["S8R"], "s8r_strip_s8r_lin", dat_node_blocks)]
+    with open(os.path.join(tmp, "s8r_strip_s8_nl.inp"), encoding="utf-8") as fh:
+        written = "*ELEMENT, TYPE=S8\n" in fh.read()
+    ok = all(runs) and written
+    if ok:
+        (d, m), (d0, m0) = same(runs[0:2]), same(runs[2:4])
+        ok = d <= 1e-4 * m and m > 1e-9 and d0 > 0.03 * m0
+        print(f"{'PASS' if ok else 'FAIL'}  s8r_strip_s8 (an S8R cantilever strip one element wide, "
+              f"NLGEOM at a small load): --approximate's S8 {d / m:.1e} of |u| {m:.4g} off its linear "
+              f"answer; as written (S8R) {d0 / m0:.3g} off")
+    return 0 if ok else 1
+
+
 @check("norton_creep_floor",
        "Norton creep below ccx's 1e-20 floor on A t^m: warned, reduced physics")
 def check_norton_creep_floor(ccx, env, tmp, shared):
@@ -19926,7 +20129,7 @@ def check_t123(ccx, env, tmp, shared):
 
     # knot beams on smooth shell nodes left the knot's rotation about the normal without
     # stiffness, so ccx's answer hung on round-off (this plate's static step 16x too stiff); now
-    # held by an *EQUATION.  Against the same plate without the modal steps (no knots)
+    # held by a *BOUNDARY about z.  Against the same plate without the modal steps (no knots)
     runs = [review_run(knot_drilling_deck(m), "knot_drilling" + ("" if m else "_ref"),
                        lambda p: (dat_node_blocks(p) or [None])[0]) for m in (True, False)]
     ok = all(runs)
@@ -20030,6 +20233,93 @@ def check_t123(ccx, env, tmp, shared):
         print(f"{'PASS' if ok else 'FAIL'}  released_knot (an S4 strip, both ends clamped, the far one "
               f"released by OP=NEW in an NLGEOM step and pulled): tip u3 {runs[0][9][2]:.6g} (the step alone "
               f"{runs[1][9][2]:.6g}, {err:.1e} off; the knots differ; before: ccx stopped)")
+    failures += 0 if ok else 1
+    return failures
+
+
+@check("shell_knot_limits", "knot drilling holds: *MODAL DYNAMIC decks, *TRANSFORM nodes, BCs in "
+       "some steps (a *BOUNDARY on the normal's largest component)")
+def check_shell_knot_limits(ccx, env, tmp, shared):
+    # --- knot drilling holds where task 123 left them free or ccx stopped ---------------------
+    review_run = shared["review_run"]
+    failures = 0
+    # a knot beam's knot off the global axes in a deck with a *MODAL DYNAMIC step stayed free
+    # about the normal (the equation that holds it crashes ccx there at random): ccx's *BUCKLE
+    # step found spurious factors near 1.0 (0.93) for 3.18.  Now a *BOUNDARY on the normal's largest
+    # global component.  Against the same cantilever without the modal steps (no knots)
+    def factors_and_tip(path):
+        f = dat_eigen_table(path, "B U C K L I N G   F A C T O R   O U T P U T")
+        return (f, dat_displacements(path)) if f else None
+    runs = [review_run(knot_buckle_deck(m), "knot_buckle" + ("" if m else "_ref"), factors_and_tip)
+            for m in (True, False)]
+    ok = all(runs)
+    if ok:
+        (got, tip), (ref, _) = runs
+        err = max(abs(a / b - 1.0) for a, b in zip(got, ref)) if len(got) == len(ref) == 4 else math.inf
+        moved = max((abs(sum(x * c for x, c in zip(u, OBLIQUE_PLANE[2]))) for u in tip.values()), default=0.0)
+        ok = err < 1e-6 and ref[0] > 1.0 and moved > 1e-6
+        print(f"{'PASS' if ok else 'FAIL'}  knot_buckle (an S4 cantilever off the global axes, its tip "
+              f"loaded in a *MODAL DYNAMIC step too): *BUCKLE factors {', '.join(f'{x:.7g}' for x in got)} "
+              f"as without knots ({err:.1e}); the modal step moved the tip {moved:.3g} (before: 0.93 for "
+              f"{ref[0]:.4g})")
+    failures += 0 if ok else 1
+
+    # knots on nodes with a *TRANSFORM were left free about the normal (0.36 of this plate's
+    # answer); ccx reads a rotational BC on a knot about the global axes, so they are held too.
+    # Against the plain plate (no knots, no transform)
+    runs = [review_run(knot_drilling_deck(m, transform=m, mid=True), "knot_transform" + ("" if m else "_ref"),
+                       lambda p: (dat_node_blocks(p) or [None])[0]) for m in (True, False)]
+    ok = all(runs)
+    if ok:
+        got, ref = runs
+        err = max(abs(a - b) for n in ref for a, b in zip(got.get(n, [math.inf] * 3), ref[n]))
+        moved = max(abs(x) for v in ref.values() for x in v)
+        ok = err <= 1e-6 * moved and moved > 1e-3 and len(got) == len(ref)
+        print(f"{'PASS' if ok else 'FAIL'}  knot_transform (the S4 plate with knot beams on a loaded line "
+              f"that has a *TRANSFORM): the middle line as without knots ({err:.1e} apart; |u| {moved:.4g}; "
+              f"before 0.36 of it)")
+    failures += 0 if ok else 1
+
+    # a knot off the axes where ccx turns it finitely under a moment in the shell's plane: the
+    # BC's share of its rotation vector along the normal changes the moment's work there (PR #9
+    # review: 10 % off, then ccx stopped), so it is held by n . theta = 0.  Against the strip in
+    # the xy-plane, at every increment of the NLGEOM step, in the strip's axes
+    def increments(path):
+        out = {round(t, 9): {int(r[0]): r[1:4] for r in rows} for st, title, _, t, rows in A.dat_blocks(path)
+               if st == 1 and title == "displacements" and t is not None}
+        return out or None
+    runs = [review_run(knot_moment_deck(p), "knot_moment" + ("" if p else "_flat"), increments)
+            for p in (OBLIQUE_PLANE, None)]
+    ok = all(runs)
+    if ok:
+        got, ref = runs
+        times = sorted(set(got) & set(ref))
+        err = max(abs(sum(a * c for a, c in zip(got[t][n], OBLIQUE_PLANE[k])) - ref[t][n][k])
+                  for t in times for n in (11, 22) for k in range(3))
+        turn = abs(ref[1.0][11][2]) if 1.0 in ref else 0.0
+        ok = 1.0 in got and 1.0 in ref and err < 1e-5 * turn and turn > 0.3
+        print(f"{'PASS' if ok else 'FAIL'}  knot_moment (an S4 strip off the global axes bent about 0.5 rad "
+              f"under NLGEOM by an in-plane tip moment, knot beams at the tip): {len(times)} increments "
+              f"as in the xy-plane ({err:.1e} off, tip u_n {turn:.4g}; the BC hold: 10 % off, then ccx "
+              f"stopped)")
+    failures += 0 if ok else 1
+
+    # released_knot off the global axes: the clamp holds the knots' rotations in step 1, so an
+    # equation n . theta = 0 could not act in every step (ccx stops on a BC on its dependent) and
+    # they stayed free in step 2, where ccx stopped (exit 201).  Now the *BOUNDARY on the
+    # normal's largest component, given again after the OP=NEW.  Against the strip in the
+    # xy-plane (held about z since 1.6.0), in the strip's axes
+    runs = [review_run(released_knot_deck(plane=p), "released_knot_oblique" + ("" if p else "_flat"),
+                       dat_displacements) for p in (OBLIQUE_PLANE, None)]
+    ok = all(runs)
+    if ok:
+        got, ref = runs
+        err = max(abs(sum(a * c for a, c in zip(got[n], OBLIQUE_PLANE[k])) - ref[n][k])
+                  for n in (9, 18) for k in range(3))
+        ok = err < 1e-5 * ref[9][2] and ref[9][2] > 0.1
+        print(f"{'PASS' if ok else 'FAIL'}  released_knot_oblique (released_knot off the global axes): tip "
+              f"u_n {sum(a * c for a, c in zip(got[9], OBLIQUE_PLANE[2])):.6g} as in the xy-plane "
+              f"({err:.1e} off in the strip's axes; before: ccx stopped)")
     failures += 0 if ok else 1
     return failures
 
