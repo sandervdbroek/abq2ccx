@@ -1143,6 +1143,96 @@ def test_flattened_set_names_made_unique():
     assert "names collide within CalculiX's 80-character name limit" in rep.text()
 
 
+def test_tie_slave_surface_trimmed_to_the_faces_near_its_master():
+    # a whole plate top tied to a small block on its middle: ccx prints 'no tied MPC generated'
+    # for every slave node away from the block and ties none (nor does Abaqus): the tie gets a
+    # surface of the slave faces with a node in a master facet's bounding box grown by the
+    # tolerance (none given: the facet's extent), a tenth of the facet and a shell's half
+    # thickness; the deck's surface stays as it is (validate_with_ccx.py tie_slave_trimmed: the
+    # same answer, 16 warnings instead of 112)
+    path = os.path.join(EXAMPLES, "tie_slave_trimmed.inp")
+    text = open(path, encoding="utf-8").read()
+    body, conv, rep = convert_str(text)
+    faces = re.search(r"\*SURFACE, NAME=PLATETOP_NEAR, TYPE=ELEMENT\n((?:\d+, S2\n)+)", body)
+    assert faces and len(faces.group(1).splitlines()) == 16, body[:200]
+    assert "*TIE, NAME=BlockOnPlate, ADJUST=no\nPLATETOP_NEAR, BLOCKBASE\n" in body
+    assert re.search(r"\*SURFACE, (?:TYPE=ELEMENT, )?NAME=PLATETOP", body)
+    assert "slave surface PLATETOP -> PLATETOP_NEAR, the 16 of its 100 faces with a node near master" in rep.text()
+    assert not conv.reduced_physics
+    # every slave face within reach: the deck's surface stays
+    body, conv, rep = convert_str(text.replace("adjust=no", "adjust=no, position tolerance=1000."))
+    assert "_NEAR" not in body and "PLATETOP, BLOCKBASE" in body
+    # a node surface: its nodes within reach
+    node = text.replace("*Surface, type=ELEMENT, name=PLATETOP\nPLATE, S2\n",
+                        "*Nset, nset=TOPN, generate\n122, 242, 1\n*Surface, type=NODE, name=PLATETOP\nTOPN, 1.\n")
+    body, conv, rep = convert_str(node)
+    kept = re.search(r"\*SURFACE, NAME=PLATETOP_NEAR, TYPE=NODE\n((?:\d+\n)+)", body)
+    assert kept and kept.group(1).split() == ["170", "171", "172", "181", "182", "183", "192", "193", "194"]
+    assert "the 9 of its 121 nodes near master surface BLOCKBASE" in rep.text()      # (those under the block)
+
+    # repeated ties reuse the trimmed surface instead of rebuilding it
+    repeated = text.replace("*Tie, name=BlockOnPlate, adjust=no\n",
+                            "*Tie, name=BlockOnPlate, adjust=no\n"
+                            "PLATETOP, BLOCKBASE\n"
+                            "*Tie, name=BlockOnPlateAgain, adjust=no\n")
+    body, conv, rep = convert_str(repeated)
+    assert body.count("*SURFACE, NAME=PLATETOP_NEAR, TYPE=ELEMENT") == 1
+    assert "PLATETOP_NEAR, BLOCKBASE" in body
+    assert body.count("PLATETOP_NEAR, BLOCKBASE") == 2
+
+    # an unbounded membrane expansion is not trimmed using its reference-face coordinates
+    membrane = text.replace("*Element, type=C3D8, elset=PLATE\n",
+                            "2001, 49.5, 49.5, 10.\n2002, 50.5, 49.5, 10.\n"
+                            "2003, 50.5, 50.5, 10.\n2004, 49.5, 50.5, 10.\n"
+                            "*Element, type=C3D8, elset=PLATE\n")
+    membrane = membrane.replace("*Elset, elset=BLOCKBOTTOM, generate\n",
+                                "*Element, type=M3D4, elset=MEMMASTER\n"
+                                "2000, 2001, 2002, 2003, 2004\n"
+                                "*Membrane Section, elset=MEMMASTER, material=STEEL\n20.\n"
+                                "*Elset, elset=BLOCKBOTTOM, generate\n")
+    membrane = membrane.replace("BLOCKBOTTOM, S1\n", "MEMMASTER, SPOS\n")
+    body, conv, rep = convert_str(membrane)
+    assert "*SURFACE, NAME=PLATETOP_NEAR" not in body
+    assert "PLATETOP, BLOCKBASE" in body
+    assert "MEMMASTER, SPOS" in body
+
+    nodal_shell = membrane.replace("*Element, type=M3D4, elset=MEMMASTER\n",
+                                  "*Element, type=S4, elset=MEMMASTER\n")
+    nodal_shell = nodal_shell.replace("*Membrane Section, elset=MEMMASTER, material=STEEL\n20.\n",
+                                      "*Nodal Thickness\n2001, 20.\n2002, 20.\n2003, 20.\n2004, 20.\n"
+                                      "*Shell Section, elset=MEMMASTER, material=STEEL, "
+                                      "nodal thickness\n0.1\n")
+    body, conv, rep = convert_str(nodal_shell)
+    assert "*SURFACE, NAME=PLATETOP_NEAR" not in body
+    assert "PLATETOP, BLOCKBASE" in body
+
+    # an undefined node on a slave face leaves the original surface and does not raise KeyError
+    undefined = text.replace("1, 1, 2, 13, 12, 122, 123, 134, 133\n",
+                             "1, 1, 2, 13, 12, 999999, 123, 134, 133\n")
+    body, conv, rep = convert_str(undefined)
+    assert "*SURFACE, NAME=PLATETOP_NEAR" not in body
+    assert "PLATETOP, BLOCKBASE" in body
+    assert "undefined node" in rep.text()
+
+
+def test_tie_slave_trimming_on_a_shell_master_with_a_section_thickness():
+    # a master on conventional shells with a section thickness is trimmed (its expanded face
+    # lies the half thickness off, which the boxes include), so the restriction to bounded
+    # masters (membranes and NODAL THICKNESS shells are left alone: the test above) does not
+    # switch trimming off for a shell such as a shaker's shroud
+    text = open(os.path.join(EXAMPLES, "tie_slave_trimmed.inp"), encoding="utf-8").read()
+    head = text[:text.index("1001, ")]                     # (the plate's nodes only)
+    plate = text[text.index("*Element, type=C3D8, elset=PLATE"):text.index("*Element, type=C3D8, elset=BLOCK")]
+    deck = (head + "2001, 40., 40., 10.5\n2002, 60., 40., 10.5\n2003, 60., 60., 10.5\n2004, 40., 60., 10.5\n"
+            + plate + "*Element, type=S4, elset=SHEET\n2001, 2001, 2002, 2003, 2004\n"
+            "*Surface, type=ELEMENT, name=PLATETOP\nPLATE, S2\n*Surface, type=ELEMENT, name=SHEETBASE\nSHEET, SNEG\n"
+            "*Solid Section, elset=PLATE, material=STEEL\n*Shell Section, elset=SHEET, material=STEEL\n1.\n"
+            "*Material, name=STEEL\n*Elastic\n210000., 0.3\n*Tie, name=T, position tolerance=0.1\nPLATETOP, SHEETBASE\n"
+            "*Nset, nset=BASE, generate\n1, 121, 1\n*Boundary\nBASE, ENCASTRE\n")
+    body, conv, rep = convert_str(deck)
+    assert "PLATETOP_NEAR, SHEETBASE" in body, [ln for ln in rep.text().splitlines() if "TIE" in ln]
+
+
 def test_quoted_names_with_commas_written_with_underscores():
     # ccx splits a card at every comma, quotes or not: ELSET="PLATE, A" is set "PLATE plus an
     # unknown parameter, so names that agree up to the comma become one set (here a solid and
@@ -19952,6 +20042,46 @@ def _main_code(argv):
         except SystemExit as exc:
             code = exc.code
     return code, err.getvalue()
+
+
+def test_terminal_report_is_grouped_numbered_wrapped_and_versioned():
+    # stderr: a header with the version, the counts and where the full report is; reduced
+    # physics as a list; the warnings numbered, then the notes, each under its place and wrapped
+    # to the width; 'Output variable X <the same rest>' entries of one card in one.  The .log
+    # keeps one line per entry (text()), under a line with the version
+    rep = A.Report()
+    rep.warn("A warning about something that matters, long enough to be wrapped onto a second "
+             "line at sixty columns.", at="deck.inp:12")
+    for v in ("AR1", "AR2", "TA1"):
+        rep.note(f"Output variable {v} dropped from *NODE PRINT (not a ccx label there).", at="deck.inp:40")
+    rep.note("Output variable U3 -> U (CalculiX naming).", at="deck.inp:40")
+    rep.note("A note without a place.")
+    rep.reduce("element STRI65 -> S6")
+    rep.warn("Reduced physics — ccx solves a different model than this Abaqus deck: element STRI65 -> "
+             "S6. Its results are not the deck's own solution (see the warnings above).")
+    text = rep.console(60)
+    assert text.startswith("Reduced physics (ccx solves another model than the deck):\n"
+                           "  - element STRI65 -> S6\n\nWarnings (1, and the reduced-physics summary above)\n"
+                           "  1. deck.inp:12\n     A warning about something that matters, long enough to\n"), text
+    assert all(len(line) <= 60 for line in text.splitlines()), text
+    assert "  - deck.inp:40\n    Output variables AR1, AR2, TA1 dropped from *NODE PRINT\n    (not a ccx label there).\n" in text, text
+    assert "    Output variable U3 -> U (CalculiX naming).\n" in text and "  - A note without a place.\n" in text
+    assert "Notes (3)" in text and A.Report().console(80) == "No conversion issues were flagged.\n"
+    d = tempfile.mkdtemp()
+    try:
+        deck = os.path.join(d, "a.inp")
+        with open(deck, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(HEX_MODEL + "*Step\n*Static\n*Cload\n7, 3, 1.\n*End Step\n")
+        code, err = _main_code([deck])
+        with open(os.path.join(d, "a_ccx.log"), encoding="utf-8") as fh:
+            log = fh.read()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    head = err.splitlines()
+    assert code == 0 and head[0] == f"abq2ccx {A.__version__}: wrote {os.path.join(d, 'a_ccx.inp')} from {deck}", err
+    assert re.fullmatch(r"  \d+ nodes, 1 elements \| \d+ warning\(s\), \d+ note\(s\), \d+ commented card\(s\)", head[1]), head
+    assert head[2] == f"  Full report: {os.path.join(d, 'a_ccx.log')} (and at the top of the converted deck)"
+    assert log.startswith(f"abq2ccx {A.__version__}: {deck} -> {os.path.join(d, 'a_ccx.inp')} (") and "\n\n[" in log
 
 
 def _still_runs(pid):

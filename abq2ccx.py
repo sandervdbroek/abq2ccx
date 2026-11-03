@@ -58,6 +58,7 @@ import signal
 import stat
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import traceback
@@ -65,7 +66,7 @@ from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
 
-__version__ = "1.6.0"
+__version__ = "1.7.0.dev0"
 
 # ---------------------------------------------------------------------------
 # Element reference data
@@ -921,6 +922,62 @@ class Report:
         lines = [f"[{level}] {self.shown(k)}" for k, (level, _) in enumerate(self.entries)] or \
             ["No conversion issues were flagged."]
         return "\n".join(lines + self.instance_lines()) + "\n"
+
+    def console(self, width: Optional[int] = None) -> str:
+        """The report as the terminal shows it (text(), the .log, keeps one line per entry):
+        the reduced-physics summary as a list, the warnings numbered and then the notes, each
+        under its place in the deck and wrapped to ``width`` (the terminal's, 60-120 columns);
+        entries 'Output variable X <the same rest>' of one card in one, 'Output variables X,
+        Y, ...'; then the instance map."""
+        if width is None:
+            width = shutil.get_terminal_size((100, 24)).columns
+        width = max(60, min(120, width))
+        out: List[str] = []
+
+        def para(text: str, first: str, rest: str) -> None:
+            out.extend(textwrap.wrap(text, width, initial_indent=first, subsequent_indent=rest,
+                                     break_long_words=False, break_on_hyphens=False) or [first.rstrip()])
+        groups: "OrderedDict[tuple, list]" = OrderedDict()
+        for k, (level, msg) in enumerate(self.entries):
+            if level == "WARNING" and self.reduced and msg.startswith("Reduced physics"):
+                continue                        # (the list below)
+            m = re.fullmatch(r"Output variable (\S+) (.+)", msg, re.S)
+            key = (level, self.where.get(k, ""), m.group(2)) if m else (level, k)
+            groups.setdefault(key, []).append(m.group(1) if m else msg)
+        if self.reduced:
+            out.append("Reduced physics (ccx solves another model than the deck):")
+            for what in self.reduced:
+                para(what, "  - ", "    ")
+            out.append("")
+        for level, title, mark in (("WARNING", "Warnings", "{n}. "), ("NOTE", "Notes", "- ")):
+            items = [(key, vals) for key, vals in groups.items() if key[0] == level]
+            if not items:
+                continue
+            out.append(f"{title} ({len(items)}" + (", and the reduced-physics summary above)"
+                                                   if level == "WARNING" and self.reduced else ")"))
+            for n, (key, vals) in enumerate(items, 1):
+                head = "  " + mark.format(n=n)
+                pad = " " * len(head)
+                where = key[1] if len(key) == 3 else self.where.get(key[1], "")
+                text = (f"Output variable{'s' if len(vals) > 1 else ''} {', '.join(vals)} {key[2]}"
+                        if len(key) == 3 else vals[0])
+                if where:
+                    out.append(head + where)
+                    para(text, pad, pad)
+                else:
+                    para(text, head, pad)
+            out.append("")
+        if not out:
+            out = ["No conversion issues were flagged.", ""]
+        inst = self.instance_lines()
+        for line in inst:                       # (an "old -> new" pair stays on one line)
+            indent = " " * (len(line) - len(line.lstrip()))
+            at = len(out)
+            para(line.strip().replace(" -> ", "\0"), indent, indent + "    ")
+            out[at:] = [x.replace("\0", " -> ") for x in out[at:]]
+        if not inst and out[-1] == "":
+            out.pop()
+        return "\n".join(out) + "\n"
 
     def instance_lines(self, limit: int = 20, names: int = 8) -> List[str]:
         """The instance map of a flattened assembly (none for a flat deck): each instance's
@@ -9709,6 +9766,13 @@ class _Mesh:
                 out.append(f"** abq2ccx: *TIE {params.get('NAME') or ''}: every slave node of {f[0]} is a "
                            f"node of {master}, which joins them already")
                 continue
+            if plain and not membrane and shell is None and name is None:
+                try:
+                    given = pf(b.param("POSITION TOLERANCE") or "")
+                except ValueError:
+                    given = None
+                name, cards = self._trimmed_tie_slave(f[0], master, reach if reach is not None else given,
+                                                      params.get("NAME") or "")
             if name and shell is not None:
                 params["POSITION TOLERANCE"] = short_real(shell[2], 6)
                 line = ", ".join([name] + f[1:])
@@ -9744,6 +9808,119 @@ class _Mesh:
         return any(ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS or
                    (ccx_type(self.geom.elements[e][0]) in BEAM_TYPES and
                     not self.geom.elements[e][0].upper().startswith(("T2D", "T3D"))) for e in es)
+
+    def _trimmed_tie_slave(self, slave: str, master: str, tol: Optional[float], tie: str
+                           ) -> Tuple[Optional[str], List[str]]:
+        """A *TIE slave surface reaching far beyond its master (a whole plate face tied to a small
+        shroud) -> a surface of its faces (a node surface: its nodes) of which some node lies
+        within ``reach`` of a master node: (its name, its *SURFACE card), or (None, []) where
+        every face is within reach, none is, or the surfaces are of another kind (the slave
+        on solids or nodes, the master on faces the converter resolves, with S1-S6 / SPOS /
+        SNEG labels).  ccx 2.23 prints 'no tied MPC generated ... no opposite master face' for
+        every node of the others (87522 of a plate's 89341 slave nodes, 15 MB of output) and
+        ties none of them; nor does Abaqus, which ties a slave node only within the position
+        tolerance of the master surface (Mesh tie constraints).  A slave node is within reach
+        when it lies in the bounding box of a master facet grown by the tolerance (``tol``: the
+        one written, or the deck's; none given: the facet's extent, beyond ccx's default, a
+        fraction of the element size), a tenth of the facet's extent (ccx's in-face tolerance at
+        its edges) and a shell master's half thickness and offset (ccx's expanded face): a point
+        within the tolerance of a facet lies in that box, so a node in none of them is tied by
+        neither code.  The master must be on solids or on conventional shells with a section
+        thickness (not NODAL THICKNESS: _shell_tie_unbounded): ccx expands membranes, plane and
+        axisymmetric elements and beams by thicknesses not bounded here.  Exact."""
+        sd, md = self.surfaces.get(slave.upper()), self.surfaces.get(master.upper())
+        if not sd or not md or md[0].startswith("NODE"):
+            return None, []
+        cache_key = ("TRIM", slave.upper(), master.upper(), tol)
+        if cache_key in self._mem_surfaces:
+            return self._mem_surfaces[cache_key], []
+        xyz, types = self.geom.nodes, {}
+        label = re.compile(r"S[1-6]|SPOS|SNEG").fullmatch
+        mfaces: List[Tuple[int, List[int]]] = []
+        for token, face in md[1]:
+            if not label((face or "").upper()):
+                return None, []
+            for e in self._resolve_elements(token):
+                ns = self._face_nodes(e, face, types)
+                if not ns or any(n not in xyz for n in ns):
+                    return None, []
+                mfaces.append((e, ns))
+        if not mfaces:
+            return None, []
+
+        # each master facet's bounding box, grown by the tolerance (none given: the facet's
+        # extent, beyond ccx's default), a tenth of its extent (ccx's in-face tolerance at its
+        # edges) and a shell master's half thickness and offset (ccx's expanded face)
+        boxes: List[Tuple[Vec, Vec]] = []
+        for e, ns in mfaces:
+            typ = ccx_type(self.geom.elements[e][0])
+            if not typ.startswith("C3D") and (typ not in SHEET_SHELLS or
+                                               e not in self._shell_sec or
+                                               e in self._shell_tie_unbounded):
+                return None, []
+            ps = [xyz[n] for n in ns]
+            lo = tuple(min(p[k] for p in ps) for k in range(3))
+            hi = tuple(max(p[k] for p in ps) for k in range(3))
+            size = math.sqrt(sum((hi[k] - lo[k]) ** 2 for k in range(3)))
+            t, off = self._shell_sec.get(e, (0.0, 0.0))
+            grow = (tol if tol is not None else size) + 0.1 * size + t * (0.5 + abs(off))
+            boxes.append((tuple(lo[k] - grow for k in range(3)), tuple(hi[k] + grow for k in range(3))))
+        reach = max(max(h[k] - l[k] for k in range(3)) for l, h in boxes)
+        if not reach > 0.0:
+            return None, []
+        cell = lambda p: (math.floor(p[0] / reach), math.floor(p[1] / reach), math.floor(p[2] / reach))
+        grid: Dict[Tuple[int, int, int], List[int]] = {}
+        for i, (l, h) in enumerate(boxes):
+            (a0, a1, a2), (b0, b1, b2) = cell(l), cell(h)
+            for grid_key in itertools.product(range(a0, b0 + 1), range(a1, b1 + 1),
+                                              range(a2, b2 + 1)):
+                grid.setdefault(grid_key, []).append(i)
+        near: Dict[int, bool] = {}
+
+        def close(n: int) -> bool:
+            if n not in near:
+                p = xyz[n]
+                near[n] = any(all(boxes[i][0][k] <= p[k] <= boxes[i][1][k] for k in range(3))
+                              for i in grid.get(cell(p), ()))
+            return near[n]
+        if sd[0].startswith("NODE"):
+            nodes = dedup(n for token, _f in sd[1] for n in self._resolve_nodes(token))
+            if any(n not in xyz for n in nodes):
+                return None, []
+            kept, total = [str(n) for n in nodes if close(n)], len(nodes)
+            what, card = "nodes", "NODE"
+        else:
+            kept, total = [], 0
+            faces = []
+            for token, face in sd[1]:
+                lab = (face or "").upper()
+                if not re.fullmatch(r"S[1-6]", lab):
+                    return None, []
+                for e in self._resolve_elements(token):
+                    info = self.geom.elements.get(e)
+                    if info is None or not ccx_type(info[0]).startswith("C3D"):
+                        return None, []
+                    ns = self._face_nodes(e, face, types)
+                    if not ns or any(n not in xyz for n in ns):
+                        return None, []
+                    total += 1
+                    faces.append((e, lab, ns))
+            for e, lab, ns in faces:
+                if any(close(n) for n in ns):
+                    kept.append(f"{e}, {lab}")
+            what, card = "faces", "ELEMENT"
+        if not kept or len(kept) == total:
+            return None, []
+        self._reserve_names()
+        name = self._fresh_name(f"{slave}_NEAR")
+        self._mem_surfaces[cache_key] = name
+        self.report.note(f"*TIE {tie}: slave surface {slave} -> {name}, the {len(kept)} of its {total} "
+                         f"{what}{'' if card == 'NODE' else ' with a node'} near master surface {master} (in a facet's bounding box "
+                         f"grown by the position tolerance, a tenth of the facet and a shell's half "
+                         f"thickness): ccx 2.23 prints 'no tied MPC generated' for every node of the "
+                         f"others and ties none of them, nor does Abaqus (beyond the position "
+                         f"tolerance). Exact.")
+        return name, [f"*SURFACE, NAME={name}, TYPE={card}"] + kept
 
     def _shared_tie_slave(self, slave: str, master: str) -> Tuple[Optional[str], List[str]]:
         """A *TIE slave surface ``slave`` that shares nodes with the faces of ``master``: ccx
@@ -12913,9 +13090,18 @@ class _Mesh:
         -0.5) from its *SHELL SECTION / *SHELL GENERAL SECTION (a layup: its plies' sum, a
         SYMMETRIC one mirrored)."""
         out: Dict[int, Tuple[float, float]] = {}
+        self._shell_tie_unbounded = set()
         for b in blocks:
             if b.keyword not in ("SHELL SECTION", "SHELL GENERAL SECTION"):
                 continue
+            members = self.geom.elset((b.param("ELSET") or "").strip())
+            for e in members:
+                typ = self.geom.elements.get(e, ("", []))[0].upper()
+                if typ in SHELL_TYPES and not typ.startswith(("SC", "SFM")):
+                    if b.has("NODAL THICKNESS"):
+                        self._shell_tie_unbounded.add(e)
+                    else:
+                        self._shell_tie_unbounded.discard(e)
             recs = [r for r in merged_data_records(b) if any(x for x in r)]
             try:
                 t = sum(pf(t) for t, _m, _o in self._section_layers(b)) if b.has("COMPOSITE") else \
@@ -12925,7 +13111,7 @@ class _Mesh:
             off = offset_fraction(b.param("OFFSET")) or 0.0
             if t <= 0:
                 continue
-            for e in self.geom.elset((b.param("ELSET") or "").strip()):
+            for e in members:
                 typ = self.geom.elements.get(e, ("", []))[0].upper()
                 if typ in SHELL_TYPES and not typ.startswith(("SC", "SFM")):
                     out[e] = (t, off)
@@ -44828,6 +45014,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._sc_hyper: set = set()
         self._section_thick: Dict[int, float] = {}  # plane element -> section thickness
         self._shell_sec: Dict[int, Tuple[float, float]] = {}    # shell -> (thickness, OFFSET); decks with ties
+        self._shell_tie_unbounded: set = set()      # shell -> NODAL THICKNESS, not bounded by _shell_sec
         self._beam_n1: Dict[int, Optional[Vec]] = {}    # beam -> approximate n1 of its section
         self._deck_cloads: Dict[Tuple[int, int], set] = {}   # deck *CLOAD (node, DOF) -> _cload_amp
         # tractions carried into an NLGEOM step as pressures (_plan_carried_tractions): step ->
@@ -49939,16 +50126,22 @@ def _convert_one(path: str, args) -> Tuple[int, dict]:
             try:
                 with open(log_path, "w", encoding="utf-8", errors="backslashreplace",
                           newline="\n") as fh:
+                    fh.write(f"abq2ccx {__version__}: {path} -> {out_path} ({len(conv.geom.nodes)} "
+                             f"nodes, {len(conv.geom.elements)} elements, {report.summary()})\n\n")
                     fh.write(report.text())
             except OSError as exc:
                 sys.stderr.write(f"abq2ccx: cannot write {log_path}: {exc}\n")
 
     if not args.json_out and not args.quiet:
-        verb = "checked" if args.check else "wrote"
-        sys.stderr.write(f"abq2ccx: {verb} {path if args.check else out_path} "
-                         f"({len(conv.geom.nodes)} nodes, {len(conv.geom.elements)} elements, "
-                         f"{report.summary()})\n")
-        sys.stderr.write(report.text())
+        verb = "checked" if args.check else f"wrote {out_path} from"
+        where = ([] if args.check else
+                 [f"  Full report: {os.path.splitext(out_path)[0]}.log (and at the top of the "
+                  f"converted deck)"] if not args.no_log else
+                 ["  Full report: at the top of the converted deck"])
+        sys.stderr.write("\n".join([f"abq2ccx {__version__}: {verb} {path}",
+                                    f"  {len(conv.geom.nodes):,} nodes, {len(conv.geom.elements):,} "
+                                    f"elements | {report.summary()}"] + where) + "\n\n")
+        sys.stderr.write(report.console())
 
     strict = args.strict and (report.n_warnings > 0 or report.n_commented > 0)
     run = run_ccx(out_path, args.ccx, args.quiet, not args.json_out, report.instances,

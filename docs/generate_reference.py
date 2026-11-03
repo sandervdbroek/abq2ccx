@@ -421,7 +421,12 @@ TRANSLATED = {
         "written out (given, or its default; ccx's own is some 20 times smaller), which a `*TIE` "
         "measures from the membrane nodes as ccx does (a tied pair adds the half thickness, also "
         "onto a rigid surface); nodes of the master face stay out. One `*TIE` per data line: ccx "
-        "reads only a card's first.",
+        "reads only a card's first. A slave surface reaching far beyond its master "
+        "→ a surface of its faces (a node surface: its nodes) with a node in a master facet's "
+        "bounding box grown by the position tolerance, a tenth of the facet and a shell master's "
+        "half thickness, "
+        "as neither code ties a node beyond the tolerance (ccx printed 'no tied MPC generated' "
+        "for each); the deck's own surface stays for other cards.",
     "*MPC": "line by line: `PIN` → `*EQUATION` on DOFs 1-3; `TIE` → per-DOF `*EQUATION` "
             "(shell/beam rotations through knots, DOF 11 in thermal steps); `BEAM` → one "
             "`*RIGID BODY` per independent node (chained lines one body); `LINK` → linearised "
