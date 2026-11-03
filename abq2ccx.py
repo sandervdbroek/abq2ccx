@@ -66,7 +66,7 @@ from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
 
-__version__ = "1.7.0.dev0"
+__version__ = "1.7.0"
 
 # ---------------------------------------------------------------------------
 # Element reference data
@@ -9817,7 +9817,7 @@ class _Mesh:
         every face is within reach, none is, or the surfaces are of another kind (the slave
         on solids or nodes, the master on faces the converter resolves, with S1-S6 / SPOS /
         SNEG labels).  ccx 2.23 prints 'no tied MPC generated ... no opposite master face' for
-        every node of the others (87522 of a plate's 89341 slave nodes, 15 MB of output) and
+        every node of the others (87541 of a plate's 89341 slave nodes, 15 MB of output) and
         ties none of them; nor does Abaqus, which ties a slave node only within the position
         tolerance of the master surface (Mesh tie constraints).  A slave node is within reach
         when it lies in the bounding box of a master facet grown by the tolerance (``tol``: the

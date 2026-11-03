@@ -8,33 +8,32 @@ From 1.6.0 on, each version opens with an overview in plain language (what now c
 gives more correct answers, what changed in using the converter), followed by the detailed
 entries. The GitHub release notes use the same section.
 
-## Unreleased
+## 1.7.0 (November 2026)
 
 ### Overview
 
-* **A readable report.** The terminal report now opens with the converter's version, the
-  model's size and where the full report is, lists the reduced physics, numbers the warnings,
-  puts each entry under its place in the deck and wraps it to the terminal, and shows repeated
-  output-variable notes once. The development version is 1.7.0.dev0, so an install from GitHub
-  is told apart from the 1.6.0 release.
-* **Leaner tie output.** A `*TIE` whose slave surface reaches far beyond its master (a whole plate
-  tied to a small shroud) is written with only the slave faces near the master: ccx printed a
-  warning for every other slave node (87522 of them, 15 MB of output, for one shaker model) and
-  tied none of them, as Abaqus does not either. The answers are unchanged.
-* **Fewer ccx failures.** Models whose part, instance, material or set names hold a comma (as
-  CAD imports often name parts) now run: ccx read such a name only up to the comma, so sets of
-  different parts merged and ccx stopped, or silently used one part's section for another's. A
-  point mass on a distributing coupling's reference node (a test mass on a shaker table) no
-  longer stops ccx.
-* **More correct answers.** A connector load or motion whose connector cannot be converted is
-  now left out with it, and reported, instead of being written onto a node attached to nothing,
-  where ccx dropped it without a message. A base excitation's scale factor (`*BASE MOTION,
-  SCALE=`), which ccx ignored, now reaches ccx: a shaker run at 45 g responded as to 1 mm/s².
+* **More correct answers.** A base excitation's scale factor (`*BASE MOTION, SCALE=`), which ccx
+  ignored, now reaches ccx: a shaker run at 45 g responded as to 1 mm/s². A connector load or
+  motion whose connector cannot be converted is now left out with it, and reported, instead of
+  being written onto a node attached to nothing, where ccx dropped it without a message.
 * **Steady-state dynamics.** A frequency response after a preload now uses the prestressed modes,
   as in Abaqus (ccx needs `PERTURBATION` on both steps; the converter dropped it). A step with
   several frequency bands computes all of them (ccx read the first only), a range from 0 Hz
   under a base acceleration no longer gives NaN, and Abaqus' total displacement `TU` is
   written (ccx's `U` there is the total one; a request for the relative `U` is warned).
+* **Fewer ccx failures.** Models whose part, instance, material or set names hold a comma (as
+  CAD imports often name parts) now run: ccx read such a name only up to the comma, so sets of
+  different parts merged and ccx stopped, or silently used one part's section for another's. A
+  point mass on a distributing coupling's reference node (a test mass on a shaker table) no
+  longer stops ccx.
+* **Leaner tie output.** A `*TIE` whose slave surface reaches far beyond its master (a whole plate
+  tied to a small shroud) is written with only the slave faces near the master: ccx printed a
+  warning for every other slave node (87541 of them, 15 MB of output, for one shaker model) and
+  tied none of them, as Abaqus does not either. The answers are unchanged.
+* **A readable report.** The terminal report now opens with the converter's version, the
+  model's size and where the full report is, lists the reduced physics, numbers the warnings,
+  puts each entry under its place in the deck and wraps it to the terminal, and shows repeated
+  output-variable notes once. The `.log` names the version too.
 
 ### Details
 
@@ -44,7 +43,7 @@ entries. The GitHub release notes use the same section.
   `file:line` and wrapped to the terminal's width (60 to 120 columns), entries `Output variable
   X <the same rest>` of one card as one `Output variables X, Y, ...`, and the instance map with
   each `old -> new` pair on one line. The `.log` keeps one line per entry, now under a line with
-  the version; the deck's `**` header is unchanged. `__version__` is 1.7.0.dev0.
+  the version; the deck's `**` header is unchanged.
 * **`*TIE` slave surfaces trimmed** — ccx 2.23 ties only the slave nodes it finds a master face
   for within the position tolerance, and prints 'no tied MPC generated ... no opposite master
   face' for every other one; Abaqus ties none beyond the tolerance either. A tie whose slave
