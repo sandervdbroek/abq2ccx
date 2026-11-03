@@ -5330,7 +5330,9 @@ def test_kinematic_rotation_only_lines_beside_other_constraints():
                         "a spring")):
         body, conv, rep = convert_str(native + extra + step)
         assert 100 not in conv._rb_rot or not any(f",{conv._rb_rot[100]}," in e for e in _equations(body))
-        assert rep.reduced == ["*KINEMATIC rotation-only coupling"] and f"rotation {who}" in rep.text()
+        # (a spring on the node's rotation is then left out too: ccx carries no rotation there)
+        left = ["SPRING1 / SPRING2 element left out"] if who == "a spring" else []
+        assert rep.reduced == left + ["*KINEMATIC rotation-only coupling"] and f"rotation {who}" in rep.text()
         assert not any(l.startswith(("*COUPLING", "*KINEMATIC")) for l in _live(body))
     # ... also in a deck of linear rigid equations (a *DYNAMIC step without NLGEOM), which had
     # the 'ties' form before: no ties to a ROT NODE beside the connector body's
