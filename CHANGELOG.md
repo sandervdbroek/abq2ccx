@@ -53,7 +53,9 @@ entries. The GitHub release notes use the same section.
   grown by the tolerance (none given: the facet's extent), a tenth of the facet (ccx's in-face
   tolerance) and a shell master's half thickness and offset, outside which no point is within
   the tolerance of the facet (`validate_with_ccx.py tie_slave_trimmed`: the same answer, 16
-  warnings instead of 112). The deck's own surface stays for other cards.
+  warnings instead of 112). The master must be on solids or on conventional shells with a
+  section thickness (not `NODAL THICKNESS`), whose expanded faces that bounds; the deck's own
+  surface stays for other cards.
 * **Names with a comma** — Abaqus reads a comma inside a quoted name as part of the name
   (`*Part, name="COLD PLATE, ASSY-11"`); ccx 2.23 splits a card at every comma, quotes or not,
   and read `ELSET="PLATE, A"` as set `"PLATE` plus an unknown parameter. Names that agree up to

@@ -1215,6 +1215,24 @@ def test_tie_slave_surface_trimmed_to_the_faces_near_its_master():
     assert "undefined node" in rep.text()
 
 
+def test_tie_slave_trimming_on_a_shell_master_with_a_section_thickness():
+    # a master on conventional shells with a section thickness is trimmed (its expanded face
+    # lies the half thickness off, which the boxes include), so the restriction to bounded
+    # masters (membranes and NODAL THICKNESS shells are left alone: the test above) does not
+    # switch trimming off for a shell such as a shaker's shroud
+    text = open(os.path.join(EXAMPLES, "tie_slave_trimmed.inp"), encoding="utf-8").read()
+    head = text[:text.index("1001, ")]                     # (the plate's nodes only)
+    plate = text[text.index("*Element, type=C3D8, elset=PLATE"):text.index("*Element, type=C3D8, elset=BLOCK")]
+    deck = (head + "2001, 40., 40., 10.5\n2002, 60., 40., 10.5\n2003, 60., 60., 10.5\n2004, 40., 60., 10.5\n"
+            + plate + "*Element, type=S4, elset=SHEET\n2001, 2001, 2002, 2003, 2004\n"
+            "*Surface, type=ELEMENT, name=PLATETOP\nPLATE, S2\n*Surface, type=ELEMENT, name=SHEETBASE\nSHEET, SNEG\n"
+            "*Solid Section, elset=PLATE, material=STEEL\n*Shell Section, elset=SHEET, material=STEEL\n1.\n"
+            "*Material, name=STEEL\n*Elastic\n210000., 0.3\n*Tie, name=T, position tolerance=0.1\nPLATETOP, SHEETBASE\n"
+            "*Nset, nset=BASE, generate\n1, 121, 1\n*Boundary\nBASE, ENCASTRE\n")
+    body, conv, rep = convert_str(deck)
+    assert "PLATETOP_NEAR, SHEETBASE" in body, [ln for ln in rep.text().splitlines() if "TIE" in ln]
+
+
 def test_quoted_names_with_commas_written_with_underscores():
     # ccx splits a card at every comma, quotes or not: ELSET="PLATE, A" is set "PLATE plus an
     # unknown parameter, so names that agree up to the comma become one set (here a solid and

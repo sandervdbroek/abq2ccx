@@ -9825,7 +9825,9 @@ class _Mesh:
         fraction of the element size), a tenth of the facet's extent (ccx's in-face tolerance at
         its edges) and a shell master's half thickness and offset (ccx's expanded face): a point
         within the tolerance of a facet lies in that box, so a node in none of them is tied by
-        neither code.  Exact."""
+        neither code.  The master must be on solids or on conventional shells with a section
+        thickness (not NODAL THICKNESS: _shell_tie_unbounded): ccx expands membranes, plane and
+        axisymmetric elements and beams by thicknesses not bounded here.  Exact."""
         sd, md = self.surfaces.get(slave.upper()), self.surfaces.get(master.upper())
         if not sd or not md or md[0].startswith("NODE"):
             return None, []
