@@ -43238,18 +43238,28 @@ class _PostPasses:
         with knot beams on its loaded nodes deflected 0.0056 or 0.105 for 0.292, by the knot
         beams' modulus; the plain shells, and the knotted ones with that rotation held, 0.292
         for any; a clamp that a later *BOUNDARY, OP=NEW releases, NLGEOM: ccx stopped, held it
-        solves).  It is held (n: the node's normal as ccx computes it, _ccx_shell_normal) —
+        solves; the spurious *BUCKLE factors 0.596 / 0.905 before 4.988 at loaded knots were
+        this too).  It is held (n: the node's normal as ccx computes it, _ccx_shell_normal) —
         nothing acts on that rotation, in Abaqus' shell as in ccx's (no drilling stiffness), so
-        it changes nothing else: along a global axis by a *BOUNDARY on that rotation, in model
-        data unless a deck BC holds it there, and again after each *BOUNDARY, OP=NEW ccx acts
-        on that leaves it free in its step (ccx's BC state, the emitted deck's); else by an
-        *EQUATION n . theta = 0 eliminating a rotation no other equation eliminates, where no
-        *BOUNDARY holds one of its rotations in any step (the equation acts in all of them; one
-        that is held needs none, and ccx stops on a BC on its dependent DOF): elsewhere warned.
-        Not by an equation in a deck with a *MODAL DYNAMIC step: ccx 2.23 crashes there at
-        random on any equation that eliminates a knot's rotation (probed: 9-12 of 50 runs, exit
-        -11 / -10 / -6, as the step starts; a *BOUNDARY there: none of 50), so such a knot
-        stays as it was, warned."""
+        it changes nothing else — by a *BOUNDARY on its global rotation k with the largest
+        |n_k| (its component along the normal), in model data unless a deck BC holds it there,
+        and again after each *BOUNDARY, OP=NEW ccx acts on that leaves it free in its step
+        (ccx's BC state, the emitted deck's).  Along a global axis that is the rotation about
+        the normal; off the axes it fixes only how much of the knot's rotation vector lies
+        along the normal, which moves nothing (probed against n . theta = 0 and the plain
+        shells: statics, *FREQUENCY, *BUCKLE, *MODAL DYNAMIC, NLGEOM, to print precision; ccx
+        writes no rotations, U holds translations only).  Where a deck BC holds a part of the
+        turn in some steps, k is one that each such step holds (that BC replaces the hold
+        there; none: warned).  On a node with a *TRANSFORM too: ccx reads a rotational BC on a
+        knot about the global axes (bounadd keeps DOFs 4-6 as SPCs, gen3dnor gives the knot's
+        rotation node no transform; probed exact), while it misreads *EQUATION rotation terms
+        there.  A moment about the normal, which the BC would turn partly into one in the
+        shell's plane, needs n . theta = 0 instead: an *EQUATION eliminating a rotation no
+        other equation eliminates, where no *BOUNDARY holds one of its rotations in any step
+        (the equation acts in all of them, and ccx stops on a BC on its dependent DOF), and not
+        in a deck with a *MODAL DYNAMIC step — ccx 2.23 crashes there at random on any MPC that
+        eliminates a knot's DOF (probed: 26 of 100 runs, exit -6 / -10 / -11; the *BOUNDARY:
+        none of 100; _warn_modal_knot_mpcs); elsewhere warned."""
         knots = set(self._knots)
         if not knots or getattr(self.opt, "solid_dof", False):
             return deck
@@ -43294,12 +43304,28 @@ class _PostPasses:
                     state |= rotations(c)
             states.append(set(state))
         phases = states or [model]              # (a deck without steps: its model data)
-        anywhere = set(model).union(*phases)
+        moments: Dict[int, List[List[float]]] = {}  # node -> each *CLOAD card's moment on it
+        for c in deck.cards:
+            if c.keyword == "CLOAD":
+                card: Dict[int, List[float]] = {}
+                for rec in c.records():
+                    lo, hi = bc_dof_range(rec[:2]) or (0, 0)
+                    for d in (d for d in (4, 5, 6) if lo <= d <= hi and rec[0]):
+                        try:
+                            v = pf(rec[2]) if len(rec) > 2 else 0.0
+                        except ValueError:
+                            v = math.inf            # (an unread value: taken as about the normal)
+                        for m in sets.members("NSET", rec[0]) or ([int(rec[0])] if rec[0].isdigit() else []):
+                            card.setdefault(m, [0.0, 0.0, 0.0])[d - 4] += v
+                for m, v in card.items():
+                    moments.setdefault(m, []).append(v)
+        modal = "MODAL DYNAMIC" in self.steps.procs
         rows: List[List[Tuple[int, int, float]]] = []
-        bcs: List[Tuple[int, int]] = []         # (holds along a global axis)
-        loose: List[int] = []                   # (no form: an equation in a *MODAL DYNAMIC deck)
-        mixed: List[int] = []                   # (no form: held by a BC in some steps only)
-        for n in sorted(knots - set(self._transformed)):
+        bcs: List[Tuple[int, int]] = []         # (n, the global rotation held)
+        loose: List[int] = []                   # (moment about the normal, *MODAL DYNAMIC deck)
+        mixed: List[int] = []                   # (moment about the normal or no common DOF, BCs in some steps)
+        local: List[int] = []                   # (moment about the normal, a *TRANSFORM)
+        for n in sorted(knots):
             own = [e for e in at.get(n, ()) if e not in beams]
             if not own or any(ccx_type(self.geom.elements[e][0]) not in SHEET_SHELLS for e in own) or \
                     len({sections.get(e) for e in own}) > 1 or None in {sections.get(e) for e in own}:
@@ -43311,7 +43337,8 @@ class _PostPasses:
             nrm = self._ccx_shell_normal(n, at)
             if nrm is None:
                 continue
-            if any(abs(vdot(nrm, a)) > 1e-6 * vnorm(a) for a in tie.get(n, ())):
+            transformed = n in self._transformed and n not in self._untr
+            if any(abs(vdot(nrm, a)) > 1e-6 * vnorm(a) or transformed for a in tie.get(n, ())):
                 continue                        # (an equation holds a part of the turn about n)
             terms = sorted(((n, k + 4, c) for k, c in enumerate(nrm) if abs(c) > 1e-12),
                            key=lambda t: ((n, t[1]) in dependent, -abs(t[2])))
@@ -43321,31 +43348,48 @@ class _PostPasses:
                 if any((n, terms[0][1]) not in s for s in phases):
                     bcs.append((n, terms[0][1]))
                 continue
-            if all(any((n, d) in s for _n, d, _c in terms) for s in phases):
+            held = [{d for _n, d, _c in terms if (n, d) in s} for s in phases]
+            if all(held):
                 continue                        # (a BC holds a part of the turn in every step)
-            if any((n, d) in anywhere for _n, d, _c in terms):
+            common = {d for _n, d, _c in terms}.intersection(*(h for h in held if h))
+            picks = [d for _n, d, c in terms if d in common and (n, d) not in dependent and
+                     abs(c) >= 0.1 * vnorm(nrm)]
+            if picks and not any(abs(vdot(nrm, m)) > 1e-9 * vnorm(m) for m in moments.get(n, ())):
+                bcs.append((n, picks[0]))       # (terms: the largest component first)
+            elif any(held) or not picks:
                 mixed.append(n)
-            elif "MODAL DYNAMIC" in self.steps.procs:
+            elif modal:
                 loose.append(n)
+            elif transformed:
+                local.append(n)
             else:
                 rows.append(terms)
+        moment = ("a moment about the normal, which a *BOUNDARY on one of its global rotations "
+                  "would turn partly into one in the shell's plane")
+        free = ("so ccx 2.23's solution may depend on round-off (probed: a knotted S4 beam 2 % to "
+                "50x too stiff, *BUCKLE factors 0.99 for 3.18)")
         if loose:
             self.report.warn(f"{len(loose)} knot(s) of the converter's knot beams on shell nodes whose "
-                             f"normal is off the global axes (e.g. node {loose[0]}), in a deck with a "
-                             f"*MODAL DYNAMIC step: their rotation about the normal has no stiffness, so "
-                             f"ccx 2.23's solution may depend on round-off (probed: a knotted S4 beam 2 % "
-                             f"to 50x too stiff), and the *EQUATION that holds it elsewhere crashes ccx's "
-                             f"*MODAL DYNAMIC step at random (probed) — verify.", once=True)
+                             f"normal is off the global axes (e.g. node {loose[0]}), under {moment}, in "
+                             f"a deck with a *MODAL DYNAMIC step: their rotation about the normal has no "
+                             f"stiffness, {free}, and the *EQUATION that holds it elsewhere crashes "
+                             f"ccx's *MODAL DYNAMIC step at random (probed) — verify.", once=True)
             self._reduces("knot drilling rotations without stiffness (deck with a *MODAL DYNAMIC step)")
         if mixed:
             self.report.warn(f"{len(mixed)} knot(s) of the converter's knot beams on shell nodes whose "
                              f"normal is off the global axes (e.g. node {mixed[0]}), with rotational BCs "
-                             f"in some steps only: in the others their rotation about the normal has no "
-                             f"stiffness, so ccx 2.23's solution may depend on round-off (probed: a "
-                             f"knotted S4 beam 2 % to 50x too stiff), and the *EQUATION that holds it "
-                             f"elsewhere would act in every step (ccx stops on a BC on its dependent "
-                             f"DOF) — verify.", once=True)
+                             f"in some steps only, under {moment} or held about different axes from step "
+                             f"to step: in the other steps their rotation about the normal has no "
+                             f"stiffness, {free}, and the *EQUATION that holds it elsewhere would act in "
+                             f"every step (ccx stops on a BC on its dependent DOF) — verify.", once=True)
             self._reduces("knot drilling rotations without stiffness (rotational BCs in some steps only)")
+        if local:
+            self.report.warn(f"{len(local)} knot(s) of the converter's knot beams on shell nodes with a "
+                             f"*TRANSFORM whose normal is off the global axes (e.g. node {local[0]}), "
+                             f"under {moment}: their rotation about the normal has no stiffness, {free}, "
+                             f"and ccx 2.23 misreads *EQUATION terms on DOFs 4-6 of a node with a "
+                             f"*TRANSFORM — verify.", once=True)
+            self._reduces("knot drilling rotations without stiffness (*TRANSFORM nodes)")
         if not rows and not bcs:
             return deck
         at = next((c.line for c in deck.cards if c.keyword == "STEP"), len(deck.lines))
@@ -44400,14 +44444,7 @@ class _PostPasses:
         first, why, eig = self._eigen_after_solver()
         if not eig or not self._mechanical:
             return
-        own = self._rot_nodes - set(self._rb_rot)
-        sections, at = self._knot_sections(blocks), self._elements_at(own)
-        knots = set(self._knots) | {n for n in own if self._ccx_knot(n, sections, at) is True}
-        dep = {terms[0][0] for ci, terms in self._emitted_equations(deck) if deck.cards[ci].step <= 0}
-        for c in self._rigid_constraints(blocks):
-            if c["emit"] != "eq":                   # (ccx's RIGID MPCs eliminate the members)
-                dep.update(n for n, ds in c["elim"].items() if ds)
-        hit = sorted(dep & knots)
+        hit = self._knot_mpc_dependents(blocks, deck)
         if not hit:
             return
         procs = dedup(f"*{self.steps.steps[s - 1].proc}" for s in eig)
@@ -44424,6 +44461,43 @@ class _PostPasses:
                          f"before step {first}, or in an analysis of their own.", once=True)
         self._reduces("equations on knots wrong in the eigenvalue / modal / linear steps after a "
                       "step ccx runs through its nonlinear solver")
+
+    def _knot_mpc_dependents(self, blocks: List[Block], deck: EmittedDeck) -> List[int]:
+        """The knots (the converter's knot beams', and the nodes ccx makes knots itself:
+        _ccx_knot) of which an emitted *EQUATION eliminates a DOF, or ccx's RIGID MPCs of a
+        *RIGID BODY / *KINEMATIC coupling (_rigid_constraints) the translations, sorted."""
+        own = self._rot_nodes - set(self._rb_rot)
+        sections, at = self._knot_sections(blocks), self._elements_at(own)
+        knots = set(self._knots) | {n for n in own if self._ccx_knot(n, sections, at) is True}
+        dep = {terms[0][0] for ci, terms in self._emitted_equations(deck) if deck.cards[ci].step <= 0}
+        for c in self._rigid_constraints(blocks):
+            if c["emit"] != "eq":                   # (ccx's RIGID MPCs eliminate the members)
+                dep.update(n for n, ds in c["elim"].items() if ds)
+        return sorted(dep & knots)
+
+    def _warn_modal_knot_mpcs(self, blocks: List[Block], deck: EmittedDeck) -> None:
+        """Warn of a deck with a *MODAL DYNAMIC step whose MPCs eliminate a DOF of a knot
+        (_knot_mpc_dependents): an *EQUATION's dependent term, such as a kinematic coupling's
+        rotation ties on shell nodes, or a member of ccx's RIGID MPCs.  ccx 2.23 then crashes
+        at random in the *MODAL DYNAMIC step — heap corruption, which macOS reports in
+        nonlinmpc, results and frd under dyna (probed: an S4 strip whose tip edge a kinematic
+        coupling ties, 11 of 60 runs; DOFs 1-3 only, 14 of 60; a one-node coupling, 15 of 60;
+        an equation on a fold's own knot, 4 of 130; exit -6 / -10 / -11; of about 300 runs that
+        finished one printed other results; SPCs on the knots: none of 60).  A kinematic
+        coupling of shell nodes needs the knots (ccx's RIGID MPCs reject plain shell nodes),
+        and ccx's *KINEMATIC already makes the reference node's rotations dependent, so no ccx
+        form avoids it: rerun a run that crashes, and compare two that finish."""
+        if "MODAL DYNAMIC" not in self.steps.procs or not self._mechanical:
+            return
+        hit = self._knot_mpc_dependents(blocks, deck)
+        if hit:
+            self.report.warn(f"Constraints (equations, couplings, rigid bodies) eliminate a DOF of "
+                             f"{len(hit)} knot(s) (e.g. node {hit[0]}; knot beams, frame joints, folded "
+                             f"shell edges) in a deck with a *MODAL DYNAMIC step: ccx 2.23 crashes at "
+                             f"random in that step (heap corruption; probed: 3-25 % of runs, exit -6 / "
+                             f"-10 / -11; one of about 300 runs that finished printed other results). No "
+                             f"ccx form avoids it: rerun a run that crashes, and compare two that finish.",
+                             once=True)
 
     @staticmethod
     def _emitted_equations(deck: EmittedDeck) -> List[Tuple[int, List[Tuple[int, int, str]]]]:
@@ -45888,6 +45962,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._audit_loads(blocks, deck)
         deck = self._hold_knot_drilling(blocks, deck)   # after the passes that write BCs and equations
         self._warn_knot_equations(blocks, deck)     # after _settle_dependents: the terms as written
+        self._warn_modal_knot_mpcs(blocks, deck)
         deck = self._initial_gradients_back(deck)   # after the audit: the initial state is no load
         deck = self._shift_total_time(deck)     # after every pass that writes load cards
         deck = self._truss_bc_index(deck)       # after every pass that writes *BOUNDARY

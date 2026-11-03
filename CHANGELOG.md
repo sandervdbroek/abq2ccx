@@ -8,6 +8,43 @@ From 1.6.0 on, each version opens with an overview in plain language (what now c
 gives more correct answers, what changed in using the converter), followed by the detailed
 entries. The GitHub release notes use the same section.
 
+## Unreleased
+
+### Overview
+
+* **More correct answers.** Shells joined at a knot (where the converter attaches a small helper
+  beam, for example to carry a load in a modal step) are now held against their free twisting
+  about the shell's normal in more cases: off the global axes in models with a modal transient
+  step, on nodes with a local coordinate system, and where a boundary condition holds them in
+  some steps only. Without that hold ccx found spurious buckling factors (0.93 for 3.18), gave
+  a plate 0.36 of its deflection, or stopped. Models with a modal transient step whose
+  constraints act on such knots are now warned that ccx may crash at random there.
+
+### Details
+
+* **Knot drilling holds** — the drilling rotation of a knot beam's knot on a smooth shell node is
+  now held by a `*BOUNDARY` on the global rotation with the largest component along the normal,
+  wherever the normal lies: off the axes that fixes only how much of the rotation vector lies
+  along the normal, which moves nothing (probed: the same answers as `n . theta = 0` in static,
+  `*BUCKLE`, `*FREQUENCY`, `*MODAL DYNAMIC` and `NLGEOM` steps; ccx writes no rotations). It
+  replaces the equation, which ccx 2.23's `*MODAL DYNAMIC` step crashed on at random (26 of 100
+  runs; the BC: none of 100), which would act in every step where BCs hold the knot in some
+  (ccx stops on a BC on its dependent DOF), and which ccx misreads on a node with a `*TRANSFORM`
+  (ccx reads a rotational BC on a knot about the global axes there). So knots off the axes in
+  decks with a `*MODAL DYNAMIC` step, knots on `*TRANSFORM` nodes and knots with rotational BCs
+  in some steps only (the BC on a rotation each such step holds) are held now. Under a moment
+  about the normal, which the BC would turn partly into the shell's plane, the equation stays,
+  warned where it cannot be written (`validate_with_ccx.py knot_buckle`, `knot_transform`,
+  `released_knot_oblique`; before: `*BUCKLE` factors 0.93 for 3.18, 0.36 of the plate's
+  deflection, ccx stopped). The spurious `*BUCKLE` factors at loaded knots noted earlier (0.596
+  before 4.988) were this free rotation.
+* **MPCs on knots in `*MODAL DYNAMIC` decks warned** — ccx 2.23 crashes at random in a `*MODAL
+  DYNAMIC` step (heap corruption; exit -6 / -10 / -11 in 3-25 % of runs) when an MPC eliminates
+  a DOF of a knot: a kinematic coupling or rigid body on shell nodes, its rotation ties, an
+  `*EQUATION` on a knot. A coupling of shell nodes needs the knots and ccx makes the reference
+  node's rotations dependent itself, so no form avoids it; one of about 300 runs that finished
+  printed other results. Such decks are now warned (rerun a crash, compare two runs).
+
 ## 1.7.0 (November 2026)
 
 ### Overview
