@@ -20069,7 +20069,8 @@ def test_terminal_report_is_grouped_numbered_wrapped_and_versioned():
     assert "  - deck.inp:40\n    Output variables AR1, AR2, TA1 dropped from *NODE PRINT\n    (not a ccx label there).\n" in text, text
     assert "    Output variable U3 -> U (CalculiX naming).\n" in text and "  - A note without a place.\n" in text
     assert "Notes (3)" in text and A.Report().console(80) == "No conversion issues were flagged.\n"
-    d = tempfile.mkdtemp()
+    d, saved = tempfile.mkdtemp(), os.environ.get("COLUMNS")
+    os.environ["COLUMNS"] = "80"                # (the same width on every platform and runner)
     try:
         deck = os.path.join(d, "a.inp")
         with open(deck, "w", encoding="utf-8", newline="\n") as fh:
@@ -20079,7 +20080,20 @@ def test_terminal_report_is_grouped_numbered_wrapped_and_versioned():
             log = fh.read()
     finally:
         shutil.rmtree(d, ignore_errors=True)
-    head = err.splitlines()
+        if saved is None:
+            os.environ.pop("COLUMNS", None)
+        else:
+            os.environ["COLUMNS"] = saved
+    # every line one column short of the width, the header's too, but for a word longer than
+    # that (a path stays whole): a long temporary path (macOS, Windows) wraps onto a next line
+    # indented by 4, joined back here
+    assert all(len(line) < 80 or " " not in line.strip() for line in err.splitlines()), err
+    head: list = []
+    for line in err.split("\n\n")[0].splitlines():
+        if line.startswith("    ") and head:
+            head[-1] += " " + line.strip()
+        else:
+            head.append(line)
     assert code == 0 and head[0] == f"abq2ccx {A.__version__}: wrote {os.path.join(d, 'a_ccx.inp')} from {deck}", err
     assert re.fullmatch(r"  \d+ nodes, 1 elements \| \d+ warning\(s\), \d+ note\(s\), \d+ commented card\(s\)", head[1]), head
     assert head[2] == f"  Full report: {os.path.join(d, 'a_ccx.log')} (and at the top of the converted deck)"

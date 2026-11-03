@@ -50165,8 +50165,8 @@ def _convert_one(path: str, args) -> Tuple[int, dict]:
         head = [f"abq2ccx {__version__}: {verb} {path}",
                 f"  {len(conv.geom.nodes):,} nodes, {len(conv.geom.elements):,} elements | "
                 f"{report.summary()}"] + where
-        sys.stderr.write("\n".join(x for i, line in enumerate(head) for x in wrap_for_terminal(
-            line.strip(), width, line[:len(line) - len(line.lstrip())], "    " if i else "  ")) + "\n\n")
+        sys.stderr.write("\n".join(x for line in head for x in wrap_for_terminal(
+            line.strip(), width, line[:len(line) - len(line.lstrip())], "    ")) + "\n\n")
         sys.stderr.write(report.console())
 
     strict = args.strict and (report.n_warnings > 0 or report.n_commented > 0)
