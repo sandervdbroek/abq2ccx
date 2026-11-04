@@ -6831,6 +6831,25 @@ BEAM_TIP = ("*Node\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n13, 1., 1., 0.
             "*Boundary\n1, encastre\n11, encastre\n")
 
 
+def test_nonlinear_spring_in_a_linear_static_step_is_flagged():
+    # ccx 2.23 never iterates for a spring: a small-strain *STATIC / *VISCO step springs the
+    # table's slope at zero (0.6 where 0.7 is right) -> warned, reduced physics; not where ccx
+    # follows the table (NLGEOM) or Abaqus is linear too (a perturbation step), nor for a table
+    # that is one straight line through zero
+    tab = "-50., -0.5\n0., 0.\n50., 0.5\n100., 1.5\n"
+    deck = ("*Node\n1, 0., 0., 0.\n2, -10., 0., 0.\n*Element, type=SPRING1, elset=K\n1, 1\n"
+            "*Spring, elset=K, nonlinear\n1\n{tab}*Element, type=SPRINGA, elset=KA\n2, 1, 2\n"
+            "*Spring, elset=KA, nonlinear\n\n{tab}*Boundary\n1, 2, 3\n2, 1, 3\n{step}*Cload\n1, 1, 60.\n*End Step\n")
+    for step in ("*Step\n*Static\n", "*Step\n*Visco\n0.1, 1.\n"):
+        body, conv, rep = convert_str(deck.format(tab=tab, step=step))
+        assert rep.text().count("*SPRING, NONLINEAR (ELSET=") == 2 and "initial slope" in " ".join(rep.reduced)
+    for step in ("*Step, nlgeom\n*Static\n0.1, 1.\n", "*Step, perturbation\n*Static\n"):
+        body, conv, rep = convert_str(deck.format(tab=tab, step=step))
+        assert "*SPRING, NONLINEAR (ELSET=" not in rep.text() and not rep.reduced
+    body, conv, rep = convert_str(deck.format(tab="-200, -1\n0, 0\n200, 1\n", step="*Step\n*Static\n"))
+    assert "*SPRING, NONLINEAR (ELSET=" not in rep.text() and not rep.reduced
+
+
 def test_rotational_springs_act_through_helper_nodes():
     # ccx 2.23's springs act on translations only (a SPRING1 on DOF 5 changed nothing): a
     # helper node whose DOF 1 an *EQUATION ties to the rotation, held across it, with a SPRINGA
@@ -7477,6 +7496,42 @@ def test_load_cases_split_into_perturbation_steps():
                                "*Cload\n7, 3, 1.\n*End Load Case\n*End Step\n")
     assert body.count("*STEADY STATE DYNAMICS") == 2 and "*LOAD CASE without *END LOAD CASE" in rep.text()
     assert "7, 3, 1." not in _step(body, 2) and "3, 1, 1." not in _step(body, 3)
+
+
+def test_later_load_case_holding_zero_solves_base_state_again():
+    # a later load case that holds a DOF the base state leaves free at its base value
+    # (*BOUNDARY, FIXED): ccx's FIXED holds the end of the step before, the previous load
+    # case's, so a general step that solves the base state again goes first (probed: 2.2e-2
+    # off, exact with it); its time is ccx's alone (TIME=TOTAL TIME amplitudes shifted), and a
+    # load case's own output requests stay in its step
+    model = MODAL.split("*Step")[0] + "*Amplitude, name=TT, time=total time\n0., 0., 10., 1.\n"
+    g = "*Step\n*Static\n*Cload\n6, 2, 1.\n*End Step\n"
+    sp = ("*Step, perturbation\n*Static\n*Dload\n1, P2, 0.5\n"
+          "*Load Case, name=A\n*Cload\n3, 1, 1.\n*Output, field\n*Element Output\nENER\n*End Load Case\n"
+          "*Load Case, name=B\n*Boundary\n6, 2, 2\n*Cload\n8, 1, 1.\n*End Load Case\n*End Step\n")
+    last = "*Step\n*Static\n*Cload, amplitude=TT\n7, 3, 1.\n*End Step\n"
+    body, conv, rep = convert_str(model + g + sp + last)
+    assert len(re.findall(r"(?m)^\*STEP", body)) == 5
+    again, b = _step(body, 3), _step(body, 4)
+    assert "this step is none of the deck's: it solves the base state again before load case B" in again
+    assert "6, 2, 1." in again and "3, 1, 1." not in again and "*BOUNDARY" not in again.split("**")[0]
+    assert "*BOUNDARY, FIXED\n6, 2, 2\n" in b and "ENER" in _step(body, 2) and "ENER" not in b
+    assert "static perturbation step not the base state plus its perturbation" not in conv.reduced_physics
+    assert "-> ccx steps 2-4" in rep.text() and "ccx step(s) 3 solve the base state again" in rep.text()
+    assert "SHIFTX=3." in body                  # (ccx steps 2-4: 1.0 each, Abaqus none)
+    # (the step added is no general step of the deck's after the perturbation step)
+    body, conv, rep = convert_str(model + g + sp)
+    assert not any("before a general step" in r for r in conv.reduced_physics) and \
+        "this step is none of the deck's" in body
+    # not before the first load case, without a general step before, nor for a nonzero value
+    for text in (model + sp, model + g + sp.replace("6, 2, 2\n", "6, 2, 2, 0.01\n")):
+        body, conv, rep = convert_str(text)
+        assert "this step is none of the deck's" not in body
+    # a card Abaqus does not allow inside a load case: warned, kept as the case's own
+    body, conv, rep = convert_str(model + g + sp.replace("*End Load Case\n*End Step", "*Temperature\n"
+                                                         "EALL, 10.\n*End Load Case\n*End Step"))
+    assert "Step 2: *TEMPERATURE inside *LOAD CASE B: Abaqus allows only" in rep.text()
+    assert "*LOAD CASE A" not in rep.text()
 
 
 def test_mode_based_steady_state_bc_values_are_ignored():
