@@ -23595,6 +23595,23 @@ def test_tie_slave_on_plane_element_faces_becomes_a_node_surface():
     body, conv, rep = convert_str(td)
     assert "SL_NODES, MA" in body and "*TIE on plane / axisymmetric faces: no temperatures tied" in conv.reduced_physics
     assert "which Abaqus ties" not in rep.text()
+    # a tied pair keeps the gap without an ADJUST (as ccx does: exact), moves its nodes with one
+    pair = gap.replace("*Tie, name=T1\n", "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\n")
+    assert not convert_str(pair)[1].reduced_physics
+    assert convert_str(pair.replace("tied\n", "tied, adjust=0.1\n"))[1].reduced_physics
+    # slave nodes on a curved quadratic master edge (its parabola y = 1.1 - 0.1 x^2, 0.075 off its
+    # chord) lie on the master: not flagged; 0.01 above it they are
+    curved = ("*Node\n1, -1., 0.\n2, 1., 0.\n3, 1., 1.\n4, -1., 1.\n5, 0., 0.\n6, 1., .5\n7, 0., 1.1\n8, -1., .5\n"
+              "11, -1., 1.\n12, 0., 1.1\n13, 0., 2.\n14, -1., 2.\n15, -.5, 1.075\n16, 0., 1.55\n17, -.5, 2.\n"
+              "18, -1., 1.5\n21, 1., 1.\n22, 1., 2.\n23, .5, 1.075\n24, 1., 1.5\n25, .5, 2.\n"
+              "*Element, type=CPE8, elset=ALL\n1, 1, 2, 3, 4, 5, 6, 7, 8\n2, 11, 12, 13, 14, 15, 16, 17, 18\n"
+              "3, 12, 21, 22, 13, 23, 24, 25, 16\n*Solid Section, elset=ALL, material=M\n1.\n*Material, name=M\n"
+              "*Elastic\n1000., 0.3\n*Surface, name=SL\n2, S1\n3, S1\n*Surface, name=MA\n1, S3\n*Tie, name=T1\n"
+              "SL, MA\n*Step\n*Static\n*End Step\n")
+    body, conv, _ = convert_str(curved)
+    assert "SL_NODES, MA" in body and not conv.reduced_physics
+    _, conv, rep = convert_str(curved.replace("-.5, 1.075", "-.5, 1.085").replace(".5, 1.075", ".5, 1.085"))
+    assert conv.reduced_physics and "2 slave node(s) (e.g. node 15) lie off the master" in rep.text()
 
 
 def test_tied_pair_of_a_membrane_on_a_rigid_surface_counts_its_thickness():

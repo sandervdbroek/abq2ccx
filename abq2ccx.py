@@ -10311,11 +10311,12 @@ class _Mesh:
           none (probed on 2.23: CPE4T strips in a steady coupled step, the interface 0 / 100
           where the merged strips have 50, 14x off in u_y; DC2D4 heat transfer stopped, 'too
           many cutbacks', as with the faces);
-        * slave nodes off the master within the tolerance, unless a *TIE's ADJUST=NO: Abaqus
-          moves them onto it strain-free (ADJUST; a tied pair without ADJUST keeps the gap),
-          ccx 2.23 moves the node but not the solid it expands it to (probed: CPE4 strips 0.02
-          / 0.04 off at a tolerance of 0.05, 2.0 % / 3.9 % off the nodes moved; CAX4 0.7 %;
-          ADJUST=NO exact)."""
+        * slave nodes off the master within the tolerance where Abaqus' ADJUST moves them onto
+          it strain free (a *TIE but with ADJUST=NO; a tied pair with an ADJUST: without one it
+          keeps the gap, as ccx does, exactly): ccx 2.23 does not move their elements, at most
+          the node (probed: CPE4 strips 0.02 / 0.04 off at a tolerance of 0.05, 2.0 % / 3.9 % off
+          the nodes moved; CAX4 0.7 %; ADJUST=NO exact).  The gap is measured to a quadratic
+          master edge's parabola, not its chord (a node on a curved edge is on the master)."""
         els = self.geom.elements
         eids = [e for e in self._surface_elements(slave) if e in els]
         if not eids or not all(ccx_type(els[e][0]).startswith(PLANE_ELEM_PREFIXES) for e in eids):
@@ -10332,17 +10333,22 @@ class _Mesh:
         gaps = self._surface_gaps(keep, mf, tol) if mf and keep else {}
         # (off by more than 1e-4 of a facet: round-off in the deck's coordinates is not a gap;
         # the answer moves by about the gap's share of the element)
-        off = [n for n in keep if n in gaps and 1e-4 * (reach or 1.0) < gaps[n][0] <= tol]
-        adjust = pair or (b.param("ADJUST") or "YES").strip().upper() != "NO"
+        off = [n for n in keep if n in gaps and 1e-4 * (reach or 1.0) < gaps[n][0] <= tol and
+               self._plane_edge_gap(n, gaps[n][1], mf) > 1e-4 * (reach or 1.0)]
+        adj = (b.param("ADJUST") or "").strip()
+        try:
+            moves = pf(adj) > 0.0 if pair else adj.upper() != "NO"
+        except ValueError:
+            moves = bool(adj)                # (a pair's ADJUST=<node set>)
         why = []
         if self._mpc_thermal:
             why.append("a step solves for temperatures, and ccx ties a 2-D slave node through the middle "
                        "node of its expansion, whose temperature its elements do not use: the tie carries "
                        "none (probed: CPE4T strips in a coupled step 14x off)")
-        if off and adjust:
+        if off and moves:
             why.append(f"{len(off)} slave node(s) (e.g. node {off[0]}) lie off the master within the "
-                       f"tolerance: Abaqus moves them onto it strain free (ADJUST), ccx 2.23 moves the node "
-                       f"but not the solid it expands it to (probed: CPE4 strips 0.02 / 0.04 off, 2.0 % / "
+                       f"tolerance: Abaqus moves them onto it strain free (ADJUST), ccx 2.23 does not move "
+                       f"their elements, at most the node (probed: CPE4 strips 0.02 / 0.04 off, 2.0 % / "
                        f"3.9 %; ADJUST=NO exact)")
         if why:
             self.report.warn(f"{what}: slave surface {slave} on plane / axisymmetric elements -> node "
@@ -10351,7 +10357,7 @@ class _Mesh:
                              "; and ".join(why) + " — verify.", once=True)
             if self._mpc_thermal:
                 self._reduces("*TIE on plane / axisymmetric faces: no temperatures tied")
-            if off and adjust:
+            if off and moves:
                 self._reduces("*TIE on plane / axisymmetric faces: slave nodes off the master moved by "
                               "ccx's ADJUST, not their elements")
             return
@@ -10360,6 +10366,29 @@ class _Mesh:
                          f"of the face nodes of the solids it expands them to, 'not active; no tied "
                          f"constraint': singular; probed: the strips merged there, exactly in plane "
                          f"strain, plane stress 5e-3 off at nu 0.3).", once=True)
+
+    def _plane_edge_gap(self, n: int, i: Optional[int], mf: Sequence[Tuple[int, List[int], int]]) -> float:
+        """The distance of node ``n`` from the master edges ``mf`` (_facet) next to edge ``i``
+        (the nearest by its chord, _surface_gaps; and those sharing a node with it), a quadratic
+        edge's parabola (corners, then its midside node) sampled and refined, not its chord."""
+        if i is None:
+            return math.inf
+        xyz, p = self.geom.nodes, self.geom.nodes[n]
+        near = [f for f in mf if set(f[1]).intersection(mf[i][1])]
+
+        def gap(fn: List[int]) -> float:
+            a, b = xyz[fn[0]], xyz[fn[1]]
+            m = xyz[fn[2]] if len(fn) > 2 else vscale(vadd(a, b), 0.5)
+            pt = lambda t: tuple(t * (t - 1) / 2 * a[k] + t * (t + 1) / 2 * b[k] + (1 - t * t) * m[k]  # noqa: E731
+                                 for k in range(3))
+            lo, hi = -1.0, 1.0
+            for _ in range(6):              # (zoom in round the nearest of 17 samples: 8x a round)
+                ts = [lo + (hi - lo) * j / 16 for j in range(17)]
+                t = min(ts, key=lambda u: math.dist(p, pt(u)))
+                step = (hi - lo) / 16
+                lo, hi = max(-1.0, t - step), min(1.0, t + step)
+            return min(math.dist(p, pt(u)) for u in (lo, (lo + hi) / 2, hi))
+        return min(gap(fn) for _e, fn, _c in near if all(x in xyz for x in fn))
 
     def _shell_tie_slave(self, slave: str, master: str, b: Block, pair: bool,
                          plan: Optional[List[int]] = None) -> \

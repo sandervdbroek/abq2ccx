@@ -180,8 +180,9 @@ entries. The GitHub release notes use the same section.
   its other nodes. Warned as reduced physics: a step solving for temperatures (ccx ties the 2-D
   node through the middle node of its expansion, whose temperature its elements do not use:
   CPE4T strips in a coupled step 14x off), and slave nodes off the master within the tolerance
-  unless `ADJUST=NO` (ccx's `ADJUST` moves the node, not its expansion: 2-4 % off for strips
-  0.02-0.04 apart; `ADJUST=NO` exact). `tie_2d_faces` also runs CPE4 and CAX8R at nu 0.3.
+  where Abaqus' `ADJUST` moves them (a `*TIE` unless `ADJUST=NO`, a tied pair with `ADJUST`): ccx
+  does not move their elements (2-4 % off for strips 0.02-0.04 apart; `ADJUST=NO` exact). The gap
+  is measured to a quadratic master edge's curve, not its chord. `tie_2d_faces` also runs CPE4 and CAX8R at nu 0.3.
 * **Tied contact pairs trimmed** — a `*CONTACT PAIR, TIED` on deformable surfaces, written as a
   `*TIE`, gets the `*TIE`'s trimmed slave surface (`validate_with_ccx.py
   tie_leftovers_pair_trimmed`: the same answer, 16 'no tied MPC' warnings instead of 112).
