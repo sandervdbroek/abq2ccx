@@ -15182,19 +15182,25 @@ class _Mesh:
         points give 0.98.  Probed on 2.23 (a strip, b = t, in 4-point bending): plastic SC8R
         carries 1.15 times its limit load, elastic to the end; creeping S8R and SC8R bend at
         0.705 / 0.52 times the exact rate, linear creep (n = 1) exactly.  Continuum shells
-        stacked two or more through the thickness (one's top face another's bottom) are not
-        flagged: their solids give 4 or more Gauss points through it, the fully plastic moment
-        exactly (code review: C3D8I in pure bending, 1 / 2 / 4 elements: 1.1547 / 1.0000 /
-        1.0000 times it).  Reduced physics, unless the deck asks for as many Gauss points as ccx
-        takes (SECTION INTEGRATION=GAUSS).  After the planners that retype the shells
+        stacked through the thickness (one's top face another's bottom, or a cohesive layer's
+        between them: _sc_stack_middles) are flagged only where the middle of the stack crosses
+        one: 2 Gauss points integrate the fully plastic |z| exactly in an element on one side of
+        the middle, so a stack of k equal elements carries 1 + 0.155 / k^2 times the fully
+        plastic moment for odd k (the middle one's points), exactly for even k (probed: C3D8I in
+        pure bending, 1 / 2 / 3 / 4 / 5 elements: 1.1547 / 1.0000 / 1.0172 / 1.0000 / 1.0062;
+        a plate 4 thicknesses wide in 4-point bending, 1 / 2 / 3: 1.155 / 1.000 / 1.017 of its
+        plane-strain limit; two SC8R bonded by a thin cohesive layer of a soft material: 0.9999),
+        and creeps at 0.97 / 0.94 times the exact rate at stress exponent 3 / 5 for 3 (section
+        theory; within 1.2 % for even k).  Reduced physics, unless the deck asks for as many
+        Gauss points as ccx takes (SECTION INTEGRATION=GAUSS).  After the planners that retype the shells
         (_plan_s4r_shells, _plan_s3_shells): the points of the shells as written."""
         plastic = self._plastic_materials(blocks) if self._steps_can_yield(blocks) else set()
         creeping = self._nonlinear_creep_materials(blocks)
         if not (plastic or creeping):
             return
         sheet: List[Tuple[str, Dict[str, int], str]] = []
-        cont: List[Tuple[str, int, str, str]] = []
-        stacked: Optional[set] = None
+        cont: List[Tuple[str, int, str, str, float]] = []
+        middles: Optional[Dict[int, float]] = None
         for b in blocks:
             mat = b.uparam("MATERIAL")
             elset = (b.param("ELSET") or "").strip()
@@ -15208,11 +15214,12 @@ class _Mesh:
                 npts = 3 if gauss else 5
             rule = f"{npts} {'Gauss' if gauss else 'Simpson'}"
             if self._continuum_shell_elset(elset):
-                if stacked is None:
-                    stacked = self._stacked_continuum_shells(blocks)
-                single = [e for e in self._existing(elset) if e not in stacked]
+                if middles is None:
+                    middles = self._sc_stack_middles(blocks)
+                single = [e for e in self._existing(elset) if e in middles]
                 if single and not (gauss and npts == 2):
-                    cont.append((elset, len(single), rule, "plastic" if mat in plastic else "creeping"))
+                    cont.append((elset, len(single), rule, "plastic" if mat in plastic else "creeping",
+                                 max(middles[e] for e in single)))
                 continue
             if mat in plastic:
                 continue                            # (_plan_plastic_shells)
@@ -15253,37 +15260,100 @@ class _Mesh:
                           "brick's Gauss points, not at the section's points)")
         if cont:
             what = " or ".join(sorted({r[3] for r in cont}, reverse=True))
+            worst = max(r[4] for r in cont if r[3] == "plastic") if "plastic" in what else 0.0
             self.report.warn(f"Continuum shells (SC6R / SC8R) of a {what} material ({len(cont)} "
-                             f"section(s): {sets(cont)}; {sum(r[1] for r in cont)} elements, one "
-                             f"through the thickness): ccx 2.23 "
-                             f"runs each as one C3D8I / C3D6 solid through the thickness, integrated "
+                             f"section(s): {sets(cont)}; {sum(r[1] for r in cont)} elements that the "
+                             f"middle of the thickness crosses: alone through it, or in a stack of "
+                             f"an odd number of equal ones or of unequal ones): ccx 2.23 "
+                             f"runs each as one C3D8I / C3D6 solid through its thickness, integrated "
                              f"at 2 Gauss points there, Abaqus at the section's "
                              f"{' / '.join(sorted({r[2] for r in cont}))} points, so in bending they "
                              f"part: "
-                             + ("plastic, 2 Gauss points stay elastic up to 1.73 times the first-"
-                                "yield moment and carry 1.155 times the fully plastic one (probed: a "
-                                "strip in 4-point bending reaches 1.15 times its limit load)"
-                                if "plastic" in what else "")
+                             + (f"plastic, the section carries {worst:.4g} times the fully plastic "
+                                f"moment here (one element through the thickness 1.155, elastic up to "
+                                f"1.73 times the first-yield moment; the middle one of 3 / 5 equal "
+                                f"ones 1.017 / 1.006; probed: a strip in 4-point bending reaches 1.15 "
+                                f"times its limit load)" if "plastic" in what else "")
                              + ("; creeping, " if what == "plastic or creeping" else "")
-                             + (creep_why if "creeping" in what else "") + "; stretched, they agree.")
+                             + (creep_why + " (the middle one of 3 equal ones: 0.97 / 0.94)"
+                                if "creeping" in what else "")
+                             + "; stretched, they agree. A stack with an even number of equal "
+                               "elements through the thickness avoids it.")
             self._reduces(f"{what} continuum shells SC6R / SC8R (ccx 2.23 integrates them through the "
                           f"thickness at 2 Gauss points, not at the section's points)")
 
-    def _stacked_continuum_shells(self, blocks: List[Block]) -> set:
-        """The continuum shells (SC6R / SC8R) whose bottom or top face (_sc_stack_faces, by
-        their section's stacking) is another continuum shell's: two or more through the
-        thickness."""
+    def _sc_stack_middles(self, blocks: List[Block]) -> Dict[int, float]:
+        """The continuum shells (SC6R / SC8R of a *SHELL SECTION) the middle of their stack's
+        thickness crosses -> the fully plastic moment of that stack with the element's 2 Gauss
+        points through its thickness, over the exact one (_flag_inelastic_shells).  A stack is
+        a column of such elements through the thickness, each one's top face (_sc_stack_faces,
+        by its section's stacking) the next one's bottom face, or joined through a cohesive
+        element's (COH3D*, a *COHESIVE SECTION's stacking: two SC8R bonded by a glue layer are
+        one stack), each element as thick as its faces lie apart.  An element alone through
+        the thickness: 2 / sqrt(3); the middle one of k equal ones: 1 + 0.155 / k^2; where the
+        middle lies at a face between two elements, none.  A branching column (a face of three
+        elements) leaves its elements out."""
+        P = self.geom.nodes
         sec: Dict[int, Block] = {}
         for b in blocks:
-            if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION"):
+            if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION", "COHESIVE SECTION"):
                 for e in self.geom.elset((b.param("ELSET") or "").strip()):
                     sec[e] = b
-        faces: Dict[frozenset, List[int]] = {}
+        cells: Dict[int, Tuple[frozenset, frozenset, float]] = {}
         for e, (typ, conn) in self.geom.elements.items():
-            if typ.upper() in PLY_SOLID and e in sec:
-                for f in self._sc_stack_faces(sec[e], list(conn)):
-                    faces.setdefault(frozenset(f), []).append(e)
-        return {e for es in faces.values() if len(es) > 1 for e in es}
+            t = typ.upper()
+            b = sec.get(e)
+            if b is None or len(conn) not in (6, 8) or any(n not in P for n in conn) or not (
+                    (t in PLY_SOLID and b.keyword != "COHESIVE SECTION") or
+                    (t.startswith("COH3D") and b.keyword == "COHESIVE SECTION")):
+                continue
+            bot, top = self._sc_stack_faces(b, list(conn))
+            n, _c = self._stack_geometry(bot, top)
+            h = sum(vdot(vsub(P[y], P[x]), n) for x, y in zip(bot, top)) / len(bot)
+            cells[e] = (frozenset(bot), frozenset(top), max(h, 0.0))
+        faces: Dict[frozenset, List[int]] = {}
+        for e, (bot, top, _h) in cells.items():
+            faces.setdefault(bot, []).append(e)
+            faces.setdefault(top, []).append(e)
+        out: Dict[int, float] = {}
+        seen: set = set()
+        for start in cells:
+            if start in seen:
+                continue
+            column, todo, ok = [], [start], True        # the column: its elements, linked by faces
+            while todo:
+                e = todo.pop()
+                if e in seen:
+                    continue
+                seen.add(e)
+                column.append(e)
+                for f in cells[e][:2]:
+                    if len(faces[f]) > 2:
+                        ok = False
+                    todo += [x for x in faces[f] if x not in seen]
+            ends = [e for e in column if sum(len(faces[f]) == 1 for f in cells[e][:2]) >= 1]
+            if not ok or len(ends) not in (1, 2) or (len(column) > 1 and len(ends) != 2):
+                continue                                # (branching or closed: left out)
+            order, prev, e = [], None, ends[0]
+            while e is not None:
+                order.append(e)
+                nxt = [x for f in cells[e][:2] for x in faces[f] if x != e and x != prev]
+                prev, e = e, (nxt[0] if nxt else None)
+            total = sum(cells[x][2] for x in order)
+            if not total > 0.0:
+                continue
+            mid, z, tol = 0.5 * total, 0.0, 1e-6 * total
+            for x in order:
+                z0, z = z, z + cells[x][2]
+                if z0 + tol < mid < z - tol:
+                    if self.geom.elements[x][0].upper() in PLY_SOLID:
+                        h = z - z0
+                        zc, g = 0.5 * (z0 + z) - mid, h / (2.0 * math.sqrt(3.0))
+                        gauss = 0.5 * h * (abs(zc - g) + abs(zc + g))
+                        exact = 0.5 * ((mid - z0) ** 2 + (z - mid) ** 2)
+                        out[x] = 1.0 + (gauss - exact) / (total * total / 4.0)
+                    break
+        return out
 
     def _plan_quadratic_shells(self, blocks: List[Block]) -> None:
         """Composite shells ccx cannot run -> the quadratic shells it can.  ccx 2.23 reads

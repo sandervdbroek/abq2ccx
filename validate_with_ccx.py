@@ -9377,6 +9377,42 @@ def t155_temperatures(dat_path):
     return blocks
 
 
+def sc_stack_bend_deck(layers, nx=4):
+    """Pure bending of a continuum-shell block 0.4 long, 0.1 wide, 0.1 thick, ``layers`` (type,
+    thickness) bottom to top (SC8R of an elastic-plastic material, E 1000, nu 0, sigma_y 1,
+    hardening 0.01, at most 5e-4 at the curvature reached, so ccx's iterations keep a tangent; COH3D8 of a soft elastic glue, E 1, *COHESIVE SECTION, RESPONSE=CONTINUUM):
+    the end x = 0 held in x, the end x = 0.4 moved u_x = theta z (plane sections), theta 50
+    times first yield, so the section is all but fully plastic (M_p = 2.5e-4)."""
+    zs = [-0.05]
+    for _t, h in layers:
+        zs.append(zs[-1] + h)
+    nid = lambda i, j, lv: 1 + i + (nx + 1) * (j + 2 * lv)  # noqa: E731
+    nodes = {nid(i, j, lv): (0.4 * i / nx, 0.1 * j, z) for lv, z in enumerate(zs) for j in range(2)
+             for i in range(nx + 1)}
+    out = ["*NODE, NSET=ALLN"] + [f"{n}, {p[0]!r}, {p[1]!r}, {p[2]!r}" for n, p in sorted(nodes.items())]
+    e = 0
+    for li, (t, h) in enumerate(layers):
+        out.append(f"*ELEMENT, TYPE={t}, ELSET=L{li}")
+        for a in range(nx):
+            e += 1
+            out.append(f"{e}, " + ", ".join(str(nid(*c)) for c in (
+                (a, 0, li), (a + 1, 0, li), (a + 1, 1, li), (a, 1, li),
+                (a, 0, li + 1), (a + 1, 0, li + 1), (a + 1, 1, li + 1), (a, 1, li + 1))))
+        out += ([f"*SHELL SECTION, ELSET=L{li}, MATERIAL=M", f"{h!r}"] if t == "SC8R" else
+                [f"*COHESIVE SECTION, ELSET=L{li}, MATERIAL=GLUE, RESPONSE=CONTINUUM"])
+    out += ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.", "*PLASTIC", "1., 0.", "1.01, 1.", "*MATERIAL, NAME=GLUE",
+            "*ELASTIC", "1., 0."]
+    left = [n for n, p in nodes.items() if p[0] == 0.0]
+    right = [n for n, p in nodes.items() if p[0] == 0.4]
+    out += ["*NSET, NSET=RIGHT"] + [", ".join(map(str, right))]
+    out += ["*NSET, NSET=MID", str(nid(nx // 2, 0, len(layers)))]
+    out += ["*BOUNDARY"] + [f"{n}, 1, 1" for n in left] + [f"{nid(0, 0, 0)}, 2, 3", f"{nid(0, 1, 0)}, 3, 3"]
+    out += ["*STEP, INC=1000", "*STATIC", "0.01, 1., 1e-8, 0.02", "*BOUNDARY"]
+    out += [f"{n}, 1, 1, {50 * 0.02 * 0.4 * nodes[n][2]!r}" for n in right]
+    out += ["*NODE PRINT, NSET=MID", "U", "*NODE PRINT, NSET=RIGHT", "RF", "*END STEP"]
+    return "\n".join(out) + "\n", {n: nodes[n][2] for n in right}
+
+
 def t155_s8r_deck(width, plastic):
     """An S8R cantilever strip 2 long (two elements along it), ``width`` elements across its
     width 1, thickness 0.1, E 1000, clamped at x = 0 and loaded by 1e-3 out of plane at its
@@ -20346,6 +20382,37 @@ def check_t155(ccx, env, tmp, shared):
               f"{'warned' if flags[0] else 'NOT warned'}; two wide {d2:.1e} apart, "
               f"{'warned' if flags[1] else 'not warned'}")
     failures += 0 if ok else 1
+    return failures
+
+
+@check("sc_stacks", "continuum shells stacked through the thickness: odd stacks flagged, bonded stacks not")
+def check_sc_stacks(ccx, env, tmp, shared):
+    # --- task 173: SC8R (ccx: C3D8I, 2 Gauss points through each) in pure bending, nearly fully
+    # plastic: k equal elements through the thickness carry 1 + 0.155 / k^2 times M_p for odd k
+    # (the element the middle crosses, flagged), M_p for even k; two SC8R bonded by a thin
+    # cohesive layer are a stack (1 - (g / t)^2 = 0.9996 of M_p), not flagged ---
+    review_run = shared["review_run"]
+    flag = "plastic continuum shells SC6R / SC8R"
+    failures = 0
+    sc = ("SC8R", 0.1)
+    for name, layers, want, flagged in (
+            ("k1", [sc], 2 / math.sqrt(3), True), ("k2", [("SC8R", 0.05)] * 2, 1.0, False),
+            ("k3", [("SC8R", 0.1 / 3)] * 3, 1 + (1 / math.sqrt(3) - 0.5) * 4 / 9 / 2, True),
+            ("bonded", [("SC8R", 0.049), ("COH3D8", 0.002), ("SC8R", 0.049)], 1 - 0.02 ** 2, False)):
+        text, z = sc_stack_bend_deck(layers)
+        tag = f"sc_stacks_{name}"
+        res = review_run(text, tag, lambda dat: (dat_node_blocks(dat), dat_node_blocks(dat, "forces")))
+        rep, conv = convert(os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}_flag.inp"))
+        got_flag = any(r.startswith(flag) for r in conv.reduced_physics)
+        ok = bool(res and res[0] and res[1])
+        if ok:
+            m = sum(v[0] * z[n] for n, v in res[1][-1].items()) / 2.5e-4
+            w = res[0][-1][min(res[0][-1])][2]
+            ok = abs(m - want) < 2e-3 and got_flag == flagged and abs(w) > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({'two SC8R bonded by a COH3D8 layer' if name == 'bonded' else f'{name[1]} SC8R'} "
+                  f"through the thickness in pure bending): M / M_p {m:.4f} vs {want:.4f}, "
+                  f"{'flagged' if got_flag else 'not flagged'}; the free mid-span top node moved w {w:.4g}")
+        failures += 0 if ok else 1
     return failures
 
 
