@@ -77,6 +77,12 @@ entries. The GitHub release notes use the same section.
   nearly the load case's whole response). A load case's own output requests no longer carry
   into the later load cases, and a card Abaqus does not allow inside a load case is warned.
 
+* **Fewer ccx failures.** A model with a heat transfer step whose other steps are only
+  frequency, buckling or modal steps no longer stops ccx where shells or beams carry a moment
+  or a rotation constraint: ccx set such a run up as heat transfer alone, with no rotations at
+  the shell and beam joints. A heat transfer step is no longer taken for one that turns those
+  joints, so such models are no longer flagged for it.
+
 ### Details
 
 * **Terminal report wrapping** — lines are wrapped one column short of the terminal's width: a
@@ -308,6 +314,24 @@ entries. The GitHub release notes use the same section.
   warned (Abaqus rejects it) and kept as that case's own. `validate_with_ccx.py review1
   load_cases_hold`: the second load case holds node 6's y at 0.02175, both ccx case steps equal
   the hand-written single-case steps (0.0 apart; the old form 2.2e-2 off).
+
+* **Heat transfer runs with eigenvalue steps** — ccx 2.23 decides from the procedure cards
+  alone, before any step, whether a run is mechanical: a `*HEAT TRANSFER` card with no
+  `*STATIC`, `*VISCO` or `*DYNAMIC` card after it (`*FREQUENCY`, `*BUCKLE` and the modal
+  procedures do not count) sets it up as heat transfer alone. Its shell and beam knots then get
+  no rotational DOFs, and ccx stopped on a rotational BC, moment or equation on one ('*ERROR in
+  gen3dboun / gen3dforc / gen3dmpc: ... do not have rotational DOFs'): the converter's knot
+  beams, their drilling holds, a `*RIGID BODY` of knotted shell nodes. A `*STATIC` card now
+  goes right before the first `*FREQUENCY` or `*BUCKLE` card after the first `*HEAT TRANSFER`
+  card; ccx runs the step's last procedure card, so the step is unchanged (the same eigenvalues
+  and buckling factors to every digit), and the run is mechanical too. Where the eigenvalue
+  steps all come before the heat step, a warning. The warning on drilling holds off the global
+  axes in eigenvalue steps after a nonlinear step no longer counts a `*HEAT TRANSFER` step,
+  which turns no knot (the eigenvalues after one are those without knots); the warning on
+  equations on knots still does (a rigid body of knotted tip nodes: 61 kHz for 462 Hz after a
+  heat step). `validate_with_ccx.py shell_knot_limits knot_heat`: a strip off the axes with
+  heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
+  without knots (before: ccx stopped).
 
 ## 1.7.0 (November 2026)
 
