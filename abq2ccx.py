@@ -31443,11 +31443,12 @@ class _Constraints:
                              "nodes) — with a SPRINGA and a DASHPOTA from it to a held node a model "
                              "span away along that DOF: exact for small motions, and under NLGEOM for "
                              "translations whose directions cannot turn (validate_with_ccx.py "
-                             "connector_bushing).  Where ccx takes their current length (NLGEOM, "
-                             "*DYNAMIC, iterated steps) the helper moves s = span / 100 times the "
+                             "connector_bushing)." + ("  ccx takes their current length here (NLGEOM, "
+                             "*DYNAMIC, iterated steps), so the helper moves s = span / 100 times the "
                              "component, with k / s^2 and c / s^2: else a rotation or relative motion "
                              "past the span flipped the force (validate_with_ccx.py "
-                             "connector_large_motion).", once=True)
+                             "connector_large_motion)." if any(s.get("scale", 1.0) != 1.0 and (s["k"] or s["c"])
+                                                               for s in live) else ""), once=True)
         if any(it.get("axial") for it in items if it["route"] == "rows"):
             self.report.note("AXIAL connector elasticity / damping -> a SPRINGA / DASHPOTA between its "
                              "nodes: the same force along their line, at any motion.", once=True)
