@@ -15,6 +15,39 @@ entries. The GitHub release notes use the same section.
 * **More correct answers.** A kinematic coupling of rotations only (`*KINEMATIC` lines such as
   `4, 6`) on shell or beam nodes now couples them. The line was dropped, so those rotations
   stayed free and a moment or rotation on the reference node reached nothing.
+* **More correct answers.** Rotational springs (`SPRING1` / `SPRING2` on DOFs 4-6), which ccx
+  ignored without a message, now act. A spring on a constrained node (an `*EQUATION`, rigid body
+  or coupling) now feels a prescribed displacement on the constraint's other nodes, which ccx's
+  linear solve dropped.
+* **Fewer ccx failures.** A point mass on a node that only `*EQUATION`s or a `*KINEMATIC
+  COUPLING` tie no longer stops ccx.
+* **More correct answers.** A shell with a section offset whose nodes are also nodes of a solid
+  (a skin merged with a block's face) is now joined to the solid at its reference surface, as in
+  Abaqus: ccx joined the shell's midsurface, 11 % off in bending for a skin of a fifth of the
+  block's depth, without a message. A `*TIE` with `TIED NSET` now ties exactly the slave nodes
+  of that set, as Abaqus does; the parameter was dropped, so every slave node was tied (or,
+  beyond ccx's default tolerance, none).
+* **Leaner tie output.** Tied contact pairs get the slave-surface trimming that `*TIE` got in
+  1.7.0: the same answers without a ccx warning for every slave node away from the master.
+* **More correct answers.** Shells joined at a knot (where the converter attaches a small helper
+  beam, for example to carry a load in a modal step) are now held against their free twisting
+  about the shell's normal in more cases: off the global axes in models with a modal transient
+  step, on nodes with a local coordinate system, and where a boundary condition holds them in
+  some steps only. Without that hold ccx found spurious buckling factors (0.93 for 3.18), gave
+  a plate 0.36 of its deflection, or stopped. Models with a modal transient step whose
+  constraints act on such knots are now warned that ccx may crash at random there.
+* **Honest flags for weaker physics.** The converter now says so where ccx runs a model with
+  weaker physics than the deck's: creeping shells, plastic or creeping continuum shells (ccx
+  bends them at 2 points through the thickness), stabilized `*VISCO` and coupled
+  temperature-displacement steps (ccx has no stabilization), a strain-free `*MODEL CHANGE, ADD`
+  in a step ccx reads as linear (where ccx stops), and `--approximate`'s general contact where
+  bodies' faces end flush.
+* **Shell strips under `--approximate`.** An `S8R` strip one element wide drifts in ccx's
+  nonlinear solver (up to many times its deflection); `--approximate` now writes it as `S8`,
+  which keeps the right answer.
+* **More correct answers.** `*BOUNDARY, FIXED` on a translation of a node with a `*TRANSFORM`,
+  where earlier loads moved it, now holds the node where the step finds it. ccx held it at the
+  wrong value (the global component read as the local one), with a warning.
 
 ### Details
 
@@ -34,6 +67,136 @@ entries. The GitHub release notes use the same section.
   physics: Abaqus turns the coupled axes with the reference node. `validate_with_ccx.py
   kinematic_rotation_only`: a strip turned rigidly by a rotation vector, twins and closed forms,
   linear and NLGEOM.
+
+* **Rotational springs** — `SPRING1` / `SPRING2` on DOFs 4-6 become a helper node whose DOF 1 an
+  `*EQUATION` ties to the rotation (a rigid body's ROT NODE, a kinematic coupling's or U1 node's
+  DOFs 4-6, or a knot; a shell/beam node gets a knot beam), with a `SPRINGA` from it to a held
+  node, scaled so that the helper reaches that node only past 100 radians: exact for small
+  rotations (a beam node's knot holds its section rigid there, so a coarse beam is a little
+  stiffer: 3 % with one element, 0.03 % with four); under NLGEOM `[APPROX]` (`--approximate`),
+  else left out and warned. On a node with no rotations in ccx the spring is left out (it carries
+  no load).
+* **Springs on constrained or transformed nodes** — a `SPRING1` / `SPRING2` on a node that a
+  constraint names, or on a local DOF of a `*TRANSFORM` node, is a `SPRINGA` to a node that
+  `*EQUATION`s keep on the DOF's line, also under NLGEOM. A rigid-body member in a deck with
+  NLGEOM keeps its spring (warned where a small-strain step would mishandle it). In a deck with an
+  NLGEOM, explicit or `*DYNAMIC` step that held node, and `DASHPOT1` / `DASHPOT2`'s, is 100 model
+  spans away (at one span, compressing one by more than a span flipped its force).
+* **Point masses** — a node on `MASS` elements alone that `*EQUATION`s tie gets a zero-stiffness
+  `SPRINGA` to a held node where it needs one; one tied in some translations only, with the
+  others free in a static step, is warned. A `*KINEMATIC COUPLING`'s mass-only members get the
+  massless tetrahedron that `*COUPLING` members already got.
+* Validate check `spring_dofs_masses` (rotational springs against rigid levers and θ = M / k, and
+  at ±0.11 rad on a 0.05 m model; constrained springs against `SPRINGA` twins and pushed five
+  spans; point masses against zero-spring twins).
+
+* **Offset shells on solid nodes** — ccx 2.23 ties a shell node that it shares with a solid to
+  the mean of the node's expanded top and bottom, the midsurface, whatever the section's
+  `OFFSET`; Abaqus joins the solid to the node, a point of the reference surface. Each such
+  node of a shell with a nonzero `OFFSET` now gets a force-free knot beam, which makes it a
+  knot: the solid is joined at the node and the shell's section turns rigidly about it, its
+  rotation about the normal held. Probed: the skin as a layer of the shell's own expansion
+  elements exactly (S4, S4R; also NLGEOM, frequencies, dynamics), S8R within 7e-4
+  (`validate_with_ccx.py tie_leftovers_offset_top` / `_bot`; before 11 % off). They turn linearly
+  where ccx iterates a step without NLGEOM (plastic, coupled), but finitely in a `*DYNAMIC` step
+  (7e-3 at 0.17 rad), warned there as for other knots. In a deck with an explicit step or U1
+  beams, which stop ccx with knot beams, it is warned as reduced physics.
+* **`*TIE, TIED NSET`** — the line's slave becomes a node surface of the slave nodes in the set
+  (none of the master's), with a `POSITION TOLERANCE` that reaches each of them: Abaqus ties
+  those nodes whatever their distance from the master, and ccx's `ADJUST` moves them onto it as
+  Abaqus' does; an instance-qualified set (`U1.TN`) resolves. A set with no slave node ties
+  nothing (a comment); an undefined one is warned. Set nodes beyond the master's edge, which
+  Abaqus ties to its nearest point, ccx ties to nothing ('no opposite master face'): warned as
+  reduced physics.
+  `validate_with_ccx.py tie_leftovers_nset` / `_nset_skin` / `_nset_plane`: the set's nodes
+  merged (tied by equations with `ADJUST=NO`), exactly. On plane, axisymmetric, membrane or beam
+  elements ccx's `ADJUST` moves a node but not the solid it expands the element to (9-11 % off),
+  so a set node off the master there is warned as reduced physics unless `ADJUST=NO`.
+* **Tied contact pairs trimmed** — a `*CONTACT PAIR, TIED` on deformable surfaces, written as a
+  `*TIE`, gets the `*TIE`'s trimmed slave surface (`validate_with_ccx.py
+  tie_leftovers_pair_trimmed`: the same answer, 16 'no tied MPC' warnings instead of 112).
+
+* **Knot drilling holds** — the drilling rotation of a knot beam's knot on a smooth shell node is
+  now held by a `*BOUNDARY` on the global rotation with the largest component along the normal,
+  wherever the normal lies: off the axes that fixes only how much of the rotation vector lies
+  along the normal, which moves nothing while the rotations are small or nothing acts on the
+  knot's rotation (probed: the same answers as `n . theta = 0` in static, `*BUCKLE`,
+  `*FREQUENCY` and `*MODAL DYNAMIC` steps, and under `NLGEOM` with forces only; ccx writes no
+  rotations). Eigenvalue and modal steps after a step ccx solves nonlinearly are not right with
+  it off the axes (frequencies squared 0.3-1.0 % low on a strip bent 0.45 rad), nor with the
+  equation, which ccx gets wrong there too: warned, as the equation was. It replaces the equation, which ccx 2.23's `*MODAL DYNAMIC` step crashed on at
+  random (26 of 100 runs; the BC: none of 100), which would act in every step where BCs hold
+  the knot in some (ccx stops on a BC on its dependent DOF), and which ccx misreads on a node
+  with a `*TRANSFORM` (ccx reads a rotational BC on a knot about the global axes there). So
+  knots off the axes in decks with a `*MODAL DYNAMIC` step, knots on `*TRANSFORM` nodes and
+  knots with rotational BCs in some steps only (the BC on a rotation each such step holds) are
+  held now. The equation stays under a moment about the normal, which the BC would turn partly
+  into the shell's plane, and where ccx turns the knot finitely (`NLGEOM`, its nonlinear
+  solver) under a moment, a rotational BC or a rotation tie, where the BC's share along the
+  normal changes the answer (a strip off the axes bent 0.5 rad by an in-plane moment: 10 % off,
+  then ccx stopped); it is warned where it cannot be written (`validate_with_ccx.py
+  knot_buckle`, `knot_transform`, `knot_moment`, `released_knot_oblique`; before: `*BUCKLE`
+  factors 0.93 for 3.18, 0.36 of the plate's deflection, ccx stopped). The spurious `*BUCKLE`
+  factors at loaded knots noted earlier (0.596 before 4.988) were this free rotation.
+* **MPCs on knots in `*MODAL DYNAMIC` decks warned** — ccx 2.23 crashes at random in a `*MODAL
+  DYNAMIC` step (heap corruption; exit -6 / -10 / -11 in 3-25 % of runs) when an MPC eliminates
+  a DOF of a knot: a kinematic coupling or rigid body on shell nodes, its rotation ties, an
+  `*EQUATION` on a knot. A coupling of shell nodes needs the knots and ccx makes the reference
+  node's rotations dependent itself, so no form avoids it; one of about 300 runs that finished
+  printed other results. Such decks are now warned (rerun a crash, compare two runs).
+
+* **Creeping and continuum shells** — ccx 2.23 integrates an expanded shell's section through
+  the thickness at its brick's Gauss points and runs a continuum shell (`SC6R`/`SC8R`) as one
+  `C3D8I`/`C3D6` solid, 2 Gauss points through the thickness; Abaqus takes the section's
+  points (5 Simpson by default). In Norton creep bending 2 points give 0.71 / 0.52 times the
+  exact steady curvature rate at stress exponent 3 / 5 (5 Simpson points 0.98), and a plastic
+  continuum shell carries 1.15 times its limit load (probed on a strip in 4-point bending). A
+  creeping `*SHELL SECTION` (a nonlinear creep law in a deck that creeps; judged on the shells
+  as written, after `--approximate`'s `S4R` / `S3` rewrites), a plastic or creeping continuum
+  shell one element through the thickness (stacked ones integrate at 4 or more points), and a
+  composite section whose plastic or creeping layer the middle crosses (continuum shells too)
+  are now reduced physics, as plastic sheet shells already were; linear creep and a `SECTION
+  INTEGRATION=GAUSS` rule with ccx's points are not.
+* **Stabilization on `*VISCO` and coupled steps** — `STABILIZE`, `FACTOR`, `ALLSDTOL` and
+  `CONTINUE` on `*VISCO` and `*COUPLED TEMPERATURE-DISPLACEMENT` went to ccx, which ignores
+  them; they are now dropped with a warning, and a stabilized step ccx iterates is reduced
+  physics, as on `*STATIC`. (`*SOILS` and `*STEADY STATE TRANSPORT` have no ccx counterpart.)
+* **Strain-free `*MODEL CHANGE, ADD`** — ccx 2.23 adds elements strain free (`ADD`, as in
+  Abaqus, or `ADD=STRAIN FREE`) only in a step it runs nonlinearly and stops otherwise ('a
+  strain-free addition of elements ... is only possible for nonlinear calculations'), judged by
+  ccx's own flag as it reads the deck (set by NLGEOM, a nonlinear material, a contact pair or an
+  `*MPC`, turned off by a `*FREQUENCY` or `*BUCKLE` step); such a card is now warned, naming
+  `ADD=WITH STRAIN`, which runs.
+* **Flush faces in general contact** — under `--approximate`, slave nodes of the generated pairs
+  that lie on an edge where their master's faces end, straight off those faces (a lid on a
+  block of the same footprint, stacked blocks, or a conformal mesh line right under a block's
+  edge), are now warned of: ccx's node-to-surface
+  contact can miss them (two blocks: 81 % of a hand-written pair's force, 12 % with the coarser
+  mesh the slave, which a hand-written pair misses too; three stacked blocks 87 % of the exact
+  force).
+* **`S8R` strips as `S8`** — an `S8R` with two opposite edges no other shell shares (a strip one
+  element wide, a lone element) in a model with a step ccx iterates drifts along its
+  `C3D20R`'s zero-energy mode (warned since 1.6.0). `--approximate` now writes such elements as
+  `S8` (`C3D20`), which stays on its linear answer (to 2e-6 under NLGEOM on strips, a plate's
+  appendix, an L of strips; as written up to 86 times off) and bends 2–7 % less than `S8R`
+  on a strip of 4 elements (elements 5–50 thicknesses wide), 11–17 % on one; composite and
+  plastic or nonlinearly creeping sections stay `S8R`, and strips of a `*RIGID BODY` are left
+  alone (`validate_with_ccx.py s8r_strip_s8`).
+
+* **`*BOUNDARY, FIXED` on `*TRANSFORM` translations moved by loads** — where the held value is
+  unknown, the node now gets a helper node without a `*TRANSFORM`, tied to its local DOFs by
+  `*EQUATION`s, and FIXED goes on the helper. Every `*BOUNDARY` on the node's translations is
+  written on the helper: with a BC of the node's own on another local DOF, a later
+  `*BOUNDARY, OP=NEW` step leaves ccx's equations unmet. Exact against the model turned into the
+  node's axes (`validate_with_ccx.py fixed_helper`: a cube with `*FREQUENCY` and restore steps,
+  an S4 plate). Not where the node has rotational BCs or other constraints, elements other than
+  solids, CPS3/CPS4/CPS4R, CPE3/CPE4/CPE4R, S3/S4/S4R or B31/B31R (shells and beams: not knots,
+  no `*DYNAMIC` step), an initial velocity, a converter midside node next to it or a
+  `*TRANSFORM` inside a step, or in decks with explicit or modal dynamics: those keep the
+  warning. In an implicit `*DYNAMIC` step the held value is right, but ccx answers a BC that
+  stops a moving DOF along an oblique axis otherwise than one along a global axis, as with its
+  own BCs on transformed nodes (one C3D8: the model 3-21 % of its peak displacement off, the
+  node's free local DOFs up to 38 %): warned as reduced physics.
 
 ## 1.7.0 (November 2026)
 
