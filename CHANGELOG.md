@@ -12,6 +12,9 @@ entries. The GitHub release notes use the same section.
 
 ### Overview
 
+* **Terminal report on Windows.** The report's lines no longer reach the terminal's last column,
+  where Windows Terminal lost the line break after them, so the next line ran on from them; the
+  report is wrapped to the width of the terminal it is shown in.
 * **More correct answers.** A kinematic coupling of rotations only (`*KINEMATIC` lines such as
   `4, 6`) on shell or beam nodes now couples them. The line was dropped, so those rotations
   stayed free and a moment or rotation on the reference node reached nothing.
@@ -50,6 +53,19 @@ entries. The GitHub release notes use the same section.
   wrong value (the global component read as the local one), with a warning.
 
 ### Details
+
+* **Terminal report wrapping** — lines are wrapped one column short of the terminal's width: a
+  line that fills the last column wraps there by itself, and Windows Terminal (120 columns by
+  default) then lost the line break after it, so the next line ran on ('... NUMBER INTERVAL /
+  TIME    INTERVAL / TIME POINTS ...'). The width is `COLUMNS` where set, else that of the terminal stderr
+  writes to (the report's; it was stdout's), else 100 columns; the header lines are wrapped too,
+  a long path moving to an indented next line. The instance map, which keeps each 'old -> new'
+  pair on one line, counted the pair's ' -> ' as one character while wrapping, so its lines ran
+  3 characters per pair past the width (80 at 80 columns): it counts all four now, in the deck's
+  header too, where a line can break one pair earlier. Widths are counted in terminal cells, not
+  characters: a path with CJK characters (two cells each) no longer runs a line past the edge;
+  a no-break or ideographic space in a path is shown as it is. A warning's or note's place in
+  the deck (a path with blanks can be long) is wrapped like its text. `__version__` is 1.7.1.dev0.
 
 * **Kinematic couplings of rotations only** — a `*COUPLING` + `*KINEMATIC` or a `*KINEMATIC
   COUPLING` whose lines hold only rotations (DOFs 4-6) of shell/beam nodes becomes `*EQUATION`

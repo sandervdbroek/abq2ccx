@@ -20263,8 +20263,10 @@ def test_instance_map_of_two_blocks():
         "  I1 (part BLOCK): nodes 1-8 (+0), elements 1-1 (+0); BOT -> I1_BOT, TOPF -> I1_TOPF, ALL -> I1_ALL",
         "  I2 (part BLOCK): nodes 9-16 (+8), elements 2-2 (+1); BOT -> I2_BOT, TOPF -> I2_TOPF, ALL -> I2_ALL"]
     head = rep.header_comment_lines()
-    assert "**   I2 (part BLOCK): nodes 9-16 (+8), elements 2-2 (+1); BOT -> I2_BOT," in head
-    assert "**     TOPF -> I2_TOPF, ALL -> I2_ALL" in head       # wrapped between pairs
+    assert "**   I1 (part BLOCK): nodes 1-8 (+0), elements 1-1 (+0); BOT -> I1_BOT," in head
+    assert "**     TOPF -> I1_TOPF, ALL -> I1_ALL" in head       # wrapped between pairs
+    assert "**   I2 (part BLOCK): nodes 9-16 (+8), elements 2-2 (+1);" in head   # (69 > 66: moves)
+    assert "**     BOT -> I2_BOT, TOPF -> I2_TOPF, ALL -> I2_ALL" in head
 
 
 def test_instance_map_of_rotated_instances():
@@ -20462,11 +20464,14 @@ def test_terminal_report_is_grouped_numbered_wrapped_and_versioned():
     assert text.startswith("Reduced physics (ccx solves another model than the deck):\n"
                            "  - element STRI65 -> S6\n\nWarnings (1, and the reduced-physics summary above)\n"
                            "  1. deck.inp:12\n     A warning about something that matters, long enough to\n"), text
-    assert all(len(line) <= 60 for line in text.splitlines()), text
+    # one column short of the width: a line that fills the terminal's last column wraps there
+    # by itself, and Windows Terminal then lost the line break after it (the next line ran on)
+    assert all(len(line) < 60 for line in text.splitlines()), text
     assert "  - deck.inp:40\n    Output variables AR1, AR2, TA1 dropped from *NODE PRINT\n    (not a ccx label there).\n" in text, text
     assert "    Output variable U3 -> U (CalculiX naming).\n" in text and "  - A note without a place.\n" in text
     assert "Notes (3)" in text and A.Report().console(80) == "No conversion issues were flagged.\n"
-    d = tempfile.mkdtemp()
+    d, saved = tempfile.mkdtemp(), os.environ.get("COLUMNS")
+    os.environ["COLUMNS"] = "80"                # (the same width on every platform and runner)
     try:
         deck = os.path.join(d, "a.inp")
         with open(deck, "w", encoding="utf-8", newline="\n") as fh:
@@ -20476,11 +20481,115 @@ def test_terminal_report_is_grouped_numbered_wrapped_and_versioned():
             log = fh.read()
     finally:
         shutil.rmtree(d, ignore_errors=True)
-    head = err.splitlines()
+        if saved is None:
+            os.environ.pop("COLUMNS", None)
+        else:
+            os.environ["COLUMNS"] = saved
+    # every line one column short of the width, the header's too, but for a word longer than
+    # that (a path stays whole): a long temporary path (macOS, Windows) wraps onto a next line
+    # indented by 4, joined back here
+    assert all(len(line) < 80 or " " not in line.strip() for line in err.splitlines()), err
+    head: list = []
+    for line in err.split("\n\n")[0].splitlines():
+        if line.startswith("    ") and head:
+            head[-1] += " " + line.strip()
+        else:
+            head.append(line)
     assert code == 0 and head[0] == f"abq2ccx {A.__version__}: wrote {os.path.join(d, 'a_ccx.inp')} from {deck}", err
     assert re.fullmatch(r"  \d+ nodes, 1 elements \| \d+ warning\(s\), \d+ note\(s\), \d+ commented card\(s\)", head[1]), head
     assert head[2] == f"  Full report: {os.path.join(d, 'a_ccx.log')} (and at the top of the converted deck)"
     assert log.startswith(f"abq2ccx {A.__version__}: {deck} -> {os.path.join(d, 'a_ccx.inp')} (") and "\n\n[" in log
+
+
+def test_instance_map_lines_stay_short_of_the_width_at_every_width():
+    # the instance map keeps each "old -> new" pair on one line through a placeholder as wide as
+    # " -> " (one character let its lines run 3 characters per pair past the width: 80 at 80,
+    # 105 at 105): at every width its lines stay one column short, and no pair is split
+    body, conv, rep = convert(os.path.join(EXAMPLES, "assembly_comma_names.inp"))
+    for width in range(60, 121):
+        text = rep.console(width)
+        inst = text[text.index("Instances"):].splitlines()
+        assert all(len(line) < width or " " not in line.strip() for line in inst), (width, inst)
+        assert "\0" not in text and all(not line.rstrip().endswith("->") and not line.lstrip().startswith("->")
+                                         for line in inst), (width, inst)
+    lines = rep.header_comment_lines()                       # the deck header: chunks of 66
+    inst = lines[next(i for i, x in enumerate(lines) if x.startswith("** Instances")):-1]
+    assert "\0" not in "".join(lines) and all(len(x) <= 3 + 4 + 66 for x in inst), inst
+    assert all(not x.rstrip().endswith("->") and not x[3:].lstrip().startswith("->") for x in inst)
+
+
+def test_report_width_reads_columns_then_stderrs_terminal():
+    # COLUMNS where set, else the terminal stderr writes to (the report's; shutil asked
+    # stdout's), else 100 columns; always within 60-120
+    saved = os.environ.get("COLUMNS")
+    try:
+        for value, want in (("80", 80), ("300", 120), ("20", 60)):
+            os.environ["COLUMNS"] = value
+            assert A.report_width() == want, value
+        os.environ.pop("COLUMNS", None)
+        err, sys.stderr = sys.stderr, io.StringIO()     # (no terminal: no fileno)
+        try:
+            assert A.report_width() == 100
+        finally:
+            sys.stderr = err
+
+        class Tty(io.StringIO):
+            def __init__(self, fd):
+                super().__init__()
+                self.fd = fd
+
+            def fileno(self):
+                return self.fd
+        asked, size = [], os.get_terminal_size              # stdout on 7, stderr on 9: 9 asked
+        streams = sys.stdout, sys.stderr
+        os.get_terminal_size = lambda fd=1: asked.append(fd) or os.terminal_size((90, 24))
+        sys.stdout, sys.stderr = Tty(7), Tty(9)
+        try:
+            assert A.report_width() == 90
+        finally:
+            sys.stdout, sys.stderr = streams
+            os.get_terminal_size = size
+        assert asked == [9], asked
+    finally:
+        if saved is None:
+            os.environ.pop("COLUMNS", None)
+        else:
+            os.environ["COLUMNS"] = saved
+    lines = A.wrap_for_terminal("a " * 100, 60, "  - ", "    ")
+    assert max(map(len, lines)) == 59 and lines[0].startswith("  - a a")
+    # counted in terminal cells: a CJK character takes two (a path of 模型 at width 120 took 138
+    # columns in 98 characters), a combining mark none; blanks between words kept, long words whole
+    assert A.terminal_cells("模型 ab") == 7 and A.terminal_cells("e\u0301") == 1
+    deck = "/tmp/" + "模型" * 10 + "/a"                   # 78 characters, but 118 cells: breaks
+    lines = A.wrap_for_terminal(f"wrote {deck}_ccx.inp from {deck}.inp", 80, "", "    ")
+    assert lines == [f"wrote {deck}_ccx.inp from", f"    {deck}.inp"], lines
+    assert [A.terminal_cells(x) for x in lines] == [66, 55]
+    assert A.wrap_for_terminal(f"x {deck}{deck}", 60, "", "    ") == ["x", f"    {deck}{deck}"]
+    assert A.wrap_for_terminal("TIME    INTERVAL  x", 60) == ["TIME    INTERVAL  x"]
+    assert A.wrap_for_terminal("", 60, "  - ") == ["  -"] and A.wrap_for_terminal("  a  ", 60) == ["a"]
+
+
+def test_terminal_report_keeps_unicode_blanks_and_wraps_deck_locations():
+    # only ASCII tabs and line breaks become blanks: a no-break or ideographic space in a path
+    # is part of its name (shown as '/tmp/my model.log', it named another file), kept whole
+    for path in ("/tmp/my\u00a0model.log", "/tmp/模型\u3000deck.inp", "/tmp/a\u2009b.inp"):
+        assert A.wrap_for_terminal(f"wrote {path}", 60) == [f"wrote {path}"], path
+    assert A.wrap_for_terminal("a\nb\r\nc\td", 60) == ["a b  c       d"]
+    # a warning's place in the deck is wrapped like its text: a 115-character path with blanks
+    # under '  1. ' filled the 120 columns (Windows Terminal then lost the line break)
+    where = "/home/user/Abaqus models/cold shaker v3/"
+    where += "a" * (115 - len(where) - len(".inp:12")) + ".inp:12"
+    rep = A.Report()
+    rep.warn("Something to check.", at=where)
+    rep.note("And a note.", at="/home/user/Abaqus models/cold shaker v3/a.inp:20")
+    for width in (60, 80, 100, 120):
+        lines = rep.console(width).splitlines()
+        assert all(A.terminal_cells(x) < width or " " not in x.strip() for x in lines), (width, lines)
+        at = lines.index("Notes (1)")
+        assert " ".join(x[5:] for x in lines[1:at - 2]) == where, lines   # (broken at blanks only)
+        assert "Something to check." in lines[at - 2] and lines[-1] == "    And a note.", lines
+        assert lines[1].startswith("  1. /home/user/Abaqus"), lines
+    assert len(where) == 115 and max(map(len, rep.console(120).splitlines())) < 120
 
 
 def _still_runs(pid):

@@ -58,15 +58,15 @@ import signal
 import stat
 import subprocess
 import sys
-import textwrap
 import threading
 import time
 import traceback
+import unicodedata
 from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
 
-__version__ = "1.7.0"
+__version__ = "1.7.1.dev0"
 
 # ---------------------------------------------------------------------------
 # Element reference data
@@ -913,8 +913,9 @@ class Report:
                 lines.append(prefix + chunk)
         for line in self.instance_lines():
             indent = (len(line) - len(line.lstrip())) * " "
-            for i, chunk in enumerate(_wrap(line.replace(" -> ", "\0"), 66)):   # keep pairs whole
-                lines.append("** " + indent + ("  " if i else "") + chunk.replace("\0", " -> "))
+            # (an "old -> new" pair stays whole: a placeholder of the arrow's own width, no blank)
+            for i, chunk in enumerate(_wrap(line.replace(" -> ", PAIR_ARROW), 66)):
+                lines.append("** " + indent + ("  " if i else "") + chunk.replace(PAIR_ARROW, " -> "))
         lines.append("** ====================================================================")
         return lines
 
@@ -929,14 +930,11 @@ class Report:
         under its place in the deck and wrapped to ``width`` (the terminal's, 60-120 columns);
         entries 'Output variable X <the same rest>' of one card in one, 'Output variables X,
         Y, ...'; then the instance map."""
-        if width is None:
-            width = shutil.get_terminal_size((100, 24)).columns
-        width = max(60, min(120, width))
+        width = max(60, min(120, report_width() if width is None else width))
         out: List[str] = []
 
         def para(text: str, first: str, rest: str) -> None:
-            out.extend(textwrap.wrap(text, width, initial_indent=first, subsequent_indent=rest,
-                                     break_long_words=False, break_on_hyphens=False) or [first.rstrip()])
+            out.extend(wrap_for_terminal(text, width, first, rest))
         groups: "OrderedDict[tuple, list]" = OrderedDict()
         for k, (level, msg) in enumerate(self.entries):
             if level == "WARNING" and self.reduced and msg.startswith("Reduced physics"):
@@ -961,8 +959,8 @@ class Report:
                 where = key[1] if len(key) == 3 else self.where.get(key[1], "")
                 text = (f"Output variable{'s' if len(vals) > 1 else ''} {', '.join(vals)} {key[2]}"
                         if len(key) == 3 else vals[0])
-                if where:
-                    out.append(head + where)
+                if where:                       # (a path with blanks can be long too)
+                    para(where, head, pad)
                     para(text, pad, pad)
                 else:
                     para(text, head, pad)
@@ -973,8 +971,8 @@ class Report:
         for line in inst:                       # (an "old -> new" pair stays on one line)
             indent = " " * (len(line) - len(line.lstrip()))
             at = len(out)
-            para(line.strip().replace(" -> ", "\0"), indent, indent + "    ")
-            out[at:] = [x.replace("\0", " -> ") for x in out[at:]]
+            para(line.strip().replace(" -> ", PAIR_ARROW), indent, indent + "    ")
+            out[at:] = [x.replace(PAIR_ARROW, " -> ") for x in out[at:]]
         if not inst and out[-1] == "":
             out.pop()
         return "\n".join(out) + "\n"
@@ -998,6 +996,56 @@ class Report:
             lines.append(f"  ... and {len(self.instances) - limit} more instance(s) (--json lists "
                          f"them all)")
         return lines
+
+
+# " -> " while a line is wrapped: as wide (4 characters), without a blank to break at, so an
+# "old -> new" pair stays on one line and the line's width is counted right (a 1-character
+# placeholder let an instance map's lines run 3 characters per pair past the width)
+PAIR_ARROW = "\0->\0"
+
+
+def report_width() -> int:
+    """The width the terminal report wraps to: COLUMNS where set, else that of the terminal the
+    report goes to (stderr; shutil.get_terminal_size asks stdout's), else 100 columns (a
+    report redirected to a file), within 60-120."""
+    try:
+        cols = int(os.environ.get("COLUMNS", "") or 0)
+    except ValueError:
+        cols = 0
+    if cols <= 0:
+        try:
+            cols = os.get_terminal_size(sys.stderr.fileno()).columns
+        except (AttributeError, ValueError, OSError):
+            cols = 100
+    return max(60, min(120, cols))
+
+
+def wrap_for_terminal(text: str, width: int, first: str = "", rest: str = "") -> List[str]:
+    """``text`` wrapped for a terminal ``width`` columns wide, one column short of it: a line
+    that fills a terminal's last column wraps there by itself, and Windows Terminal (120
+    columns by default) then lost the line break after it, so the next line ran on from it
+    ('... NUMBER INTERVAL / TIME    INTERVAL / TIME POINTS ...').  Widths are counted in the
+    terminal's cells (terminal_cells), so a path with CJK characters stays one column short
+    too; long words (a path, a set name) stay whole, the blanks between words as they are.
+    Only ASCII tabs and line breaks become blanks (as in textwrap): a no-break or ideographic
+    space in a path is part of its name, kept and not broken at."""
+    limit, out, cur, gap, words = width - 1, [], first, "", False
+    for tok in re.findall(r" +|[^ ]+", re.sub(r"[\n\r\v\f]", " ", text.expandtabs())):
+        if tok[0] == " ":
+            gap = tok if words else ""          # (a line starts at its first word)
+        elif words and terminal_cells(cur + gap + tok) > limit:
+            out.append(cur)
+            cur, gap = rest + tok, ""
+        else:
+            cur, gap, words = cur + gap + tok, "", True
+    return out + [cur] if words else [first.rstrip()]
+
+
+def terminal_cells(text: str) -> int:
+    """The columns ``text`` takes in a terminal: two for a wide (East Asian) character, none
+    for a combining mark, one for any other."""
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF"
+               else 1 for c in text)
 
 
 def _wrap(text: str, width: int) -> List[str]:
@@ -51815,9 +51863,12 @@ def _convert_one(path: str, args) -> Tuple[int, dict]:
                  [f"  Full report: {os.path.splitext(out_path)[0]}.log (and at the top of the "
                   f"converted deck)"] if not args.no_log else
                  ["  Full report: at the top of the converted deck"])
-        sys.stderr.write("\n".join([f"abq2ccx {__version__}: {verb} {path}",
-                                    f"  {len(conv.geom.nodes):,} nodes, {len(conv.geom.elements):,} "
-                                    f"elements | {report.summary()}"] + where) + "\n\n")
+        width = report_width()
+        head = [f"abq2ccx {__version__}: {verb} {path}",
+                f"  {len(conv.geom.nodes):,} nodes, {len(conv.geom.elements):,} elements | "
+                f"{report.summary()}"] + where
+        sys.stderr.write("\n".join(x for line in head for x in wrap_for_terminal(
+            line.strip(), width, line[:len(line) - len(line.lstrip())], "    ")) + "\n\n")
         sys.stderr.write(report.console())
 
     strict = args.strict and (report.n_warnings > 0 or report.n_commented > 0)
