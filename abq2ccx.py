@@ -10217,8 +10217,14 @@ class _Mesh:
         coupling the faces of shells the converter knotted for it (_plan_rigid_couplings); and
         so do plane and axisymmetric elements, whose faces are edges (_facet): ccx 2.23 couples
         other nodes of the solids it expands them to, for every face label (probed on CPE4 /
-        CAX4: -56 % / -22 %; the edges' nodes are exact).  A tie's surface on membranes and
-        other elements stays as it is, warned.  Nodes of ``exclude`` stay out (a tie's
+        CAX4: -56 % / -22 %; the edges' nodes are exact).  A tie's surface on plane and
+        axisymmetric elements (CPS / CPE / CAX) is one too: ccx 2.23 ties none of the face
+        nodes of the solids it expands them to ('DOF ... of node ... is not active; no tied
+        constraint') and the model is singular (probed on CPS4 / CAX4 strips: 7e14 / 4e13 x the
+        displacements), where a node surface of the edges' nodes ties them as Abaqus does, the
+        strips merged there exactly (CAX4 1e-4, its wedge; ccx still says DOF 3, out of the
+        plane, of each such node is not active: its own plane MPCs hold it).  A tie's surface on
+        membranes and other elements stays as it is, warned.  Nodes of ``exclude`` stay out (a tie's
         master-face nodes, a coupling's reference node: ccx would tie them to themselves and
         loop in its cascade, "zero coefficient on the dependent side"); with none left the
         name is "" (nothing to tie)."""
@@ -10228,9 +10234,13 @@ class _Mesh:
         eids = self._surface_elements(surf)
         mine = [e for e in eids if e in self._qmem or self.geom.elements[e][0].upper().startswith("M3D")
                 or (shells and (ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS or
-                                self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)))]
+                                self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)))
+                or (not shells and ccx_type(self.geom.elements[e][0]).startswith(PLANE_ELEM_PREFIXES))]
         if not mine:
             return None, []
+        planar = [e for e in mine if self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)]
+        if len(mine) < len(eids) and not shells and len(planar) == len(mine):
+            return None, []                 # (plane faces and other elements': left as they are)
         if len(mine) < len(eids) and not shells:
             self.report.warn(f"{what} surface {surf} lies on membranes and on other elements: ccx "
                              f"skips the membranes' face nodes their hinge to the membrane node "
@@ -10247,7 +10257,13 @@ class _Mesh:
         self._reserve_names()
         name = self._fresh_name(f"{surf}_NODES")
         self._mem_surfaces[key] = name
-        if any(self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES) for e in mine):
+        if planar and not shells:
+            self.report.note(f"{what} surface {surf} on plane / axisymmetric elements -> node "
+                             f"surface {name} of their edges' nodes, which Abaqus ties (ccx 2.23 ties "
+                             f"none of the face nodes of the solids it expands them to, 'not active; "
+                             f"no tied constraint': singular; probed, the strips merged there exactly).",
+                             once=True)
+        elif planar:
             self.report.note(f"{what} surface {surf} on plane / axisymmetric elements -> node "
                              f"surface {name} of their edges' nodes, which Abaqus couples (ccx 2.23 "
                              f"couples other nodes of the solids it expands them to, for every face "

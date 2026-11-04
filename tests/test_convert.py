@@ -23499,6 +23499,30 @@ def test_tie_on_linear_membranes_ties_their_nodes():
     assert "every slave node of MS is a node of BS" in body
 
 
+def test_tie_slave_on_plane_element_faces_becomes_a_node_surface():
+    # ccx 2.23 ties none of the face nodes of the solid it expands a CPS / CPE / CAX element to
+    # ('not active; no tied constraint': singular, 7e14 x |u|); Abaqus ties the edges' nodes ->
+    # a node surface of them (validate_with_ccx.py tie_2d_faces: the strips merged, exactly)
+    deck = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2., 1.\n4, 1., 1.\n5, 1., 1.\n6, 2., 1.\n7, 2., 2.\n"
+            "8, 1., 2.\n*Element, type={typ}, elset=ALL\n1, 1, 2, 3, 4\n2, 5, 6, 7, 8\n"
+            "*Solid Section, elset=ALL, material=M\n{sec}\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Surface, name=SL\n2, S1\n*Surface, name=MA\n1, S3\n{tie}*Boundary\n1, 1, 2\n2, 1, 2\n"
+            "*Step\n*Static\n*Cload\n7, 1, 1.\n8, 2, 1.\n*End Step\n")
+    for typ, sec in (("CPS4", "1."), ("CPE4R", "1."), ("CAX4", "")):
+        body, conv, rep = convert_str(deck.format(typ=typ, sec=sec, tie="*Tie, name=T1\nSL, MA\n"))
+        assert _card_at(body, "*SURFACE, NAME=SL_NODES, TYPE=NODE") == ["5", "6"], typ
+        assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.1") == ["SL_NODES, MA"]
+        assert "on plane / axisymmetric elements -> node surface SL_NODES" in rep.text()
+        assert not conv.reduced_physics
+    # a TIED contact pair too; a node the master shares stays out (ccx would loop)
+    pair = "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\nSL, MA\n"
+    body, conv, _ = convert_str(deck.format(typ="CPS4", sec="1.", tie=pair))
+    assert _card_at(body, "*TIE, NAME=ABQ2CCX_TIED1, POSITION TOLERANCE=0.025") == ["SL_NODES, MA"]
+    body, conv, _ = convert_str(deck.format(typ="CPS4", sec="1.", tie="*Tie, name=T1\nSL, MA\n").replace(
+        "2, 5, 6, 7, 8", "2, 4, 6, 7, 8"))
+    assert _card_at(body, "*SURFACE, NAME=SL_NODES, TYPE=NODE") == ["6"] and not conv.reduced_physics
+
+
 def test_tied_pair_of_a_membrane_on_a_rigid_surface_counts_its_thickness():
     # Abaqus' tied contact counts membrane thickness ("Defining tied contact"): a membrane whose
     # SNEG face rests on a rigid plate (its nodes half a thickness above) joins the plate's body

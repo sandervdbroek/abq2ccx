@@ -8930,6 +8930,34 @@ def shell_tie_deck(kind, typ="S4"):
     raise ValueError(kind)
 
 
+def tie_2d_face_deck(typ, merged, pair=False):
+    """Two 4 x 1 strips of ``typ`` (CPS4 / CAX4; x 0-2, r 1-3), the lower's base held, the upper on
+    its top: the upper's bottom faces (S1) tied to the lower's top faces (S3) — by a *TIE, or a
+    TIED *CONTACT PAIR (``pair``) — or ``merged``, the strips sharing those nodes; the upper's top
+    pulled along x, then along y."""
+    x0 = 1.0 if typ == "CAX4" else 0.0
+    lo = {(i, k): 1 + i + 5 * k for i in range(5) for k in range(2)}
+    up = {(i, k): (lo[(i, 1)] if merged and k == 0 else 101 + i + 5 * k) for i in range(5) for k in range(2)}
+    xyz = {n: (x0 + 0.5 * i, float(k)) for (i, k), n in lo.items()}
+    xyz.update({n: (x0 + 0.5 * i, 1.0 + k) for (i, k), n in up.items()})
+    els = [f"{base + i}, {g[(i, 0)]}, {g[(i + 1, 0)]}, {g[(i + 1, 1)]}, {g[(i, 1)]}"
+           for g, base in ((lo, 1), (up, 11)) for i in range(4)]
+    top = [up[(i, 1)] for i in range(5)]
+    out = ["*HEADING", f"plane face tie {typ}", "*NODE"] + [f"{n}, {x:g}, {y:g}" for n, (x, y) in sorted(xyz.items())]
+    out += [f"*ELEMENT, TYPE={typ}, ELSET=ALL"] + els + [
+        f"*SOLID SECTION, ELSET=ALL, MATERIAL=M\n{'' if typ == 'CAX4' else '1.'}", "*MATERIAL, NAME=M",
+        "*ELASTIC", "200000., 0.", "*NSET, NSET=TOP\n" + ", ".join(map(str, top)), "*NSET, NSET=BASE\n1, 2, 3, 4, 5"]
+    if not merged:
+        out += ["*SURFACE, NAME=SL\n11, S1\n12, S1\n13, S1\n14, S1", "*SURFACE, NAME=MA\n1, S3\n2, S3\n3, S3\n4, S3",
+                "*SURFACE INTERACTION, NAME=SI\n*CONTACT PAIR, INTERACTION=SI, TIED\nSL, MA" if pair else
+                "*TIE, NAME=T1\nSL, MA"]
+    out += ["*BOUNDARY\nBASE, 1, 2"]
+    for d in (1, 2):
+        out += ["*STEP", "*STATIC", "*CLOAD, OP=NEW"] + [f"{n}, {d}, 20." for n in top] + \
+            ["*NODE PRINT, NSET=TOP", "U", "*END STEP"]
+    return "\n".join(out) + "\n"
+
+
 def tie_offset_deck(spos, merged):
     """An S4 skin (t 0.1, nu 0) on the top of a C3D8 block (x 0-2, y 0-1, z 0-1; 4 x 2 x 1, its base
     clamped), its edge x = 2 pulled along x, then pushed along z (the PR #8 reviewer's deck):
@@ -19938,6 +19966,43 @@ def check_tie_offset_knots(ccx, env, tmp, shared):
                   f"tied by its {tag.upper()} face to a block, its edge pulled, then pushed): the block's "
                   f"edge nodes as the skin merged with its nodes, knotted, in both steps ({err:.1e} apart; "
                   f"|u| {moved:.4g} at least; before: {before})")
+        failures += 0 if ok else 1
+    return failures
+
+
+@check("tie_2d_faces", "*TIE slaves on plane / axisymmetric element faces: a node surface of their nodes")
+def check_tie_2d_faces(ccx, env, tmp, shared):
+    # --- ccx 2.23 ties none of the face nodes of the solids it expands plane / axisymmetric
+    # elements to (singular); a node surface of the edges' nodes ties them as Abaqus does
+    failures = 0
+
+    def run(tag, deck):
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        res = (dat_node_blocks(os.path.join(d, "job.dat")), " ".join(rep.text().split()),
+               list(conv.reduced_physics)) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if res is None:
+            print(f"FAIL  {tag}: did not solve ({status})")
+        return res
+    for typ, pair, tol in (("CPS4", False, 1e-9), ("CPS4", True, 1e-9), ("CAX4", False, 3e-4)):
+        tag = f"{typ}{'_pair' if pair else ''}"
+        runs = [run(f"t2f_{tag}", tie_2d_face_deck(typ, False, pair)), run(f"t2f_{tag}_ref", tie_2d_face_deck(typ, True))]
+        ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) == 2
+        if ok:
+            got, want = runs[0][0], runs[1][0]
+            err = max(abs(a - b) for g, w in zip(got, want) for n, v in w.items()
+                      for a, b in zip(g.get(n, [math.inf] * 3), v[:3]))
+            moved = min(max(abs(x) for v in w.values() for x in v[:3]) for w in want)
+            ok = err <= tol * moved and moved > 1e-5 and not runs[0][2] and \
+                "on plane / axisymmetric elements -> node surface SL_NODES" in runs[0][1]
+            print(f"{'PASS' if ok else 'FAIL'}  tie_2d_faces_{tag} ({typ} strips, the upper's bottom faces "
+                  f"tied to the lower's top{' by a TIED *CONTACT PAIR' if pair else ''}, pulled along x, then "
+                  f"y): its top nodes as the strips merged in both steps ({err:.1e} apart; |u| {moved:.4g} at "
+                  f"least{'; CAX4: its wedge' if typ == 'CAX4' else ''}; before: singular, 7e14 x |u|)")
         failures += 0 if ok else 1
     return failures
 
