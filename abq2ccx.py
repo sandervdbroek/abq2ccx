@@ -46013,6 +46013,91 @@ class _PostPasses:
         "PLASTIC", "CREEP", "HYPERELASTIC", "HYPERFOAM", "DEFORMATION PLASTICITY", "MOHR COULOMB",
         "MOHR COULOMB HARDENING", "RATE DEPENDENT", "USER MATERIAL"))
 
+    def _warn_transform_bc_traps(self, deck: EmittedDeck) -> None:
+        """Warn of two ccx 2.23 traps around *TRANSFORM nodes, read on the converted deck (after
+        every pass that writes *BOUNDARY, before _fixed_helper_nodes moves lines to helpers).
+
+        *KINEMATIC: every *KINEMATIC coupling registers the equations that tie its reference
+        node's rotations under DOFs 4-6 but writes their first terms on DOFs 5-7 (couplings.f);
+        in a deck with any *TRANSFORM, *BOUNDARY, OP=NEW re-indexes all equations by their
+        first terms (boundarys.f) and stops there, '*ERROR reading *BOUNDARY' (probed: the
+        *TRANSFORM on the reference node, a coupled node or an unconnected one, with or without
+        BCs on the reference node, OP=NEW in step 1 or later; without a *TRANSFORM it runs).
+
+        Implicit *DYNAMIC: a BC on a translation of a *TRANSFORM node whose local axis is not
+        the global one of that number, new in a step after one that moves the model (or on a
+        node with an initial velocity; not after *FREQUENCY steps alone, which leave it at rest),
+        stops a moving DOF otherwise than one along a global axis
+        (probed on one C3D8 against the model turned into the node's axes, the DOF held at the
+        value it had reached: 55 % of the peak displacement off at 20 increments a step, 6 % at
+        80; axes along permuted global ones 13 %; exact for local axes equal to the global ones,
+        for a BC held from a rest start, driven from it on a ramp (0.1 %) or released).  ccx
+        starts the extra node that carries such a BC's value from the node's global
+        displacement (bounadd.f).  No exact form is known (the helper node of
+        _plan_fixed_helpers is off there too): warned, with reduced physics; FIXED lines that
+        planner took (_fixed_unknown) are warned there."""
+        cards = deck.cards
+        if not any(c.keyword == "TRANSFORM" for c in cards):
+            return
+        renew = sorted({c.step for c in cards if c.keyword == "BOUNDARY" and c.step >= 1 and
+                        c.uparam("OP") == "NEW"})
+        if renew and any(c.keyword == "KINEMATIC" for c in cards):
+            self.report.warn(f"*BOUNDARY, OP=NEW (step {', '.join(map(str, renew))}) in a deck with a "
+                             f"*KINEMATIC coupling and a *TRANSFORM: ccx 2.23 stops there ('*ERROR "
+                             f"reading *BOUNDARY'): it registers the coupling's rotation equations "
+                             f"under other DOFs than it writes them on, and OP=NEW re-indexes all "
+                             f"equations when the deck has a *TRANSFORM (probed).", once=True)
+        if not self._transformed:
+            return
+        sets = self._mesh_sets.read(deck)
+        dyn = {c.step for c in cards if c.keyword == "DYNAMIC" and c.step >= 1 and not c.has("EXPLICIT")}
+        if not dyn:
+            return
+        moving = set()                          # nodes with an initial velocity
+        for c in cards:
+            if c.keyword == "INITIAL CONDITIONS" and c.uparam("TYPE").startswith("VELOCITY"):
+                for rec in c.records():
+                    if rec and rec[0].strip():
+                        moving.update(sets.members("NSET", rec[0].strip()) or ())
+        moves = {c.step for c in cards if c.step >= 1 and c.keyword in (       # (a *FREQUENCY step
+            "STATIC", "DYNAMIC", "VISCO", "MODAL DYNAMIC", "COUPLED TEMPERATURE-DISPLACEMENT",
+            "UNCOUPLED TEMPERATURE-DISPLACEMENT")}                              # leaves it at rest)
+        skip = {(n, d) for n, d, _s in self._fixed_unknown}
+        held: set = set()                       # (node, DOF) in force so far
+        step, before, hits = 0, set(), []
+        for c in cards:
+            if c.step > step:
+                step, before = c.step, set(held)
+            if c.keyword != "BOUNDARY" or c.step < 0:
+                continue
+            if c.uparam("OP") == "NEW":
+                held = set()
+            for j in c.rows:
+                f = trimmed_fields(deck.lines[j].split(","))
+                ns = sets.members("NSET", f[0]) if f else None
+                rng = bc_dof_range(f) if ns is not None else None
+                for n in [n for n in ns if n in self._transformed] if rng else ():
+                    ax = self._local_axes(n)
+                    for d in range(max(rng[0], 1), min(rng[1], 3) + 1):
+                        if step in dyn and (n, d) not in before and \
+                                (n in moving or any(k < step for k in moves)) and \
+                                isinstance(ax, tuple) and ax[d - 1][d - 1] < 1 - 1e-9 and \
+                                not (c.has("FIXED") and (n, d) in skip):
+                            hits.append(f"node {n} DOF {d} (step {step})")
+                        held.add((n, d))
+        hits = list(dict.fromkeys(hits))
+        if hits:
+            self.report.warn(f"*BOUNDARY on translations of *TRANSFORM nodes, new in implicit *DYNAMIC "
+                             f"steps after the node could move ({', '.join(hits[:4])}"
+                             f"{', ...' if len(hits) > 4 else ''}): ccx 2.23 stops a moving DOF along "
+                             f"an axis other than the global one of its number otherwise than along a "
+                             f"global axis (probed on one C3D8 against the model turned into the "
+                             f"node's axes: 55 % of the peak displacement off at 20 increments a step, "
+                             f"6 % at 80, 13 % for axes along permuted global ones). Held from the "
+                             f"start of the analysis instead, it is exact.", once=True)
+            self._reduces("*BOUNDARY on a *TRANSFORM translation new in an implicit *DYNAMIC step "
+                          "(ccx 2.23 stops the DOF otherwise than along a global axis)")
+
     def _warn_strain_free_adds(self, deck: EmittedDeck) -> None:
         """Warn of a *MODEL CHANGE, TYPE=ELEMENT that adds elements strain free (ADD without a
         value: Abaqus' default, and ccx's; ADD=STRAIN FREE) where ccx 2.23 stops on it ('a
@@ -47890,6 +47975,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_strain_free_adds(deck)       # (reads the cards as written)
         deck = self._initial_gradients_back(deck)   # after the audit: the initial state is no load
         deck = self._shift_total_time(deck)     # after every pass that writes load cards
+        self._warn_transform_bc_traps(deck)     # (BCs on the nodes, as every pass wrote them)
         deck = self._fixed_helper_nodes(deck)   # after every other pass that writes *BOUNDARY
         deck = self._truss_bc_index(deck)       # after every pass that writes *BOUNDARY
         out = self._short_fields(deck.render())     # last: every card is written

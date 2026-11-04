@@ -25533,6 +25533,34 @@ def test_transformed_bcs_through_helper_nodes_where_op_new_would_loosen_equation
         "*BOUNDARY, OP=NEW (ccx 2.23)" in conv.reduced_physics
 
 
+def test_transform_bc_warnings_dynamic_stops_and_kinematic_op_new():
+    # implicit *DYNAMIC: a BC on an oblique *TRANSFORM translation new after the node could
+    # move is answered otherwise than along a global axis (probed): warned, reduced physics
+    dyn = "*Step\n*Dynamic, direct\n0.05, 1.\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Dynamic, direct\n" \
+        "0.05, 1.\n*Boundary\n7, 2, 2, 0.01\n*End Step\n"
+    flag = "*BOUNDARY on a *TRANSFORM translation new in an implicit *DYNAMIC step (ccx 2.23 stops " \
+        "the DOF otherwise than along a global axis)"
+    body, conv, rep = convert_str(FIXED_TR_HEX + dyn)
+    assert "new in implicit *DYNAMIC steps after the node could move (node 7 DOF 2 (step 2))" in rep.text()
+    assert flag in conv.reduced_physics
+    # held from the start, in static steps, or on local axes equal to the global ones: quiet
+    for deck in (FIXED_TR_HEX + "*Boundary\n7, 2, 2, 0.\n" + dyn.replace("*Boundary\n7, 2, 2, 0.01\n", ""),
+                 FIXED_TR_HEX + dyn.replace("*Dynamic, direct\n0.05, 1.", "*Static"),
+                 FIXED_TR_HEX.replace("1., 1., 0.5, -1., 1., 1.", "1., 0., 0., 0., 1., 0.") + dyn):
+        body, conv, rep = convert_str(deck)
+        assert "new in implicit *DYNAMIC" not in rep.text() and flag not in conv.reduced_physics
+    # a *KINEMATIC coupling and a *TRANSFORM: ccx stops at *BOUNDARY, OP=NEW (probed): warned
+    kin = "*Node\n20, 0.5, 0.5, 1.5\n*Surface, type=NODE, name=ST\nTOP\n*Coupling, constraint name=C, " \
+        "ref node=20, surface=ST\n*Kinematic\n1, 3\n"
+    steps = "*Step\n*Static\n*Cload\n20, 1, 1.\n*End Step\n*Step\n*Static\n*Boundary, op=NEW\nBOT, 1, 3\n" \
+        "*Cload, op=NEW\n20, 3, 1.\n*End Step\n"
+    stop = "*BOUNDARY, OP=NEW (step 2) in a deck with a *KINEMATIC coupling and a *TRANSFORM: ccx 2.23 stops there"
+    body, conv, rep = convert_str(FIXED_TR_HEX + kin + steps)
+    assert "*KINEMATIC" in body and stop in rep.text()
+    body, conv, rep = convert_str(VEL_HEX + kin + steps)
+    assert "*KINEMATIC" in body and stop not in rep.text()
+
+
 def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
     # FIXED in a linear perturbation step holds the base state: 0, which a static perturbation
     # step's restore adds the base value to (a rotation was written as that value, then doubled)
