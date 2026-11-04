@@ -25892,16 +25892,20 @@ class _Dofs:
         first.  ccx ramps the angles where Abaqus ramps the rotation vector: equal at the end
         of the step, the director's path in between a little apart.
 
-        Rewritten: the states (_rot_bc_walk) of a general NLGEOM step holding all three
-        rotations, or the two off the normal with the free one along it (ccx's shell node has
-        no drilling rotation: taken as zero), on the step's own amplitude.  The nodes: as
-        _plan_shell_rotation_pairs (not its 'pair' nodes).  Warned (reduced physics) where such
-        a state has no such form: a *DYNAMIC step in the deck (ccx knots the node there, which
-        reads the values as Abaqus does), a card on an amplitude, a value carried on from a
-        geometrically linear step, a velocity-type BC, a director turned 90 deg or more."""
+        Rewritten: the states (_rot_bc_walk) of a general NLGEOM step before the first *DYNAMIC
+        step (ccx knots the node there and keeps the knot, which reads the values as Abaqus
+        does) holding all three rotations, or the two off the normal with the free one along it
+        (exact to first order only: Abaqus' normal turns with that free drilling rotation too,
+        which ccx's shell node lacks: taken as zero), on the step's own amplitude.  The nodes:
+        as _plan_shell_rotation_pairs (not its 'pair' nodes).  Warned (reduced physics) where
+        such a state has no such form: a *DYNAMIC step after it (it would carry the angles into
+        the knot), a card on an amplitude, a value carried on from a geometrically linear step,
+        a velocity-type BC, a director turned 90 deg or more."""
         if getattr(self.opt, "solid_dof", False) or not self._mechanical or self._has_normal:
             return
-        nl = {st.no for st in self.steps if st.nlgeom and not st.perturbation}
+        first = min((st.no for st in self.steps if st.proc == "DYNAMIC"), default=None)
+        nl = {st.no for st in self.steps if st.nlgeom and not st.perturbation and
+              (first is None or st.no < first)}
         if not nl:
             return
         sheet = {n for typ, conn in self.geom.elements.values() if ccx_type(typ) in SHEET_SHELLS
@@ -25910,12 +25914,10 @@ class _Dofs:
                 self._rot_mode.get(n) in (None, "keep")}
         cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]] = []
         step = 0
-        dyn = False
+        dyn = first is not None
         for b in blocks:
             if b.keyword == "STEP":
                 step += 1
-            elif b.keyword == "DYNAMIC":
-                dyn = True
             elif b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2:
                 cards.append((b, step, self._rot_items(b, cand)))
         used = sorted({n for _, _, items in cards for n in items})
@@ -25949,7 +25951,9 @@ class _Dofs:
                              f"projected about each axis), those of the normal turned by the "
                              f"rotation vector the values are in Abaqus (the deck's values read "
                              f"as such angles are 0.4-6.5 % off at 0.2-0.6 rad; probed). Exact "
-                             f"at the end of each step.", once=True)
+                             f"at the end of each step where they hold all three rotations; with "
+                             f"the rotation about the normal free, Abaqus' normal turns with it "
+                             f"too (second order), which ccx's shell node lacks.", once=True)
         for why, ns in hit.items():
             self.report.warn(f"Rotational BCs on {len(ns)} shell node(s) (e.g. node {ns[0]}) about "
                              f"two axes at once in an NLGEOM step, which Abaqus reads as the "
@@ -25962,9 +25966,10 @@ class _Dofs:
     def _rot_finite_lines(self, n: int, axes: Tuple[Vec, Vec, Vec], nrm: Vec, walk: list,
                           nl: set, dyn: bool) -> Union[None, str, Dict[Tuple[int, int], List[str]]]:
         """_rot_lines (card, node) of shell node ``n`` (local ``axes``, normal ``nrm``) whose
-        rotational BC states ``walk`` (_rot_bc_walk) an NLGEOM step (``nl``) reads as ccx's
-        angles otherwise (_plan_shell_finite_rotations); None where none does, why there is
-        no form where one does and cannot (``dyn``: the deck has a *DYNAMIC step)."""
+        rotational BC states ``walk`` (_rot_bc_walk) an NLGEOM step (``nl``: those before the
+        first *DYNAMIC one) reads as ccx's angles otherwise (_plan_shell_finite_rotations); None
+        where none does, why there is no form where one does and cannot (``dyn``: a *DYNAMIC
+        step follows)."""
         e1: Optional[Vec] = None
         rows = []                       # (card, step, values, counted DOFs, new values)
         for b, s, st, amp in walk:
@@ -25994,8 +25999,8 @@ class _Dofs:
         if not carried and not any(isinstance(r[4], dict) for r in rows):
             return next((r[4] for r in rows if isinstance(r[4], str) and r[2] is not None), None)
         if dyn:
-            return ("the deck has a *DYNAMIC step, where ccx makes the node a knot, which reads "
-                    "the values as Abaqus does")
+            return ("a *DYNAMIC step follows, where ccx makes the node a knot, which would read "
+                    "the angles as the rotation vector")
         why = next((r[4] for r in rows if isinstance(r[4], str)), None)
         if why is not None:
             return why

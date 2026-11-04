@@ -320,8 +320,11 @@ entries. The GitHub release notes use the same section.
   edge of a strip turned (0.1, 0.2, 0) came out 0.4 % of max |u| off, (-0.5, 0.25, 0) 6.5 %.
   Where a step's BCs hold all three rotations, or the two off the normal, the values are now
   written as the angles of the normal turned by that rotation vector: exact at the end of each
-  step (ccx ramps the angles, so the path in between differs a little). On an amplitude, in a
-  deck with a `*DYNAMIC` step or carried on from a linear step, warned as reduced physics.
+  step where all three are held (ccx ramps the angles, so the path in between differs a
+  little); with the rotation about the normal free, to first order (Abaqus' normal turns with
+  it too, which ccx's shell node lacks). On an amplitude, before a `*DYNAMIC` step (where ccx
+  makes the node a knot, which reads the values as Abaqus does) or carried on from a linear
+  step, warned as reduced physics.
   `validate_with_ccx.py shell_finite_rotation`: a cantilever's tip turned by (0.3, -0.4, 0),
   also off the global axes, as through a rotation-only coupling (3e-7, 5e-7; before 3 %, 7 %).
 

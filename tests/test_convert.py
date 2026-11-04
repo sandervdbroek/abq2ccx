@@ -17085,7 +17085,13 @@ def test_shell_finite_rotations_nlgeom():
         "*Step", "*Amplitude, name=A\n0., 0., 1., 1.\n*Step")
     dyn = strip(more="*Step, nlgeom\n*Dynamic\n0.1, 1.\n*End Step\n")
     carry = strip(step="*Step\n", more="*Step, nlgeom\n*Static\n0.1, 1.\n*Cload\n3, 3, 1.\n*End Step\n")
-    for deck, why in ((amp, "a card on an amplitude"), (dyn, "a *DYNAMIC step"),
+    # a *DYNAMIC step: ccx knots the node there (and after): as given, not flagged
+    for deck in (strip().replace("*Static\n", "*Dynamic\n"),
+                 strip().replace("*Step, nlgeom\n*Static", "*Step, nlgeom\n*Dynamic\n0.1, 1.\n*End Step\n"
+                                 "*Step, nlgeom\n*Static")):
+        body, conv, rep = convert_str(deck)
+        assert conv._rot_mode.get(3) is None and not conv.reduced_physics, conv.reduced_physics
+    for deck, why in ((amp, "a card on an amplitude"), (dyn, "a *DYNAMIC step follows"),
                       (carry, "carries on into an NLGEOM one")):
         body, conv, rep = convert_str(deck)
         assert all(ln.startswith("TIP") for ln in rot_lines(body)), rot_lines(body)
