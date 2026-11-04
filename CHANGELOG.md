@@ -53,6 +53,10 @@ entries. The GitHub release notes use the same section.
 * **Shell strips under `--approximate`.** An `S8R` strip one element wide drifts in ccx's
   nonlinear solver (up to many times its deflection); `--approximate` now writes it as `S8`,
   which keeps the right answer.
+* **Continuum-shell stacks judged by their middle.** A plastic or creeping continuum shell is
+  now flagged where the middle of its stack's thickness crosses it: alone through the thickness
+  (1.155 times the fully plastic moment) or the middle one of an odd stack (1.017 for 3), not in
+  an even stack, nor in two shells bonded by a cohesive layer.
 * **Shell strips flagged in linear models too.** An `S8R` strip one element wide is now
   flagged in every model, not only where ccx iterates: its displacements carry a spurious pinch
   through the thickness (up to twice the true largest displacement), and `*BUCKLE` can find
@@ -80,6 +84,12 @@ entries. The GitHub release notes use the same section.
   dynamic step, holding such a node along one of its turned axes after it has started moving
   gives a different motion than in Abaqus (flagged as reduced physics); and in a model with a
   kinematic coupling, ccx stops at a `*BOUNDARY, OP=NEW`.
+
+* **Fewer ccx failures.** A model with a heat transfer step whose other steps are only
+  frequency, buckling or modal steps no longer stops ccx where shells or beams carry a moment
+  or a rotation constraint: ccx set such a run up as heat transfer alone, with no rotations at
+  the shell and beam joints. A heat transfer step is no longer taken for one that turns those
+  joints, so such models are no longer flagged for it.
 
 ### Details
 
@@ -210,10 +220,20 @@ entries. The GitHub release notes use the same section.
   continuum shell carries 1.15 times its limit load (probed on a strip in 4-point bending). A
   creeping `*SHELL SECTION` (a nonlinear creep law in a deck that creeps; judged on the shells
   as written, after `--approximate`'s `S4R` / `S3` rewrites), a plastic or creeping continuum
-  shell one element through the thickness (stacked ones integrate at 4 or more points), and a
-  composite section whose plastic or creeping layer the middle crosses (continuum shells too)
+  shell the middle of the thickness crosses (one element through it, or the middle one of an
+  odd stack: see below), and a composite section whose plastic or creeping layer the middle crosses (continuum shells too)
   are now reduced physics, as plastic sheet shells already were; linear creep and a `SECTION
   INTEGRATION=GAUSS` rule with ccx's points are not.
+* **Continuum-shell stacks** — continuum shells stacked through the thickness are now judged
+  by the middle of the stack: 2 Gauss points per element integrate the fully plastic stress
+  exactly in an element on one side of it, so k equal elements carry 1 + 0.155 / k^2 times the
+  fully plastic moment for odd k and exactly it for even k (probed in pure bending, 1-5
+  elements: 1.1547 / 1.0000 / 1.0172 / 1.0000 / 1.0062; in creep, 3 elements bend at 0.97 / 0.94
+  times the exact rate at stress exponent 3 / 5). The element the middle crosses is flagged with
+  the section's factor (an odd or unequal stack included); a stack whose middle lies between
+  two elements is not. Elements joined through a cohesive layer (`COH3D8` / `COH3D6`) count as
+  one stack: two `SC8R` bonded by a thin glue layer carried 0.9999 of the fully plastic moment
+  and were flagged before (`validate_with_ccx.py sc_stacks`).
 * **Stabilization on `*VISCO` and coupled steps** — `STABILIZE`, `FACTOR`, `ALLSDTOL` and
   `CONTINUE` on `*VISCO` and `*COUPLED TEMPERATURE-DISPLACEMENT` went to ccx, which ignores
   them; they are now dropped with a warning, and a stabilized step ccx iterates is reduced
@@ -327,6 +347,24 @@ entries. The GitHub release notes use the same section.
   under DOFs 4-6 but writes their first terms on 5-7 (couplings.f), and OP=NEW re-indexes the
   equations by their first terms when the deck has a `*TRANSFORM` (probed: the `*TRANSFORM` on
   the reference node, a coupled node or an unconnected one, OP=NEW in step 1 or later). Warned.
+
+* **Heat transfer runs with eigenvalue steps** — ccx 2.23 decides from the procedure cards
+  alone, before any step, whether a run is mechanical: a `*HEAT TRANSFER` card with no
+  `*STATIC`, `*VISCO` or `*DYNAMIC` card after it (`*FREQUENCY`, `*BUCKLE` and the modal
+  procedures do not count) sets it up as heat transfer alone. Its shell and beam knots then get
+  no rotational DOFs, and ccx stopped on a rotational BC, moment or equation on one ('*ERROR in
+  gen3dboun / gen3dforc / gen3dmpc: ... do not have rotational DOFs'): the converter's knot
+  beams, their drilling holds, a `*RIGID BODY` of knotted shell nodes. A `*STATIC` card now
+  goes right before the first `*FREQUENCY` or `*BUCKLE` card after the first `*HEAT TRANSFER`
+  card; ccx runs the step's last procedure card, so the step is unchanged (the same eigenvalues
+  and buckling factors to every digit), and the run is mechanical too. Where the eigenvalue
+  steps all come before the heat step, a warning. The warning on drilling holds off the global
+  axes in eigenvalue steps after a nonlinear step no longer counts a `*HEAT TRANSFER` step,
+  which turns no knot (the eigenvalues after one are those without knots); the warning on
+  equations on knots still does (a rigid body of knotted tip nodes: 61 kHz for 462 Hz after a
+  heat step). `validate_with_ccx.py shell_knot_limits knot_heat`: a strip off the axes with
+  heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
+  without knots (before: ccx stopped).
 
 ## 1.7.0 (November 2026)
 

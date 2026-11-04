@@ -9377,6 +9377,42 @@ def t155_temperatures(dat_path):
     return blocks
 
 
+def sc_stack_bend_deck(layers, nx=4):
+    """Pure bending of a continuum-shell block 0.4 long, 0.1 wide, 0.1 thick, ``layers`` (type,
+    thickness) bottom to top (SC8R of an elastic-plastic material, E 1000, nu 0, sigma_y 1,
+    hardening 0.01, at most 5e-4 at the curvature reached, so ccx's iterations keep a tangent; COH3D8 of a soft elastic glue, E 1, *COHESIVE SECTION, RESPONSE=CONTINUUM):
+    the end x = 0 held in x, the end x = 0.4 moved u_x = theta z (plane sections), theta 50
+    times first yield, so the section is all but fully plastic (M_p = 2.5e-4)."""
+    zs = [-0.05]
+    for _t, h in layers:
+        zs.append(zs[-1] + h)
+    nid = lambda i, j, lv: 1 + i + (nx + 1) * (j + 2 * lv)  # noqa: E731
+    nodes = {nid(i, j, lv): (0.4 * i / nx, 0.1 * j, z) for lv, z in enumerate(zs) for j in range(2)
+             for i in range(nx + 1)}
+    out = ["*NODE, NSET=ALLN"] + [f"{n}, {p[0]!r}, {p[1]!r}, {p[2]!r}" for n, p in sorted(nodes.items())]
+    e = 0
+    for li, (t, h) in enumerate(layers):
+        out.append(f"*ELEMENT, TYPE={t}, ELSET=L{li}")
+        for a in range(nx):
+            e += 1
+            out.append(f"{e}, " + ", ".join(str(nid(*c)) for c in (
+                (a, 0, li), (a + 1, 0, li), (a + 1, 1, li), (a, 1, li),
+                (a, 0, li + 1), (a + 1, 0, li + 1), (a + 1, 1, li + 1), (a, 1, li + 1))))
+        out += ([f"*SHELL SECTION, ELSET=L{li}, MATERIAL=M", f"{h!r}"] if t == "SC8R" else
+                [f"*COHESIVE SECTION, ELSET=L{li}, MATERIAL=GLUE, RESPONSE=CONTINUUM"])
+    out += ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.", "*PLASTIC", "1., 0.", "1.01, 1.", "*MATERIAL, NAME=GLUE",
+            "*ELASTIC", "1., 0."]
+    left = [n for n, p in nodes.items() if p[0] == 0.0]
+    right = [n for n, p in nodes.items() if p[0] == 0.4]
+    out += ["*NSET, NSET=RIGHT"] + [", ".join(map(str, right))]
+    out += ["*NSET, NSET=MID", str(nid(nx // 2, 0, len(layers)))]
+    out += ["*BOUNDARY"] + [f"{n}, 1, 1" for n in left] + [f"{nid(0, 0, 0)}, 2, 3", f"{nid(0, 1, 0)}, 3, 3"]
+    out += ["*STEP, INC=1000", "*STATIC", "0.01, 1., 1e-8, 0.02", "*BOUNDARY"]
+    out += [f"{n}, 1, 1, {50 * 0.02 * 0.4 * nodes[n][2]!r}" for n in right]
+    out += ["*NODE PRINT, NSET=MID", "U", "*NODE PRINT, NSET=RIGHT", "RF", "*END STEP"]
+    return "\n".join(out) + "\n", {n: nodes[n][2] for n in right}
+
+
 def t155_s8r_deck(width, plastic):
     """An S8R cantilever strip 2 long (two elements along it), ``width`` elements across its
     width 1, thickness 0.1, E 1000, clamped at x = 0 and loaded by 1e-3 out of plane at its
@@ -20349,6 +20385,37 @@ def check_t155(ccx, env, tmp, shared):
     return failures
 
 
+@check("sc_stacks", "continuum shells stacked through the thickness: odd stacks flagged, bonded stacks not")
+def check_sc_stacks(ccx, env, tmp, shared):
+    # --- task 173: SC8R (ccx: C3D8I, 2 Gauss points through each) in pure bending, nearly fully
+    # plastic: k equal elements through the thickness carry 1 + 0.155 / k^2 times M_p for odd k
+    # (the element the middle crosses, flagged), M_p for even k; two SC8R bonded by a thin
+    # cohesive layer are a stack (1 - (g / t)^2 = 0.9996 of M_p), not flagged ---
+    review_run = shared["review_run"]
+    flag = "plastic continuum shells SC6R / SC8R"
+    failures = 0
+    sc = ("SC8R", 0.1)
+    for name, layers, want, flagged in (
+            ("k1", [sc], 2 / math.sqrt(3), True), ("k2", [("SC8R", 0.05)] * 2, 1.0, False),
+            ("k3", [("SC8R", 0.1 / 3)] * 3, 1 + (1 / math.sqrt(3) - 0.5) * 4 / 9 / 2, True),
+            ("bonded", [("SC8R", 0.049), ("COH3D8", 0.002), ("SC8R", 0.049)], 1 - 0.02 ** 2, False)):
+        text, z = sc_stack_bend_deck(layers)
+        tag = f"sc_stacks_{name}"
+        res = review_run(text, tag, lambda dat: (dat_node_blocks(dat), dat_node_blocks(dat, "forces")))
+        rep, conv = convert(os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}_flag.inp"))
+        got_flag = any(r.startswith(flag) for r in conv.reduced_physics)
+        ok = bool(res and res[0] and res[1])
+        if ok:
+            m = sum(v[0] * z[n] for n, v in res[1][-1].items()) / 2.5e-4
+            w = res[0][-1][min(res[0][-1])][2]
+            ok = abs(m - want) < 2e-3 and got_flag == flagged and abs(w) > 1e-3
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({'two SC8R bonded by a COH3D8 layer' if name == 'bonded' else f'{name[1]} SC8R'} "
+                  f"through the thickness in pure bending): M / M_p {m:.4f} vs {want:.4f}, "
+                  f"{'flagged' if got_flag else 'not flagged'}; the free mid-span top node moved w {w:.4g}")
+        failures += 0 if ok else 1
+    return failures
+
+
 @check("s8r_strip_s8", "S8R strips one element wide written as S8 under --approximate; *BUCKLE flagged")
 def check_s8r_strip_s8(ccx, env, tmp, shared):
     # --- task 159: an S8R strip one element wide in an NLGEOM step (a load 1e-4 as large, so
@@ -20996,6 +21063,27 @@ def check_spring_dofs_masses(ccx, env, tmp, shared):
     return failures
 
 
+def knot_heat_deck(ssd=True):
+    """An S4 strip 1 x 0.1 x 0.01 off the global axes (E 1.2e7, nu 0), clamped at one end: a
+    steady-state *HEAT TRANSFER step (the clamped end at 20), a *FREQUENCY step and, with
+    ``ssd``, a *STEADY STATE DYNAMICS step loading the tip by moments (knot beams there, held
+    about the normal by a *BOUNDARY on a global rotation).  The *FREQUENCY step prints no
+    output of its own; its eigenvalues go to the .dat."""
+    nodes = "".join(f"{i + 1}, {0.08 * i:.6g}, {0.036 * i:.6g}, {-0.048 * i:.6g}\n"
+                    f"" for i in range(11)) + "".join(
+        f"{i + 12}, {0.08 * i:.6g}, {0.08 + 0.036 * i:.6g}, {0.06 - 0.048 * i:.6g}\n" for i in range(11))
+    elems = "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 13}, {i + 12}\n" for i in range(10))
+    text = ("*NODE\n" + nodes + "*ELEMENT, TYPE=S4, ELSET=E\n" + elems +
+            "*NSET, NSET=TIP\n11, 22\n*NSET, NSET=FIX\n1, 12\n*MATERIAL, NAME=M\n*ELASTIC\n1.2e7, 0.\n"
+            "*DENSITY\n1e-3\n*CONDUCTIVITY\n50.\n*SPECIFIC HEAT\n500.\n*SHELL SECTION, ELSET=E, "
+            "MATERIAL=M\n0.01\n*BOUNDARY\nFIX, 1, 6\n*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 1.\n"
+            "*BOUNDARY\nFIX, 11, 11, 20.\n*END STEP\n*STEP\n*FREQUENCY\n3\n*END STEP\n")
+    if ssd:
+        text += ("*STEP\n*STEADY STATE DYNAMICS\n0.5, 0.5, 1\n*CLOAD\n11, 5, 8e-05\n11, 6, 6e-05\n"
+                 "22, 5, 8e-05\n22, 6, 6e-05\n*END STEP\n")
+    return text
+
+
 @check("shell_knot_limits", "knot drilling holds: *MODAL DYNAMIC decks, *TRANSFORM nodes, BCs in "
        "some steps (a *BOUNDARY on the normal's largest component)")
 def check_shell_knot_limits(ccx, env, tmp, shared):
@@ -21079,6 +21167,24 @@ def check_shell_knot_limits(ccx, env, tmp, shared):
         print(f"{'PASS' if ok else 'FAIL'}  released_knot_oblique (released_knot off the global axes): tip "
               f"u_n {sum(a * c for a, c in zip(got[9], OBLIQUE_PLANE[2])):.6g} as in the xy-plane "
               f"({err:.1e} off in the strip's axes; before: ccx stopped)")
+    failures += 0 if ok else 1
+
+    # a run whose procedures are *HEAT TRANSFER and eigenvalue / modal steps alone: ccx sets it up
+    # as heat transfer, its knots without rotations, and stopped on the knots' drilling hold
+    # ('*ERROR in gen3dboun ... do not have rotational DOFs').  A *STATIC card ahead of the
+    # *FREQUENCY card makes it mechanical too.  Against the strip without the modal step (no
+    # knots), whose run has the heat step too
+    runs = [review_run(knot_heat_deck(s), "knot_heat" + ("" if s else "_ref"),
+                       lambda p: dat_eigen_table(p, "E I G E N V A L U E   O U T P U T") or None)
+            for s in (True, False)]
+    ok = all(runs)
+    if ok:
+        got, ref = runs
+        err = max(abs(a / b - 1.0) for a, b in zip(got, ref)) if len(got) == len(ref) == 3 else math.inf
+        ok = err < 1e-6 and ref[0] > 100.0
+        print(f"{'PASS' if ok else 'FAIL'}  knot_heat (the strip off the axes: *HEAT TRANSFER, *FREQUENCY, "
+              f"tip moments in *STEADY STATE DYNAMICS): ccx runs all three steps, frequencies "
+              f"{', '.join(f'{x:.7g}' for x in got)} as without knots ({err:.1e}; before: ccx stopped)")
     failures += 0 if ok else 1
     return failures
 
