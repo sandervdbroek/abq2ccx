@@ -37,7 +37,8 @@ entries. The GitHub release notes use the same section.
   were up to 10 % off; now the answers equal the skin merged with the block.
 * **More correct answers.** A `*TIE` or tied contact pair whose slave surface is the faces of
   plane or axisymmetric elements now ties them. ccx tied none of those faces' nodes, so the model
-  was singular (answers some 1e14 times too large).
+  was singular (answers some 1e14 times too large). Such a tie that should carry temperatures, or
+  move slave nodes onto the master, is warned and flagged: ccx does neither for these elements.
 * **Leaner tie output.** Tied contact pairs get the slave-surface trimming that `*TIE` got in
   1.7.0: the same answers without a ccx warning for every slave node away from the master.
 * **More correct answers.** Shells joined at a knot (where the converter attaches a small helper
@@ -176,7 +177,11 @@ entries. The GitHub release notes use the same section.
   nu 0): the strips merged, exactly (CAX4 1.6e-4, its wedge); before 7e14 x the displacements. At
   nu 0.3 plane strain stays exact and plane stress is 5e-3 off, where ccx's merged nodes share the
   expanded thickness. A plane slave that shares nodes with its master, left out before, now ties
-  its other nodes.
+  its other nodes. Warned as reduced physics: a step solving for temperatures (ccx ties the 2-D
+  node through the middle node of its expansion, whose temperature its elements do not use:
+  CPE4T strips in a coupled step 14x off), and slave nodes off the master within the tolerance
+  unless `ADJUST=NO` (ccx's `ADJUST` moves the node, not its expansion: 2-4 % off for strips
+  0.02-0.04 apart; `ADJUST=NO` exact). `tie_2d_faces` also runs CPE4 and CAX8R at nu 0.3.
 * **Tied contact pairs trimmed** — a `*CONTACT PAIR, TIED` on deformable surfaces, written as a
   `*TIE`, gets the `*TIE`'s trimmed slave surface (`validate_with_ccx.py
   tie_leftovers_pair_trimmed`: the same answer, 16 'no tied MPC' warnings instead of 112).

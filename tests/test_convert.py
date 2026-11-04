@@ -23576,6 +23576,25 @@ def test_tie_slave_on_plane_element_faces_becomes_a_node_surface():
     body, conv, _ = convert_str(deck.format(typ="CPS4", sec="1.", tie="*Tie, name=T1\nSL, MA\n").replace(
         "2, 5, 6, 7, 8", "2, 4, 6, 7, 8"))
     assert _card_at(body, "*SURFACE, NAME=SL_NODES, TYPE=NODE") == ["6"] and not conv.reduced_physics
+    # slave nodes off the master: Abaqus' ADJUST moves them, ccx only the 2-D node, not its
+    # expansion (2-4 % off) -> warned, reduced physics; exact with ADJUST=NO
+    gap = deck.format(typ="CPE4", sec="1.", tie="*Tie, name=T1\nSL, MA\n").replace(
+        "5, 1., 1.\n6, 2., 1.\n", "5, 1., 1.005\n6, 2., 1.005\n")
+    body, conv, rep = convert_str(gap)
+    assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.1") == ["SL_NODES, MA"]
+    assert conv.reduced_physics == ["*TIE on plane / axisymmetric faces: slave nodes off the master moved "
+                                    "by ccx's ADJUST, not their elements"]
+    assert "2 slave node(s) (e.g. node 5) lie off the master" in rep.text() and "which Abaqus ties" not in rep.text()
+    _, conv, _ = convert_str(gap.replace("*Tie, name=T1\n", "*Tie, name=T1, adjust=no\n"))
+    assert not conv.reduced_physics
+    # a step solving for temperatures: the tie carries none (ccx ties the node's middle
+    # expansion node, whose temperature its elements do not use)
+    td = deck.format(typ="CPE4T", sec="1.", tie="*Tie, name=T1\nSL, MA\n").replace(
+        "*Elastic\n1000., 0.3\n", "*Elastic\n1000., 0.3\n*Conductivity\n1.\n*Expansion\n1e-5\n").replace(
+        "*Static\n", "*Coupled Temperature-Displacement, steady state\n1., 1.\n")
+    body, conv, rep = convert_str(td)
+    assert "SL_NODES, MA" in body and "*TIE on plane / axisymmetric faces: no temperatures tied" in conv.reduced_physics
+    assert "which Abaqus ties" not in rep.text()
 
 
 def test_tied_pair_of_a_membrane_on_a_rigid_surface_counts_its_thickness():

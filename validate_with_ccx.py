@@ -8933,23 +8933,32 @@ def shell_tie_deck(kind, typ="S4"):
     raise ValueError(kind)
 
 
-def tie_2d_face_deck(typ, merged, pair=False):
-    """Two 4 x 1 strips of ``typ`` (CPS4 / CAX4; x 0-2, r 1-3), the lower's base held, the upper on
-    its top: the upper's bottom faces (S1) tied to the lower's top faces (S3) — by a *TIE, or a
-    TIED *CONTACT PAIR (``pair``) — or ``merged``, the strips sharing those nodes; the upper's top
-    pulled along x, then along y."""
-    x0 = 1.0 if typ == "CAX4" else 0.0
-    lo = {(i, k): 1 + i + 5 * k for i in range(5) for k in range(2)}
-    up = {(i, k): (lo[(i, 1)] if merged and k == 0 else 101 + i + 5 * k) for i in range(5) for k in range(2)}
-    xyz = {n: (x0 + 0.5 * i, float(k)) for (i, k), n in lo.items()}
-    xyz.update({n: (x0 + 0.5 * i, 1.0 + k) for (i, k), n in up.items()})
-    els = [f"{base + i}, {g[(i, 0)]}, {g[(i + 1, 0)]}, {g[(i + 1, 1)]}, {g[(i, 1)]}"
-           for g, base in ((lo, 1), (up, 11)) for i in range(4)]
-    top = [up[(i, 1)] for i in range(5)]
+def tie_2d_face_deck(typ, merged, pair=False, nu=0.0):
+    """Two 4 x 1 strips of ``typ`` (CPS4 / CPE4 / CAX4, or quadratic CAX8R; x 0-2, r 1-3), the
+    lower's base held, the upper on its top: the upper's bottom faces (S1) tied to the lower's
+    top faces (S3) — by a *TIE, or a TIED *CONTACT PAIR (``pair``) — or ``merged``, the strips
+    sharing those nodes; the upper's top pulled along x, then along y; Poisson's ratio ``nu``."""
+    quad = typ.endswith(("8", "8R"))
+    h = 2 if quad else 1                                    # (grid steps per element)
+    x0 = 1.0 if typ.startswith("CAX") else 0.0
+    keep = lambda i, k: not quad or i % 2 == 0 or k % 2 == 0                     # noqa: E731
+    lo = {(i, k): 1 + i + 9 * k for i in range(4 * h + 1) for k in range(h + 1) if keep(i, k)}
+    up = {(i, k): (lo[(i, h)] if merged and k == 0 else 101 + i + 9 * k) for (i, k) in lo}
+    xyz = {n: (x0 + 0.5 * i / h, k / h) for (i, k), n in lo.items()}
+    xyz.update({n: (x0 + 0.5 * i / h, 1.0 + k / h) for (i, k), n in up.items()})
+    els = []
+    for g, base in ((lo, 1), (up, 11)):
+        for e in range(4):
+            i = h * e
+            c = [g[(i, 0)], g[(i + h, 0)], g[(i + h, h)], g[(i, h)]]
+            c += [g[(i + 1, 0)], g[(i + 2, 1)], g[(i + 1, 2)], g[(i, 1)]] if quad else []
+            els.append(f"{base + e}, " + ", ".join(map(str, c)))
+    top = [up[(i, h)] for i in range(4 * h + 1)]
     out = ["*HEADING", f"plane face tie {typ}", "*NODE"] + [f"{n}, {x:g}, {y:g}" for n, (x, y) in sorted(xyz.items())]
     out += [f"*ELEMENT, TYPE={typ}, ELSET=ALL"] + els + [
-        f"*SOLID SECTION, ELSET=ALL, MATERIAL=M\n{'' if typ == 'CAX4' else '1.'}", "*MATERIAL, NAME=M",
-        "*ELASTIC", "200000., 0.", "*NSET, NSET=TOP\n" + ", ".join(map(str, top)), "*NSET, NSET=BASE\n1, 2, 3, 4, 5"]
+        f"*SOLID SECTION, ELSET=ALL, MATERIAL=M\n{'' if typ.startswith('CAX') else '1.'}", "*MATERIAL, NAME=M",
+        "*ELASTIC", f"200000., {nu:g}", "*NSET, NSET=TOP\n" + ", ".join(map(str, top)),
+        "*NSET, NSET=BASE\n" + ", ".join(str(lo[(i, 0)]) for i in range(4 * h + 1))]
     if not merged:
         out += ["*SURFACE, NAME=SL\n11, S1\n12, S1\n13, S1\n14, S1", "*SURFACE, NAME=MA\n1, S3\n2, S3\n3, S3\n4, S3",
                 "*SURFACE INTERACTION, NAME=SI\n*CONTACT PAIR, INTERACTION=SI, TIED\nSL, MA" if pair else
@@ -19997,9 +20006,11 @@ def check_tie_2d_faces(ccx, env, tmp, shared):
         if res is None:
             print(f"FAIL  {tag}: did not solve ({status})")
         return res
-    for typ, pair, tol in (("CPS4", False, 1e-9), ("CPS4", True, 1e-9), ("CAX4", False, 3e-4)):
-        tag = f"{typ}{'_pair' if pair else ''}"
-        runs = [run(f"t2f_{tag}", tie_2d_face_deck(typ, False, pair)), run(f"t2f_{tag}_ref", tie_2d_face_deck(typ, True))]
+    for typ, pair, nu, tol in (("CPS4", False, 0.0, 1e-9), ("CPS4", True, 0.0, 1e-9), ("CPE4", False, 0.3, 1e-9),
+                               ("CAX4", False, 0.0, 3e-4), ("CAX8R", False, 0.3, 3e-4)):
+        tag = f"{typ}{'_pair' if pair else ''}{'_nu' if nu else ''}"
+        runs = [run(f"t2f_{tag}", tie_2d_face_deck(typ, False, pair, nu)),
+                run(f"t2f_{tag}_ref", tie_2d_face_deck(typ, True, nu=nu))]
         ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) == 2
         if ok:
             got, want = runs[0][0], runs[1][0]
@@ -20009,9 +20020,9 @@ def check_tie_2d_faces(ccx, env, tmp, shared):
             ok = err <= tol * moved and moved > 1e-5 and not runs[0][2] and \
                 "on plane / axisymmetric elements -> node surface SL_NODES" in runs[0][1]
             print(f"{'PASS' if ok else 'FAIL'}  tie_2d_faces_{tag} ({typ} strips, the upper's bottom faces "
-                  f"tied to the lower's top{' by a TIED *CONTACT PAIR' if pair else ''}, pulled along x, then "
-                  f"y): its top nodes as the strips merged in both steps ({err:.1e} apart; |u| {moved:.4g} at "
-                  f"least{'; CAX4: its wedge' if typ == 'CAX4' else ''}; before: singular, 7e14 x |u|)")
+                  f"tied to the lower's top{' by a TIED *CONTACT PAIR' if pair else ''}, nu {nu:g}, pulled along "
+                  f"x, then y): its top nodes as the strips merged in both steps ({err:.1e} apart; |u| {moved:.4g} "
+                  f"at least{'; CAX: its wedge' if typ.startswith('CAX') else ''}; before: singular, 7e14 x |u|)")
         failures += 0 if ok else 1
     return failures
 
