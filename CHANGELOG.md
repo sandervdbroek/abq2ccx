@@ -51,6 +51,9 @@ entries. The GitHub release notes use the same section.
 * **More correct answers.** `*BOUNDARY, FIXED` on a translation of a node with a `*TRANSFORM`,
   where earlier loads moved it, now holds the node where the step finds it. ccx held it at the
   wrong value (the global component read as the local one), with a warning.
+* **More correct answers.** A connector spring or dashpot (`*CONNECTOR ELASTICITY` / `DAMPING`)
+  turned or moved further than the model's size, in a nonlinear or dynamic step, no longer flips
+  its force: a 0.11 rad turn on a 5 cm model came out 1.8 times too large in one direction.
 
 ### Details
 
@@ -213,6 +216,19 @@ entries. The GitHub release notes use the same section.
   stops a moving DOF along an oblique axis otherwise than one along a global axis, as with its
   own BCs on transformed nodes (one C3D8: the model 3-21 % of its peak displacement off, the
   node's free local DOFs up to 38 %): warned as reduced physics.
+
+* **Connector springs past the model's span** — a connector component's spring and dashpot act
+  between a helper node, which an `*EQUATION` ties to the component, and a held node a model
+  span away. Where ccx takes a `SPRINGA`'s current length (NLGEOM, `*DYNAMIC`, explicit, and
+  steps it iterates for plasticity or contact) the helper passed that node once the component
+  exceeded the span read as a length, and the force flipped: a rotation of 0.11 rad on a 0.05 m
+  model gave 2.199e-3 and -4.001e-3 for moments of ±110, a translation of five spans 0.07 for
+  0.05. There the helper now moves s = span / 100 times the component with stiffness k / s² and
+  damping c / s² (a second helper where a `*CONNECTOR MOTION` / `LOAD` sits on the first), as
+  rotational `SPRING1` / `SPRING2` do: the same forces, up to 100 radians or spans. The
+  translational spring form's held node is also 100 spans away in decks with such iterated
+  steps. `validate_with_ccx.py connector_large_motion`: ±2.198817e-3 (the deck `SPRING1`'s
+  answer), also by a `*CONNECTOR LOAD`, and ±0.05.
 
 ## 1.7.0 (November 2026)
 
