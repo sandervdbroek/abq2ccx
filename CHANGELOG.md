@@ -56,6 +56,9 @@ entries. The GitHub release notes use the same section.
 * **More correct answers.** `*BOUNDARY, FIXED` on a translation of a node with a `*TRANSFORM`,
   where earlier loads moved it, now holds the node where the step finds it. ccx held it at the
   wrong value (the global component read as the local one), with a warning.
+* **More correct answers.** An `*EQUATION` or a `*TIE` on a node with a `*TRANSFORM` and a
+  boundary condition of its own now holds after a later `*BOUNDARY, OP=NEW`. ccx let go of it
+  there without a message (a gap of a third of the motion in a test cube).
 * **More correct answers.** A connector spring or dashpot (`*CONNECTOR ELASTICITY` / `DAMPING`)
   turned or moved further than the model's size, in a nonlinear or dynamic step, no longer flips
   its force: a 0.11 rad turn on a 5 cm model came out 1.8 times too large in one direction.
@@ -233,6 +236,17 @@ entries. The GitHub release notes use the same section.
   stops a moving DOF along an oblique axis otherwise than one along a global axis, as with its
   own BCs on transformed nodes (one C3D8: the model 3-21 % of its peak displacement off, the
   node's free local DOFs up to 38 %): warned as reduced physics.
+* **`*TRANSFORM` node BCs before `*BOUNDARY, OP=NEW`** — ccx 2.23 writes a BC on a transformed
+  node's local translation as an equation with an extra node carrying the value, substitutes it
+  into every other linear constraint holding the DOF it eliminates, and on a later
+  `*BOUNDARY, OP=NEW` deletes those constraints with the BC (where they eliminate a DOF of the
+  node) or leaves them on the freed extra node: a deck or converter `*EQUATION` on the node,
+  either side, and the slaves tied to it as a `*TIE` master come loose, silently (probed, ccx's
+  current source too; not with OP=NEW in step 1, a BC sharing no global component with the
+  equation's terms, or `*RIGID BODY`). Such nodes now get the helper node form of `*BOUNDARY,
+  FIXED` above: every BC on their translations on an untransformed helper node tied to them.
+  Exact against each step solved alone (`validate_with_ccx.py opnew_helper`: an equation, a
+  tie). Where that form does not apply (the guards above), a warning and reduced physics.
 
 * **Connector springs past the model's span** — a connector component's spring and dashpot act
   between a helper node, which an `*EQUATION` ties to the component, and a held node a model
