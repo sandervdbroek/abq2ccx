@@ -58,6 +58,12 @@ entries. The GitHub release notes use the same section.
   turned or moved further than the model's size, in a nonlinear or dynamic step, no longer flips
   its force: a 0.11 rad turn on a 5 cm model came out 1.8 times too large in one direction.
 
+* **More correct answers.** In a static perturbation step with `*LOAD CASE`s after a loaded
+  base state, a later load case that holds a node at zero (its base-state position, in Abaqus)
+  now holds it there: ccx held it where the previous load case left it (in a test cube, off by
+  nearly the load case's whole response). A load case's own output requests no longer carry
+  into the later load cases, and a card Abaqus does not allow inside a load case is warned.
+
 ### Details
 
 * **Terminal report wrapping** — lines are wrapped one column short of the terminal's width: a
@@ -243,6 +249,22 @@ entries. The GitHub release notes use the same section.
   translational spring form's held node is also 100 spans away in decks with such iterated
   steps. `validate_with_ccx.py connector_large_motion`: ±2.198817e-3 (the deck `SPRING1`'s
   answer), also by a `*CONNECTOR LOAD`, and ±0.05.
+
+* **Later load cases holding a DOF at zero** — a zero `*BOUNDARY` in a static perturbation step
+  holds a DOF the base state leaves free at its base-state value: `*BOUNDARY, FIXED`, which ccx
+  holds at the end of the step before. For the second and later `*LOAD CASE`s that step was the
+  previous load case's ccx step, so they were warned and flagged as reduced physics. Now a
+  general step that solves the base state again (the base state's loads, BCs and temperatures)
+  goes before such a load case, after a general step and where the case's step holds a DOF at
+  zero, and the load case's step uses FIXED. The step is marked in the deck and named in the
+  load-case note. Its time counts in ccx's total time only, so `TIME=TOTAL TIME` amplitudes
+  later get the shift for it. A load case's own output database requests stay in its ccx step:
+  each later load case carries what the first one carries (it carried the previous case's). A
+  card other than `*BOUNDARY`, `*CLOAD`, `*DLOAD`, `*DSLOAD`, `*INERTIA RELIEF`, `*BASE
+  MOTION`, `*CONNECTOR LOAD`, `*CONNECTOR MOTION` or an output request inside a load case is
+  warned (Abaqus rejects it) and kept as that case's own. `validate_with_ccx.py review1
+  load_cases_hold`: the second load case holds node 6's y at 0.02175, both ccx case steps equal
+  the hand-written single-case steps (0.0 apart; the old form 2.2e-2 off).
 
 ## 1.7.0 (November 2026)
 
