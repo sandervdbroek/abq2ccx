@@ -10330,7 +10330,9 @@ class _Mesh:
         reach = self._mean_diagonal([self._face_points(e, face) for token, face in md[1]
                                      for e in self._resolve_elements(token) if e in els]) if mf else 0.0
         gaps = self._surface_gaps(keep, mf, tol) if mf and keep else {}
-        off = [n for n in keep if n in gaps and 1e-6 * (reach or 1.0) < gaps[n][0] <= tol]
+        # (off by more than 1e-4 of a facet: round-off in the deck's coordinates is not a gap;
+        # the answer moves by about the gap's share of the element)
+        off = [n for n in keep if n in gaps and 1e-4 * (reach or 1.0) < gaps[n][0] <= tol]
         adjust = pair or (b.param("ADJUST") or "YES").strip().upper() != "NO"
         why = []
         if self._mpc_thermal:
