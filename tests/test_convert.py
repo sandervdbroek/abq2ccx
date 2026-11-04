@@ -23572,18 +23572,35 @@ def test_tie_of_shells_on_solid_faces_ties_their_nodes():
     assert not conv.reduced_physics
 
 
-def test_tie_of_shells_with_a_section_offset_ties_their_reference_face():
-    # a section OFFSET moves the expanded shell off its nodes: ccx's node is its midsurface, the
-    # SPOS / SNEG face at the reference surface is exact (probed: 1e-7 off knotted nodes tied)
-    for off, lab in ((", offset=SPOS", "SPOS"), (", offset=-0.5", "SNEG")):
-        body, conv, _ = convert_str(_skin(face=", SNEG", off=off))
-        assert _card_at(body, f"*SURFACE, NAME=SKIN_{lab}, TYPE=ELEMENT") == [f"2, {lab}"]
-        assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.141421") == [f"SKIN_{lab}, TOP"]
+def test_tie_of_shells_with_a_section_offset_knots_their_nodes():
+    # a section OFFSET moves the expanded shell off its nodes: ccx ties a plain node's midsurface,
+    # and the SPOS / SNEG face at the reference surface ties too little (a load or BC on a skin
+    # node makes ccx skip the SNEG face's node: 1.9x off) -> knot beams on the slave nodes on the
+    # master (the node the reference point) and a node surface of them, as an offset skin merged
+    # with the solid (validate_with_ccx.py tie_offset_knots: exact; before 1.9x / 10 % off)
+    for off in (", offset=SPOS", ", offset=-0.5", ", offset=0.25"):
+        body, conv, rep = convert_str(_skin(face=", SNEG", off=off))
+        assert _card_at(body, "*SURFACE, NAME=SKIN_NODES, TYPE=NODE") == ["2", "3", "6", "5"], off
+        assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.141421") == ["SKIN_NODES, TOP"]
+        assert sorted(conv._knots) == [2, 3, 5, 6] and conv._offset_knots == {2, 3, 5, 6}
+        assert "ELSET=ABQ2CCX_KNOT" in body and "nodes of shells with a section OFFSET knotted" in rep.text()
         assert not conv.reduced_physics
-    body, conv, rep = convert_str(_skin(off=", offset=0.25"))
-    assert _card_at(body, "*TIE, NAME=T1") == ["SKIN, TOP"]
+    # a TIED contact pair too; the master's own node stays out (merged: _plan_offset_solid_knots)
+    body, conv, _ = convert_str(_skin(off=", offset=SNEG", tie="*Surface Interaction, name=SI\n*Contact Pair, "
+                                                                "interaction=SI, tied\nSKIN, TOP\n"))
+    assert _card_at(body, "*TIE, NAME=ABQ2CCX_TIED1, POSITION TOLERANCE=0.025") == ["SKIN_NODES, TOP"]
+    assert sorted(conv._knots) == [2, 3, 5, 6] and not conv.reduced_physics
+    body, conv, _ = convert_str(_skin(off=", offset=SNEG", n2="15"))
+    assert _card_at(body, "*SURFACE, NAME=SKIN_NODES, TYPE=NODE") == ["3", "6", "5"]
+    assert sorted(conv._knots) == [3, 5, 6, 15] and not conv.reduced_physics
+    # no knot beams in an explicit deck (they stop its solver): the deck's surface, warned
+    body, conv, rep = convert_str(_skin(face=", SNEG", off=", offset=SNEG", step=S4_SKIN_STEP.replace(
+        "*Static", "*Dynamic, Explicit\n, 1e-4")))
+    assert _card_at(body, "*TIE, NAME=T1") == ["SKIN, TOP"] and not conv._knots
     assert conv.reduced_physics == ["*TIE on conventional shells: a shell section OFFSET at the master "
-                                    "(Abaqus ties the reference surface, ccx's node its midsurface)"]
+                                    "(Abaqus ties the reference surface, ccx's node its midsurface; the "
+                                    "knot beams that would make it the reference point stop ccx's "
+                                    "explicit solver)"]
     assert "No ccx form is exact" in rep.text()
 
 

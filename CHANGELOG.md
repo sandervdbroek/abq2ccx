@@ -30,6 +30,11 @@ entries. The GitHub release notes use the same section.
   block's depth, without a message. A `*TIE` with `TIED NSET` now ties exactly the slave nodes
   of that set, as Abaqus does; the parameter was dropped, so every slave node was tied (or,
   beyond ccx's default tolerance, none).
+* **More correct answers.** A shell with a section offset tied by its nodes to a solid face (a
+  `*TIE` or tied contact pair of an offset skin on a block) is now tied at its reference surface
+  and carries loads there, as in Abaqus. Tied by its offset face, a skin's loaded edge stayed
+  untied in ccx (twice the block's deflection, or none in a second step), and other offset skins
+  were up to 10 % off; now the answers equal the skin merged with the block.
 * **Leaner tie output.** Tied contact pairs get the slave-surface trimming that `*TIE` got in
   1.7.0: the same answers without a ccx warning for every slave node away from the master.
 * **More correct answers.** Shells joined at a knot (where the converter attaches a small helper
@@ -139,6 +144,18 @@ entries. The GitHub release notes use the same section.
   merged (tied by equations with `ADJUST=NO`), exactly. On plane, axisymmetric, membrane or beam
   elements ccx's `ADJUST` moves a node but not the solid it expands the element to (9-11 % off),
   so a set node off the master there is warned as reduced physics unless `ADJUST=NO`.
+* **Offset shells tied to solids** — a `*TIE` / TIED `*CONTACT PAIR` whose slave shell nodes lie
+  on solid master faces, of shells with a nonzero section `OFFSET`, now ties a node surface of
+  those nodes and gives each a force-free knot beam, as for offset shells merged with solids: the
+  node is the reference point. ccx 2.23 ties a plain shell node's midsurface, and the SPOS / SNEG
+  face at the reference surface (the converter's form since task 129) is no cure: a force, BC
+  or equation on a plain shell node makes ccx take the node's SNEG-side expanded node as its own
+  MPC's dependent, so the tie skips it ('DOF 3 of node ... is not active; no tied constraint'),
+  and the force acts at the midsurface. `validate_with_ccx.py tie_offset_knots_sneg` / `_spos`
+  (the PR #8 reviewer's skin, loaded at its edge): the block as under the skin merged with its
+  nodes, knotted, exactly; before 1.9x off with the loaded edge untied (a second step all zero)
+  for SNEG, 0.5-10 % for SPOS. Other offsets, which were warned as reduced physics, are exact the
+  same way; in a deck with an explicit step or U1 beams they still are.
 * **Tied contact pairs trimmed** — a `*CONTACT PAIR, TIED` on deformable surfaces, written as a
   `*TIE`, gets the `*TIE`'s trimmed slave surface (`validate_with_ccx.py
   tie_leftovers_pair_trimmed`: the same answer, 16 'no tied MPC' warnings instead of 112).
