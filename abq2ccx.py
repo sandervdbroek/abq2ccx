@@ -11107,6 +11107,48 @@ class _Mesh:
             self.report.warn("[APPROX] Rotational SPRING1 / SPRING2 under NLGEOM written in their linear "
                              "form: exact for small rotations only.", once=True)
 
+    def _warn_linear_nonlinear_springs(self, blocks: List[Block]) -> None:
+        """A *SPRING, NONLINEAR whose table is not one straight line through zero, in a deck with
+        a *STATIC or *VISCO step that ccx 2.23 solves linearly (no NLGEOM and nothing it iterates,
+        _solver_steps; not a linear perturbation step, which Abaqus solves linearly too): ccx's
+        springs never turn its nonlinear solver on (springs.f), so there it springs the table's
+        slope at zero (probed: a SPRING1 of slope 100 up to 0.5 and 50 beyond, pulled by 60,
+        moved 0.6 where 0.7 is right; a SPRINGA and a *VISCO step alike).  Warned, reduced
+        physics."""
+        steps = [st.no for st, why in zip(self.steps, self._solver_steps)
+                 if st.proc in ("STATIC", "VISCO") and not why and not st.ccx_nlgeom and not st.perturbation]
+        if not steps:
+            return
+        for b in blocks:
+            if b.keyword != "SPRING" or not b.has("NONLINEAR") or id(b) in self._joint_cards or \
+                    not self._elset_types(b):
+                continue
+            groups: Dict[Tuple[str, ...], List[Tuple[float, float]]] = {}
+            for ln in b.data[1:] if b.data and dof_line(b.data[0]) else b.data:
+                f = trimmed_fields(ln.split(","))
+                try:
+                    groups.setdefault(tuple(x.strip() for x in f[2:]), []).append((pf(f[0]), pf(f[1])))
+                except (ValueError, IndexError):
+                    continue
+
+            def straight(pts: List[Tuple[float, float]]) -> bool:
+                """The points (force, displacement) lie on one line through zero."""
+                top = max(pts, key=lambda p: abs(p[1]))
+                if top[1] == 0.0:
+                    return False
+                big = max(abs(p[0]) for p in pts) or 1.0
+                return all(abs(fo - top[0] / top[1] * d) <= 1e-9 * big for fo, d in pts)
+            if not groups or all(straight(pts) for pts in groups.values()):
+                continue
+            self.report.warn(f"*SPRING, NONLINEAR (ELSET={b.param('ELSET') or ''}) in a deck with "
+                             f"small-strain *STATIC / *VISCO step(s) {', '.join(map(str, steps[:5]))}"
+                             f"{' ...' if len(steps) > 5 else ''}, which ccx 2.23 solves linearly: its "
+                             f"springs never turn on its nonlinear solver, so there it springs the "
+                             f"table's slope at zero (probed: a table softening from 100 to 50 at 0.5, "
+                             f"pulled by 60: 0.6 where 0.7 is right); NLGEOM on the step makes ccx "
+                             f"follow the table.", at=b)
+            self._reduces("*SPRING, NONLINEAR at its initial slope in a step ccx solves linearly")
+
     def _plan_anisotropic_masses(self, blocks: List[Block]) -> None:
         """*MASS, TYPE=ANISOTROPIC: principal masses M11, M22, M33 along the axes v_i of its
         ORIENTATION, else the global ones (Abaqus *MASS), which ccx 2.23 lacks: it reads the
@@ -47737,6 +47779,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_print_sets(blocks)           # after the mesh planners: their nodes and elements
         self._plan_dashpots(blocks)             # after the planners above: the nodes' *TRANSFORM axes
         self._plan_springs(blocks)              # likewise
+        self._warn_linear_nonlinear_springs(blocks)
         self._plan_anisotropic_masses(blocks)   # after _plan_node_classes: the nodes with rotations
         self._plan_free_masses(blocks)          # after it and the planners adding elements above
         self._plan_driven_dashpots(blocks)      # after _plan_dashpots: their rows

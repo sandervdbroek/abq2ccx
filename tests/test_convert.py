@@ -6831,6 +6831,25 @@ BEAM_TIP = ("*Node\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n13, 1., 1., 0.
             "*Boundary\n1, encastre\n11, encastre\n")
 
 
+def test_nonlinear_spring_in_a_linear_static_step_is_flagged():
+    # ccx 2.23 never iterates for a spring: a small-strain *STATIC / *VISCO step springs the
+    # table's slope at zero (0.6 where 0.7 is right) -> warned, reduced physics; not where ccx
+    # follows the table (NLGEOM) or Abaqus is linear too (a perturbation step), nor for a table
+    # that is one straight line through zero
+    tab = "-50., -0.5\n0., 0.\n50., 0.5\n100., 1.5\n"
+    deck = ("*Node\n1, 0., 0., 0.\n2, -10., 0., 0.\n*Element, type=SPRING1, elset=K\n1, 1\n"
+            "*Spring, elset=K, nonlinear\n1\n{tab}*Element, type=SPRINGA, elset=KA\n2, 1, 2\n"
+            "*Spring, elset=KA, nonlinear\n\n{tab}*Boundary\n1, 2, 3\n2, 1, 3\n{step}*Cload\n1, 1, 60.\n*End Step\n")
+    for step in ("*Step\n*Static\n", "*Step\n*Visco\n0.1, 1.\n"):
+        body, conv, rep = convert_str(deck.format(tab=tab, step=step))
+        assert rep.text().count("*SPRING, NONLINEAR (ELSET=") == 2 and "initial slope" in " ".join(rep.reduced)
+    for step in ("*Step, nlgeom\n*Static\n0.1, 1.\n", "*Step, perturbation\n*Static\n"):
+        body, conv, rep = convert_str(deck.format(tab=tab, step=step))
+        assert "*SPRING, NONLINEAR (ELSET=" not in rep.text() and not rep.reduced
+    body, conv, rep = convert_str(deck.format(tab="-200, -1\n0, 0\n200, 1\n", step="*Step\n*Static\n"))
+    assert "*SPRING, NONLINEAR (ELSET=" not in rep.text() and not rep.reduced
+
+
 def test_rotational_springs_act_through_helper_nodes():
     # ccx 2.23's springs act on translations only (a SPRING1 on DOF 5 changed nothing): a
     # helper node whose DOF 1 an *EQUATION ties to the rotation, held across it, with a SPRINGA

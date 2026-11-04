@@ -67,6 +67,9 @@ entries. The GitHub release notes use the same section.
 * **More correct answers.** A connector spring or dashpot (`*CONNECTOR ELASTICITY` / `DAMPING`)
   turned or moved further than the model's size, in a nonlinear or dynamic step, no longer flips
   its force: a 0.11 rad turn on a 5 cm model came out 1.8 times too large in one direction.
+* **Honest flag for nonlinear springs.** A nonlinear spring (`*SPRING, NONLINEAR`) in a static
+  step without NLGEOM is now warned: ccx solves such a step linearly and takes the spring's
+  initial stiffness (0.6 where 0.7 is right).
 
 * **More correct answers.** In a static perturbation step with `*LOAD CASE`s after a loaded
   base state, a later load case that holds a node at zero (its base-state position, in Abaqus)
@@ -284,6 +287,12 @@ entries. The GitHub release notes use the same section.
   steps. `validate_with_ccx.py connector_large_motion`: ±2.198817e-3 (the deck `SPRING1`'s
   answer), also by a `*CONNECTOR LOAD`, and ±0.05.
 
+* **Nonlinear springs in linear steps** — ccx 2.23's springs never switch on its nonlinear
+  solver, so in a `*STATIC` or `*VISCO` step it solves linearly (no NLGEOM, no plastic, creep or
+  hyperelastic material, no contact; not a linear perturbation step) a `*SPRING, NONLINEAR`
+  acts with its table's slope at zero (probed: `SPRING1` and `SPRINGA` softening from 100 to 50
+  at 0.5, pulled by 60: 0.6 where 0.7 is right; NLGEOM 0.6994). Such a card is now warned and
+  reported as reduced physics, unless its table is one straight line through zero.
 * **Later load cases holding a DOF at zero** — a zero `*BOUNDARY` in a static perturbation step
   holds a DOF the base state leaves free at its base-state value: `*BOUNDARY, FIXED`, which ccx
   holds at the end of the step before. For the second and later `*LOAD CASE`s that step was the
