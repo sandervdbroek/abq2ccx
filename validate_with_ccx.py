@@ -8737,6 +8737,39 @@ def fixed_helper_deck(kind):
             pr + "*END STEP\n")
 
 
+def opnew_helper_deck(kind, part="both"):
+    """Decks of the opnew_helper check: node 7 of a C3D8 cube (base held) has an oblique
+    *TRANSFORM, a BC on its local u2 in step 1 and loads; step 2 gives *BOUNDARY, OP=NEW (the
+    base again) and other loads.  ccx 2.23 would loosen node 7's other constraints there:
+
+    * eq: an *EQUATION ties node 6's u1 to node 7's local u1;
+    * tie: a second cube on top, its bottom face tied to the first cube's top (node 7 master).
+
+    ``part``: "both" (the case), "s1" (step 1 alone), "s2" (step 2 alone: its BCs and loads,
+    without node 7's BC, which the OP=NEW releases): linear static references."""
+    xyz = {1: (0, 0, 0), 2: (1, 0, 0), 3: (1, 1, 0), 4: (0, 1, 0), 5: (0, 0, 1), 6: (1, 0, 1),
+           7: (1, 1, 1), 8: (0, 1, 1)}
+    els = "1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+    if kind == "tie":
+        xyz.update({k + 10: (x, y, z + (1 if k <= 4 else 2)) for k, (x, y, z) in list(xyz.items())})
+        els += "2, 11, 12, 13, 14, 15, 16, 17, 18\n"
+    out = "*HEADING\nopnew helper, " + kind + "\n*NODE, NSET=ALLN\n" + \
+        "".join(f"{n}, {x}, {y}, {z}\n" for n, (x, y, z) in sorted(xyz.items())) + \
+        "*ELEMENT, TYPE=C3D8, ELSET=E\n" + els + "*NSET, NSET=BOT\n1, 2, 3, 4\n*NSET, NSET=NN\n7\n" \
+        "*SOLID SECTION, ELSET=E, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n1000., 0.3\n" \
+        "*TRANSFORM, NSET=NN\n%g, %g, %g, %g, %g, %g\n" % (_T133_A + _T133_B)
+    out += "*EQUATION\n2\n6, 1, 1., 7, 1, -1.\n" if kind == "eq" else \
+        "*SURFACE, NAME=MS\n1, S2\n*SURFACE, NAME=SS\n2, S1\n*TIE, NAME=T, POSITION TOLERANCE=0.01\nSS, MS\n"
+    out += "*BOUNDARY\nBOT, 1, 3\n"
+    pr = "*NODE PRINT, NSET=ALLN, GLOBAL=YES\nU\n*END STEP\n"
+    if part != "s2":
+        out += "*STEP\n*STATIC\n*BOUNDARY\n7, 2, 2, 0.01\n*CLOAD\n7, 1, 10.\n6, 3, 5.\n" + pr
+    if part != "s1":
+        out += "*STEP\n*STATIC\n" + ("*BOUNDARY, OP=NEW\nBOT, 1, 3\n" if part == "both" else "") + \
+            "*CLOAD, OP=NEW\n7, 3, 20.\n5, 2, 10.\n" + pr
+    return out
+
+
 def _t133_axes(kind, p):
     """The local axes 1, 2, 3 of fixed_transform_deck(kind)'s *TRANSFORM at point ``p``."""
     def unit(v):
@@ -19573,6 +19606,53 @@ def check_fixed_helper(ccx, env, tmp, shared):
                   f"node's axes, held there by ccx's FIXED along a global axis ({err:.1e} apart of "
                   f"{scale:.3g}; the node held to {held:.1e}, the model moved {moved:.4g} in step 2; "
                   f"before: held at step 1's global components, {before:.4g} off)")
+            if not helper or got[2]:
+                print("      helper node form not used, or reduced: " + "; ".join(got[2]))
+        failures += 0 if ok else 1
+    return failures
+
+
+@check("opnew_helper", "*TRANSFORM node BCs before *BOUNDARY, OP=NEW: equations and ties kept")
+def check_opnew_helper(ccx, env, tmp, shared):
+    # --- a *TRANSFORM node with a BC of its own and an *EQUATION / a *TIE master surface on it,
+    # then *BOUNDARY, OP=NEW: ccx 2.23 would loosen the equation and tie with the BC; the BCs go
+    # to a helper node.  Against the steps solved one at a time (linear static) ---
+    failures = 0
+    ax = _t133_axes("obl", (0., 0., 0.))
+
+    def solve(kind, part):
+        src, inp = os.path.join(tmp, f"oh_{kind}_{part}_src.inp"), os.path.join(tmp, f"oh_{kind}_{part}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(opnew_helper_deck(kind, part))
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        blocks = dat_node_blocks(os.path.join(d, "job.dat")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if blocks is None:
+            print(f"FAIL  opnew_helper {kind} {part}: did not solve ({status})")
+            print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
+        return None if blocks is None else (blocks, rep.text(), conv.reduced_physics)
+    for kind, what in (("eq", "an *EQUATION from node 6's u1 to node 7's local u1"),
+                       ("tie", "a cube tied on top, node 7 on the master surface")):
+        got, r1, r2 = solve(kind, "both"), solve(kind, "s1"), solve(kind, "s2")
+        ok = bool(got and r1 and r2) and len(got[0]) == 2
+        if ok:
+            a, b = got[0], [r1[0][0], r2[0][0]]
+            ok = all(set(p) == set(q) for p, q in zip(a, b))
+            err = max(abs(x - y) for p, q in zip(a, b) for n in q for x, y in zip(p.get(n, ()), q[n])) \
+                if ok else math.inf
+            scale = max(abs(x) for q in b for u in q.values() for x in u)
+            u7 = tuple(sum(e[k] * a[1][7][k] for k in range(3)) for e in ax)
+            gap = abs(u7[0] - a[1][6][0]) if kind == "eq" else \
+                max(abs(a[1][n][i] - a[1][n + 6][i]) for n in (5, 6, 7, 8) for i in range(3))
+            moved = max(abs(x - y) for n in a[1] for x, y in zip(a[1][n], a[0][n]))
+            helper = "written on a helper node" in " ".join(got[1].split())
+            ok = ok and err <= 1e-6 * scale and gap <= 1e-6 * scale and moved > 1e-2 and helper and \
+                not got[2]
+            print(f"{'PASS' if ok else 'FAIL'}  opnew_helper_{kind} ({what}): each step against the step "
+                  f"solved alone ({err:.1e} apart of {scale:.3g}); after the OP=NEW the "
+                  f"{'equation' if kind == 'eq' else 'tie'} holds to {gap:.1e}, the model moved "
+                  f"{moved:.4g} in step 2")
             if not helper or got[2]:
                 print("      helper node form not used, or reduced: " + "; ".join(got[2]))
         failures += 0 if ok else 1
