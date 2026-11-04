@@ -12,6 +12,12 @@ entries. The GitHub release notes use the same section.
 
 ### Overview
 
+* **More correct answers.** Rotational springs (`SPRING1` / `SPRING2` on DOFs 4-6), which ccx
+  ignored without a message, now act. A spring on a constrained node (an `*EQUATION`, rigid body
+  or coupling) now feels a prescribed displacement on the constraint's other nodes, which ccx's
+  linear solve dropped.
+* **Fewer ccx failures.** A point mass on a node that only `*EQUATION`s or a `*KINEMATIC
+  COUPLING` tie no longer stops ccx.
 * **More correct answers.** A shell with a section offset whose nodes are also nodes of a solid
   (a skin merged with a block's face) is now joined to the solid at its reference surface, as in
   Abaqus: ccx joined the shell's midsurface, 11 % off in bending for a skin of a fifth of the
@@ -41,6 +47,28 @@ entries. The GitHub release notes use the same section.
   wrong value (the global component read as the local one), with a warning.
 
 ### Details
+
+* **Rotational springs** — `SPRING1` / `SPRING2` on DOFs 4-6 become a helper node whose DOF 1 an
+  `*EQUATION` ties to the rotation (a rigid body's ROT NODE, a kinematic coupling's or U1 node's
+  DOFs 4-6, or a knot; a shell/beam node gets a knot beam), with a `SPRINGA` from it to a held
+  node, scaled so that the helper reaches that node only past 100 radians: exact for small
+  rotations (a beam node's knot holds its section rigid there, so a coarse beam is a little
+  stiffer: 3 % with one element, 0.03 % with four); under NLGEOM `[APPROX]` (`--approximate`),
+  else left out and warned. On a node with no rotations in ccx the spring is left out (it carries
+  no load).
+* **Springs on constrained or transformed nodes** — a `SPRING1` / `SPRING2` on a node that a
+  constraint names, or on a local DOF of a `*TRANSFORM` node, is a `SPRINGA` to a node that
+  `*EQUATION`s keep on the DOF's line, also under NLGEOM. A rigid-body member in a deck with
+  NLGEOM keeps its spring (warned where a small-strain step would mishandle it). In a deck with an
+  NLGEOM, explicit or `*DYNAMIC` step that held node, and `DASHPOT1` / `DASHPOT2`'s, is 100 model
+  spans away (at one span, compressing one by more than a span flipped its force).
+* **Point masses** — a node on `MASS` elements alone that `*EQUATION`s tie gets a zero-stiffness
+  `SPRINGA` to a held node where it needs one; one tied in some translations only, with the
+  others free in a static step, is warned. A `*KINEMATIC COUPLING`'s mass-only members get the
+  massless tetrahedron that `*COUPLING` members already got.
+* Validate check `spring_dofs_masses` (rotational springs against rigid levers and θ = M / k, and
+  at ±0.11 rad on a 0.05 m model; constrained springs against `SPRINGA` twins and pushed five
+  spans; point masses against zero-spring twins).
 
 * **Offset shells on solid nodes** — ccx 2.23 ties a shell node that it shares with a solid to
   the mean of the node's expanded top and bottom, the midsurface, whatever the section's

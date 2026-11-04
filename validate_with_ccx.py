@@ -6965,6 +6965,134 @@ def spring_transform_deck():
             "*CLOAD\n1, 1, 1.\n2, 2, 1.\n*NODE PRINT, NSET=PROBE, GLOBAL=YES\nU\n*END STEP\n")
 
 
+def spring_rotation_beam_deck(twin=False):
+    """Three B31 cantilevers along x (1 long, 4 elements, RECT 0.1 x 0.1, E 1e4), clamped at
+    x = 0: tip 5 on a SPRING1 of 1 on its DOF 5 and pushed 0.01 along z; tips 15 and 25 joined
+    by a SPRING2 of 1 on DOFs 5, 5, only 15 pushed (beam 21-25 moves through the spring alone).
+    ``twin``: each rotational spring as SPRING1 / SPRING2s of k / (2 a^2) = 50 along x on rigid
+    levers (*MPC BEAM) to nodes at z = +/-a (a = 0.1): the same moment k theta (and an axial
+    spring the beams' zero axial motion does not feel)."""
+    out = "*NODE\n" + "".join(f"{10 * b + i + 1}, {0.25 * i:g}, {b}., 0.\n" for b in range(3) for i in range(5))
+    out += "*ELEMENT, TYPE=B31, ELSET=BEAMS\n" + "".join(
+        f"{10 * b + i + 1}, {10 * b + i + 1}, {10 * b + i + 2}\n" for b in range(3) for i in range(4))
+    if twin:
+        out += "*NODE\n" + "".join(f"{41 + 2 * b}, 1., {b}., 0.1\n{42 + 2 * b}, 1., {b}., -0.1\n" for b in range(3))
+        out += "*MPC\n" + "".join(f"BEAM, {41 + 2 * b + s}, {10 * b + 5}\n" for b in range(3) for s in (0, 1))
+        out += ("*ELEMENT, TYPE=SPRING1, ELSET=KT1\n31, 41\n32, 42\n*SPRING, ELSET=KT1\n1\n50.\n"
+                "*ELEMENT, TYPE=SPRING2, ELSET=KT2\n33, 43, 45\n34, 44, 46\n*SPRING, ELSET=KT2\n1, 1\n50.\n")
+    else:
+        out += ("*ELEMENT, TYPE=SPRING1, ELSET=KR1\n31, 5\n*SPRING, ELSET=KR1\n5\n1.\n"
+                "*ELEMENT, TYPE=SPRING2, ELSET=KR2\n32, 15, 25\n*SPRING, ELSET=KR2\n5, 5\n1.\n")
+    return out + ("*MATERIAL, NAME=STEEL\n*ELASTIC\n1.e4, 0.3\n*BEAM SECTION, ELSET=BEAMS, MATERIAL=STEEL, "
+                  "SECTION=RECT\n0.1, 0.1\n0., 0., 1.\n*NSET, NSET=TIPS\n5, 15, 25\n*BOUNDARY\n1, ENCASTRE\n"
+                  "11, ENCASTRE\n21, ENCASTRE\n*STEP\n*STATIC\n*CLOAD\n5, 3, 0.01\n15, 3, 0.01\n"
+                  "*NODE PRINT, NSET=TIPS\nU\n*END STEP\n")
+
+
+def spring_rotation_ref_deck():
+    """A C3D8 unit cube as a *RIGID BODY on reference node 100 at its centre, and a second one
+    whose nodes a kinematic coupling (*COUPLING, *KINEMATIC 1-3) ties to reference node 200 at
+    its centre; each reference node held but in one rotation, on a SPRING1 of 50 on it (DOF 6
+    of 100, DOF 4 of 200) and loaded by a moment of 1 about it: theta = 1/50, the corners 7 and
+    17 move theta x (0.5, 0.5, 0.5) = (-0.01, 0.01, 0) and (0, -0.01, 0.01)."""
+    cube = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+    out = "*NODE\n" + "".join(f"{10 * c + i + 1}, {x + 2 * c}., {y}., {z}.\n" for c in range(2)
+                              for i, (x, y, z) in enumerate(cube))
+    return out + ("100, 0.5, 0.5, 0.5\n200, 2.5, 0.5, 0.5\n*ELEMENT, TYPE=C3D8, ELSET=C1\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+                  "*ELEMENT, TYPE=C3D8, ELSET=C2\n2, 11, 12, 13, 14, 15, 16, 17, 18\n*NSET, NSET=C2N, GENERATE\n"
+                  "11, 18, 1\n*NSET, NSET=PROBE\n7, 17\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+                  "*SOLID SECTION, ELSET=C1, MATERIAL=M\n*SOLID SECTION, ELSET=C2, MATERIAL=M\n"
+                  "*RIGID BODY, ELSET=C1, REF NODE=100\n*SURFACE, TYPE=NODE, NAME=S2\nC2N\n"
+                  "*COUPLING, CONSTRAINT NAME=K2, REF NODE=200, SURFACE=S2\n*KINEMATIC\n1, 3\n"
+                  "*ELEMENT, TYPE=SPRING1, ELSET=KZ\n31, 100\n*SPRING, ELSET=KZ\n6\n50.\n"
+                  "*ELEMENT, TYPE=SPRING1, ELSET=KX\n32, 200\n*SPRING, ELSET=KX\n4\n50.\n"
+                  "*BOUNDARY\n100, 1, 5\n200, 1, 3\n200, 5, 6\n*STEP\n*STATIC\n*CLOAD\n100, 6, 1.\n200, 4, 1.\n"
+                  "*NODE PRINT, NSET=PROBE\nU\n*END STEP\n")
+
+
+def spring_large_motion_deck(kind, sign):
+    """``kind`` "rot": an SI B31 cantilever 0.05 m long (4 elements, RECT 5 x 5 mm, steel), a
+    SPRING1 of 1000 on its tip's DOF 6, a tip moment of ``sign`` 110 (0.11 rad, past the model's
+    span read as radians): *DYNAMIC (ramped over 1 s, held to 2 s, no NLGEOM) and *STATIC NLGEOM
+    (--approximate).  "line": a node 0.01 from a held one (a soft truss between them, an *EQUATION
+    tying their DOF 3), on a SPRING1 of 100 on DOF 1 and pushed by ``sign`` 5 under NLGEOM: 0.05,
+    five spans."""
+    if kind == "line":
+        return ("*NODE\n1, 0., 0., 0.\n2, 0.01, 0., 0.\n*ELEMENT, TYPE=T3D2, ELSET=T\n1, 1, 2\n*MATERIAL, NAME=M\n"
+                "*ELASTIC\n1., 0.\n*SOLID SECTION, ELSET=T, MATERIAL=M\n1.e-9\n*ELEMENT, TYPE=SPRING1, ELSET=K\n"
+                "5, 2\n*SPRING, ELSET=K\n1\n100.\n*EQUATION\n2\n2, 3, 1., 1, 3, -1.\n*NSET, NSET=P\n2\n"
+                f"*BOUNDARY\n1, 1, 3\n2, 2, 2\n*STEP, NLGEOM\n*STATIC\n0.05, 1.\n*CLOAD\n2, 1, {5.0 * sign:g}\n"
+                "*NODE PRINT, NSET=P\nU\n*END STEP\n")
+    out = "*NODE\n" + "".join(f"{i + 1}, {0.0125 * i:g}, 0., 0.\n" for i in range(5))
+    out += ("*ELEMENT, TYPE=B31, ELSET=BEAM\n1, 1, 2\n2, 2, 3\n3, 3, 4\n4, 4, 5\n*ELEMENT, TYPE=SPRING1, "
+            "ELSET=RS\n100, 5\n*SPRING, ELSET=RS\n6\n1000.\n*MATERIAL, NAME=STEEL\n*ELASTIC\n2.1e11, 0.3\n"
+            "*DENSITY\n7800.\n*BEAM SECTION, ELSET=BEAM, MATERIAL=STEEL, SECTION=RECT\n0.005, 0.005\n0., 0., 1.\n"
+            "*NSET, NSET=TIP\n5\n*BOUNDARY\n1, 1, 6\n")
+    step = ("*AMPLITUDE, NAME=RAMP\n0., 0., 1., 1., 2., 1.\n*STEP, INC=2000\n*DYNAMIC\n0.01, 2.\n"
+            "*CLOAD, AMPLITUDE=RAMP\n") if kind == "dyn" else "*STEP, NLGEOM\n*STATIC\n0.05, 1.\n*CLOAD\n"
+    return out + step + f"5, 6, {110.0 * sign:g}\n*NODE PRINT, NSET=TIP\nU\n*END STEP\n"
+
+
+def spring_dependent_deck(twin=False):
+    """Springs on DOFs that an MPC eliminates, in a *STATIC step (E 100, nu 0 unit cubes held at
+    their bases): cube 1-8 with u5x = 0.5 u6x + u300x (a deck *EQUATION), u300x = 0.01 by a BC,
+    and a SPRING1 of 10 on node 5's DOF 1; cube 11-18 whose top a *RIGID BODY ties to node 110,
+    moved 0.01 along x (free to turn about y and z), and a SPRING1 of 10 on member 15's DOF 1.
+    ``twin``: those springs as SPRINGAs to held nodes 100 away along -x (exact in a small-strain
+    step).  Node 21 with a *TRANSFORM (30 degrees about z), moved 0.01 along its local 1 by a BC,
+    pulls node 22 through a SPRING2 of 100 (DOFs 1, 1), which a SPRING1 of 300 holds: 0.0025."""
+    cube = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+    out = "*NODE\n" + "".join(f"{10 * c + i + 1}, {x + 3 * c}., {y}., {z}.\n" for c in range(2)
+                              for i, (x, y, z) in enumerate(cube))
+    out += ("300, 0., 0., 2.\n110, 3.5, 0.5, 1.\n21, 7., 0., 0.\n22, 8., 0., 0.\n201, -100., 0., 1.\n"
+            "202, -97., 0., 1.\n*ELEMENT, TYPE=C3D8, ELSET=CUBES\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "2, 11, 12, 13, 14, 15, 16, 17, 18\n*NSET, NSET=BOT\n1, 2, 3, 4, 11, 12, 13, 14\n"
+            "*NSET, NSET=TOP2\n15, 16, 17, 18\n*NSET, NSET=PROBE\n5, 6, 15, 17, 22\n*NSET, NSET=T\n21\n"
+            "*TRANSFORM, NSET=T\n0.866025403784439, 0.5, 0., -0.5, 0.866025403784439, 0.\n"
+            "*MATERIAL, NAME=M\n*ELASTIC\n100., 0.\n*SOLID SECTION, ELSET=CUBES, MATERIAL=M\n"
+            "*EQUATION\n3\n5, 1, 1., 6, 1, -0.5, 300, 1, -1.\n*RIGID BODY, NSET=TOP2, REF NODE=110\n")
+    if twin:
+        out += ("*ELEMENT, TYPE=SPRINGA, ELSET=KA\n31, 5, 201\n32, 15, 202\n*SPRING, ELSET=KA\n\n10.\n"
+                "*BOUNDARY\n201, 1, 3\n202, 1, 3\n")
+    else:
+        out += "*ELEMENT, TYPE=SPRING1, ELSET=K1\n31, 5\n32, 15\n*SPRING, ELSET=K1\n1\n10.\n"
+    return out + ("*ELEMENT, TYPE=SPRING2, ELSET=K2\n33, 21, 22\n*SPRING, ELSET=K2\n1, 1\n100.\n"
+                  "*ELEMENT, TYPE=SPRING1, ELSET=K3\n34, 22\n*SPRING, ELSET=K3\n1\n300.\n"
+                  "*BOUNDARY\nBOT, 1, 3\n300, 2, 3\n110, 2, 4\n21, 2, 3\n22, 2, 3\n"
+                  "*STEP\n*STATIC\n*BOUNDARY\n300, 1, 1, 0.01\n110, 1, 1, 0.01\n21, 1, 1, 0.01\n"
+                  "*NODE PRINT, NSET=PROBE, GLOBAL=YES\nU\n*END STEP\n")
+
+
+def tied_point_mass_deck(kind, twin=False):
+    """A point mass of 5 (*MASS on node 10, no other element) between two C3D8 unit cubes held
+    at their bases (E 100, nu 0, density 1).  ``kind`` "eq": u10 = (u7 + u18) / 2 in DOFs 1-3
+    (deck *EQUATIONs), a *STATIC step pushing it 1 along x, then a *FREQUENCY step; "part":
+    the same tie in DOF 1 alone, BCs holding its DOFs 2, 3 (*STATIC only); "kc": a *KINEMATIC
+    COUPLING of 10, 7 and 18 (DOFs 1-3) to node 100, *FREQUENCY.  ``twin``: node 10 also on a
+    SPRINGA of stiffness 0 to a held node — or ("kc") the coupling as a node-surface *COUPLING."""
+    cube = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0), (0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)]
+    out = "*NODE\n" + "".join(f"{10 * c + i + 1}, {x + 2 * c}., {y}., {z}.\n" for c in range(2)
+                              for i, (x, y, z) in enumerate(cube))
+    out = out.replace("\n11, 2.", "\n10, 1.5, 0.5, 1.\n11, 2.")
+    out += ("100, 1.5, 0.5, 3.\n*ELEMENT, TYPE=C3D8, ELSET=CUBES\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+            "2, 11, 12, 13, 14, 15, 16, 17, 18\n*ELEMENT, TYPE=MASS, ELSET=PM\n3, 10\n*MASS, ELSET=PM\n5.\n"
+            "*NSET, NSET=BOT\n1, 2, 3, 4, 11, 12, 13, 14\n*NSET, NSET=P\n7, 10, 18\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n100., 0.\n*DENSITY\n1.\n*SOLID SECTION, ELSET=CUBES, MATERIAL=M\n*BOUNDARY\nBOT, 1, 3\n")
+    if twin and kind != "kc":
+        out += ("*NODE\n20, 1.5, 0.5, -99.\n*ELEMENT, TYPE=SPRINGA, ELSET=Z\n4, 10, 20\n*SPRING, ELSET=Z\n\n0.\n"
+                "*BOUNDARY\n20, 1, 3\n")
+    if kind == "kc":
+        out += ("*SURFACE, TYPE=NODE, NAME=KS\n10\n7\n18\n*COUPLING, CONSTRAINT NAME=C1, REF NODE=100, "
+                "SURFACE=KS\n*KINEMATIC\n1, 3\n") if twin else \
+            "*KINEMATIC COUPLING, REF NODE=100\n10, 1, 3\n7, 1, 3\n18, 1, 3\n"
+    else:
+        out += "*EQUATION\n" + "".join(f"3\n10, {d}, 1., 7, {d}, -0.5, 18, {d}, -0.5\n"
+                                       for d in ((1, 2, 3) if kind == "eq" else (1,)))
+        out += "" if kind == "eq" else "*BOUNDARY\n10, 2, 3\n"
+        out += "*STEP\n*STATIC\n*CLOAD\n10, 1, 1.\n*NODE PRINT, NSET=P\nU\n*END STEP\n"
+    return out + ("*STEP\n*FREQUENCY\n4\n*END STEP\n" if kind != "part" else "")
+
+
 def spring_numbers_deck():
     """*SPRING constants Abaqus reads and ccx 2.23 stopped on: a SPRING1 of '100', a SPRINGA of
     '1e2' after a DOF line '2,' (Abaqus: a blank line), a SPRING2 of '50' on DOFs 1, 1, and a
@@ -20234,6 +20362,110 @@ def check_t123(ccx, env, tmp, shared):
               f"released by OP=NEW in an NLGEOM step and pulled): tip u3 {runs[0][9][2]:.6g} (the step alone "
               f"{runs[1][9][2]:.6g}, {err:.1e} off; the knots differ; before: ccx stopped)")
     failures += 0 if ok else 1
+    return failures
+
+
+@check("spring_dofs_masses",
+       "SPRING1 / SPRING2 on rotations and constrained DOFs; point masses only constraints tie")
+def check_spring_dofs_masses(ccx, env, tmp, shared):
+    # --- SPRING1 / SPRING2 on rotations and on DOFs an MPC eliminates; point masses on nodes
+    # that only *EQUATIONs (or a *KINEMATIC COUPLING) tie ---
+    review_run = shared["review_run"]
+    failures = 0
+    # rotational springs at beam tips (ccx springs translations only: the SPRING1 / SPRING2 on
+    # DOF 5 changed nothing, tips 0.03955 / 0.03955 / 0) against rigid levers of SPRING1 / 2s
+    runs = [review_run(spring_rotation_beam_deck(tw), f"spring_rotation_beam{'_twin' if tw else ''}",
+                       dat_displacements) for tw in (False, True)]
+    ok = all(runs) and all(n in r for r in runs for n in (5, 15, 25))
+    if ok:
+        got, ref = ([r[n][2] for n in (5, 15, 25)] for r in runs)
+        err = max(abs(a - b) for a, b in zip(got, ref))
+        ok = err < 1e-6 * max(abs(x) for x in ref) and got[0] < 0.5 * 0.03955 and got[2] > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  spring_rotation_beam (B31 cantilevers, a SPRING1 of 1 on a "
+              f"tip's DOF 5 and a SPRING2 of 1 on DOFs 5, 5 between two tips, one pushed): tips "
+              f"{', '.join(f'{x:.7g}' for x in got)}, the unloaded beam's through the spring alone; "
+              f"rigid levers of translational springs {', '.join(f'{x:.7g}' for x in ref)} ({err:.1e} "
+              f"off; ignored before: 0.03955, 0.03955, 0)")
+    else:
+        print(f"FAIL  spring_rotation_beam: {runs}")
+    failures += 0 if ok else 1
+    # on the rotations of a *RIGID BODY's reference node (its ROT NODE) and a kinematic
+    # coupling's (its DOFs 4-6): theta = M / k
+    u = review_run(spring_rotation_ref_deck(), "spring_rotation_ref", dat_displacements)
+    ok = bool(u) and 7 in u and 17 in u
+    if ok:
+        want = {7: (-0.01, 0.01, 0.0), 17: (0.0, -0.01, 0.01)}
+        err = max(abs(a - b) for n in want for a, b in zip(u[n], want[n]))
+        ok = err < 1e-8
+        print(f"{'PASS' if ok else 'FAIL'}  spring_rotation_ref (SPRING1s of 50 on DOF 6 of a rigid "
+              f"body's reference node and DOF 4 of a kinematic coupling's, moments of 1): corners "
+              f"({', '.join(f'{x:.6g}' for x in u[7])}), ({', '.join(f'{x:.6g}' for x in u[17])}) = "
+              f"theta x r with theta = 1/50 ({err:.1e} off)")
+    else:
+        print(f"FAIL  spring_rotation_ref: {u}")
+    failures += 0 if ok else 1
+    # past the span: a rotation of 0.11 rad on a 0.05 m model (the helper node, which moved the
+    # rotation read as a length, passed its held node: the force flipped, 2.199e-3 / -3.991e-3),
+    # and a constrained translational spring pushed five spans (0.07 for 0.05): +/- the same
+    for kind in ("dyn", "nl", "line"):
+        runs = [review_run(spring_large_motion_deck(kind, sg), f"spring_large_{kind}_{'p' if sg > 0 else 'm'}",
+                           dat_displacements, approximate=kind == "nl") for sg in (1, -1)]
+        node, k = (2, 0) if kind == "line" else (5, 1)
+        ok = all(runs) and all(node in r for r in runs)
+        if ok:
+            up, down = (r[node][k] for r in runs)
+            err = abs(up + down) / max(abs(up), 1e-30)
+            ok = err < 1e-6 and abs(up) > 1e-4 and (kind != "line" or abs(up - 0.05) < 1e-9)
+            print(f"{'PASS' if ok else 'FAIL'}  spring_large_{kind} ("
+                  + ("a constrained SPRING1 of 100 pushed by +/-5 under NLGEOM, five model spans"
+                     if kind == "line" else f"a rotational SPRING1 of 1000 at a 0.05 m cantilever's tip, "
+                     f"moments +/-110, {'*DYNAMIC' if kind == 'dyn' else '*STATIC NLGEOM --approximate'}")
+                  + f"): {up:.7g} / {down:.7g} ({err:.1e} off antisymmetric)")
+        else:
+            print(f"FAIL  spring_large_{kind}: {runs}")
+        failures += 0 if ok else 1
+    # springs on DOFs an MPC eliminates, under a BC on its other DOFs (ccx 2.23's small-strain
+    # solve dropped it: 8.78e-3 for 7.70e-3, 0.01 for 7.69e-3; a transformed node's SPRING2 0)
+    runs = [review_run(spring_dependent_deck(tw), f"spring_dependent{'_twin' if tw else ''}",
+                       dat_displacements) for tw in (False, True)]
+    ok = all(runs) and all(n in r for r in runs for n in (5, 15, 22))
+    if ok:
+        got, ref = runs
+        err = max(abs(a - b) for n in (5, 6, 15, 17) for a, b in zip(got[n], ref[n]))
+        ok = err < 1e-9 and abs(got[22][0] - 0.0025) < 1e-9 and abs(got[5][0] - 0.01) > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  spring_dependent (SPRING1s on an *EQUATION's dependent DOF "
+              f"and a rigid-body member, their MPCs' other DOFs moved by BCs; a SPRING2 from a "
+              f"transformed node a BC moves): u5x {got[5][0]:.7g}, u15x {got[15][0]:.7g}, SPRINGA "
+              f"twins {ref[5][0]:.7g}, {ref[15][0]:.7g} ({err:.1e} off); u22x {got[22][0]:.7g} (0.0025)")
+    else:
+        print(f"FAIL  spring_dependent: {runs}")
+    failures += 0 if ok else 1
+    # point masses on nodes only *EQUATIONs tie (ccx 2.23 stopped: 'add_sm_st / add_sm_ei:
+    # coefficient should be 0'), and a *KINEMATIC COUPLING member ('add_bo_st'): against the
+    # node also on a zero spring, or the coupling as a *COUPLING
+    def read(path):
+        """(the first displacement block: the *STATIC step's, which ccx prints again for the
+        modes; the frequencies)."""
+        return (dat_node_blocks(path) or [{}])[0], dat_eigen_table(path, "E I G E N V A L U E   O U T P U T")
+    for kind, what in (("eq", "*EQUATIONs of DOFs 1-3, *STATIC and *FREQUENCY"),
+                       ("part", "an *EQUATION of DOF 1, BCs on 2, 3, *STATIC"),
+                       ("kc", "a *KINEMATIC COUPLING member, *FREQUENCY")):
+        runs = [review_run(tied_point_mass_deck(kind, tw), f"tied_point_mass_{kind}{'_twin' if tw else ''}",
+                           read) for tw in (False, True)]
+        ok = all(runs) and (kind == "kc" or all(10 in r[0] for r in runs)) and \
+            (kind == "part" or all(len(r[1]) == 4 for r in runs))
+        if ok:
+            (u, f), (ur, fr) = runs
+            err = max([abs(a - b) for a, b in zip(u.get(10, ()), ur.get(10, ()))] +
+                      [abs(a - b) / max(b, 1e-30) for a, b in zip(f, fr) if b > 1e-3] + [0.0])
+            ok = err < 1e-6 and (kind == "kc" or u[10][0] > 1e-3)
+            print(f"{'PASS' if ok else 'FAIL'}  tied_point_mass_{kind} (a MASS-only node, {what}): "
+                  + (f"u10x {u[10][0]:.7g}; " if 10 in u else "") +
+                  (f"frequencies {', '.join(f'{x:.7g}' for x in f)}; " if f else "") +
+                  f"the twin {err:.1e} off (ccx stopped before)")
+        else:
+            print(f"FAIL  tied_point_mass_{kind}: {runs}")
+        failures += 0 if ok else 1
     return failures
 
 

@@ -6390,12 +6390,15 @@ def test_rotated_instance_turns_part_dofs():
     part = ROT_PART.format(nl="", sp2="1, 3", coupling="*Kinematic Coupling, ref node=100\nTIP, 1, 2\n")
     body, conv, rep = convert_str(_instanced(part, "0., 0., 0., 1., 0., 0., 90.", tail=ROT_TAIL))
     # 90 degrees about x: part y is global z, part z global -y
-    assert "*SPRING, ELSET=I_SPR\n3\n1000.\n" in body
+    # (the springs, on a coupled node, are SPRINGAs to nodes held on the turned DOF's line)
+    assert "*SPRING, ELSET=I_SPR\n1000.\n" in body and _spring_line(conv, "I_SPR") == (0.0, 0.0, 1.0)
     assert "*EQUATION\n3\n5, 3, 1., 11, 1, 1., 11, 3, -1.\n2\n2, 1, 1., 4, 2, 1.\n" in body
     assert "*KINEMATIC\n1, 1\n3, 3\n" in body and body.count("*KINEMATIC") == 1   # (one coupling)
     # the SPRING2's DOFs 1 (along x) and 3 (along -y) turn with opposite senses: in the axes
     assert "*ORIENTATION, NAME=I_ABQ2CCX_AXES, SYSTEM=RECTANGULAR\n1., 0., 0., 0., 0., 1.\n" in body
-    assert "*SPRING, ELSET=I_SP2, ORIENTATION=I_ABQ2CCX_AXES\n1, 3\n" in body
+    assert "*SPRING, ELSET=I_SP2\n1000.\n" in body and _spring_line(conv, "I_SP2") == (1.0, 0.0, 0.0)
+    g = conv.geom.elements[conv.geom.elsets["I_SP2"][0]][1][1]
+    assert f"*EQUATION\n2\n{g}, 1, 1, 12, 2, 1\n" in body         # (u_g . x = u_12 . -y)
     assert "SPRING1 / SPRING2 elements are turned with it" in rep.text() and conv.reduced_physics == []
     # a general rotation (30 degrees about z): an equation term (n, j, c) is the terms
     # (n, k, c R_kj), the largest of the first one's first; node 2's term is in the axes of its
@@ -6407,7 +6410,8 @@ def test_rotated_instance_turns_part_dofs():
             "11, 2, -0.366025403784\n2\n2, 1, 1., 4, 3, -1.\n") in body
     assert "*ORIENTATION, NAME=I_ABQ2CCX_AXES, SYSTEM=RECTANGULAR\n0.866025403784439, 0.5, 0., " \
            "-0.5, 0.866025403784439, 0.\n" in body
-    assert "*SPRING, ELSET=I_SPR, ORIENTATION=I_ABQ2CCX_AXES\n2\n" in body
+    assert "*SPRING, ELSET=I_SPR\n1000.\n" in body and \
+        _spring_line(conv, "I_SPR") == (round(-0.5, 9), round(0.75 ** 0.5, 9), 0.0)
     # (a coupling of DOF 2 alone along the turned axis e2 leaves the rotation about e2 free:
     # the linear equations Abaqus solves, along e2, with e2 . theta = 0 on the ROT NODE)
     assert "*EQUATION\n2\n101, 2, 1., 101, 1, -0.57735026919\n" in body and "*KINEMATIC" not in body
@@ -6432,7 +6436,8 @@ def test_rotated_instance_dofs_without_a_global_form():
     part = ROT_PART.format(nl="", sp2="5, 5", coupling="").replace(
         "2\n2, 1, 1., 4, 3, -1.\n", "2\nMIX, 1, 1., 4, 3, -1.\n*Nset, nset=MIX\n2, 3\n")
     body, conv, rep = convert_str(_instanced(part, "0., 0., 0., 0., 0., 1., 30.", tail=ROT_TAIL))
-    assert "*SPRING, ELSET=I_SP2\n5, 5\n" in body
+    # (on solid nodes, which have no rotations: left out, nothing else stiffens those DOFs)
+    assert "** *SPRING, ELSET=I_SP2\n** 5, 5\n" in body and "on a rotation of a node that has none" in rep.text()
     assert "the rotational DOFs of its SPRING1 / SPRING2 elements (*SPRING, ELSET=SP2) have no " \
            "global form" in rep.text()
     assert "node set MIX has nodes with and without a part-level *TRANSFORM" in rep.text()
@@ -6493,7 +6498,8 @@ def test_rotated_instance_turns_gaps_dashpots_and_constraint_axes():
     assert "*COUPLING, CONSTRAINT NAME=I_C, REF NODE=9, SURFACE=I_TOP\n*DISTRIBUTING\n1, 3\n4, 4\n6, 6\n" in body
     assert "*DASHPOT, ELSET=I_D1\n10.\n" in body                # (the DOF line goes: _plan_dashpots)
     assert "*EQUATION\n1\n13, 3, 1\n*EQUATION\n2\n13, 2, 1, 12, 2, -1\n" in body   # ground node on z
-    assert conv.geom.nodes[13] == (3.0, 0.0, -math.sqrt(14.0)) and conv.geom.elements[3] == ("DASHPOTA", [12, 13])
+    assert conv.geom.nodes[13] == (3.0, 0.0, -A.Converter.LINE_REACH * math.sqrt(14.0)) and \
+        conv.geom.elements[3] == ("DASHPOTA", [12, 13])
     assert "couplings of some DOFs and DASHPOT1 elements are turned with it" in rep.text()
     # 30 degrees about z: the instance's axes; the gap's direction cosines turned, its area kept
     moment = ROT_TAIL + "*Step\n*Static\n*Cload\nI.9, 4, 1.\n*End Step\n"     # (node 9's rotation used)
@@ -6540,7 +6546,7 @@ def test_dashpot1_to_a_ground_node_on_its_line():
             "*Element, type=MASS, elset=EM\n14, 1\n*Mass, elset=EM\n1.\n"
             "*Step, nlgeom\n*Dynamic\n0.1, 1.\n*Cload\n1, 1, 1.\n*End Step\n")
     body, conv, rep = convert_str(deck)
-    span = math.sqrt(5.0)
+    span = A.Converter.LINE_REACH * math.sqrt(5.0)      # (a *DYNAMIC deck: 100 spans)
     assert conv.geom.elements[11] == ("DASHPOTA", [1, 4])
     assert all(abs(a - b) < 1e-12 for a, b in zip(conv.geom.nodes[4], (-0.6 * span, -0.8 * span, 0.0)))
     # u_4 . v = 0, u_4 . w = u_1 . w for the two w normal to v = (0.6, 0.8, 0)
@@ -6685,6 +6691,13 @@ def test_connector_on_a_distributing_reference_node_ties_its_rotation():
     assert conv.reduced_physics == []
 
 
+def _spring_line(conv, elset):
+    """The unit direction (rounded) from the held node to the node of the first SPRINGA in
+    ``elset`` (_plan_springs' line form)."""
+    n, g = conv.geom.elements[conv.geom.elsets[elset][0]][1]
+    return tuple(round(x, 9) + 0.0 for x in A.vunit(A.vsub(conv.geom.nodes[n], conv.geom.nodes[g])))
+
+
 def test_springs_on_transformed_nodes_act_on_their_local_dofs():
     # Abaqus' SPRING1 / SPRING2 DOFs at a node with a *TRANSFORM are its local ones; ccx 2.23
     # springs the global DOF (probed: 1/75 where 1/100 is right): the spring goes to a new node
@@ -6696,16 +6709,152 @@ def test_springs_on_transformed_nodes_act_on_their_local_dofs():
             "*Element, type=SPRING1, elset=K4\n4, 3\n*Spring, elset=K4, orientation=OR\n1\n10.\n"
             "*Orientation, name=OR\n0., 1., 0., -1., 0., 0.\n*Boundary\n1, 1, 3\n2, 1, 3\n3, 1, 3\n")
     body, conv, rep = convert_str(deck)
-    # node 1's DOF 1 and node 2's DOF 2 go to new nodes 4 and 5; node 3 (no transform), DOF 3
-    # of node 1 (its local z is global z) and an oriented spring stay
-    assert conv.geom.elements[1] == ("SPRING1", [4]) and conv.geom.elements[2] == ("SPRING2", [5, 3])
+    # node 1's DOF 1 and node 2's DOF 2 are SPRINGAs to new nodes 4 and 5 held on the local
+    # axis's line (the SPRING2's moves along it with node 3's DOF 3); DOF 3 of node 1 (its local
+    # z is global z) and an oriented spring stay
+    assert conv.geom.elements[1] == ("SPRINGA", [1, 4]) and conv.geom.elements[2] == ("SPRINGA", [2, 5])
     assert conv.geom.elements[3] == ("SPRING1", [1]) and conv.geom.elements[4] == ("SPRING1", [3])
-    assert "*EQUATION\n2\n4, 1, 1, 1, 1, -1\n*EQUATION\n1\n4, 2, 1\n*EQUATION\n1\n4, 3, 1\n" in body
-    assert "*EQUATION\n2\n5, 2, 1, 2, 2, -1\n" in body and conv.reduced_physics == []
-    assert "SPRING1 / SPRING2 element(s) on nodes with a *TRANSFORM" in rep.text()
-    # a rotational DOF off its global axis: warned
-    _, conv, rep = convert_str(deck.replace("*Spring, elset=K1\n1\n", "*Spring, elset=K1\n4\n"))
-    assert conv.reduced_physics == ["SPRING1 / SPRING2 on a transformed node's rotation"]
+    assert _spring_line(conv, "K1") == (0.6, 0.8, 0.0) and _spring_line(conv, "K2") == (-0.8, 0.6, 0.0)
+    assert "*SPRING, ELSET=K1\n100.\n" in body and "*SPRING, ELSET=K2\n50.\n" in body
+    assert "*EQUATION\n2\n4, 2, 0.8, 4, 1, 0.6\n" in body and "*EQUATION\n3\n5, 1, -0.8, 5, 2, 0.6, 3, 3, -1\n" in body
+    assert conv.reduced_physics == []
+    assert "SPRING1 / SPRING2 element(s) on a node with a *TRANSFORM or a constraint" in rep.text()
+    # a rotation of a node without rotations (springs only): left out, exact
+    body, conv, rep = convert_str(deck.replace("*Spring, elset=K1\n1\n", "*Spring, elset=K1\n4\n"))
+    assert 1 not in conv.geom.elements and "** *SPRING, ELSET=K1\n" in body and conv.reduced_physics == []
+
+
+BEAM_TIP = ("*Node\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n13, 1., 1., 0.\n12, 0.5, 1., 0.\n11, 0., 1., 0.\n"
+            "*Element, type=B31, elset=B\n1, 1, 2\n2, 2, 3\n3, 11, 12\n4, 12, 13\n*Material, name=M\n*Elastic\n"
+            "1e4, 0.3\n*Beam Section, elset=B, material=M, section=RECT\n0.1, 0.1\n0., 0., 1.\n"
+            "*Boundary\n1, encastre\n11, encastre\n")
+
+
+def test_rotational_springs_act_through_helper_nodes():
+    # ccx 2.23's springs act on translations only (a SPRING1 on DOF 5 changed nothing): a
+    # helper node whose DOF 1 an *EQUATION ties to the rotation, held across it, with a SPRINGA
+    # to a held node; a shell/beam node gets a knot beam (validate_with_ccx.py spring_rotation_*)
+    springs = ("*Element, type=SPRING1, elset=K1\n31, 3\n*Spring, elset=K1\n5\n1.\n"
+               "*Element, type=SPRING2, elset=K2\n32, 3, 13\n*Spring, elset=K2\n5, 6\n2.\n")
+    step = "*Step\n*Static\n*Cload\n3, 3, 0.01\n*End Step\n"
+    body, conv, rep = convert_str(BEAM_TIP + springs + step)
+    (h, g), h2 = conv.geom.elements[31][1], conv.geom.elements[32][1][0]
+    assert conv.geom.elements[31][0] == conv.geom.elements[32][0] == "SPRINGA"
+    assert conv.geom.nodes[h] == conv.geom.nodes[3] and conv.geom.nodes[g][0] < 0.0
+    # (u_h = s theta, s = span / 100, and k / s^2: h meets its held node a span away only at
+    # 100 rad — ccx's SPRINGA takes its current length under NLGEOM and in *DYNAMIC)
+    s = conv._model_span() / A.Converter.SPRING_TURNS
+    rows = [r[:1] + [(n, d, round(c / s, 9)) for n, d, c in r[1:]] if r[0][0] in (h, h2) else r
+            for r in _equation_terms(body)]
+    assert [(h, 1, 1.0), (3, 5, -1.0)] in rows and [(h, 2, 1.0)] in rows and [(g, 3, 1.0)] in rows
+    assert [(h2, 1, 1.0), (3, 5, -1.0), (13, 6, 1.0)] in rows        # (u_h = s (theta_3y - theta_13z))
+    k1 = [float(x) for x in body.split("*SPRING, ELSET=K1\n")[1].split("\n")[:1]][0]
+    assert {3, 13} <= set(conv._knots) and abs(k1 * s * s - 1.0) < 1e-9
+    assert A.Converter._scaled_spring_line("-100., -1., 20.", 0.5, True) == "-200.,-0.5, 20." and \
+        A.Converter._scaled_spring_line("x, 1.", 0.5, True) == "x, 1."
+    assert "on rotations (DOFs 4-6), which ccx 2.23's springs ignore" in rep.text() and not conv.reduced_physics
+    # a rigid body's reference node: on its ROT NODE (the deck's node, on an element, is a member
+    # of the body and the reference point a new node: its rotation is the body's)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n100, 0.5, 0., 0.\n*Element, type=T3D2, elset=T\n1, 1, 2\n"
+            "*Material, name=M\n*Elastic\n1e4, 0.3\n*Solid Section, elset=T, material=M\n0.01\n"
+            "*Nset, nset=BODY\n1, 2\n*Rigid Body, ref node=100, tie nset=BODY\n"
+            "*Element, type=SPRING1, elset=K\n31, 100\n*Spring, elset=K\n6\n50.\n*Boundary\n100, 1, 5\n"
+            "*Step\n*Static\n*Cload\n100, 6, 1.\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    h = conv.geom.elements[31][1][0]
+    rot = next(r for ref, r in conv._rb_rot.items())
+    s = conv._model_span() / A.Converter.SPRING_TURNS
+    row = next(r for r in _equation_terms(body) if r[0] == (h, 1, 1.0))
+    assert len(row) == 2 and row[1][:2] == (rot, 3) and abs(row[1][2] + s) < 1e-9 * s and not conv.reduced_physics
+    # a node without rotations in ccx (a solid's, a free one): left out, nothing else stiffens
+    # that DOF in Abaqus; NLGEOM: left out unless --approximate
+    body, conv, rep = convert_str(deck.replace("31, 100\n", "31, 5\n").replace("100, 0.5", "5, 3., 0., 0.\n100, 0.5"))
+    assert 31 not in conv.geom.elements and "on a rotation of a node that has none in ccx" in rep.text()
+    assert "** *SPRING, ELSET=K\n" in body and not conv.reduced_physics
+    nl = BEAM_TIP + springs + step.replace("*Step\n", "*Step, nlgeom\n")
+    _, conv, rep = convert_str(nl)
+    assert 31 not in conv.geom.elements and "rerun with --approximate" in rep.text()
+    assert conv.reduced_physics == ["SPRING1 / SPRING2 element left out"]
+    _, conv, rep = convert_str(nl, approximate=True)
+    assert conv.geom.elements[31][0] == "SPRINGA" and "[APPROX] Rotational SPRING1 / SPRING2 under NLGEOM" in rep.text()
+    # a knot on a node with a *TRANSFORM: ccx misreads its DOFs 4-6 in an equation
+    _, conv, rep = convert_str(BEAM_TIP + "*Nset, nset=TR\n3\n*Transform, nset=TR\n0., 1., 0., -1., 0., 0.\n"
+                               + springs.split("*Element, type=SPRING2")[0] + step)
+    assert 31 not in conv.geom.elements and "ccx misreads DOFs 4-6 of a node with a *TRANSFORM" in rep.text()
+
+
+def test_springs_on_constrained_dofs_become_springas_on_held_lines():
+    # ccx 2.23's small-strain solve drops what a nonzero BC on an MPC's other DOFs puts on a
+    # SPRING1 / SPRING2 on its eliminated DOF (probed): a SPRINGA from the node to a node held
+    # on the DOF's line (validate_with_ccx.py spring_dependent); a free node's stays as it is
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 3., 0., 0.\n*Element, type=SPRING1, elset=K\n"
+            "31, 1\n32, 3\n*Spring, elset=K\n2\n10.\n*Element, type=SPRING1, elset=KF\n33, 4\n*Spring, elset=KF\n1\n5.\n"
+            "*Equation\n2\n1, 2, 1., 2, 1, -1.\n*Boundary\n2, 2, 3\n3, 1, 3\n1, 1, 1\n1, 3, 3\n"
+            "*Step\n*Static\n*Boundary\n2, 1, 1, 0.01\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    n, g = conv.geom.elements[31][1]
+    assert conv.geom.elements[31][0] == conv.geom.elements[32][0] == "SPRINGA" and n == 1
+    assert conv.geom.nodes[g] == (0.0, -conv._model_span(), 0.0)     # (along -y, the DOF's line)
+    rows = _equation_terms(body)
+    assert [(g, 2, 1.0)] in rows and [(g, 1, -1.0), (1, 1, 1.0)] in rows
+    assert conv.geom.elements[33] == ("SPRING1", [4]) and "*SPRING, ELSET=K\n10.\n*SPRING, ELSET=KF\n1\n5.\n" in body
+    assert "on a node with a *TRANSFORM or a constraint" in rep.text() and not conv.reduced_physics
+    # a member of ccx's own rigid body in a deck with NLGEOM keeps its spring (ccx solves the
+    # SPRINGA form's equations there off), warned where a small-strain step mishandles it
+    rb = deck.replace("*Equation\n2\n1, 2, 1., 2, 1, -1.\n", "*Nset, nset=RB\n1\n*Rigid Body, ref node=2, tie nset=RB\n")
+    two = rb.replace("*End Step\n", "*End Step\n*Step, nlgeom\n*Static\n*End Step\n")
+    _, conv, rep = convert_str(two)
+    assert conv.geom.elements[31] == ("SPRING1", [1]) and "the springs are kept as they are" in rep.text()
+    assert conv.reduced_physics == ["SPRING1 / SPRING2 on a rigid-body member in small-strain steps"]
+    _, conv, rep = convert_str(rb.replace("*Step\n", "*Step, nlgeom\n"))
+    assert conv.geom.elements[31] == ("SPRING1", [1]) and not conv.reduced_physics
+
+
+def test_point_masses_only_equations_tie_get_a_zero_spring():
+    # ccx 2.23 stops on a MASS-only node an equation eliminates ('add_sm_st / add_sm_ei:
+    # coefficient should be 0', probed): a zero SPRINGA to a held node, where equations name all
+    # its translations or BCs hold the others in every step (validate_with_ccx.py tied_point_mass)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n10, 1., 1., 0.\n*Element, type=T3D2, elset=T\n"
+            "1, 1, 2\n2, 2, 3\n*Element, type=MASS, elset=PM\n5, 10\n*Mass, elset=PM\n5.\n*Material, name=M\n"
+            "*Elastic\n100., 0.\n*Density\n1.\n*Solid Section, elset=T, material=M\n0.01\n*Boundary\n1, 1, 3\n"
+            "2, 2, 3\n3, 2, 3\n*Equation\n{eqs}*Step\n*Static\n*Cload\n10, 1, 1.\n*End Step\n")
+    full = "".join(f"3\n10, {d}, 1., 2, {d}, -0.5, 3, {d}, -0.5\n" for d in (1, 2, 3))
+    body, conv, rep = convert_str(deck.format(eqs=full))
+    hold = [e for e, (t, c) in conv.geom.elements.items() if t == "SPRINGA" and c[0] == 10]
+    assert len(hold) == 1 and "*SPRING, ELSET=ABQ2CCX_MASS_HOLD\n0.\n" in body
+    g = conv.geom.elements[hold[0]][1][1]
+    assert all([(g, k, 1.0)] in _equation_terms(body) for k in (1, 2, 3))
+    assert "on MASS elements alone that *EQUATIONs tie" in rep.text() and not conv.reduced_physics
+    # some translations only: where BCs hold the others in every step; else warned
+    one = "3\n10, 1, 1., 2, 1, -0.5, 3, 1, -0.5\n"
+    body, conv, rep = convert_str(deck.format(eqs=one + "*Boundary\n10, 2, 3\n"))
+    assert "ABQ2CCX_MASS_HOLD" in body
+    body, conv, rep = convert_str(deck.format(eqs=one))
+    assert "ABQ2CCX_MASS_HOLD" not in body and "in some translations only" in rep.text()
+    body, conv, rep = convert_str(deck.format(eqs=one).replace("*Static\n", "*Dynamic\n0.01, 0.1\n"))
+    assert "ABQ2CCX_MASS_HOLD" in body                  # (its free DOFs move, as in Abaqus)
+
+
+def test_kinematic_coupling_member_masses_get_a_tetrahedron():
+    # ccx 2.23's *FREQUENCY stops ('add_bo_st') on a MASS-only member of a kinematic coupling: a
+    # *KINEMATIC COUPLING's members get the massless tetrahedron a *COUPLING's do, as lines of
+    # their DOFs (validate_with_ccx.py tied_point_mass_kc)
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n10, 0.5, 1., 0.\n100, 0.5, 0.5, 0.\n*Element, type=T3D2, "
+            "elset=T\n1, 1, 2\n*Element, type=MASS, elset=PM\n5, 10\n*Mass, elset=PM\n5.\n*Material, name=M\n"
+            "*Elastic\n100., 0.\n*Density\n1.\n*Solid Section, elset=T, material=M\n0.01\n"
+            "*Kinematic Coupling, ref node=100\n10, 1, 3\n2, 1, 3\n*Boundary\n1, 1, 3\n100, 2, 6\n"
+            "*Step\n*Frequency\n1\n*End Step\n")
+    body, conv, rep = convert_str(deck)
+    tet = next(c for t, c in conv.geom.elements.values() if t == "C3D4")
+    assert tet[0] == 10 and all(f"\n{m}\n" in body.split("*COUPLING")[0].split("*SURFACE, TYPE=NODE")[-1] + "\n"
+                                for m in tet[1:])
+    assert "massless tetrahedron" in rep.text() and not conv.reduced_physics
+    # (well-posed: the body moves along x on the truss; ccx 2.23 runs it, f 0.07115)
+    # in a deck with a *DYNAMIC step the coupling's dynamic form takes the new nodes as a group
+    body, conv, rep = convert_str(deck.replace("*End Step\n", "*End Step\n*Step\n*Dynamic\n0.1, 1.\n*End Step\n"))
+    plan = next(p for p in conv._coupling_plan.values() if p.get("kind") == "kdyn")
+    tet = next(c for t, c in conv.geom.elements.values() if t == "C3D4")
+    assert tet[0] == 10 and (tet[1:], {1, 2, 3}) in plan["groups"]
 
 
 def test_rotated_instance_springs_on_transformed_nodes_and_anisotropic_masses():
@@ -6717,7 +6866,7 @@ def test_rotated_instance_springs_on_transformed_nodes_and_anisotropic_masses():
             "*Nset, nset=TR\n2\n*Transform, nset=TR\n0.6, 0.8, 0., -0.8, 0.6, 0.\n"
             "*Element, type=MASS, elset=EM\n60, 3\n*Mass, elset=EM, type=ANISOTROPIC\n1., 4., 4.\n")
     body, conv, rep = convert_str(_instanced(part, tail=ROT_TAIL))
-    assert "*SPRING, ELSET=I_SPR\n1\n100.\n" in body and "*EQUATION\n2\n5, 1, 1, 2, 1, -1\n" in body
+    assert "*SPRING, ELSET=I_SPR\n100.\n" in body and _spring_line(conv, "I_SPR") == (-0.8, 0.6, 0.0)
     # the dashpot's ground node on the turned transform's axis 1, (-0.8, 0.6, 0)
     assert "*EQUATION\n2\n4, 1, -0.8, 4, 2, 0.6\n" in body
     # the mass's axes are the instance's: 2 is -x, 3 is z
@@ -15693,7 +15842,8 @@ def test_legacy_distributing_coupling_as_equations():
     assert "the element leaves the mesh" in rep.text() and not conv.reduced_physics
     # DCOUP2D: DOFs 1, 2, 6
     body, conv, _ = convert_str(deck("DCOUP2D"))
-    heads = [row[0][:2] for row in _equation_terms(body)]
+    lines = {conv.geom.elements[e][1][1] for e in (101, 102, 103)}     # (the springs' held lines)
+    heads = [row[0][:2] for row in _equation_terms(body) if row[0][0] not in lines]
     assert (10, 3) not in heads and (10, 1) in heads and len(heads) == 3
     # kept as ccx's card, warned: a *MASS on the element; NLGEOM with the offset (unless --approximate)
     body, conv, rep = convert_str(deck(model="*Mass, elset=DC\n10.\n"))
