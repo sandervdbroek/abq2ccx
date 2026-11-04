@@ -14159,6 +14159,37 @@ def test_connector_motion_and_load_on_helper_nodes():
 
 
 
+def test_connector_helpers_scaled_where_ccx_takes_current_lengths():
+    # where ccx takes a SPRINGA / DASHPOTA's current length (*DYNAMIC here), a component's helper
+    # moves s = span / 100 times the component (span 1: two coincident nodes) with k / s^2 and
+    # c / s^2 — unscaled, a motion past the span flipped the force (validate connector_large_motion)
+    beh = "*Connector Elasticity, component=1\n100.\n*Connector Damping, component=1\n4.\n"
+    dyn = BUSH.format(typ="Cartesian", beh=beh).replace("*Static\n", "*Dynamic\n0.01, 1.\n").replace(
+        "*Boundary\n", "*Element, type=MASS, elset=M\n20, 2\n*Mass, elset=M\n1.\n*Boundary\n")
+
+    def values(body, card):
+        """(the nonzero ones: node 2, on a MASS alone, also gets a zero SPRINGA)"""
+        return [float(m) for m in re.findall(rf"\*{card}, ELSET=ABQ2CCX_CONN\S+\n(\S+)\n", body) if float(m)]
+    body, conv, rep = convert_str(dyn)
+    eq = _all_equations(body)[0]
+    assert eq[0][1:] == (1, -1.0)
+    assert sorted((n, d, round(v, 12)) for n, d, v in eq[1:]) == [(2, 1, 0.006), (2, 2, 0.008)]
+    assert values(body, "SPRING") == [1e6] and values(body, "DASHPOT") == [4e4]
+    # a *CONNECTOR LOAD on the sprung component: its helper keeps the load and the unscaled row,
+    # the springs sit on a second helper tied to s times its DOF 1
+    body, conv, rep = convert_str(dyn.replace("*Cload\n2, 1, 1.\n2, 5, 0.1\n", "*Connector Load\n10, 1, 3.\n"))
+    h1 = conv._conn_act[(10, 1)]
+    eqs = _all_equations(body)
+    row = next(eq for eq in eqs if any(n == h1 for n, _d, _v in eq) and len(eq) > 2)
+    assert next(v for n, d, v in row if n == h1) == -1.0 and f"*CLOAD\n{h1}, 1, 3." in body
+    two = [eq for eq in eqs if len(eq) == 2 and eq[1] == (h1, 1, -0.01)]
+    assert len(two) == 1 and two[0][0][1:] == (1, 1.0)
+    g = reparse(body)
+    assert [conn[0] for typ, conn in g.elements.values()
+            if typ in ("SPRINGA", "DASHPOTA") and conn[0] != 2] == [two[0][0][0]] * 2
+    assert values(body, "SPRING") == [1e6] and not rep.reduced
+
+
 CONN_LOAD_HELD = ("*Node, nset=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 0., -1.\n*Element, type=B31, elset=BM\n"
                   "1, 3, 2\n*Beam Section, elset=BM, material=M, section=RECT\n0.1, 0.1\n1., 0., 0.\n"
                   "*Material, name=M\n*Elastic\n2.e5, 0.3\n*Orientation, name=OR\n0.866025403784, 0.5, 0., "

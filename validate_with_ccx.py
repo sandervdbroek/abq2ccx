@@ -7033,6 +7033,32 @@ def spring_large_motion_deck(kind, sign):
     return out + step + f"5, 6, {110.0 * sign:g}\n*NODE PRINT, NSET=TIP\nU\n*END STEP\n"
 
 
+def connector_large_motion_deck(kind, sign):
+    """Connector springs moved past the model's span where ccx takes current lengths.  "moment"
+    / "load": spring_large_motion_deck's SI B31 cantilever (0.05 m) in its *DYNAMIC step, a
+    ROTATION connector from held node 6 at the tip to tip 5 with elasticity 1000 on component 6,
+    turned 0.11 rad by a tip moment of ``sign`` 110 ("moment") or a *CONNECTOR LOAD of it
+    ("load", on the helper that carries the load).  "line": a CARTESIAN connector (elasticity
+    100 on component 1) from held node 1 to node 2 0.01 away (a soft truss between them), pushed
+    by ``sign`` 5 under NLGEOM: 0.05, five spans."""
+    if kind == "line":
+        return ("*NODE, NSET=P\n1, 0., 0., 0.\n2, 0.01, 0., 0.\n*ELEMENT, TYPE=T3D2, ELSET=T\n1, 1, 2\n"
+                "*MATERIAL, NAME=M\n*ELASTIC\n1., 0.\n*SOLID SECTION, ELSET=T, MATERIAL=M\n1.e-9\n"
+                "*ELEMENT, TYPE=CONN3D2, ELSET=C\n5, 1, 2\n*CONNECTOR SECTION, ELSET=C, BEHAVIOR=B\nCARTESIAN,\n"
+                "*CONNECTOR BEHAVIOR, NAME=B\n*CONNECTOR ELASTICITY, COMPONENT=1\n100.\n*BOUNDARY\n1, 1, 3\n"
+                "2, 2, 3\n*STEP, NLGEOM\n*STATIC\n0.05, 1.\n"
+                f"*CLOAD\n2, 1, {5.0 * sign:g}\n*NODE PRINT, NSET=P\nU\n*END STEP\n")
+    out = "*NODE\n" + "".join(f"{i + 1}, {0.0125 * i:g}, 0., 0.\n" for i in range(5)) + "6, 0.05, 0., 0.\n"
+    out += ("*ELEMENT, TYPE=B31, ELSET=BEAM\n1, 1, 2\n2, 2, 3\n3, 3, 4\n4, 4, 5\n*MATERIAL, NAME=STEEL\n"
+            "*ELASTIC\n2.1e11, 0.3\n*DENSITY\n7800.\n*BEAM SECTION, ELSET=BEAM, MATERIAL=STEEL, SECTION=RECT\n"
+            "0.005, 0.005\n0., 0., 1.\n*NSET, NSET=TIP\n5\n*BOUNDARY\n1, 1, 6\n6, 1, 6\n"
+            "*ELEMENT, TYPE=CONN3D2, ELSET=C\n100, 6, 5\n*CONNECTOR SECTION, ELSET=C, BEHAVIOR=B\nROTATION,\n"
+            "*CONNECTOR BEHAVIOR, NAME=B\n*CONNECTOR ELASTICITY, COMPONENT=6\n1000.\n"
+            "*AMPLITUDE, NAME=RAMP\n0., 0., 1., 1., 2., 1.\n*STEP, INC=2000\n*DYNAMIC\n0.01, 2.\n")
+    load = "*CONNECTOR LOAD, AMPLITUDE=RAMP\n100, 6, " if kind == "load" else "*CLOAD, AMPLITUDE=RAMP\n5, 6, "
+    return out + load + f"{110.0 * sign:g}\n*NODE PRINT, NSET=TIP\nU\n*END STEP\n"
+
+
 def spring_dependent_deck(twin=False):
     """Springs on DOFs that an MPC eliminates, in a *STATIC step (E 100, nu 0 unit cubes held at
     their bases): cube 1-8 with u5x = 0.5 u6x + u300x (a deck *EQUATION), u300x = 0.01 by a BC,
@@ -20631,6 +20657,39 @@ def check_kinematic_rotation_only(ccx, env, tmp, shared):
         else:
             print(f"FAIL  {tag}: the twin did not solve ({status})")
     failures += 0 if ok else 1
+    return failures
+
+
+@check("connector_large_motion",
+       "connector springs turned or moved past the model's span where ccx takes current lengths")
+def check_connector_large_motion(ccx, env, tmp, shared):
+    # a connector component's helper node moved the component read as a length: past its held
+    # node a span away the SPRINGA's force flipped where ccx takes current lengths (2.199e-3 /
+    # -4.001e-3; 0.07 for 0.05); now it moves span / 100 times it: +/- the same, and the
+    # rotations the deck SPRING1's (spring_large_dyn, 2.198817e-3)
+    review_run = shared["review_run"]
+    failures = 0
+    got = {}
+    for kind, what in (("moment", "a ROTATION connector spring of 1000 at a 0.05 m cantilever's tip, "
+                                  "moments +/-110, *DYNAMIC"),
+                       ("load", "the same turned by a *CONNECTOR LOAD of +/-110"),
+                       ("line", "a CARTESIAN connector spring of 100 pushed by +/-5 under NLGEOM "
+                                "(--approximate), five spans")):
+        runs = [review_run(connector_large_motion_deck(kind, sg), f"connector_large_{kind}_{'p' if sg > 0 else 'm'}",
+                           dat_displacements, approximate=kind == "line") for sg in (1, -1)]
+        node, k = (2, 0) if kind == "line" else (5, 1)
+        ok = all(runs) and all(node in r for r in runs)
+        if ok:
+            up, down = (r[node][k] for r in runs)
+            got[kind] = up
+            err = abs(up + down) / max(abs(up), 1e-30)
+            ok = err < 1e-6 and abs(up) > 1e-4 and (kind != "line" or abs(up - 0.05) < 1e-9) and \
+                (kind != "load" or abs(up - got.get("moment", 0.0)) < 1e-6 * abs(up))
+            print(f"{'PASS' if ok else 'FAIL'}  connector_large_{kind} ({what}): {up:.7g} / {down:.7g} "
+                  f"({err:.1e} off antisymmetric)")
+        else:
+            print(f"FAIL  connector_large_{kind}: {runs}")
+        failures += 0 if ok else 1
     return failures
 
 

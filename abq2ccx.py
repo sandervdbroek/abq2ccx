@@ -10797,6 +10797,13 @@ class _Mesh:
     # lengths (_line_element)
     LINE_REACH = 100.0
 
+    def _current_lengths(self) -> bool:
+        """Whether ccx 2.23 takes the current length of a SPRINGA / DASHPOTA in a step of the
+        deck: one under NLGEOM, explicit or *DYNAMIC, or one it iterates (_solver_steps: its
+        springs take the displacements so far where NLGEOM is off too, e_c3d.f)."""
+        return any(st.ccx_nlgeom or st.explicit or st.proc == "DYNAMIC" for st in self.steps) or \
+            any(self._solver_steps)
+
     def _line_element(self, e: int, typ: str, n: int, v: Vec, far: List[Tuple[int, int, float]],
                       rows: List[List[Tuple[int, int, float]]]) -> None:
         """Element ``e`` as a ``typ`` (DASHPOTA / SPRINGA) from node ``n`` to a new node g a
@@ -10806,13 +10813,12 @@ class _Mesh:
         plane): the line n-g stays along v, so the element acts along v at any motion
         (_plan_dashpots, _plan_springs) — until n passes g.  Where ccx takes the element's
         current length (a step under NLGEOM, explicit or *DYNAMIC) that flips its force
-        (probed: a SPRING1 pushed five spans moved 0.07 for 0.05), so there g is LINE_REACH
-        spans away.  g takes n's temperatures, and where a step solves for them T_g = T_n
+        (probed: a SPRING1 pushed five spans moved 0.07 for 0.05), so there (_current_lengths)
+        g is LINE_REACH spans away.  g takes n's temperatures, and where a step solves for them T_g = T_n
         (ccx gives the ground node one, and a free one stops ccx, probed: exit 255)."""
         unit = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
         plane = n in self._plane_only
-        reach = self._model_span() * (self.LINE_REACH if any(
-            st.ccx_nlgeom or st.explicit or st.proc == "DYNAMIC" for st in self.steps) else 1.0)
+        reach = self._model_span() * (self.LINE_REACH if self._current_lengths() else 1.0)
         g = max(self.geom.nodes) + 1
         self.geom.add_node(g, vsub(self.geom.nodes[n], vscale(v, reach)))
         self.geom.elements[e] = (typ, [n, g])
@@ -31368,7 +31374,8 @@ class _Constraints:
         self.geom.add_to_elset(name, [eid])
         return name
 
-    def _conn_component_elements(self, it: dict, live: List[dict]) -> List[Tuple[int, int]]:
+    def _conn_component_elements(self, it: dict, live: List[dict],
+                                 eqs: List[List[Tuple[int, int, float]]]) -> List[Tuple[int, int]]:
         """The springs and dashpots of connector item ``it``'s written component rows (``live``,
         _conn_soft) and its AXIAL component: a SPRINGA and a DASHPOTA from the helper to a new
         node a model span away along -x, the helper held across x and the new node in all
@@ -31376,20 +31383,30 @@ class _Constraints:
         SPRING1 on the helper's DOF 1: ccx 2.23's linear *STATIC drops what a nonzero BC puts
         on a SPRING1 / SPRING2 through an equation (probed: a prescribed node DOF moved the
         others as if the spring were not there; NLGEOM and SPRINGA are right); a SPRINGA /
-        DASHPOTA between the nodes.  Returns the BCs they need.  Fills it["sets"] (their
-        element sets)."""
+        DASHPOTA between the nodes.  Where ccx takes their current length (_current_lengths)
+        the helper moves s = span / SPRING_TURNS times the component (the row's scale, or a
+        second helper tied to s u_h, into ``eqs``, where a motion or load sits on the first)
+        and the values are k / s^2, c / s^2: the same forces, and the helper reaches the held
+        node only past SPRING_TURNS radians or spans (unscaled, a rotation of 0.11 rad on a
+        0.05 m model flipped the force; probed).  Returns the BCs they need.  Fills
+        it["sets"] (their element sets)."""
         bcs: List[Tuple[int, int]] = []
         sets: List[str] = []
         for s in live:
             h = s["h"]
             if not (s["k"] or s["c"]):
                 continue
+            sc = s.get("scale", 1.0)
+            if s.get("split") and sc != 1.0:
+                h = max(self.geom.nodes) + 1
+                self.geom.add_node(h, self.geom.nodes[s["h"]])
+                eqs.append([(h, 1, 1.0), (s["h"], 1, -sc)])
             g = max(self.geom.nodes) + 1
             self.geom.add_node(g, vsub(self.geom.nodes[h], (self._model_span(), 0.0, 0.0)))
             if s["k"]:
-                sets.append(self._conn_element("SPRINGA", [h, g], s["k"]))
+                sets.append(self._conn_element("SPRINGA", [h, g], s["k"] / (sc * sc)))
             if s["c"]:
-                sets.append(self._conn_element("DASHPOTA", [h, g], s["c"]))
+                sets.append(self._conn_element("DASHPOTA", [h, g], s["c"] / (sc * sc)))
                 self._conn_dashpots.add(self._next_ids()[1])
             bcs += [(h, 2), (h, 3), (g, 1), (g, 2), (g, 3)]
         if it.get("axial"):
@@ -31426,7 +31443,12 @@ class _Constraints:
                              "nodes) — with a SPRINGA and a DASHPOTA from it to a held node a model "
                              "span away along that DOF: exact for small motions, and under NLGEOM for "
                              "translations whose directions cannot turn (validate_with_ccx.py "
-                             "connector_bushing).", once=True)
+                             "connector_bushing)." + ("  ccx takes their current length here (NLGEOM, "
+                             "*DYNAMIC, iterated steps), so the helper moves s = span / 100 times the "
+                             "component, with k / s^2 and c / s^2: else a rotation or relative motion "
+                             "past the span flipped the force (validate_with_ccx.py "
+                             "connector_large_motion)." if any(s.get("scale", 1.0) != 1.0 and (s["k"] or s["c"])
+                                                               for s in live) else ""), once=True)
         if any(it.get("axial") for it in items if it["route"] == "rows"):
             self.report.note("AXIAL connector elasticity / damping -> a SPRINGA / DASHPOTA between its "
                              "nodes: the same force along their line, at any motion.", once=True)
@@ -31546,6 +31568,9 @@ class _Constraints:
                         body_of.setdefault(m, {"ref": ref})
 
         u1n = self._u1_nodes()
+        # where ccx takes the springs' current lengths, a component's helper moves this times the
+        # component (_conn_component_elements)
+        scale = self._model_span() / self.SPRING_TURNS if self._current_lengths() else 1.0
 
         def carrier(n: int) -> Optional[Tuple[int, int]]:
             """(node, its DOF that carries rotation component 1) of node n's rotation."""
@@ -32073,6 +32098,10 @@ class _Constraints:
                         first = next((k for k in big_c if plain(*k)), big_c[0])
                 else:
                     first = hk
+                if first == hk and (s["k"] or s["c"]) and scale != 1.0:
+                    # (the helper moves ``scale`` times the component: _conn_component_elements)
+                    terms = OrderedDict((k, v if k == hk else scale * v) for k, v in terms.items())
+                s["scale"], s["split"] = scale, first != hk
                 eqs.append([(first[0], first[1], terms[first])] +
                            [(k[0], k[1], v) for k, v in terms.items() if k != first])
                 deps.add(first)
@@ -32183,7 +32212,7 @@ class _Constraints:
             if twin is not None:
                 self._mpc_twin(twin[0])          # made now, under the id its rows name
             taken_deps.update(eq[0][:2] for eq in eqs)
-            bcs = list(bcs) + self._conn_component_elements(it, live)
+            bcs = list(bcs) + self._conn_component_elements(it, live, eqs)
             # a node on MASS elements alone whose DOFs only equations tie: ccx 2.23 stops ('add_sm_ei:
             # coefficient should be 0': MASS elements are not in its matrix structure; probed) — a
             # SPRINGA of stiffness 0 to a new held node puts the node there, changing nothing
