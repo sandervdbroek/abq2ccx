@@ -137,8 +137,9 @@ a different model without saying so. With it, these reframings are made, each wi
   midside nodes;
 * a plastic `*SHELL SECTION` (ccx integrates it at 2 Gauss points through the thickness) → a
   composite of 2 equal layers, its linear shells `S8R` / `S6`;
-* `S8R` strips one element wide (two opposite free edges) in a model with a step ccx iterates,
-  where its `C3D20R`'s zero-energy mode drifts → `S8` (2–7 % stiffer on a strip of 4 elements);
+* `S8R` strips one element wide (two opposite free edges), where its `C3D20R`'s zero-energy
+  mode pinches the displacements, buckles spuriously and drifts in iterated steps → `S8` (2–7 %
+  stiffer on a strip of 4 elements);
 * `S4`, `S4R5`, `S4T` and `S4RT` shells collapsed to a triangle → `S3`, `S3R`, `S3T`, `S3RT`
   (a collapsed `S4R` is `S3R` without the option: exact);
 * a `*DAMPING` value the materials share but Abaqus does not apply to point masses, springs or

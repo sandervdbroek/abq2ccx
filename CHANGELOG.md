@@ -30,6 +30,11 @@ entries. The GitHub release notes use the same section.
   block's depth, without a message. A `*TIE` with `TIED NSET` now ties exactly the slave nodes
   of that set, as Abaqus does; the parameter was dropped, so every slave node was tied (or,
   beyond ccx's default tolerance, none).
+* **More correct answers.** A shell with a section offset tied by its nodes to a solid face (a
+  `*TIE` or tied contact pair of an offset skin on a block) is now tied at its reference surface
+  and carries loads there, as in Abaqus. Tied by its offset face, a skin's loaded edge stayed
+  untied in ccx (twice the block's deflection, or none in a second step), and other offset skins
+  were up to 10 % off; now the answers equal the skin merged with the block.
 * **Leaner tie output.** Tied contact pairs get the slave-surface trimming that `*TIE` got in
   1.7.0: the same answers without a ccx warning for every slave node away from the master.
 * **More correct answers.** Shells joined at a knot (where the converter attaches a small helper
@@ -48,6 +53,11 @@ entries. The GitHub release notes use the same section.
 * **Shell strips under `--approximate`.** An `S8R` strip one element wide drifts in ccx's
   nonlinear solver (up to many times its deflection); `--approximate` now writes it as `S8`,
   which keeps the right answer.
+* **Shell strips flagged in linear models too.** An `S8R` strip one element wide is now
+  flagged in every model, not only where ccx iterates: its displacements carry a spurious pinch
+  through the thickness (up to twice the true largest displacement), and `*BUCKLE` can find
+  spurious modes at buckling factors 4-5 times too low; its stresses, reactions and frequencies
+  are right. `--approximate` writes such strips as `S8` in every model.
 * **More correct answers.** `*BOUNDARY, FIXED` on a translation of a node with a `*TRANSFORM`,
   where earlier loads moved it, now holds the node where the step finds it. ccx held it at the
   wrong value (the global component read as the local one), with a warning.
@@ -140,6 +150,18 @@ entries. The GitHub release notes use the same section.
   merged (tied by equations with `ADJUST=NO`), exactly. On plane, axisymmetric, membrane or beam
   elements ccx's `ADJUST` moves a node but not the solid it expands the element to (9-11 % off),
   so a set node off the master there is warned as reduced physics unless `ADJUST=NO`.
+* **Offset shells tied to solids** — a `*TIE` / TIED `*CONTACT PAIR` whose slave shell nodes lie
+  on solid master faces, of shells with a nonzero section `OFFSET`, now ties a node surface of
+  those nodes and gives each a force-free knot beam, as for offset shells merged with solids: the
+  node is the reference point. ccx 2.23 ties a plain shell node's midsurface, and the SPOS / SNEG
+  face at the reference surface (the converter's form since task 129) is no cure: a force, BC
+  or equation on a plain shell node makes ccx take the node's SNEG-side expanded node as its own
+  MPC's dependent, so the tie skips it ('DOF 3 of node ... is not active; no tied constraint'),
+  and the force acts at the midsurface. `validate_with_ccx.py tie_offset_knots_sneg` / `_spos`
+  (the PR #8 reviewer's skin, loaded at its edge): the block as under the skin merged with its
+  nodes, knotted, exactly; before 1.9x off with the loaded edge untied (a second step all zero)
+  for SNEG, 0.5-10 % for SPOS. Other offsets, which were warned as reduced physics, are exact the
+  same way; in a deck with an explicit step or U1 beams they still are.
 * **Tied contact pairs trimmed** — a `*CONTACT PAIR, TIED` on deformable surfaces, written as a
   `*TIE`, gets the `*TIE`'s trimmed slave surface (`validate_with_ccx.py
   tie_leftovers_pair_trimmed`: the same answer, 16 'no tied MPC' warnings instead of 112).
@@ -210,6 +232,18 @@ entries. The GitHub release notes use the same section.
   on a strip of 4 elements (elements 5–50 thicknesses wide), 11–17 % on one; composite and
   plastic or nonlinearly creeping sections stay `S8R`, and strips of a `*RIGID BODY` are left
   alone (`validate_with_ccx.py s8r_strip_s8`).
+* **`S8R` strips in linear steps** — the `C3D20R`'s zero-energy mode shows in linear answers
+  too, as a pinch through the thickness at the free edges' midside nodes (probed on cantilever
+  strips of 1 x 1 to 8 x 1 elements against `S8` and four elements across): the top and bottom
+  surface nodes there move apart by up to twice the true largest displacement, under any load
+  and in every mode shape (the largest |U| 1.5-10 times the true one), and `*BUCKLE` can find
+  spurious modes of it, depending on round-off (a strip in axial compression: 0.66-0.80
+  against 3.28 on macOS arm64; the true factor on Linux x86_64); stresses,
+  reactions, eigenfrequencies and corner-node displacements are right. Such strips are now
+  warned and flagged as reduced physics in every mechanical model (a flag of its own in a model
+  with a `*BUCKLE` step), and `--approximate` writes them as `S8` there too (the strip buckles at
+  3.35-3.46). `validate_with_ccx.py s8r_strip_s8` gains a `*BUCKLE` case: as written 9.3, `S8`
+  61.2, four elements across 56.2.
 
 * **`*BOUNDARY, FIXED` on `*TRANSFORM` translations moved by loads** — where the held value is
   unknown, the node now gets a helper node without a `*TRANSFORM`, tied to its local DOFs by

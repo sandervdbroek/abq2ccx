@@ -332,10 +332,12 @@ def dat_displacement(dat_path, node):
 
 # The element-formulation flags a check's vehicle may carry beside what the check is about:
 # ccx's C3D8 locking where the material keeps its volume, its S3 wedge, a plastic or creeping
-# shell section's (a continuum shell's too) 2 Gauss points through the thickness
-# (Converter._plan_volume_locking, _plan_s3_shells, _plan_plastic_shells, _flag_inelastic_shells)
+# shell section's (a continuum shell's too) 2 Gauss points through the thickness, a linear model's
+# S8R strip one element wide (Converter._plan_volume_locking, _plan_s3_shells,
+# _plan_plastic_shells, _flag_inelastic_shells, _warn_s8r_strips)
 VEHICLE_FLAGS = ("element C3D8 of a ", "element S3 (", "plastic *SHELL SECTION", "creeping *SHELL SECTION",
-                 "plastic continuum shells", "creeping continuum shells", "plastic or creeping continuum shells")
+                 "plastic continuum shells", "creeping continuum shells", "plastic or creeping continuum shells",
+                 "S8R strips one element wide (")
 
 
 def other_reduced(conv):
@@ -8931,6 +8933,44 @@ def shell_tie_deck(kind, typ="S4"):
     raise ValueError(kind)
 
 
+def tie_offset_deck(spos, merged):
+    """An S4 skin (t 0.1, nu 0) on the top of a C3D8 block (x 0-2, y 0-1, z 0-1; 4 x 2 x 1, its base
+    clamped), its edge x = 2 pulled along x, then pushed along z (the PR #8 reviewer's deck):
+    OFFSET=SNEG, its nodes its own on the block's top, tied by its SNEG face; ``spos``: the mirror
+    (the skin under the block's bottom, normal into the block, OFFSET=SPOS, its SPOS face tied;
+    the top clamped, the push along -z); ``merged``: the skin on the block's nodes."""
+    z = (lambda k: 1.0 - k) if spos else (lambda k: float(k))           # noqa: E731
+    blk = lambda i, j, k: 1 + i + 5 * j + 15 * k                       # noqa: E731
+    skin = (lambda i, j: blk(i, j, 1)) if merged else (lambda i, j: 300 + i + 5 * j)   # noqa: E731
+    xyz = {blk(i, j, k): (0.5 * i, 0.5 * j, z(k)) for i in range(5) for j in range(3) for k in (0, 1)}
+    xyz.update({skin(i, j): (0.5 * i, 0.5 * j, z(1)) for i in range(5) for j in range(3)})
+    out = ["*HEADING", f"offset skin tie {'spos' if spos else 'sneg'}", "*NODE"]
+    out += [f"{n}, {x:g}, {y:g}, {w:g}" for n, (x, y, w) in sorted(xyz.items())]
+    out.append("*ELEMENT, TYPE=C3D8, ELSET=LOW")
+    for j in range(2):
+        for i in range(4):
+            bot = [blk(i, j, 0), blk(i + 1, j, 0), blk(i + 1, j + 1, 0), blk(i, j + 1, 0)]
+            top = [blk(i, j, 1), blk(i + 1, j, 1), blk(i + 1, j + 1, 1), blk(i, j + 1, 1)]
+            out.append(", ".join(map(str, [1 + i + 4 * j] + (top + bot if spos else bot + top))))
+    out.append("*ELEMENT, TYPE=S4, ELSET=SKIN")
+    out += [f"{100 + i + 4 * j}, {skin(i, j)}, {skin(i + 1, j)}, {skin(i + 1, j + 1)}, {skin(i, j + 1)}"
+            for j in range(2) for i in range(4)]
+    face = "SPOS" if spos else "SNEG"
+    out += ["*SOLID SECTION, ELSET=LOW, MATERIAL=M", f"*SHELL SECTION, ELSET=SKIN, MATERIAL=M, OFFSET={face}",
+            "0.1", "*MATERIAL, NAME=M", "*ELASTIC", "200000., 0.",
+            "*NSET, NSET=END\n" + ", ".join(str(skin(4, j)) for j in range(3)),
+            "*NSET, NSET=EDGE\n" + ", ".join(str(blk(4, j, 1)) for j in range(3)),
+            "*NSET, NSET=CLAMP\n" + ", ".join(str(blk(i, j, 0)) for i in range(5) for j in range(3))]
+    if not merged:
+        out += [f"*SURFACE, NAME=SL\nSKIN, {face}", "*SURFACE, NAME=MA\n" +
+                "\n".join(f"{e}, {'S1' if spos else 'S2'}" for e in range(1, 9)), "*TIE, NAME=T1\nSL, MA"]
+    out += ["*BOUNDARY\nCLAMP, 1, 3"]
+    for d, v in ((1, 33.3333333333), (3, -33.3333333333 if spos else 33.3333333333)):
+        out += ["*STEP", "*STATIC", "*CLOAD, OP=NEW", f"END, {d}, {v}", "*NODE PRINT, NSET=EDGE", "U",
+                "*END STEP"]
+    return "\n".join(out) + "\n"
+
+
 def tie_leftover_deck(kind):
     """Decks of the tie-leftovers checks, all of C3D8I / C3D8 bricks (nu 0) and their twins.
 
@@ -14414,9 +14454,9 @@ def check_t150(ccx, env, tmp, shared):
         _rep, conv = convert(src, inp)
         d, status, out = run_ccx(ccx, env, inp)
         t150_dirs.append(d)
-        if status != "solved" or conv.reduced_physics:
+        if status != "solved" or other_reduced(conv):          # (the S8R strip's vehicle flag)
             print(f"FAIL  {tag}: " + (f"did not solve ({status})" if status != "solved" else
-                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+                                      "reduced physics: " + "; ".join(other_reduced(conv))))
             print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
             return None
         return os.path.join(d, "job.dat")
@@ -18939,14 +18979,17 @@ def check_t116(ccx, env, tmp, shared):
               f"0, 11, 31 too; ccx stopped): left out, u_x = 1 / E ({err:.1e} off)")
     failures += 0 if ok else 1
     # a collapsed S4R / S4 (ccx stopped in gen3dnor): as S3R, exactly; S4 under --approximate
-    # (which writes the triangle and its twin as S6, their neighbour as S8R)
+    # (which writes the triangle and its twin as S6, their neighbour as S8R, a strip one element
+    # wide and so S8: _plan_s8r_strips, task 173)
     S4R_REDUCED = "element S4R (ccx 2.23 bends it only through its C3D8R's hourglass stiffness)"
     S6_APPROX = "--approximate: Element S3 (1 elements) written as S6"
+    S8_APPROX = "--approximate: S8R strips one element wide written as S8"
     for kind, reduced, approx in (("coll_s4r", [S4R_REDUCED], False),
-                                  ("coll_s4", ["--approximate: Collapsed S4 shells written as S3", S6_APPROX], True)):
+                                  ("coll_s4", ["--approximate: Collapsed S4 shells written as S3", S6_APPROX,
+                                               S8_APPROX], True)):
         runs = [t116_run(f"t116_{kind}", kind, reduced, approx),
-                t116_run(f"t116_{kind}_ref", kind + "_ref", [S4R_REDUCED] if kind == "coll_s4r" else [S6_APPROX],
-                         approx)]
+                t116_run(f"t116_{kind}_ref", kind + "_ref", [S4R_REDUCED] if kind == "coll_s4r" else
+                         [S6_APPROX, S8_APPROX], approx)]
         ok = all(r is not None for r in runs)
         if ok:
             got, want = t116_last(runs[0]), t116_last(runs[1])
@@ -19869,6 +19912,45 @@ def check_tie_leftovers(ccx, env, tmp, shared):
     return failures
 
 
+@check("tie_offset_knots", "offset shells tied by their nodes: knot beams, as merged with the solid")
+def check_tie_offset_knots(ccx, env, tmp, shared):
+    # --- an offset skin tied to a solid: ccx's SNEG face tie skipped the nodes a load makes its
+    # own MPC's dependents, and a force on a plain shell node acts at its midsurface; knot beams
+    # and a node surface of the slave nodes are the skin merged with the block's nodes, knotted
+    failures = 0
+
+    def run(tag, deck):
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        res = (dat_node_blocks(os.path.join(d, "job.dat")), " ".join(rep.text().split()),
+               list(conv.reduced_physics), out.count("not active")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if res is None:
+            print(f"FAIL  {tag}: did not solve ({status})")
+        return res
+    for spos, before in ((False, "1.9x off, step 2 all zero: the loaded nodes untied"),
+                         (True, "0.5-10 % off: the forces at the midsurface")):
+        tag = "spos" if spos else "sneg"
+        runs = [run(f"tok_{tag}", tie_offset_deck(spos, False)), run(f"tok_{tag}_ref", tie_offset_deck(spos, True))]
+        ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) == 2
+        if ok:
+            got, want = runs[0][0], runs[1][0]
+            err = max(abs(a - b) for g, w in zip(got, want) for n, v in w.items()
+                      for a, b in zip(g.get(n, [math.inf] * 3), v[:3]))
+            moved = min(max(abs(x) for v in w.values() for x in v[:3]) for w in want)
+            ok = err <= 1e-9 * moved and moved > 1e-4 and runs[0][3] == 0 and not runs[0][2] and \
+                "nodes of shells with a section OFFSET knotted" in runs[0][1]
+            print(f"{'PASS' if ok else 'FAIL'}  tie_offset_knots_{tag} (an S4 skin of OFFSET={tag.upper()} "
+                  f"tied by its {tag.upper()} face to a block, its edge pulled, then pushed): the block's "
+                  f"edge nodes as the skin merged with its nodes, knotted, in both steps ({err:.1e} apart; "
+                  f"|u| {moved:.4g} at least; before: {before})")
+        failures += 0 if ok else 1
+    return failures
+
+
 @check("midside_bc", "a card that moves one end of an edge the converter put a node on")
 def check_midside_bc(ccx, env, tmp, shared):
     # --- a card that moves one end of an edge the converter put a node on: the node takes the
@@ -20267,7 +20349,7 @@ def check_t155(ccx, env, tmp, shared):
     return failures
 
 
-@check("s8r_strip_s8", "S8R strips one element wide written as S8 under --approximate")
+@check("s8r_strip_s8", "S8R strips one element wide written as S8 under --approximate; *BUCKLE flagged")
 def check_s8r_strip_s8(ccx, env, tmp, shared):
     # --- task 159: an S8R strip one element wide in an NLGEOM step (a load 1e-4 as large, so
     # the answer is the linear one): as written it drifts along the C3D20R's zero-energy mode;
@@ -20292,7 +20374,35 @@ def check_s8r_strip_s8(ccx, env, tmp, shared):
         print(f"{'PASS' if ok else 'FAIL'}  s8r_strip_s8 (an S8R cantilever strip one element wide, "
               f"NLGEOM at a small load): --approximate's S8 {d / m:.1e} of |u| {m:.4g} off its linear "
               f"answer; as written (S8R) {d0 / m0:.3g} off")
-    return 0 if ok else 1
+    # --- task 173: the same strip in axial compression, *BUCKLE (a linear step): as written its
+    # C3D20R pinch mode buckles spuriously, 4-5 times too low (flagged); --approximate's S8 near
+    # a strip four elements across (no strip, S8R) ---
+    def buckle(width):
+        text = t155_s8r_deck(width, False)
+        tip = [ln.split(",")[0] for ln in text.splitlines() if re.fullmatch(r"\d+, 3, [0-9.eE+-]+", ln)]
+        text = re.sub(r"(?m)^\d+, 3, [0-9.eE+-]+\n", "", text)
+        return text.replace("*STATIC\n*CLOAD\n", "*BUCKLE\n2\n*CLOAD\n" + "".join(
+            f"{n}, 1, {-1e-3 / len(tip):.8g}\n" for n in tip))
+    fac = lambda dat: dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T")  # noqa: E731
+    bruns = [review_run(buckle(1), "s8r_strip_s8_buckle", fac, approximate=True),
+             review_run(buckle(1), "s8r_strip_s8r_buckle", fac),
+             review_run(buckle(4), "s8r_strip_wide_buckle", fac)]
+    rep, conv = convert(os.path.join(tmp, "s8r_strip_s8r_buckle_src.inp"),
+                        os.path.join(tmp, "s8r_strip_s8r_buckle_flag.inp"))
+    flagged = any(r.startswith("S8R strips one element wide in a *BUCKLE step") for r in conv.reduced_physics)
+    with open(os.path.join(tmp, "s8r_strip_s8_buckle.inp"), encoding="utf-8") as fh:
+        bwritten = "*ELEMENT, TYPE=S8\n" in fh.read()
+    bok = all(bruns) and bwritten and flagged
+    if bok:
+        s8, s8r, ref = (r[0] for r in bruns)
+        # (whether ccx finds the strip's spurious mode depends on round-off: below half the
+        # factor on macOS arm64, not on Linux x86_64; the flag stands either way)
+        bok = abs(s8 / ref - 1) < 0.15 and ref > 0 and (s8r < 0.5 * ref or abs(s8r / ref - 1) < 0.15)
+        print(f"{'PASS' if bok else 'FAIL'}  s8r_strip_s8 (the strip in axial compression, *BUCKLE): "
+              f"--approximate's S8 {s8:.4g}, as written (S8R, flagged) {s8r:.4g}"
+              f"{' (a spurious mode)' if s8r < 0.5 * ref else ' (no spurious mode on this platform)'}, "
+              f"four elements across (S8R) {ref:.4g}")
+    return 0 if ok and bok else 1
 
 
 @check("norton_creep_floor",
