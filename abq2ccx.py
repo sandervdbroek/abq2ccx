@@ -2359,6 +2359,25 @@ def coupling_dof_range(g: Sequence[str]) -> Tuple[int, int]:
     return pint(d1), pint(d2 or d1)
 
 
+def zero_bc_held(b: Block) -> bool:
+    """Whether *BOUNDARY card ``b`` holds a DOF at zero: FIXED, a type (ENCASTRE, XSYMM, ...)
+    or a line whose value is blank or 0."""
+    if b.has("FIXED"):
+        return True
+    for rec in merged_data_records(b):
+        if not rec or not rec[0]:
+            continue
+        try:
+            if len(rec) > 1 and rec[1]:
+                pf(rec[1])
+            if len(rec) < 4 or not rec[3] or pf(rec[3]) == 0.0:
+                return True
+        except ValueError:
+            if len(rec) > 1 and rec[1] and not rec[1][:1].isdigit():
+                return True                     # (a type; an unreadable value is not zero)
+    return False
+
+
 def fields_at(rec: Sequence[str], n: int, default: float = 0.0) -> List[float]:
     """The first ``n`` fields of data record ``rec`` as numbers, read by position: a blank or
     missing field is ``default`` (Abaqus reads a blank as 0); ValueError if a field is not a
@@ -34842,8 +34861,9 @@ class _Loads:
                     self.report.note(f"*STEP, PERTURBATION dropped on a *{proc} step (ccx reads it only "
                                      f"on *FREQUENCY / *BUCKLE; it runs *{proc} as a linear "
                                      f"procedure anyway).", once=True)
-                elif any(not s.perturbation for s in self.steps.steps[cur.no:]):
-                    # (a later general step)
+                elif any(not s.perturbation and id(s.cards[0]) not in self._lc_resolve
+                         for s in self.steps.steps[cur.no:]):
+                    # (a later general step of the deck's)
                     self.report.warn("*STEP, PERTURBATION on a static step dropped: ccx runs it as a "
                                      "general step, so the next general step starts from its deformed "
                                      "state (its loads and boundary conditions are given back there) "
@@ -43266,8 +43286,16 @@ class _Output:
         # its preselected variables, "DEFAULT" for the preselected default
         carried: Dict[bool, Optional[list]] = {False: None, True: None}
         prev_pert = False
+        # (a load case's own requests apply to it alone: each case's step carries what the
+        # first one does; the step _split_load_cases adds between two changes nothing)
+        family: Tuple[Dict[bool, Optional[list]], bool] = (carried, prev_pert)
         for step in self.steps:
             k, inner, proc = step.no, step.cards[1:], step.proc_card
+            if id(step.cards[0]) in self._lc_first:
+                family = (dict(carried), prev_pert)
+            elif id(step.cards[0]) in self._lc_later:
+                carried, prev_pert = dict(family[0]), family[1]
+            keep = (dict(carried), prev_pert) if id(step.cards[0]) in self._lc_resolve else None
             timing = self._step_timing(step)
             if timing["kind"] == "explicit":
                 timing["dtstable"] = self._explicit_stable_increment(blocks, proc)
@@ -43332,6 +43360,8 @@ class _Output:
                 reqs += self._carried_requests(step.cards[0], held, timing, quiet, k)
                 carried[pert] = (held if held is not None else [("DEFAULT", None)]) + own
             prev_pert = pert
+            if keep is not None:
+                carried, prev_pert = keep
             steps.append((k, timing, reqs))
         return steps
 
@@ -45200,6 +45230,8 @@ class _PostPasses:
         # emitted step -> the time ccx alone adds: a perturbation step's Step.ccx_period (None:
         # unknown; emitted step k is Step k: one *STEP line each)
         added = {n: self.steps.steps[self.emit.written[n].no - 1].ccx_period for n in self._pert_idx}
+        # (and a step _split_load_cases adds, which Abaqus does not have)
+        added.update((st.no, st.ccx_period) for st in self.steps if id(st.cards[0]) in self._lc_resolve)
         # each card's emitted step.  This pass's own rule: a card between steps or after the
         # last counts with the step before it
         at: List[int] = []
@@ -46805,6 +46837,9 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._dp_nlgeom = False                    # one stays: ccx runs NLGEOM (_plan_dp_materials)
         self._dp_unused: Dict[int, str] = {}       # cards of an unused one -> why commented out
         self._lc_marks: Dict[int, str] = {}        # *LOAD CASE of a step split per case -> its case
+        self._lc_resolve: set = set()           # ids of the *STEP cards _split_load_cases adds
+        self._lc_first: set = set()             # ... of the first load case's step, a later one's
+        self._lc_later: set = set()
         self._matrix_steps: Dict[int, Block] = {}  # MATRIXSTORAGE *FREQUENCY -> its *MATRIX GENERATE
         self._geostatic: Dict[int, Block] = {}     # *STATIC -> the *GEOSTATIC it stands for
         # --approximate: *COUPLED TEMPERATURE-DISPLACEMENT -> its Abaqus/Explicit *DYNAMIC
@@ -47455,7 +47490,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                              "step's first output card.", once=True)
             return self._anchored_output(b)        # a preselected request's cards
         if id(b) in self._lc_marks:                     # _split_load_cases
-            return [f"** abq2ccx: this step is Abaqus' {self._lc_marks[id(b)]}"]
+            return [f"** abq2ccx: {self._lc_marks[id(b)]}"]
         if kw == "PARAMETER":
             self.report.note("*PARAMETER card dropped; its <name> substitutions were already "
                              "applied to the deck (ccx has no parametric input).", once=True)
@@ -47969,6 +48004,11 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
             out[j:j] = move[at]
         return out
 
+    # what Abaqus allows inside a *LOAD CASE (besides output database requests; Analysis
+    # User's Guide, multiple load case analysis)
+    _LC_CARDS = ("LOAD CASE", "BOUNDARY", "CLOAD", "DLOAD", "DSLOAD", "INERTIA RELIEF",
+                 "BASE MOTION", "CONNECTOR LOAD", "CONNECTOR MOTION")
+
     def _split_load_cases(self, blocks: List[Block]) -> List[Block]:
         """A linear perturbation *STATIC or *STEADY STATE DYNAMICS step with *LOAD CASE blocks
         -> one such step per load case, as Abaqus reads them ("conceptually equivalent to"
@@ -48020,7 +48060,23 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                 self.report.warn(f"Step {s}: *LOAD CASE without *END LOAD CASE (Abaqus requires "
                                  f"one): closed at the next *LOAD CASE or *END STEP.", once=True,
                                  at=open_end)
+            alien = next((b for b in cards[1:] if id(b) in owner and b.keyword not in self._LC_CARDS
+                          and b.keyword != "OUTPUT" and not b.keyword.endswith(" OUTPUT")), None)
+            if alien is not None:
+                self.report.warn(f"Step {s}: *{alien.keyword} inside *LOAD CASE "
+                                 f"{names[owner[id(alien)]]}: Abaqus allows only *BOUNDARY, *CLOAD, "
+                                 f"*DLOAD, *DSLOAD, *INERTIA RELIEF, *BASE MOTION and output database "
+                                 f"requests there (it rejects the deck); kept as that load case's "
+                                 f"own.", once=True, at=alien)
             release = any(b.keyword == "BOUNDARY" and b.uparam("OP") == "NEW" for b in cards)
+            # a static load case after the first that holds a DOF at zero (FIXED holds the base-
+            # state value of a DOF the base state leaves free, _add_base) after a general step:
+            # a general step that solves the base state again first (BaseStateRestore gives it
+            # the base state), as ccx's FIXED holds the step before's end, here the previous
+            # load case's (probed: 2.2e-2 off; exact with it)
+            resolve = proc.keyword == "STATIC" and any(j not in pert for j in range(1, s))
+            first = n = s + extra                  # the ccx steps: the first one, the next one
+            again: List[int] = []                  # those that solve the base state again
             for k in range(len(names)):
                 group = [b if k == 0 else Block(b.keyword, OrderedDict(b.params), list(b.data)).placed(b)
                          for b in cards if b.keyword != "END LOAD CASE" and owner.get(id(b), k) == k]
@@ -48030,17 +48086,34 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
                              if b.keyword == "BOUNDARY" and b.uparam("OP") != "NEW" else b for b in group]
                     if not any(b.keyword == "BOUNDARY" for b in group):
                         group.insert(at + 1, Block("BOUNDARY", OrderedDict(OP="NEW"), []).placed(group[at]))
-                self._lc_marks.update((id(b), f"load case {names[k]} of the deck's step {s} "
+                if k and resolve and any(b.keyword == "BOUNDARY" and zero_bc_held(b) for b in group):
+                    again.append(n)
+                    head = Block("STEP", OrderedDict(), []).placed(cards[0])
+                    mark = Block("LOAD CASE", OrderedDict(), []).placed(cards[0])
+                    self._lc_resolve.add(id(head))
+                    self._lc_marks[id(mark)] = (f"this step is none of the deck's: it solves the "
+                                                f"base state again before load case {names[k]} "
+                                                f"of the deck's step {s}")
+                    out += [head, Block("STATIC", OrderedDict(), []).placed(proc), mark,
+                            Block("END STEP", OrderedDict(), []).placed(cards[-1])]
+                    n += 1
+                (self._lc_later if k else self._lc_first).add(id(group[0]))
+                self._lc_marks.update((id(b), f"this step is Abaqus' load case {names[k]} of the "
+                                              f"deck's step {s} "
                                               f"({k + 1} of {len(names)})")
                                       for b in group if b.keyword == "LOAD CASE")
                 out += group
+                n += 1
+            extra += n - first - 1
             self.report.note(f"Step {s}: its {len(names)} load cases ({', '.join(names)}) -> ccx "
-                             f"steps {s + extra}-{s + extra + len(names) - 1}, one *{proc.keyword} "
+                             f"steps {first}-{n - 1}, one *{proc.keyword} "
                              f"perturbation step each, with the step's own loads, BCs and output "
                              f"requests and those of its load case, about the same base state "
-                             f"(Abaqus: equivalent to consecutive perturbation steps). Later step "
-                             f"numbers in this report count the ccx steps.", at=cards[0])
-            extra += len(names) - 1
+                             f"(Abaqus: equivalent to consecutive perturbation steps)"
+                             + (f"; ccx step(s) {', '.join(map(str, again))} solve the base state "
+                                f"again before a load case that holds a DOF at zero (ccx's "
+                                f"*BOUNDARY, FIXED holds the end of the step before)" if again else "")
+                             + ". Later step numbers in this report count the ccx steps.", at=cards[0])
         return out
 
     def _ssd_bands(self, blocks: List[Block]) -> List[Block]:
