@@ -11910,7 +11910,7 @@ class _Mesh:
         if empty:
             return ["** abq2ccx: *CONTACT PAIR " + (b.param("INTERACTION") or "") + ": its slave "
                     "nodes are members of the rigid body of its master surface"] + comments
-        return self._contact_pair_lines(nb) + comments
+        return self._contact_pair_lines(nb, id(b) in self._n2s_pairs) + comments
 
     # ccx's 'S, S' surface-to-surface self-contact against symmetric pairs (Abaqus' self-contact),
     # measured on 2.23: a C-shaped strip whose arm tip closes a gap 0.2 by 0.05 / 0.2 / 0.4,
@@ -12956,7 +12956,9 @@ class _Mesh:
                                      list(b.data), False, warn=False)
         return self.passthrough(b)
 
-    def _contact_pair_lines(self, b: Block) -> List[str]:
+    def _contact_pair_lines(self, b: Block, n2s: bool = False) -> List[str]:
+        """``*CONTACT PAIR`` card ``b`` as ccx lines (``n2s``: as NODE TO SURFACE,
+        _plan_table_pairs)."""
         if b.has("TIED"):
             out: List[str] = []
             adj = (b.param("ADJUST") or "").strip()
@@ -13012,6 +13014,8 @@ class _Mesh:
             self.report.note("*CONTACT PAIR without TYPE -> TYPE=NODE TO SURFACE (the Abaqus/Standard "
                              "default; ccx requires it explicitly). If ccx struggles to converge, "
                              "try TYPE=SURFACE TO SURFACE (ccx's face-to-face contact).", once=True)
+        if n2s:
+            keep["TYPE"] = "NODE TO SURFACE"
         if "SMALL SLIDING" in keep and (keep.get("TYPE") or "").upper().replace(" ", "") == \
                 "SURFACETOSURFACE":
             del keep["SMALL SLIDING"]
@@ -13334,6 +13338,95 @@ class _Mesh:
                              "faces in ccx).", once=True)
         return f"S{k + 2}"
 
+    def _order_gap_conductance(self, blocks: List[Block]) -> List[Block]:
+        """``blocks`` with each *SURFACE INTERACTION's model-data *GAP CONDUCTANCE cards that
+        come before its first *SURFACE BEHAVIOR moved to right after it: Abaqus takes an
+        interaction's cards in any order, ccx 2.23 stops on a *GAP CONDUCTANCE before the
+        *SURFACE BEHAVIOR ("should be preceded by a *SURFACE BEHAVIOR card", gapconductances.f;
+        probed).  An interaction without one gets HARD after its *SURFACE INTERACTION card
+        (handle_surface_interaction)."""
+        first_sb: Dict[int, int] = {}           # interaction card's index -> its first SB's
+        moved: Dict[int, List[Block]] = {}      # SB index -> the cards that follow it
+        skip = set()
+        for scan in (1, 2):
+            si = None
+            for i, b in enumerate(blocks):
+                if b.keyword == "STEP":
+                    break
+                if b.keyword == "SURFACE INTERACTION":
+                    si = i
+                elif si is None:
+                    continue
+                elif scan == 1 and b.keyword == "SURFACE BEHAVIOR":
+                    first_sb.setdefault(si, i)
+                elif scan == 2 and b.keyword == "GAP CONDUCTANCE" and i < first_sb.get(si, -1):
+                    moved.setdefault(first_sb[si], []).append(b)
+                    skip.add(i)
+                    self.report.note(f"*GAP CONDUCTANCE of interaction {blocks[si].param('NAME')} "
+                                     f"written after its *SURFACE BEHAVIOR (ccx stops on one "
+                                     f"before it; Abaqus takes the cards in any order).", at=b)
+        if not moved:
+            return blocks
+        return [c for i, b in enumerate(blocks) if i not in skip for c in [b] + moved.get(i, [])]
+
+    def _ccx_f2f(self, b: Block) -> bool:
+        """Whether ccx gets *CONTACT PAIR card ``b`` as face-to-face contact: TYPE=SURFACE TO
+        SURFACE, unless _plan_table_pairs writes it node-to-surface."""
+        return id(b) not in self._n2s_pairs and \
+            b.uparam("TYPE").replace(" ", "") == "SURFACETOSURFACE"
+
+    @staticmethod
+    def _tabular_line(pts: Sequence[Tuple[float, float]]) -> float:
+        """K where TABULAR (pressure, overclosure) points ``pts`` lie on p = K h through the
+        origin (K > 0), else 0."""
+        k = pts[-1][0] / pts[-1][1] if pts[0] == (0.0, 0.0) and pts[-1][1] > 0.0 else 0.0
+        return k if k > 0.0 and all(abs(p - k * h) <= 1e-9 * abs(pts[-1][0]) for p, h in pts) \
+            else 0.0
+
+    def _plan_table_pairs(self, blocks: List[Block]) -> None:
+        """--approximate: ccx 2.23's face-to-face contact reads no TABULAR pressure-overclosure
+        table (no contact force; handle_surface_behavior) and no form of Abaqus' EXPONENTIAL
+        curve; its node-to-surface contact reads both (probed on two pressed cubes: 754.67 for
+        Abaqus' 754.72, and 431.20 for 431.41 where face-to-face ccx's own exponential law did
+        not converge).  So where a SURFACE TO SURFACE pair's interaction has such a law (not a
+        TABULAR line through the origin, which is LINEAR there exactly), every face-to-face pair
+        is written NODE TO SURFACE (_n2s_pairs, [APPROX]): ccx takes one TYPE for all of a
+        deck's pairs (the last card's, contactpairs.f).  Not where a self-contact pair needs
+        face-to-face contact (_self_approx: node-to-surface 'S, S' is unusable)."""
+        self._n2s_pairs = set()
+        if not self._approx:
+            return
+        lossy, si = set(), None
+        for b in blocks:
+            if b.keyword == "STEP":
+                break
+            if b.keyword == "SURFACE INTERACTION":
+                si = b.uparam("NAME")
+            elif b.keyword == "SURFACE BEHAVIOR" and si:
+                law = (b.param("PRESSURE-OVERCLOSURE") or "").replace(" ", "").upper()
+                try:
+                    recs = [fields_at(r, 2) for r in merged_data_records(b) if r]
+                except ValueError:
+                    recs = []
+                if law == "TABULAR" and not (len(recs) > 1 and self._tabular_line(
+                        [(p, h) for p, h in recs])) or law == "EXPONENTIAL" and recs and \
+                        min(recs[0]) > 0.0 and not b.has("NO SEPARATION") and \
+                        not has_field_dependence(b):
+                    lossy.add(si)
+        pairs = [b for b in blocks if b.keyword == "CONTACT PAIR" and not b.has("TIED") and
+                 any(x.strip() for x in b.data) and self._ccx_f2f(b)]
+        hit = sorted({b.uparam("INTERACTION") for b in pairs} & lossy)
+        if not hit or any(id(b) in self._self_approx for b in pairs):
+            return
+        self._n2s_pairs = {id(b) for b in pairs}
+        self.report.warn(f"[APPROX] *CONTACT PAIR, TYPE=SURFACE TO SURFACE written as NODE TO "
+                         f"SURFACE (interaction {', '.join(hit)}: ccx's face-to-face contact reads "
+                         f"no TABULAR pressure-overclosure table and not Abaqus' EXPONENTIAL curve, "
+                         f"its node-to-surface contact reads both; ccx takes one TYPE for all "
+                         f"pairs, so every face-to-face pair is written so): node-to-surface "
+                         f"contact acts at the slave nodes, Abaqus' surface-to-surface over the "
+                         f"slave faces.", once=True)
+
     def _plan_surface_behavior(self, blocks: List[Block]) -> None:
         """The interactions with no *SURFACE BEHAVIOR (``_si_missing_behavior``): Abaqus'
         default is hard contact, ccx errors without the card, so handle_surface_interaction
@@ -13357,8 +13450,7 @@ class _Mesh:
                 self._si_cards.setdefault(cur_si, []).append(blk)
                 self._card_si[id(blk)] = cur_si
             elif blk.keyword == "CONTACT PAIR" and not blk.has("TIED"):
-                kind = "F2F" if (blk.param("TYPE") or "").replace(" ", "").upper() == \
-                    "SURFACETOSURFACE" else "N2F"
+                kind = "F2F" if self._ccx_f2f(blk) else "N2F"
                 for rec in merged_data_records(blk):
                     if rec and rec[0]:
                         self._si_pairs.setdefault(blk.uparam("INTERACTION"), []).append(
@@ -13463,7 +13555,9 @@ class _Mesh:
                                  f"clearance d: 1 % of p0 at c0, never zero; Abaqus': zero at c0), "
                                  f"and its face-to-face contact reads no TABULAR form of "
                                  f"Abaqus' curve (ccx 2.23: no contact force); kept as ccx's law. "
-                                 f"A NODE TO SURFACE pair takes Abaqus' curve exactly.", once=True)
+                                 f"A NODE TO SURFACE pair takes Abaqus' curve exactly"
+                                 f"{'' if self._approx else ' (--approximate writes the pairs so)'}.",
+                                 once=True)
                 self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL on a face-to-"
                               "face pair (ccx's exponential law differs)")
                 return self.passthrough(b)
@@ -13492,9 +13586,8 @@ class _Mesh:
         (pa, ha), (pb, hb) = pts[-2], pts[-1]
         slope = (pb - pa) / (hb - ha)
         if "F2F" in kinds:
-            k = pts[-1][0] / pts[-1][1] if pts[0] == (0.0, 0.0) and pts[-1][1] > 0.0 else 0.0
-            if k > 0.0 and "N2F" not in kinds and all(
-                    abs(p - k * h) <= 1e-9 * abs(pts[-1][0]) for p, h in pts):
+            k = self._tabular_line(pts)
+            if k > 0.0 and "N2F" not in kinds:
                 self.report.note(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR of interaction "
                                  f"{si}: the straight line p = {short_real(k, 9)} h through the "
                                  f"origin, written as ccx's LINEAR law (its face-to-face contact "
@@ -13504,7 +13597,9 @@ class _Mesh:
             self.report.warn(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR of interaction {si} "
                              f"on a SURFACE TO SURFACE pair: ccx 2.23's face-to-face contact reads "
                              f"no TABULAR table (probed: no contact force), so that pair transmits "
-                             f"no pressure. A NODE TO SURFACE pair reads it.", once=True)
+                             f"no pressure. A NODE TO SURFACE pair reads it"
+                             f"{'' if self._approx else ' (--approximate writes the pairs so)'}.",
+                             once=True)
             self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR on a face-to-face pair "
                           "(no contact pressure in ccx 2.23)")
         # pressure at a clearance (soft contact from a negative overclosure on): up to the
@@ -42421,7 +42516,7 @@ class _Loads:
         for b in blocks:
             if b.keyword != "CONTACT PAIR" or b.has("TIED"):
                 continue
-            f2f = (b.param("TYPE") or "").replace(" ", "").upper() == "SURFACETOSURFACE"
+            f2f = self._ccx_f2f(b)
             coef = self.CONTACT_MASS_AREA["F2F" if f2f else "N2F"]
             kpen = k_of.get(b.uparam("INTERACTION")) or k_hard
             for rec in merged_data_records(b):
@@ -43229,15 +43324,13 @@ class _Output:
         self._out_contact = {           # the contact ccx gets (_contact_output_issues)
             "abaqus": any(b.keyword in ("CONTACT PAIR", "CONTACT") for b in blocks),
             "pairs": len(pairs),
-            "nts": any(b.uparam("TYPE").replace(" ", "") != "SURFACETOSURFACE"
-                       for b in pairs),
+            "nts": any(not self._ccx_f2f(b) for b in pairs),
             # elements whose expanded nodes only a 3-D .frd (a beam or shell model) holds
             "flat": not frd3d and any(c.startswith(PLANE_ELEM_PREFIXES + ("M3D",))
                                       for c in types.values()),
             "axi": any(c.startswith("CAX") for c in types.values()),
             # (slave, master, face-to-face) of each ccx contact pair, for *CONTACT PRINT
-            "pair_list": [(f[0].strip(), f[1].strip(),
-                           b.uparam("TYPE").replace(" ", "") == "SURFACETOSURFACE")
+            "pair_list": [(f[0].strip(), f[1].strip(), self._ccx_f2f(b))
                           for b in pairs for f in merged_data_records(b) if len(f) > 1 and
                           not {f[0].strip().upper(), f[1].strip().upper()} & set(self._analytic_skipped)]}
         steps = self._step_output_requests(blocks, quiet)
@@ -46954,6 +47047,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._si_cards: Dict[str, List[Block]] = {}     # interaction -> its *SURFACE BEHAVIOR /
         self._card_si: Dict[int, str] = {}             # *GAP CONDUCTANCE cards; card -> it
         self._si_pairs: Dict[str, List[Tuple[str, str]]] = {}   # -> (N2F / F2F, slave)
+        self._n2s_pairs: set = set()        # face-to-face pairs written node-to-surface (_plan_table_pairs)
         # *BOUNDARY on rigid-coupling members (see _plan_coupled_bcs)
         self._bc_drop: Dict[int, set] = {}         # id(*BOUNDARY) -> (node, dof) taken off it
         self._bc_lines: Dict[int, List[List[str]]] = {}   # id(*BOUNDARY) -> its records after that
@@ -47677,6 +47771,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         blocks = self._blank_periods(blocks)          # before the step model reads the periods
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
         blocks = self._plan_self_contact(blocks)      # before anything reads contact pairs
+        blocks = self._order_gap_conductance(blocks)  # before anything reads interaction cards
         self._plan_deck_facts(blocks)
         self.build_geometry(blocks, imperfect=True)
         blocks = self._split_coupling_refs(blocks)
@@ -47821,7 +47916,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_s8r_strips()                     # _plan_s8r_strips' strips
         self._warn_dashpot_steps(blocks)            # after _plan_dashpots: its rows
         self._plan_circ_explicit_increment(blocks)
-        self._plan_rigid_contact_increment(blocks)
+        self._plan_table_pairs(blocks)          # after _plan_base_state_facts: the deck's TYPEs
+        self._plan_rigid_contact_increment(blocks)  # after it: the TYPEs ccx gets
         self._complete_temperature_ic()         # after every planner that adds knot nodes
         self._plan_output(blocks)               # last: it reads the final mesh (knot beams too)
         self._plan_surface_behavior(blocks)

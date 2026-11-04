@@ -77,8 +77,9 @@ beam, buckling and statics references above; *EL FILE requests ccx stopped or cr
 and the same decks without them; *EL PRINT ELKE in a linear static and a *BUCKLE step against
 u0 cos 100 t and the same deck without it, and after a *FREQUENCY step against A cos 100 t and
 u0; *CONTACT PRINT CFN for every pair against a rigid punch's reaction; TABULAR and
-EXPONENTIAL pressure-overclosure laws and *GAP CONDUCTANCE against clearance on two pressed
-cubes against Abaqus' laws; and decks a code review
+EXPONENTIAL pressure-overclosure laws (face-to-face pairs under --approximate too) and *GAP
+CONDUCTANCE against clearance (also before the *SURFACE BEHAVIOR) on two pressed cubes against
+Abaqus' laws; and decks a code review
 found converted wrongly:
 a planar beam's coupled tip, a velocity BC a coupling implies, amplitude points 1e-4 apart at
 time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank Poisson's ratio,
@@ -19776,7 +19777,11 @@ def check_contact_property_tables(ccx, env, tmp, shared):
              ", TYPE=SURFACE TO SURFACE", 1e-3,
              lambda f: (None, 100.0 / (2.0 + 1.0 / (50.0 + 0.1 * f))),
              "a clearance *GAP CONDUCTANCE after a PRESSURE one, face-to-face",
-             "0: ccx read the later card against pressure")):
+             "0: ccx read the later card against pressure"),
+            ("gap_conductance_first", clearance + hard, "", 1e-3,
+             lambda f: (None, 100.0 / (2.0 + 1.0 / 100.0)),
+             "the clearance *GAP CONDUCTANCE before the *SURFACE BEHAVIOR",
+             "ccx stopped: 'should be preceded by a *SURFACE BEHAVIOR card'")):
         res = review_run(pressed_cubes_deck(inter, pair, tag.startswith("gap"), push), tag, cubes_totals)
         (f, q), (f0, q0) = res or (0.0, None), want(res[0] if res else 0.0)
         got, ref = (q, q0) if f0 is None else (f, f0)
@@ -19789,6 +19794,32 @@ def check_contact_property_tables(ccx, env, tmp, shared):
                   f"Abaqus' law ({err:.1e} apart; pressed by a force {f:.6g}; before: {before})")
         elif res:
             print(f"FAIL  {tag}: no heat flux printed")
+        failures += 0 if ok else 1
+    # --approximate: face-to-face pairs with a TABULAR / EXPONENTIAL law written node-to-surface,
+    # which reads Abaqus' curve (ccx's face-to-face contact: no TABULAR table, its own exponential)
+    pts = ((0.0, 0.0), (50.0, 0.005), (200.0, 0.01))
+
+    def tab3(h):
+        if h <= 0.0:
+            return 0.0
+        for (p1, h1), (p2, h2) in zip(pts, pts[1:]):
+            if h <= h2:
+                return p1 + (p2 - p1) * (h - h1) / (h2 - h1)
+        return 200.0 + 3e4 * (h - 0.01)
+    for tag, inter, push, law, tol, before in (
+            ("contact_tabular_s2s_approx", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR\n"
+             "0., 0.\n50., 0.005\n200., 0.01\n", 0.03, tab3, 1e-4, "0: no TABULAR table face-to-face"),
+            ("contact_exponential_s2s_approx", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL\n"
+             "2e-4, 100.\n", 1e-3, abq_exponential, 3e-3,
+             "ccx's own law face-to-face: too many cutbacks")):
+        res = review_run(pressed_cubes_deck(inter, ", TYPE=SURFACE TO SURFACE", False, push), tag,
+                         cubes_totals, approximate=True)
+        ref = pressed_cubes_force(law, push)
+        err = abs(ccx_ratio(res[0], ref) - 1) if res else math.inf
+        ok = err < tol and ref > 1.0
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (a SURFACE TO SURFACE pair, --approximate: node-to-"
+              f"surface): contact force {res[0] if res else math.nan:.7g} vs {ref:.7g} for Abaqus' "
+              f"law ({err:.1e} apart; before: {before})")
         failures += 0 if ok else 1
     # code check G2-4: ccx's node-to-surface springs reach a clearance of 1e-3 sqrt(A) (here
     # 5e-4): a TABULAR curve's pressure at larger clearances is lost there, reduced physics

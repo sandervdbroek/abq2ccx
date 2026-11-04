@@ -3401,6 +3401,56 @@ def test_gap_conductance_against_clearance():
     assert conv.reduced_physics == []
 
 
+def test_gap_conductance_before_surface_behavior():
+    # Abaqus takes an interaction's cards in any order; ccx 2.23 stops on a *GAP CONDUCTANCE
+    # before the *SURFACE BEHAVIOR (validate_with_ccx gap_conductance_first): written after it
+    gc = "*Gap Conductance\n100., 0.\n0., 0.01\n"
+    hard = "*Surface Behavior, pressure-overclosure=HARD\n"
+    for si in (gc + hard, gc + "*Friction\n0.1\n" + hard, "*Friction\n0.1\n" + gc + hard):
+        body, conv, rep = cubes(si, proc=COUPLED_STEADY, el="C3D8T")
+        cards = interaction_cards(body)
+        assert cards.index("*SURFACE BEHAVIOR") < cards.index("\n*GAP CONDUCTANCE\n100., 0.\n"), si
+        assert cards.count("*GAP CONDUCTANCE") == 1 and ("*FRICTION" in cards) == ("Friction" in si)
+        assert "written after its *SURFACE BEHAVIOR" in rep.text()
+    # in order already, or no *SURFACE BEHAVIOR (HARD comes right after the interaction card)
+    for si in (hard + gc, gc):
+        body, conv, rep = cubes(si, proc=COUPLED_STEADY, el="C3D8T")
+        assert interaction_cards(body).splitlines()[1] == "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD"
+        assert "written after its *SURFACE BEHAVIOR" not in rep.text()
+
+
+def test_face_to_face_tables_node_to_surface_approximate():
+    # ccx's face-to-face contact reads no TABULAR table and not Abaqus' EXPONENTIAL curve, its
+    # node-to-surface contact reads both (validate_with_ccx contact_tables_n2s_approx): under
+    # --approximate every face-to-face pair is written NODE TO SURFACE (ccx takes one TYPE for all)
+    s2s = ", type=SURFACE TO SURFACE"
+    flag = "--approximate: *CONTACT PAIR, TYPE=SURFACE TO SURFACE written as NODE TO SURFACE"
+    tab = "*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n100., 0.01\n150., 0.02\n"
+    exp = "*Surface Behavior, pressure-overclosure=EXPONENTIAL\n2e-4, 100.\n"
+    for si in (tab, exp):
+        deck = STACKED_CUBES.format(si=si, pair=s2s, proc="*Static", el="C3D8")
+        body, conv, rep = convert_str(deck, approximate=True)
+        assert "*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE\n" in body
+        assert conv.reduced_physics == [flag], conv.reduced_physics
+        cards = interaction_cards(body).splitlines()
+        assert cards[1] == "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR"
+        assert cards[2] == ("0., 0." if si == tab else "0., -0.0002") and len(cards) > 5
+        body, conv, rep = convert_str(deck)          # without: flagged, the option named
+        assert "TYPE=SURFACE TO SURFACE" in body and "--approximate writes the pairs so" in rep.text()
+    # with a second face-to-face pair on a HARD interaction: both written node-to-surface
+    two = STACKED_CUBES.format(si=tab, pair=s2s, proc="*Static", el="C3D8").replace(
+        "*Boundary\n1, 1, 3", "*Surface Interaction, name=H\n*Surface Behavior, pressure-overclosure="
+        "HARD\n*Contact Pair, interaction=H, type=SURFACE TO SURFACE\nLTOP, UBOT\n*Boundary\n1, 1, 3", 1)
+    body, conv, _ = convert_str(two, approximate=True)
+    assert body.count("TYPE=NODE TO SURFACE") == 2 and "SURFACE TO SURFACE" not in body
+    # a straight line through the origin is ccx's LINEAR law face-to-face: kept so
+    line = STACKED_CUBES.format(si="*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n"
+                                   "100., 0.01\n", pair=s2s, proc="*Static", el="C3D8")
+    body, conv, _ = convert_str(line, approximate=True)
+    assert "TYPE=SURFACE TO SURFACE" in body and "PRESSURE-OVERCLOSURE=LINEAR" in body
+    assert conv.reduced_physics == []
+
+
 def test_static_direct_with_contact_gets_automatic_increments():
     # ccx's penalty contact can need a cutback where Abaqus' converges at a fixed increment,
     # and under DIRECT ccx then stops (lcharleux_indentation_berko, at the start of
