@@ -10264,7 +10264,8 @@ class _Mesh:
                              f"probed).", once=True)
         return name, [f"*SURFACE, NAME={name}, TYPE=NODE"] + [str(n) for n in keep]  # ccx: one per line
 
-    def _shell_tie_slave(self, slave: str, master: str, b: Block, pair: bool) -> \
+    def _shell_tie_slave(self, slave: str, master: str, b: Block, pair: bool,
+                         plan: Optional[List[int]] = None) -> \
             Optional[Tuple[Optional[str], List[str], float]]:
         """A tie ``b`` (a *TIE; with ``pair`` a TIED *CONTACT PAIR) of surfaces on conventional
         shells (SHEET_SHELLS).  Abaqus ties the slave nodes — a shell's nodes, its reference
@@ -10277,16 +10278,22 @@ class _Mesh:
         * a slave on shells whose nodes lie on solid faces (a skin on a solid, a shell edge on
           a solid face — a T joint): a node surface of those nodes is the merged mesh
           exactly, where SPOS / SNEG / both faces were 1-14 % off and a T joint's edge faces
-          53-57 % (bending: they clamp the joint the tie hinges); with a section OFFSET of
-          0.5 / -0.5 the face at the reference surface, SPOS / SNEG (the node surface is ccx's
-          midsurface: 3-7 % off).  -> (that surface's name, its *SURFACE card, the POSITION
-          TOLERANCE: Abaqus', _membrane_tie_tolerance); name "" with no node left to tie (the
-          master's own nodes stay out, as for membranes);
+          53-57 % (bending: they clamp the joint the tie hinges); with a section OFFSET the
+          same on nodes _plan_offset_tie_knots knotted (the knot is the reference point, the
+          section rigid about it, as for an offset skin merged with a solid: ccx ties a plain
+          node's midsurface, 3-7 % off; the SPOS / SNEG face at the reference surface ties too
+          little: a force, BC or equation on a plain shell node makes ccx take that face's
+          expanded node as its dependent, so the tie skips it — probed, a skin's loaded edge
+          1.9x the merged knotted skin's deflection — and puts the force at the midsurface,
+          0.5-10 % off where the loaded nodes are tied).  -> (that surface's name, its *SURFACE
+          card, the POSITION TOLERANCE: Abaqus', _membrane_tie_tolerance); name "" with no
+          node left to tie (the master's own nodes stay out, as for membranes);
         * shell edges on shell edges in one plane, of one section: ccx's edge faces are the
           merged mesh exactly (noted; None: the line stays);
         * no ccx form is exact (warned, reduced physics; (None, [], tolerance): the deck's own
           form stays): slave shell nodes off the master surface (the face touching it 0.2-2.6 %
-          off the rigid offset, the node surface 4-8 %), another OFFSET, a master on shells,
+          off the rigid offset, the node surface 4-8 %), an OFFSET without knots (an explicit
+          deck, U1 beams), a master on shells,
           shell edges at an angle or of other sections, a slave on shells and other elements, a
           step solving for temperatures (ccx's shell node carries none: the tied skin kept its
           own).  The tolerance is Abaqus' (_membrane_tie_tolerance) plus how far ccx's expanded
@@ -10294,7 +10301,8 @@ class _Mesh:
           reaches no face half a thickness off and ties nothing ('no tied MPC ... too far
           away'; probed).
         None also where no conventional shell takes part, or the master is not on solids or
-        shells (membranes: _membrane_node_surface)."""
+        shells (membranes: _membrane_node_surface).  With ``plan`` (_plan_offset_tie_knots): the
+        offset shells' nodes the node form ties are added to it, nothing written or reported."""
         sd, md = self.surfaces.get(slave.upper()), self.surfaces.get(master.upper())
         els, sec = self.geom.elements, self._shell_sec
         if sd is None or md is None or md[0].startswith("NODE") or not sec:
@@ -10321,7 +10329,7 @@ class _Mesh:
                         shells.setdefault(n, []).append(e)
         shells = {n: dedup(es) for n, es in shells.items() if es}
         on_master = [e for e, _, _ in mf if sheet(e)]
-        if not shells and not on_master:
+        if (not shells and not on_master) or (plan is not None and on_master):
             return None
         what = "*CONTACT PAIR, TIED" if pair else f"*TIE {b.param('NAME') or ''}".rstrip()
         tol = self._membrane_tie_tolerance(b.param("ADJUST" if pair else "POSITION TOLERANCE"),
@@ -10356,18 +10364,25 @@ class _Mesh:
                 reach = dict.fromkeys(reach, 0.0)
             gaps = self._surface_gaps(list(shells), mf, tol + max(reach.values()) + max(eps.values()))
             near = [n for n in shells if gaps[n][0] <= eps[n]]
-            offs = {sec[e][1] for n in near for e in shells[n]}
+            shared = set(self._surface_member_nodes(master))
+            turned = [n for n in near if n not in shared and any(sec[e][1] for e in shells[n])]
             if any(eps[n] < gaps[n][0] <= tol + reach[n] for n in shells):
                 why = ("slave shell nodes off the master surface (Abaqus ties them through a rigid "
                        "offset)")
             elif not near:
                 return None                         # (no node within the tolerance)
-            elif offs == {0.0} or (offs <= {0.5, -0.5} and len(offs) == 1 and sf is not None and
-                                   all(c != 2 for _, _, c in sf)):
-                return self._shell_tie_form(slave, master, near, offs.pop(), sf, what, tol)
+            elif plan is not None:
+                plan.extend(turned)
+                return None
+            elif set(turned) <= set(self._knots):   # (_plan_offset_tie_knots)
+                return self._shell_tie_form(slave, master, near, bool(turned), what, tol)
             else:
                 why = ("a shell section OFFSET at the master (Abaqus ties the reference surface, "
-                       "ccx's node its midsurface)")
+                       "ccx's node its midsurface; the knot beams that would make it the reference "
+                       "point stop " + ("ccx's explicit solver" if self._explicit_deck else
+                                        "ccx in a model with U1 beams") + ")")
+        if plan is not None:
+            return None
         self.report.warn(f"{what}: slave {slave} / master {master} on conventional shells — Abaqus "
                          f"ties the slave nodes (a shell's reference surface) to the master's reference "
                          f"surface, through a rigid offset where they lie apart, the rotations too "
@@ -10385,36 +10400,29 @@ class _Mesh:
         return None, [], tol + half(on_master) + (half([e for es in shells.values() for e in es])
                                                   if sf is not None else 0.0)
 
-    def _shell_tie_form(self, slave: str, master: str, near: List[int], off: float,
-                        sf: Optional[List[Tuple[int, List[int], int]]], what: str,
+    def _shell_tie_form(self, slave: str, master: str, near: List[int], knotted: bool, what: str,
                         tol: float) -> Optional[Tuple[str, List[str], float]]:
         """The exact form of _shell_tie_slave for slave shell nodes ``near`` on solid master
-        faces, their section OFFSET ``off``: OFFSET 0 a node surface of them (but the master's
-        own nodes); 0.5 / -0.5 the SPOS / SNEG face of the slave's shells (None where it
-        shares nodes with the master: _shared_tie_slave)."""
+        faces: a node surface of them (but the master's own nodes), the nodes of shells with a
+        section OFFSET knotted (``knotted``: _plan_offset_tie_knots)."""
         shared = set(self._surface_member_nodes(master))
-        if off:
-            if shared.intersection(n for _, fn, _ in sf for n in fn):
-                return None
-            lab = "SPOS" if off > 0 else "SNEG"
-            key: tuple = (slave.upper(), lab)
-            body = [f"{e}, {lab}" for e in dedup(e for e, _, _ in sf)]
-            kind = (f"its {lab} faces, the shells' reference surface (OFFSET={short_real(off, 3)}; "
-                    f"probed on 2.23: 1e-7 off the knotted nodes tied, ccx's node, the midsurface, "
-                    f"3-7 %)")
-        else:
-            keep = [n for n in near if n not in shared]
-            if not keep:
-                return "", [], tol
-            key, body = (slave.upper(), tuple(keep)), [str(n) for n in keep]
-            kind = ("a node surface of the slave nodes on the master (probed on 2.23: the merged "
-                    "mesh exactly, also for a shell edge on a solid face; the faces 1-14 % off, a T "
-                    "joint's edge faces 57 % in bending)")
+        keep = [n for n in near if n not in shared]
+        if not keep:
+            return "", [], tol
+        key, body = (slave.upper(), tuple(keep)), [str(n) for n in keep]
+        kind = ("a node surface of the slave nodes on the master (probed on 2.23: the merged "
+                "mesh exactly, also for a shell edge on a solid face; the faces 1-14 % off, a T "
+                "joint's edge faces 57 % in bending)")
+        if knotted:
+            kind += (", the nodes of shells with a section OFFSET knotted (knot beams: the node is "
+                     "the reference point, as for an offset skin merged with a solid; ccx ties a "
+                     "plain node's midsurface, and its SPOS / SNEG face ties too little: a load or "
+                     "BC on a skin node makes ccx skip the SNEG face's node; probed, 1.9x off)")
         if key not in self._mem_surfaces:
             self._reserve_names()
-            self._mem_surfaces[key] = self._fresh_name(f"{slave}_{'NODES' if not off else lab}")
+            self._mem_surfaces[key] = self._fresh_name(f"{slave}_NODES")
             name = self._mem_surfaces[key]
-            cards = [f"*SURFACE, NAME={name}, TYPE={'ELEMENT' if off else 'NODE'}"] + body
+            cards = [f"*SURFACE, NAME={name}, TYPE=NODE"] + body
         else:
             name, cards = self._mem_surfaces[key], []
         self.report.note(f"{what}: slave surface {slave} on conventional shells whose nodes lie on "
@@ -34313,6 +34321,39 @@ class _Constraints:
                          f"about it (probed: the skin as a layer of its expansion elements exactly).",
                          once=True)
 
+    def _plan_offset_tie_knots(self, blocks: List[Block]) -> None:
+        """Slave nodes of *TIE / TIED *CONTACT PAIR lines on conventional shells with a section
+        OFFSET that lie on solid master faces (_shell_tie_slave's node form): Abaqus ties the
+        node, a point of the shell's reference surface; ccx 2.23 ties a plain shell node's
+        midsurface, and the SPOS / SNEG face at the reference surface is no cure: a force, BC
+        or equation on a plain shell node makes ccx take its SNEG-side expanded node as the
+        dependent (gen3dforc / gen3dboun / gen3dmpc), so the tie skips it ('DOF 3 of node ...
+        is not active; no tied constraint'), and the force acts at the midsurface (probed: an
+        S4 skin tied by its SNEG face, loaded at its edge, 1.9x the merged knotted skin's
+        deflection, nothing in a second step; the SPOS mirror 0.5-10 % off).  Each gets a force-free knot beam
+        (_add_knot_beams): the node is the reference point, the section rigid about it — the
+        offset skin merged with the solid, knotted (_plan_offset_solid_knots).  Not in a deck
+        with an explicit step or U1 beams: _shell_tie_slave warns there."""
+        if not self._mechanical or getattr(self.opt, "solid_dof", False) or not self._shell_sec or \
+                self._explicit_deck or self._u1:
+            return
+        need: List[int] = []
+        for b in blocks:
+            pair = b.keyword == "CONTACT PAIR" and b.has("TIED")
+            if not (b.keyword == "TIE" or pair) or b.has("CYCLIC SYMMETRY") or b.has("MULTISTAGE") or \
+                    (not pair and (b.param("TIED NSET") or "").strip()):
+                continue
+            for rec in merged_data_records(b):
+                f = [x.strip() for x in rec if x.strip()]
+                if len(f) < 2 or f[0].upper() == f[1].upper() or \
+                        (id(b), record_key([x.upper() for x in f])) in self._tie_to_rigid:
+                    continue
+                self._shell_tie_slave(f[0], f[1], b, pair, plan=need)
+        need = [n for n in dedup(need) if n not in self._knots]
+        if need:
+            self._add_knot_beams(need, blocks)
+            self._offset_knots |= set(need)
+
     def _plan_modal_knots(self, blocks: List[Block]) -> None:
         """ccx 2.23's modal procedures on shell/beam nodes that are not knots (probed on S4
         strips and a B32R column, against a superposition of ccx's own modes that matches a
@@ -47661,6 +47702,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_modal_starts(blocks)
         self._plan_modal_knots(blocks)          # before _plan_op_new_rotations: its knots stay knots
         self._plan_offset_solid_knots(blocks)   # likewise
+        self._plan_offset_tie_knots(blocks)     # likewise; after it (its knots)
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_transformed_corners(blocks)      # after it: its 'keep' nodes

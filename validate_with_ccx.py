@@ -8928,6 +8928,44 @@ def shell_tie_deck(kind, typ="S4"):
     raise ValueError(kind)
 
 
+def tie_offset_deck(spos, merged):
+    """An S4 skin (t 0.1, nu 0) on the top of a C3D8 block (x 0-2, y 0-1, z 0-1; 4 x 2 x 1, its base
+    clamped), its edge x = 2 pulled along x, then pushed along z (the PR #8 reviewer's deck):
+    OFFSET=SNEG, its nodes its own on the block's top, tied by its SNEG face; ``spos``: the mirror
+    (the skin under the block's bottom, normal into the block, OFFSET=SPOS, its SPOS face tied;
+    the top clamped, the push along -z); ``merged``: the skin on the block's nodes."""
+    z = (lambda k: 1.0 - k) if spos else (lambda k: float(k))           # noqa: E731
+    blk = lambda i, j, k: 1 + i + 5 * j + 15 * k                       # noqa: E731
+    skin = (lambda i, j: blk(i, j, 1)) if merged else (lambda i, j: 300 + i + 5 * j)   # noqa: E731
+    xyz = {blk(i, j, k): (0.5 * i, 0.5 * j, z(k)) for i in range(5) for j in range(3) for k in (0, 1)}
+    xyz.update({skin(i, j): (0.5 * i, 0.5 * j, z(1)) for i in range(5) for j in range(3)})
+    out = ["*HEADING", f"offset skin tie {'spos' if spos else 'sneg'}", "*NODE"]
+    out += [f"{n}, {x:g}, {y:g}, {w:g}" for n, (x, y, w) in sorted(xyz.items())]
+    out.append("*ELEMENT, TYPE=C3D8, ELSET=LOW")
+    for j in range(2):
+        for i in range(4):
+            bot = [blk(i, j, 0), blk(i + 1, j, 0), blk(i + 1, j + 1, 0), blk(i, j + 1, 0)]
+            top = [blk(i, j, 1), blk(i + 1, j, 1), blk(i + 1, j + 1, 1), blk(i, j + 1, 1)]
+            out.append(", ".join(map(str, [1 + i + 4 * j] + (top + bot if spos else bot + top))))
+    out.append("*ELEMENT, TYPE=S4, ELSET=SKIN")
+    out += [f"{100 + i + 4 * j}, {skin(i, j)}, {skin(i + 1, j)}, {skin(i + 1, j + 1)}, {skin(i, j + 1)}"
+            for j in range(2) for i in range(4)]
+    face = "SPOS" if spos else "SNEG"
+    out += ["*SOLID SECTION, ELSET=LOW, MATERIAL=M", f"*SHELL SECTION, ELSET=SKIN, MATERIAL=M, OFFSET={face}",
+            "0.1", "*MATERIAL, NAME=M", "*ELASTIC", "200000., 0.",
+            "*NSET, NSET=END\n" + ", ".join(str(skin(4, j)) for j in range(3)),
+            "*NSET, NSET=EDGE\n" + ", ".join(str(blk(4, j, 1)) for j in range(3)),
+            "*NSET, NSET=CLAMP\n" + ", ".join(str(blk(i, j, 0)) for i in range(5) for j in range(3))]
+    if not merged:
+        out += [f"*SURFACE, NAME=SL\nSKIN, {face}", "*SURFACE, NAME=MA\n" +
+                "\n".join(f"{e}, {'S1' if spos else 'S2'}" for e in range(1, 9)), "*TIE, NAME=T1\nSL, MA"]
+    out += ["*BOUNDARY\nCLAMP, 1, 3"]
+    for d, v in ((1, 33.3333333333), (3, -33.3333333333 if spos else 33.3333333333)):
+        out += ["*STEP", "*STATIC", "*CLOAD, OP=NEW", f"END, {d}, {v}", "*NODE PRINT, NSET=EDGE", "U",
+                "*END STEP"]
+    return "\n".join(out) + "\n"
+
+
 def tie_leftover_deck(kind):
     """Decks of the tie-leftovers checks, all of C3D8I / C3D8 bricks (nu 0) and their twins.
 
@@ -19857,6 +19895,45 @@ def check_tie_leftovers(ccx, env, tmp, shared):
               f"whole top on a small block): the block nodes as the untrimmed pair ({err:.1e} apart; |u| "
               f"{moved:.4g}); 'no tied MPC' warnings {runs[0][3]} instead of {runs[1][3]}")
     failures += 0 if ok else 1
+    return failures
+
+
+@check("tie_offset_knots", "offset shells tied by their nodes: knot beams, as merged with the solid")
+def check_tie_offset_knots(ccx, env, tmp, shared):
+    # --- an offset skin tied to a solid: ccx's SNEG face tie skipped the nodes a load makes its
+    # own MPC's dependents, and a force on a plain shell node acts at its midsurface; knot beams
+    # and a node surface of the slave nodes are the skin merged with the block's nodes, knotted
+    failures = 0
+
+    def run(tag, deck):
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        res = (dat_node_blocks(os.path.join(d, "job.dat")), " ".join(rep.text().split()),
+               list(conv.reduced_physics), out.count("not active")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if res is None:
+            print(f"FAIL  {tag}: did not solve ({status})")
+        return res
+    for spos, before in ((False, "1.9x off, step 2 all zero: the loaded nodes untied"),
+                         (True, "0.5-10 % off: the forces at the midsurface")):
+        tag = "spos" if spos else "sneg"
+        runs = [run(f"tok_{tag}", tie_offset_deck(spos, False)), run(f"tok_{tag}_ref", tie_offset_deck(spos, True))]
+        ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) == 2
+        if ok:
+            got, want = runs[0][0], runs[1][0]
+            err = max(abs(a - b) for g, w in zip(got, want) for n, v in w.items()
+                      for a, b in zip(g.get(n, [math.inf] * 3), v[:3]))
+            moved = min(max(abs(x) for v in w.values() for x in v[:3]) for w in want)
+            ok = err <= 1e-9 * moved and moved > 1e-4 and runs[0][3] == 0 and not runs[0][2] and \
+                "nodes of shells with a section OFFSET knotted" in runs[0][1]
+            print(f"{'PASS' if ok else 'FAIL'}  tie_offset_knots_{tag} (an S4 skin of OFFSET={tag.upper()} "
+                  f"tied by its {tag.upper()} face to a block, its edge pulled, then pushed): the block's "
+                  f"edge nodes as the skin merged with its nodes, knotted, in both steps ({err:.1e} apart; "
+                  f"|u| {moved:.4g} at least; before: {before})")
+        failures += 0 if ok else 1
     return failures
 
 
