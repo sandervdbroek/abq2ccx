@@ -14389,8 +14389,9 @@ class _Mesh:
           midsides move apart by up to twice the true largest displacement under any load and
           in every mode shape (the 3-D results' largest |U| 1.5-10 times the true one; the
           shell-node means move in plane up to 1.5 times the largest deflection);
-        * *BUCKLE finds spurious modes of that pinch, at buckling factors 4-5 times too low (a
-          cantilever strip in axial compression: 0.66-0.80 against 3.28);
+        * *BUCKLE can find spurious modes of that pinch, depending on round-off, at buckling
+          factors 4-5 times too low (a cantilever strip in axial compression: 0.66-0.80 against
+          3.28 on macOS arm64; the true factor on Linux x86_64);
         * a step ccx runs through its nonlinear solver (_solver_steps, NLGEOM too) drifts along
           it (against the linear *STATIC step: 6-410 % of max |u| under a never-reached
           *PLASTIC, 12 % to 86 times under NLGEOM at a load 1e-4 as small, 60-25000 x in a

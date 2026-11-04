@@ -55,7 +55,7 @@ entries. The GitHub release notes use the same section.
   which keeps the right answer.
 * **Shell strips flagged in linear models too.** An `S8R` strip one element wide is now
   flagged in every model, not only where ccx iterates: its displacements carry a spurious pinch
-  through the thickness (up to twice the true largest displacement), and `*BUCKLE` finds
+  through the thickness (up to twice the true largest displacement), and `*BUCKLE` can find
   spurious modes at buckling factors 4-5 times too low; its stresses, reactions and frequencies
   are right. `--approximate` writes such strips as `S8` in every model.
 * **More correct answers.** `*BOUNDARY, FIXED` on a translation of a node with a `*TRANSFORM`,
@@ -230,8 +230,9 @@ entries. The GitHub release notes use the same section.
   too, as a pinch through the thickness at the free edges' midside nodes (probed on cantilever
   strips of 1 x 1 to 8 x 1 elements against `S8` and four elements across): the top and bottom
   surface nodes there move apart by up to twice the true largest displacement, under any load
-  and in every mode shape (the largest |U| 1.5-10 times the true one), and `*BUCKLE` finds
-  spurious modes of it (a strip in axial compression: 0.66-0.80 against 3.28); stresses,
+  and in every mode shape (the largest |U| 1.5-10 times the true one), and `*BUCKLE` can find
+  spurious modes of it, depending on round-off (a strip in axial compression: 0.66-0.80
+  against 3.28 on macOS arm64; the true factor on Linux x86_64); stresses,
   reactions, eigenfrequencies and corner-node displacements are right. Such strips are now
   warned and flagged as reduced physics in every mechanical model (a flag of its own in a model
   with a `*BUCKLE` step), and `--approximate` writes them as `S8` there too (the strip buckles at

@@ -20386,10 +20386,13 @@ def check_s8r_strip_s8(ccx, env, tmp, shared):
     bok = all(bruns) and bwritten and flagged
     if bok:
         s8, s8r, ref = (r[0] for r in bruns)
-        bok = abs(s8 / ref - 1) < 0.15 and s8r < 0.5 * ref and ref > 0
+        # (whether ccx finds the strip's spurious mode depends on round-off: below half the
+        # factor on macOS arm64, not on Linux x86_64; the flag stands either way)
+        bok = abs(s8 / ref - 1) < 0.15 and ref > 0 and (s8r < 0.5 * ref or abs(s8r / ref - 1) < 0.15)
         print(f"{'PASS' if bok else 'FAIL'}  s8r_strip_s8 (the strip in axial compression, *BUCKLE): "
-              f"--approximate's S8 {s8:.4g}, as written (S8R, flagged) {s8r:.4g}, four elements "
-              f"across (S8R) {ref:.4g}")
+              f"--approximate's S8 {s8:.4g}, as written (S8R, flagged) {s8r:.4g}"
+              f"{' (a spurious mode)' if s8r < 0.5 * ref else ' (no spurious mode on this platform)'}, "
+              f"four elements across (S8R) {ref:.4g}")
     return 0 if ok and bok else 1
 
 
