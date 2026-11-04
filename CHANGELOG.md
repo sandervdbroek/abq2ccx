@@ -77,6 +77,10 @@ entries. The GitHub release notes use the same section.
   nearly the load case's whole response). A load case's own output requests no longer carry
   into the later load cases, and a card Abaqus does not allow inside a load case is warned.
 
+* **More correct answers.** A rotation prescribed on a shell node about two axes at once in a
+  geometrically nonlinear step now turns the shell as the rotation vector Abaqus reads it.
+  ccx read the same values as other angles: a test strip's turned edge came out 3-7 % off.
+
 ### Details
 
 * **Terminal report wrapping** — lines are wrapped one column short of the terminal's width: a
@@ -308,6 +312,18 @@ entries. The GitHub release notes use the same section.
   warned (Abaqus rejects it) and kept as that case's own. `validate_with_ccx.py review1
   load_cases_hold`: the second load case holds node 6's y at 0.02175, both ccx case steps equal
   the hand-written single-case steps (0.0 apart; the old form 2.2e-2 off).
+
+* **Finite shell rotation BCs** — Abaqus/Standard reads a shell node's rotational BCs in an
+  NLGEOM step as the components of its total rotation vector; at a shell node that is no knot
+  ccx 2.23 holds, by two mean-rotation MPCs, the angles of the shell normal projected about the
+  first BC's axis e1 and about n x e1. The same to first order; about two axes at once the
+  edge of a strip turned (0.1, 0.2, 0) came out 0.4 % of max |u| off, (-0.5, 0.25, 0) 6.5 %.
+  Where a step's BCs hold all three rotations, or the two off the normal, the values are now
+  written as the angles of the normal turned by that rotation vector: exact at the end of each
+  step (ccx ramps the angles, so the path in between differs a little). On an amplitude, in a
+  deck with a `*DYNAMIC` step or carried on from a linear step, warned as reduced physics.
+  `validate_with_ccx.py shell_finite_rotation`: a cantilever's tip turned by (0.3, -0.4, 0),
+  also off the global axes, as through a rotation-only coupling (3e-7, 5e-7; before 3 %, 7 %).
 
 ## 1.7.0 (November 2026)
 

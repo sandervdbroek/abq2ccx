@@ -17038,6 +17038,60 @@ def test_transformed_shell_rotation_pairs_off_the_normal():
     assert not any(held in r for r in conv.reduced_physics)
 
 
+def test_shell_finite_rotations_nlgeom():
+    # rotational BCs on a shell node about two axes in an NLGEOM step: Abaqus reads the values
+    # as the rotation vector; ccx 2.23's mean-rotation MPCs hold the angles of the normal
+    # projected about e1 (the first axis) and n x e1, so the values are written as those of
+    # the normal turned by the rotation vector: atan2(-n'.e2, n'.n), atan2(n'.e1, n'.n)
+    def strip(bcs="*Boundary\nTIP, 4, 4, 0.1\nTIP, 5, 5, 0.2\nTIP, 6, 6, 0.\n", step="*Step, nlgeom\n",
+              more=""):
+        return ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+                "6, 2., 1., 0.\n*Element, type=S4, elset=E\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*Nset, nset=TIP\n"
+                "3, 6\n*Shell Section, elset=E, material=M\n0.02\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+                f"*Density\n1.\n*Boundary\n1, 1, 6\n4, 1, 6\n{step}*Static\n0.1, 1.\n{bcs}*End Step\n{more}")
+
+    def rot_lines(body):
+        return [ln for ln in body.splitlines() if re.fullmatch(r"[36], [456], [456](, .*)?", ln)
+                or ln.startswith(("TIP, 4", "TIP, 5", "TIP, 6"))]
+    d = A.vrotate((0.1, 0.2, 0.0), (0.0, 0.0, 1.0))
+    a1, a2 = math.atan2(-d[1], d[2]), math.atan2(d[0], d[2])
+    body, conv, rep = convert_str(strip())
+    got = rot_lines(body)
+    assert [ln.rsplit(",", 1)[0] if ln.count(",") == 3 else ln for ln in got] == \
+        ["3, 4, 4", "3, 5, 5", "3, 6, 6", "6, 4, 4", "6, 5, 5", "6, 6, 6"], got
+    assert abs(float(got[0].split(",")[3]) - a1) < 1e-11 and abs(float(got[1].split(",")[3]) - a2) < 1e-11
+    assert abs(a1 - 0.10135221746694) < 1e-12 and conv._rot_mode.get(3) == "finite"
+    assert "about two axes at once in an NLGEOM step: written as the angles" in rep.text()
+    assert not conv.reduced_physics
+    # the two in-plane ones, the drilling one free: the same values
+    body, conv, _ = convert_str(strip("*Boundary\nTIP, 4, 4, 0.1\nTIP, 5, 5, 0.2\n"))
+    assert [ln.split(",")[3].strip() for ln in rot_lines(body)[:2]] == [got[0].split(",")[3].strip(),
+                                                                       got[1].split(",")[3].strip()]
+    # as given: a linear step, a rotation about one axis, the drilling rotation about two
+    for deck in (strip(step="*Step\n"), strip("*Boundary\nTIP, 4, 4, 0.3\nTIP, 5, 6\n"),
+                 strip("*Boundary\nTIP, 4, 4, 0.3\nTIP, 6, 6, 0.2\n")):
+        body, conv, rep = convert_str(deck)
+        assert all(ln.startswith("TIP") for ln in rot_lines(body)) and conv._rot_mode.get(3) is None
+        assert "about two axes at once" not in rep.text() and not conv.reduced_physics
+    # model data's BCs act in step 1; zero rotations (ENCASTRE) are left alone
+    body, conv, rep = convert_str(strip("").replace("*Step", "*Boundary\nTIP, 4, 4, 0.1\nTIP, 5, 5, 0.2\n"
+                                                    "TIP, 6, 6, 0.\n*Step"))
+    assert conv._rot_mode.get(3) == "finite" and not conv.reduced_physics
+    body, conv, rep = convert_str(strip("*Boundary\nTIP, ENCASTRE\n"))
+    assert conv._rot_mode.get(3) is None and not conv.reduced_physics
+    # no form: on an amplitude, with a *DYNAMIC step, carried on from a linear step
+    flag = "finite shell rotation BCs about two axes read as projected angles"
+    amp = strip().replace("*Boundary\nTIP", "*Boundary, amplitude=A\nTIP").replace(
+        "*Step", "*Amplitude, name=A\n0., 0., 1., 1.\n*Step")
+    dyn = strip(more="*Step, nlgeom\n*Dynamic\n0.1, 1.\n*End Step\n")
+    carry = strip(step="*Step\n", more="*Step, nlgeom\n*Static\n0.1, 1.\n*Cload\n3, 3, 1.\n*End Step\n")
+    for deck, why in ((amp, "a card on an amplitude"), (dyn, "a *DYNAMIC step"),
+                      (carry, "carries on into an NLGEOM one")):
+        body, conv, rep = convert_str(deck)
+        assert all(ln.startswith("TIP") for ln in rot_lines(body)), rot_lines(body)
+        assert why in rep.text() and flag in conv.reduced_physics, (why, conv.reduced_physics)
+
+
 def test_shell_rotation_pairs_without_transform():
     # two global rotations held on a shell node, both off its normal: ccx 2.23 holds both
     # in-plane rotations, so the free one too.  Where the free axis lies in the shell plane
