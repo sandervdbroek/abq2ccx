@@ -25251,6 +25251,44 @@ def test_eigen_steps_after_a_nonlinear_solver_step_warn_of_equations_on_knots():
     assert KNOT_WARN not in rep.text(), rep.text()
 
 
+def test_heat_transfer_run_gets_a_static_card_for_its_knots():
+    # ccx 2.23 sets a run up as heat transfer alone where its procedure cards hold *HEAT
+    # TRANSFER and no *STATIC / *VISCO / *DYNAMIC after it (eigenvalue and modal procedures do
+    # not count): its knots get no rotations and ccx stopped on the knot beams' drilling hold
+    # (gen3dboun).  A *STATIC card ahead of the first *FREQUENCY / *BUCKLE card after the heat
+    # step makes the run mechanical; the drilling-hold warning no longer counts the heat step as
+    # one that turns the knots, the knot-equation warning still does (61 kHz for 462 Hz, probed)
+    nodes = "".join(f"{i + 1}, {0.08 * i:.6g}, {0.036 * i:.6g}, {-0.048 * i:.6g}\n" for i in range(11)) + \
+        "".join(f"{i + 12}, {0.08 * i:.6g}, {0.08 + 0.036 * i:.6g}, {0.06 - 0.048 * i:.6g}\n" for i in range(11))
+    model = ("*NODE\n" + nodes + "*ELEMENT, TYPE=S4, ELSET=E\n" +
+             "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 13}, {i + 12}\n" for i in range(10)) +
+             "*NSET, NSET=FIX\n1, 12\n*MATERIAL, NAME=M\n*ELASTIC\n1.2e7, 0.\n*DENSITY\n1e-3\n"
+             "*CONDUCTIVITY\n50.\n*SHELL SECTION, ELSET=E, MATERIAL=M\n0.01\n*BOUNDARY\nFIX, 1, 6\n")
+    heat = "*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 1.\n*BOUNDARY\nFIX, 11, 11, 20.\n*END STEP\n"
+    freq = "*STEP\n*FREQUENCY\n3\n*END STEP\n"
+    ssd = "*STEP\n*STEADY STATE DYNAMICS\n0.5, 0.5, 1\n*CLOAD\n11, 5, 8e-05\n22, 6, 6e-05\n*END STEP\n"
+    out, conv, rep = convert_str(model + heat + freq + ssd)
+    assert "\n*STATIC\n*FREQUENCY" in out and out.count("\n*STATIC\n") == 1
+    assert "*STATIC written ahead of step 2's *FREQUENCY card" in rep.text()
+    assert "held about the normal by a *BOUNDARY" not in rep.text(), rep.text()
+    assert not any("knot drilling holds" in r for r in conv.reduced_physics)
+    # not without a heat step, nor where a *STATIC step after it makes the run mechanical
+    for text in (model + freq + ssd, model + heat + "*STEP\n*STATIC\n*END STEP\n" + freq + ssd):
+        out, conv, rep = convert_str(text)
+        assert "\n*STATIC\n*FREQUENCY" not in out
+    # a *BUCKLE step takes it too; eigenvalue steps before the heat step only: warned
+    out, _, rep = convert_str(model + heat + "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n11, 1, -1.\n*END STEP\n")
+    assert "\n*STATIC\n*BUCKLE" in out
+    out, _, rep = convert_str(model + freq + heat)
+    assert "*STATIC\n" not in out and "ccx 2.23 sets this run up as a heat transfer analysis" in rep.text()
+    # the knot-equation warning still counts a heat step
+    rb = "*RIGID BODY, REF NODE=901, TIE NSET=RB\n"
+    _, conv, rep = convert_str(KNOT_CANTILEVER.format(
+        extra="*CONDUCTIVITY\n50.\n", con=rb, nl="", eig="*FREQUENCY\n3",
+        first="*HEAT TRANSFER, STEADY STATE\n1., 1.\n*BOUNDARY\nFIX, 11, 11, 20."))
+    assert KNOT_WARN in rep.text() and "*STATIC written ahead of step 2's" in rep.text()
+
+
 def test_mass_member_tetrahedron_left_out_where_ccx_exits_on_it():
     # B08: a *MASS-only member of a rigid body with shell members, every *FREQUENCY step after
     # a step ccx runs through its nonlinear solver: ccx exits 255 on the massless tetrahedron

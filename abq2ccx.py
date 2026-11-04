@@ -45031,6 +45031,61 @@ class _PostPasses:
                              once=True)
         return deck.edited()
 
+    # the procedure cards from which ccx 2.23 tells a mechanical run (readinput.c), the
+    # eigenvalue procedures that take a *STATIC card ahead of their own unchanged (probed)
+    _RUN_MECHANICAL = ("STATIC", "VISCO", "DYNAMIC")
+    _RUN_COUPLED = ("COUPLED TEMPERATURE-DISPLACEMENT", "UNCOUPLED TEMPERATURE-DISPLACEMENT",
+                    "ELECTROMAGNETICS")
+
+    def _mechanical_run_type(self, deck: EmittedDeck) -> EmittedDeck:
+        """ccx 2.23 sets a run up as heat transfer alone, before any step, when its keyword lines
+        hold a *HEAT TRANSFER card and no *STATIC, *VISCO or *DYNAMIC card after it (nor one
+        anywhere with initial temperatures) or coupled step: *FREQUENCY, *BUCKLE and the modal
+        procedures do not count (readinput.c, ithermal(2) = 2).  Its shell and beam knots then
+        get no rotational DOFs (gen3dnor: rig = -1), and ccx stops on a rotational BC, moment
+        or equation on one ('*ERROR in gen3dboun / gen3dforc / gen3dmpc: ... the elements to
+        which this node belongs do not have rotational DOFs'; probed on the converter's knot
+        beams and drilling holds, and on a *RIGID BODY of knotted shell nodes).  ccx runs a
+        step's last procedure card, so a *STATIC card right before the first *FREQUENCY or
+        *BUCKLE card after the first *HEAT TRANSFER card makes the run mechanical too and the
+        step what it was (probed: the same eigenvalues and buckling factors to every digit).
+        Without such a step, a warning."""
+        state, init, heat = 0, False, None
+        for c in deck.cards:
+            kw = c.keyword
+            if kw == "INITIAL CONDITIONS" and c.uparam("TYPE") == "TEMPERATURE":
+                init = True
+            elif kw in self._RUN_MECHANICAL:
+                state = (1 if init else 0) if state == 0 else 3 if state == 2 else state
+            elif kw == "HEAT TRANSFER":
+                state, heat = state + 2 if state < 2 else state, heat or c
+            elif kw in self._RUN_COUPLED:
+                state = 3
+        mech = [s for s in deck.steps if s.proc is not None and s.proc.keyword in self._EIGEN_PROCS]
+        if state != 2 or not mech:
+            return deck
+        at = next((s.proc for s in deck.steps if s.proc is not None and s.proc.index > heat.index
+                   and s.proc.keyword in ("FREQUENCY", "BUCKLE")), None)
+        if at is None:
+            self.report.warn(f"ccx 2.23 sets this run up as a heat transfer analysis (its procedure "
+                             f"cards hold *HEAT TRANSFER and no *STATIC, *VISCO or *DYNAMIC after it; "
+                             f"step(s) {', '.join(str(s.number) for s in mech)} do not count): shell and "
+                             f"beam knots get no rotational DOFs there, and ccx stops on a rotational "
+                             f"BC, moment or equation on one. Put a *FREQUENCY or *BUCKLE step after "
+                             f"the first *HEAT TRANSFER step.", once=True)
+            return deck
+        deck.insert_before(at, ["** abq2ccx: *STATIC ahead of the step's own procedure (ccx runs the "
+                                "last one): it makes ccx set the run up as a mechanical one too",
+                                "*STATIC"])
+        self.report.note(f"*STATIC written ahead of step {at.step}'s *{at.keyword} card: ccx 2.23 sets a "
+                         f"run up as heat transfer alone where its procedure cards hold *HEAT TRANSFER "
+                         f"and no *STATIC, *VISCO or *DYNAMIC after it (*FREQUENCY and the modal "
+                         f"procedures do not count), and then gives shell and beam knots no rotational "
+                         f"DOFs: it stops on a rotational BC, moment or equation on one (probed). ccx "
+                         f"runs the step's last procedure card, so the step is what it was (probed: "
+                         f"the same eigenvalues and buckling factors).", once=True)
+        return deck.edited()
+
     def _no_analysis_segfaults(self, deck: EmittedDeck) -> EmittedDeck:
         """The first step ccx stops at (*NO ANALYSIS: _no_analysis) in a deck with a material
         card of NO_ANALYSIS_SEGFAULTS, on which ccx 2.23 segfaults there: as the first step it
@@ -46007,11 +46062,14 @@ class _PostPasses:
         if not eig or not self._mechanical:
             return
         hit = self._knot_mpc_dependents(blocks, deck)
-        gauged = [n for n in self._knot_gauges if n not in hit]
+        # (a *HEAT TRANSFER step turns no knot: a gauge stays exact after it, probed)
+        g_first, g_why, g_eig = self._eigen_after_solver(heat=False)
+        gauged = [n for n in self._knot_gauges if n not in hit] if g_eig else []
         procs = dedup(f"*{self.steps.steps[s - 1].proc}" for s in eig)
         if gauged:
-            self.report.warn(f"{' / '.join(procs)} step(s) {', '.join(map(str, eig))} after step {first} "
-                             f"({why}, which ccx 2.23 runs through its nonlinear solver), with "
+            g_procs = dedup(f"*{self.steps.steps[s - 1].proc}" for s in g_eig)
+            self.report.warn(f"{' / '.join(g_procs)} step(s) {', '.join(map(str, g_eig))} after step "
+                             f"{g_first} ({g_why}, which ccx 2.23 runs through its nonlinear solver), with "
                              f"{len(gauged)} knot(s) of the converter's knot beams on shell nodes whose "
                              f"normal is off the global axes (e.g. node {gauged[0]}), held about the "
                              f"normal by a *BOUNDARY on a global rotation: once the knot has turned, ccx "
@@ -46021,7 +46079,7 @@ class _PostPasses:
                              f"(probed: a strip bent 0.45 rad, its frequencies squared 0.3-1.0 % low, a "
                              f"steady-state response 3 % off). Those eigenvalues, modes and later linear "
                              f"results are not the deck's; the steps before are exact. Run those steps "
-                             f"before step {first}, or in an analysis of their own.", once=True)
+                             f"before step {g_first}, or in an analysis of their own.", once=True)
             self._reduces("knot drilling holds off the global axes wrong in the eigenvalue / modal "
                           "steps after a step ccx runs through its nonlinear solver")
         if not hit:
@@ -47962,6 +48020,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         deck = self._shift_total_time(deck)     # after every pass that writes load cards
         deck = self._fixed_helper_nodes(deck)   # after every other pass that writes *BOUNDARY
         deck = self._truss_bc_index(deck)       # after every pass that writes *BOUNDARY
+        deck = self._mechanical_run_type(deck)  # last: it adds a procedure card ahead of a step's own
         out = self._short_fields(deck.render())     # last: every card is written
         if self.reduced_physics:
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
@@ -48407,17 +48466,17 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
     # the steps ccx 2.23 solves on the eigenmodes of its linear system (_eigen_after_solver)
     _EIGEN_PROCS = ("FREQUENCY", "BUCKLE", "MODAL DYNAMIC", "STEADY STATE DYNAMICS", "COMPLEX FREQUENCY")
 
-    def _eigen_after_solver(self) -> Tuple[int, str, List[int]]:
-        """The first step ccx 2.23 runs through its nonlinear solver (``_solver_steps``, or a
-        *HEAT TRANSFER step, which it runs there too), why, and the eigenvalue and modal steps
-        after it (step numbers): ccx carries an equation on a knot wrongly into those
-        (_warn_knot_equations); (0, "", []) where there are none."""
+    def _eigen_after_solver(self, heat: bool = True) -> Tuple[int, str, List[int]]:
+        """The first step ccx 2.23 runs through its nonlinear solver (``_solver_steps``, or,
+        with ``heat``, a *HEAT TRANSFER step, which it runs there too), why, and the eigenvalue
+        and modal steps after it (step numbers): ccx carries an equation on a knot wrongly into
+        those (_warn_knot_equations); (0, "", []) where there are none."""
         first, why = 0, ""
         for step, it in zip(self.steps, self._solver_steps):
             if why and step.proc in self._EIGEN_PROCS:
                 return first, why, [s.no for s in self.steps
                                     if s.no >= step.no and s.proc in self._EIGEN_PROCS]
-            if not why and (it or step.proc == "HEAT TRANSFER"):
+            if not why and (it or heat and step.proc == "HEAT TRANSFER"):
                 first, why = step.no, it or "a *HEAT TRANSFER step"
         return 0, "", []
 
