@@ -163,8 +163,11 @@ entries. The GitHub release notes use the same section.
   faces (S1-S4) of CPS / CPE / CAX elements now ties a node surface of those edges' nodes (none
   of the master's), with Abaqus' position tolerance. ccx 2.23 ties none of the face nodes of the
   solids it expands such elements to ('DOF ... is not active; no tied constraint') and the model
-  is singular. `validate_with_ccx.py tie_2d_faces` (CPS4 strips, by a tie and a tied pair; CAX4):
-  the strips merged, exactly (CAX4 1.6e-4, its wedge); before 7e14 x the displacements.
+  is singular. `validate_with_ccx.py tie_2d_faces` (CPS4 strips, by a tie and a tied pair; CAX4;
+  nu 0): the strips merged, exactly (CAX4 1.6e-4, its wedge); before 7e14 x the displacements. At
+  nu 0.3 plane strain stays exact and plane stress is 5e-3 off, where ccx's merged nodes share the
+  expanded thickness. A plane slave that shares nodes with its master, left out before, now ties
+  its other nodes.
 * **Tied contact pairs trimmed** — a `*CONTACT PAIR, TIED` on deformable surfaces, written as a
   `*TIE`, gets the `*TIE`'s trimmed slave surface (`validate_with_ccx.py
   tie_leftovers_pair_trimmed`: the same answer, 16 'no tied MPC' warnings instead of 112).

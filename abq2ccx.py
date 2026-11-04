@@ -10172,7 +10172,7 @@ class _Mesh:
         constraints), so a slave surface on solid elements, or a node surface, becomes a node
         surface of its other nodes: (its name, its *SURFACE card), "" with none left (probed:
         the answer of the blocks merged at the interface).  (None, []): nothing shared; ("?",
-        []): shared on another element family (shells, plane elements)."""
+        []): shared on another element family (shells; plane elements: _membrane_node_surface)."""
         sd = self.surfaces.get(slave.upper())
         shared = set(self._surface_member_nodes(master))
         nodes = self._surface_member_nodes(slave)
@@ -10221,9 +10221,11 @@ class _Mesh:
         axisymmetric elements (CPS / CPE / CAX) is one too: ccx 2.23 ties none of the face
         nodes of the solids it expands them to ('DOF ... of node ... is not active; no tied
         constraint') and the model is singular (probed on CPS4 / CAX4 strips: 7e14 / 4e13 x the
-        displacements), where a node surface of the edges' nodes ties them as Abaqus does, the
-        strips merged there exactly (CAX4 1e-4, its wedge; ccx still says DOF 3, out of the
-        plane, of each such node is not active: its own plane MPCs hold it).  A tie's surface on
+        displacements), where a node surface of the edges' nodes ties them as Abaqus does: the
+        strips merged there exactly in plane strain (CAX4 1e-4, its wedge); in plane stress at
+        nu 0.3 5e-3 off, the merged nodes sharing the expanded thickness, which Abaqus' plane
+        stress elements have no nodal DOF for (ccx still says DOF 3, out of the plane, of each
+        such node is not active: its own plane MPCs hold it).  A tie's surface on
         membranes and other elements stays as it is, warned.  Nodes of ``exclude`` stay out (a tie's
         master-face nodes, a coupling's reference node: ccx would tie them to themselves and
         loop in its cascade, "zero coefficient on the dependent side"); with none left the
@@ -10261,7 +10263,8 @@ class _Mesh:
             self.report.note(f"{what} surface {surf} on plane / axisymmetric elements -> node "
                              f"surface {name} of their edges' nodes, which Abaqus ties (ccx 2.23 ties "
                              f"none of the face nodes of the solids it expands them to, 'not active; "
-                             f"no tied constraint': singular; probed, the strips merged there exactly).",
+                             f"no tied constraint': singular; probed: the strips merged there, plane stress 5e-3 off at "
+                             f"nu 0.3).",
                              once=True)
         elif planar:
             self.report.note(f"{what} surface {surf} on plane / axisymmetric elements -> node "

@@ -19153,7 +19153,7 @@ def test_analytical_segments_exact_or_approximate():
     tie = (ANALYTIC_2D + "*SURFACE, NAME=BOT\nTOPE, S1\n*SURFACE, NAME=RT\nTOPE, S3\n" +
            curved[len(ANALYTIC_2D):].split("*SURFACE INTERACTION")[0] + "*TIE, NAME=T1\nTOP, TOOL\nBOT, RT\n")
     body, conv, _ = convert_str(tie)
-    assert "\nBOT, RT" in body and "** TOP, TOOL" in body and "*TIE" in conv.reduced_physics
+    assert "\nBOT_NODES, RT" in body and "** TOP, TOOL" in body and "*TIE" in conv.reduced_physics
     body, _, rep = convert_str(curved, approximate=True)
     msg = [m for _, m in rep.entries if m.startswith("[APPROX] Analytical rigid surface TOOL")]
     assert msg and "degrees" in msg[0] and "chord sag" in msg[0]
@@ -25831,9 +25831,9 @@ def test_tie_on_one_surface_or_on_shared_nodes():
              "*Surface, name=AR\nA, S2\n*Surface, name=BL\nB, S4\n*Tie, name=T1\nBL, AR\n"
              "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=A, material=M\n1.\n"
              "*Solid Section, elset=B, material=M\n1.\n")
-    body, conv, rep = convert_str(plane)
-    assert "** *TIE, NAME=T1\n** BL, AR" in body and "shares nodes with the faces" in rep.text()
-    assert conv.reduced_physics == ["*TIE whose slave surface shares nodes with its master (left out)"]
+    body, conv, rep = convert_str(plane)                 # (plane faces: a node surface of the others)
+    assert "*SURFACE, NAME=BL_NODES, TYPE=NODE\n13\n*TIE, NAME=T1, POSITION TOLERANCE=0.1\nBL_NODES, AR\n" in body
+    assert not conv.reduced_physics
 
 
 def test_kinematic_coupling_mass_member_gets_a_massless_tetrahedron():
