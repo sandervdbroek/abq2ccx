@@ -5268,6 +5268,105 @@ def test_kinematic_rotation_lines():
     assert "couples no translational DOF" in rep.text() and "per DOF range" not in rep.text()
 
 
+def test_kinematic_rotation_only_lines_on_shell_nodes():
+    # a coupling of rotations only of shell/beam nodes: no ccx *KINEMATIC (it couples
+    # translations only); each knotted node's rotations are tied to DOFs 1-3 of a ROT NODE that
+    # carries the reference node's rotation, where its moments and rotational BCs go
+    step = "*Step\n*Static\n*Boundary\n1,1,6\n4,1,6\n*Cload\n100,5,2.\n*End Step\n"
+    native = S4 + ("*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, "
+                   "surface=RS\n*Kinematic\n4, 6\n")
+    for deck in (native, S4 + "*Kinematic Coupling, ref node=100\nR, 4, 6\n"):
+        body, conv, rep = convert_str(deck + step)
+        rot = conv._rb_rot[100]
+        assert {5, 6} <= set(conv._knots) and not any(l.startswith("*COUPLING") for l in _live(body))
+        assert sorted(_equations(body)) == sorted(f"{n},{k},1.,{rot},{k - 3},-1."
+                                                  for n in (5, 6) for k in (4, 5, 6))
+        assert f"*CLOAD\n{rot}, 2, 2." in body
+        # the turn about the shells' normal reaches only the knots' drilling rotations: held
+        assert f"{rot},3,3" in _bc_lines(body) and "common normal" in rep.text()
+        assert not rep.reduced and "NOT coupled" not in rep.text()
+    # the deck holding that rotation itself: no hold; a moment about the normal is lost (warned)
+    body, conv, rep = convert_str(native + step.replace("4,1,6\n", "4,1,6\n100,6,6\n"))
+    assert _bc_lines(body).count(f"{conv._rb_rot[100]},3,3") == 1 and not rep.reduced
+    _, _, rep = convert_str(native + step.replace("100,5,2.", "100,6,2."))
+    assert rep.reduced == ["moment about the shell normal on a rotation-only coupling"]
+    # one rotation: one tie per node; under NLGEOM some rotations (not all three) are reduced
+    body, conv, rep = convert_str(native.replace("4, 6\n", "5, 5\n") + step)
+    assert sorted(_equations(body)) == [f"{n},5,1.,{conv._rb_rot[100]},2,-1." for n in (5, 6)]
+    assert not rep.reduced
+    _, _, rep = convert_str(native.replace("4, 6\n", "5, 5\n") + step.replace("*Step", "*Step, nlgeom"))
+    assert rep.reduced == ["kinematic coupling of some rotations under NLGEOM (axes not turned)"]
+    _, _, rep = convert_str(native + step.replace("*Step", "*Step, nlgeom"))
+    assert not rep.reduced
+    # beside a translation line the rotations are tied to the reference node's own DOFs 4-6,
+    # which carry ccx's coupling rotation: no warning
+    body, _, rep = convert_str(native.replace("4, 6\n", "1, 3\n4, 6\n") + step)
+    assert sorted(_equations(body)) == sorted(f"{n},{k},1.,100,{k},-1." for n in (5, 6) for k in (4, 5, 6))
+    assert "NOT coupled" not in rep.text() and not rep.reduced
+
+
+def test_kinematic_rotation_only_lines_beside_other_constraints():
+    native = S4 + ("*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, "
+                   "surface=RS\n*Kinematic\n4, 6\n")
+    step = "*Step\n*Static\n*Boundary\n1,1,6\n4,1,6\n*Cload\n100,5,2.\n*End Step\n"
+    # beside a coupling of translations on the same node: the ties go to the node's DOFs 4-6,
+    # which carry ccx's coupling rotation (a ROT NODE of their own turned apart from it)
+    other = ("*Node\n7,3,0,0\n8,3,1,0\n*Nset,nset=T\n7,8\n*Surface, type=node, name=TS\nT\n"
+             "*Coupling, constraint name=C2, ref node=100, surface=TS\n*Kinematic\n1, 3\n")
+    for deck in (native + other, S4 + "*Kinematic Coupling, ref node=100\nR, 4, 6\n" + other):
+        body, conv, rep = convert_str(deck + step)
+        assert 100 not in conv._rb_rot
+        assert sorted(_equations(body)) == sorted(f"{n},{k},1.,100,{k},-1." for n in (5, 6) for k in (4, 5, 6))
+        assert [l for l in _live(body) if l.startswith("*COUPLING")] == \
+            ["*COUPLING, CONSTRAINT NAME=C2, REF NODE=100, SURFACE=TS"]
+        assert "*CLOAD\n100,5,2." in body and not rep.reduced and "different DOFs" not in rep.text()
+    # another constraint on the node's rotation that the ROT NODE cannot carry: left as it was
+    for extra, who in (("*Node\n200,2.5,0.5,0\n*Element, type=CONN3D2, elset=CN\n60, 100, 200\n"
+                        "*Connector Section, elset=CN\nBeam\n", "a rigid connector"),
+                       ("*Node\n200,2.5,0.5,0\n*MPC\nBEAM, 100, 200\n", "an *MPC"),
+                       ("*Node\n200,2.5,0.5,0\n*Nset, nset=RB\n100\n*Rigid Body, ref node=200, "
+                        "tie nset=RB\n", "a *RIGID BODY"),
+                       ("*Element, type=SPRING1, elset=SP\n70, 100\n*Spring, elset=SP\n5\n5.\n",
+                        "a spring")):
+        body, conv, rep = convert_str(native + extra + step)
+        assert 100 not in conv._rb_rot or not any(f",{conv._rb_rot[100]}," in e for e in _equations(body))
+        # (a spring on the node's rotation is then left out too: ccx carries no rotation there)
+        left = ["SPRING1 / SPRING2 element left out"] if who == "a spring" else []
+        assert rep.reduced == left + ["*KINEMATIC rotation-only coupling"] and f"rotation {who}" in rep.text()
+        assert not any(l.startswith(("*COUPLING", "*KINEMATIC")) for l in _live(body))
+    # ... also in a deck of linear rigid equations (a *DYNAMIC step without NLGEOM), which had
+    # the 'ties' form before: no ties to a ROT NODE beside the connector body's
+    dyn = step.replace("*Static", "*Dynamic\n0.01, 0.1").replace("100,5,2.", "100,5,0.005")
+    body, conv, rep = convert_str(native.replace("*Elastic\n1000.,0.3\n", "*Elastic\n1000.,0.3\n*Density\n1e-6\n")
+                                  + "*Node\n200,2.5,0.5,0\n*Element, type=CONN3D2, elset=CN\n60, 100, 200\n"
+                                  "*Connector Section, elset=CN\nBeam\n" + dyn)
+    assert not any(e.startswith(("5,", "6,")) for e in _equations(body))
+    assert "*KINEMATIC rotation-only coupling" in rep.reduced and "rotation a rigid connector" in rep.text()
+    # a connector whose rows read the ROT NODE (HINGE), or a rotary inertia (left out itself): tied
+    for extra in ("*Node\n200,2.5,0.5,0\n*Element, type=CONN3D2, elset=CN\n60, 100, 200\n"
+                  "*Connector Section, elset=CN\nHinge\n",
+                  "*Element, type=ROTARYI, elset=PR\n51, 100\n*Rotary Inertia, elset=PR\n1e-3,1e-3,1e-3\n"):
+        body, conv, rep = convert_str(native + extra + step)
+        rot = conv._rb_rot[100]
+        assert f"5,4,1.,{rot},1,-1." in _equations(body) and "rotation-only coupling" not in rep.reduced
+    # a *MODAL DYNAMIC step: the ties eliminate knot rotations, on which ccx crashes at random
+    modal = native.replace("*Elastic\n1000.,0.3\n", "*Elastic\n1000.,0.3\n*Density\n1e-6\n") + (
+        "*Boundary\n1,1,6\n4,1,6\n*Step\n*Frequency\n4\n*End Step\n*Step\n*Modal Dynamic\n"
+        "0.01, 0.1\n*Cload\n100,5,2.\n*End Step\n")
+    _, _, rep = convert_str(modal)
+    assert "*MODAL DYNAMIC step: its rotation ties" in rep.text()
+    _, _, rep = convert_str(native + step)
+    assert "*MODAL DYNAMIC" not in rep.text()
+    # nodes whose rotations cannot be tied (a *TRANSFORM on them): commented out, said so
+    _, _, rep = convert_str(native + "*Transform, nset=R\n0.,1.,0.,-1.,0.,0.\n" + step)
+    assert "could not be tied" in rep.text() and "nodes without rotations" not in rep.text()
+    # ... beside a coupling of some translations on a reference node with a *TRANSFORM
+    _, _, rep = convert_str(native + other.replace("1, 3\n", "1, 2\n") +
+                            "*Nset, nset=REFN\n100\n*Transform, nset=REFN\n0.,1.,0.,-1.,0.,0.\n" + step)
+    assert "could not be tied" in rep.text() and "which carry ccx's coupling rotation" not in rep.text()
+    assert "*KINEMATIC rotation-only coupling" in rep.reduced
+
+
 def _bc_lines(body):
     """The *BOUNDARY data lines of a converted deck, blanks removed."""
     out, inside = [], False

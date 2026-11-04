@@ -12,6 +12,9 @@ entries. The GitHub release notes use the same section.
 
 ### Overview
 
+* **More correct answers.** A kinematic coupling of rotations only (`*KINEMATIC` lines such as
+  `4, 6`) on shell or beam nodes now couples them. The line was dropped, so those rotations
+  stayed free and a moment or rotation on the reference node reached nothing.
 * **More correct answers.** Rotational springs (`SPRING1` / `SPRING2` on DOFs 4-6), which ccx
   ignored without a message, now act. A spring on a constrained node (an `*EQUATION`, rigid body
   or coupling) now feels a prescribed displacement on the constraint's other nodes, which ccx's
@@ -47,6 +50,23 @@ entries. The GitHub release notes use the same section.
   wrong value (the global component read as the local one), with a warning.
 
 ### Details
+
+* **Kinematic couplings of rotations only** — a `*COUPLING` + `*KINEMATIC` or a `*KINEMATIC
+  COUPLING` whose lines hold only rotations (DOFs 4-6) of shell/beam nodes becomes `*EQUATION`
+  ties θ(node) = θ(reference node) between each node's knot and a `ROT NODE` that carries the
+  reference node's rotation (its rotational BCs, moments, equation terms and connector rows
+  move there), or, where a coupling of translations shares the reference node, the node's own
+  DOFs 4-6. Where a rigid body, `*MPC`, rigid connector, spring or distributing coupling also
+  uses the reference node's rotation, the line is still dropped (reduced physics, the reason
+  said). Where the members are flat shells, the reference node's turn about their normal moves
+  only the knots' drilling rotations and is held (ccx did not converge on it under NLGEOM); a
+  moment about that normal is warned. In a deck with a `*MODAL DYNAMIC` step the ties are
+  warned: ccx crashes at random on equations that eliminate knot rotations. A rotation line
+  beside a translation line no longer reports its rotations as not coupled (they were tied
+  already). Under NLGEOM a coupling of some rotations, not all three, is warned as reduced
+  physics: Abaqus turns the coupled axes with the reference node. `validate_with_ccx.py
+  kinematic_rotation_only`: a strip turned rigidly by a rotation vector, twins and closed forms,
+  linear and NLGEOM.
 
 * **Rotational springs** — `SPRING1` / `SPRING2` on DOFs 4-6 become a helper node whose DOF 1 an
   `*EQUATION` ties to the rotation (a rigid body's ROT NODE, a kinematic coupling's or U1 node's
