@@ -8741,6 +8741,131 @@ def shell_tie_deck(kind, typ="S4"):
     raise ValueError(kind)
 
 
+def tie_leftover_deck(kind):
+    """Decks of the tie-leftovers checks, all of C3D8I / C3D8 bricks (nu 0) and their twins.
+
+    * offset_top / offset_bot / layer_top / layer_bot: a cantilever x 0-10, y 0-1, z 0-1 (10 x 1
+      x 2 C3D8I, its x = 0 face held) with a skin t 0.2 on its top (bottom) face, S4 of OFFSET
+      -0.5 (0.5) on the block's own face nodes; its twin the skin as a layer of C3D8I (ccx's S4
+      expansion element) on those nodes.  Step 1 pulls the end face down, step 2 along x.
+    * nset / nset_ref: two blocks x 0-2, y 0-1 (4 x 2 x 1 C3D8 each), the lower's base held, the
+      upper 0.1 above it; *TIE, TIED NSET of the upper's bottom face nodes at x <= 1 (default
+      ADJUST); its twin those nodes moved down onto the lower's top nodes and merged with them.
+      Step 1 pushes the upper's top along x, step 2 pulls it up (the untied half opens).
+    * nset_skin / nset_skin_ref: an S4 skin on the lower block's top (nodes of its own on the
+      face), tied by its SNEG face with TIED NSET of its nodes at x <= 1; its twin those nodes
+      the block's.  Loads on the skin's far edge.
+    * nset_plane / nset_plane_ref: two CPS4 strips x 0-2 (4 x 1 each), the upper 0.1 above the
+      lower, TIED NSET of its bottom nodes at x <= 1 with ADJUST=NO; its twin *EQUATIONs between
+      those nodes and the lower's top nodes below them."""
+    xyz = {}
+    if kind.startswith("nset_plane"):
+        nodes = {1 + i + 5 * k: (0.5 * i, float(k)) for i in range(5) for k in range(2)}
+        nodes.update({101 + i + 5 * k: (0.5 * i, 1.1 + k) for i in range(5) for k in range(2)})
+        els = [f"{b0 + i}, {n0 + i}, {n0 + i + 1}, {n0 + i + 6}, {n0 + i + 5}" for b0, n0 in ((1, 1), (11, 101))
+               for i in range(4)]
+        tie = ("*EQUATION\n" + "".join(f"2\n{101 + i}, {d}, 1., {6 + i}, {d}, -1.\n" for i in range(3)
+                                       for d in (1, 2))) if kind.endswith("ref") else \
+            ("*NSET, NSET=TIED\n101, 102, 103\n*SURFACE, NAME=SL\n11, S1\n12, S1\n13, S1\n14, S1\n"
+             "*SURFACE, NAME=MA\n1, S3\n2, S3\n3, S3\n4, S3\n*TIE, NAME=T1, TIED NSET=TIED, ADJUST=NO\nSL, MA\n")
+        steps = "".join(f"*STEP\n*STATIC\n*CLOAD, OP=NEW\nEND, {d}, 20.\n*NODE PRINT, NSET=END\nU\n*END STEP\n"
+                        for d in (1, 2))
+        return (f"*HEADING\ntie leftovers {kind}\n*NODE\n" +
+                "".join(f"{n}, {x:g}, {y:g}\n" for n, (x, y) in sorted(nodes.items())) +
+                "*ELEMENT, TYPE=CPS4, ELSET=ALL\n" + "\n".join(els) + "\n*SOLID SECTION, ELSET=ALL, MATERIAL=M\n1.\n"
+                "*MATERIAL, NAME=M\n*ELASTIC\n200000., 0.\n*NSET, NSET=END\n106, 107, 108, 109, 110\n"
+                f"*NSET, NSET=CLAMP\n1, 2, 3, 4, 5\n{tie}*BOUNDARY\nCLAMP, 1, 2\n{steps}")
+
+    def grid(x0, dx, nx, y0, dy, ny, z0, dz, nz, base):
+        out = {}
+        for k in range(nz + 1):
+            for j in range(ny + 1):
+                for i in range(nx + 1):
+                    out[(i, j, k)] = n = base + i + (nx + 1) * (j + (ny + 1) * k)
+                    xyz[n] = (x0 + i * dx, y0 + j * dy, z0 + k * dz)
+        return out
+
+    def bricks(g, nx, ny, nz, eid):
+        out = []
+        for k in range(nz):
+            for j in range(ny):
+                for i in range(nx):
+                    c = [g[(i + a, j + b, k + h)] for h in (0, 1) for a, b in ((0, 0), (1, 0), (1, 1), (0, 1))]
+                    out.append(f"{eid + len(out)}, " + ", ".join(map(str, c)))
+        return out
+
+    def lines(ids):
+        return "\n".join(", ".join(map(str, ids[i:i + 12])) for i in range(0, len(ids), 12))
+    if kind.startswith(("offset", "layer")):
+        top = kind.endswith("top")
+        g = grid(0.0, 1.0, 10, 0.0, 1.0, 1, 0.0, 0.5, 2, 1)
+        zf = 2 if top else 0
+        if kind.startswith("offset"):
+            skin = [f"{100 + i}, " + ", ".join(str(g[(i + a, b, zf)]) for a, b in ((0, 0), (1, 0), (1, 1), (0, 1)))
+                    for i in range(10)]
+            extra = ("*ELEMENT, TYPE=S4, ELSET=SKIN\n" + "\n".join(skin) + "\n*SHELL SECTION, ELSET=SKIN, "
+                     f"MATERIAL=M, OFFSET={'-0.5' if top else '0.5'}\n0.2\n")
+        else:
+            lay = {(i, j, 0): g[(i, j, zf)] for i in range(11) for j in range(2)}
+            lay.update({(i, j, 1): 500 + i + 11 * j for i in range(11) for j in range(2)})
+            for i in range(11):
+                for j in range(2):
+                    p = xyz[g[(i, j, zf)]]
+                    xyz[500 + i + 11 * j] = (p[0], p[1], p[2] + (0.2 if top else -0.2))
+            if not top:
+                lay = {(i, j, 1 - k): n for (i, j, k), n in lay.items()}
+            extra = ("*ELEMENT, TYPE=C3D8I, ELSET=SKIN\n" + "\n".join(bricks(lay, 10, 1, 1, 100)) +
+                     "\n*SOLID SECTION, ELSET=SKIN, MATERIAL=M\n")
+        end = [g[(10, j, k)] for j in range(2) for k in range(3)]
+        clamp = [g[(0, j, k)] for j in range(2) for k in range(3)]
+        model = ("*ELEMENT, TYPE=C3D8I, ELSET=BLK\n" + "\n".join(bricks(g, 10, 1, 2, 1)) + "\n" + extra +
+                 "*SOLID SECTION, ELSET=BLK, MATERIAL=M\n")
+        sets = f"*NSET, NSET=END\n{lines(end)}\n*NSET, NSET=CLAMP\n{lines(clamp)}\n"
+        loads = (("END", 3, -1.0 / 6), ("END", 1, 100.0 / 6))
+    else:
+        gap = 0.1 if kind.startswith("nset") and "skin" not in kind else 0.0
+        lo = grid(0.0, 0.5, 4, 0.0, 0.5, 2, 0.0, 1.0, 1, 1)
+        top = {(i, j): lo[(i, j, 1)] for i in range(5) for j in range(3)}
+        chosen = {(i, j) for (i, j) in top if i <= 2}
+        ref = kind.endswith("ref")
+        model = "*ELEMENT, TYPE=C3D8, ELSET=LOW\n" + "\n".join(bricks(lo, 4, 2, 1, 1)) + \
+            "\n*SOLID SECTION, ELSET=LOW, MATERIAL=M\n"
+        upper = "\n".join(f"{1 + i + 4 * j}, S2" for i in range(4) for j in range(2))
+        if "skin" in kind:
+            sg = {k: (n if ref and k in chosen else 300 + k[0] + 5 * k[1]) for k, n in top.items()}
+            for k, n in top.items():
+                xyz.setdefault(sg[k], xyz[n])
+            model += ("*ELEMENT, TYPE=S4, ELSET=SKIN\n" + "\n".join(
+                f"{100 + i + 4 * j}, {sg[(i, j)]}, {sg[(i + 1, j)]}, {sg[(i + 1, j + 1)]}, {sg[(i, j + 1)]}"
+                for i in range(4) for j in range(2)) + "\n*SHELL SECTION, ELSET=SKIN, MATERIAL=M\n0.1\n")
+            if not ref:
+                model += (f"*NSET, NSET=TIED\n{lines(sorted(sg[k] for k in chosen))}\n*SURFACE, NAME=SL\n"
+                          f"SKIN, SNEG\n*SURFACE, NAME=MA\n{upper}\n*TIE, NAME=T1, TIED NSET=TIED\nSL, MA\n")
+            end = [sg[(4, j)] for j in range(3)]
+        else:
+            up = grid(0.0, 0.5, 4, 0.0, 0.5, 2, 1.0 + gap, 1.0, 1, 101)
+            if ref:
+                for (i, j) in chosen:
+                    xyz.pop(up[(i, j, 0)])
+                    up[(i, j, 0)] = top[(i, j)]
+            model += "*ELEMENT, TYPE=C3D8, ELSET=UP\n" + "\n".join(bricks(up, 4, 2, 1, 51)) + \
+                "\n*SOLID SECTION, ELSET=UP, MATERIAL=M\n"
+            if not ref:
+                model += (f"*NSET, NSET=TIED\n{lines(sorted(up[(i, j, 0)] for i, j in chosen))}\n"
+                          f"*SURFACE, NAME=SL\n" + "\n".join(f"{51 + i + 4 * j}, S1" for i in range(4)
+                                                             for j in range(2)) +
+                          f"\n*SURFACE, NAME=MA\n{upper}\n*TIE, NAME=T1, TIED NSET=TIED\nSL, MA\n")
+            end = [up[(i, j, 1)] for i in range(5) for j in range(3)]
+        clamp = [lo[(i, j, 0)] for i in range(5) for j in range(3)]
+        sets = f"*NSET, NSET=END\n{lines(end)}\n*NSET, NSET=CLAMP\n{lines(clamp)}\n"
+        loads = (("END", 1, 100.0 / len(end)), ("END", 3, 100.0 / len(end)))
+    nodes = "*NODE\n" + "".join(f"{n}, {p[0]:g}, {p[1]:g}, {p[2]:g}\n" for n, p in sorted(xyz.items()))
+    steps = "".join(f"*STEP\n*STATIC\n*CLOAD, OP=NEW\n{s}, {d}, {v:.12g}\n*NODE PRINT, NSET=END\nU\n*END STEP\n"
+                    for s, d, v in loads)
+    return (f"*HEADING\ntie leftovers {kind}\n{nodes}{model}{sets}*MATERIAL, NAME=M\n*ELASTIC\n200000., 0.\n"
+            f"*BOUNDARY\nCLAMP, 1, 3\n{steps}")
+
+
 _EMB_EDGES = {"hex": ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6),
                       (3, 7)),
               "tet": ((0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)),
@@ -19326,6 +19451,74 @@ def check_t129(ccx, env, tmp, shared):
                   f"{'knotted nodes tied' if kind == 'offset' else 'merged mesh'} ({err:.1e} apart; |u| "
                   f"{moved:.6g}; before: {before})")
         failures += 0 if ok else 1
+    return failures
+
+
+@check("tie_leftovers", "offset shells on solid nodes, *TIE TIED NSET, tied pairs' slave trimming")
+def check_tie_leftovers(ccx, env, tmp, shared):
+    # --- shells of a section OFFSET merged with solid nodes (knot beams), *TIE, TIED NSET (the set's
+    # nodes only, whatever their distance), a TIED *CONTACT PAIR's slave surface trimmed as a *TIE's
+    failures = 0
+
+    def run(tag, deck):
+        """(the .dat's displacement blocks, the report text, reduced physics, the 'no tied MPC'
+        warnings) of ``deck`` converted and solved, or None (FAIL printed)."""
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        res = (dat_node_blocks(os.path.join(d, "job.dat")), " ".join(rep.text().split()),
+               list(conv.reduced_physics), out.count("no tied MPC")) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if res is None:
+            print(f"FAIL  {tag}: did not solve ({status})")
+        return res
+    for kind, ref, what, mark, before in (
+            ("offset_top", "layer_top", "an S4 skin of OFFSET -0.5 on the top face nodes of a C3D8I "
+             "cantilever", "a force-free knot beam", "11 % off in bending: ccx joins the midsurface"),
+            ("offset_bot", "layer_bot", "an S4 skin of OFFSET 0.5 on its bottom face nodes",
+             "a force-free knot beam", "11 % off"),
+            ("nset", "nset_ref", "*TIE, TIED NSET of half a block's bottom face nodes, 0.1 above the "
+             "master (beyond the default tolerance)", "TIED NSET=TIED -> slave node surface",
+             "every slave node tied, or none: singular"),
+            ("nset_skin", "nset_skin_ref", "*TIE, TIED NSET of half an S4 skin's nodes on a block",
+             "TIED NSET=TIED -> slave node surface", "the whole skin tied, 5x off"),
+            ("nset_plane", "nset_plane_ref", "*TIE, TIED NSET, ADJUST=NO of half a CPS4 strip's bottom "
+             "nodes 0.1 above another", "TIED NSET=TIED -> slave node surface", "nothing tied: singular")):
+        runs = [run(f"tl_{kind}", tie_leftover_deck(kind)), run(f"tl_{ref}", tie_leftover_deck(ref))]
+        ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) == 2
+        if ok:
+            got, want = runs[0][0], runs[1][0]
+            err = max(abs(a - b) for g, w in zip(got, want) for n, v in w.items()
+                      for a, b in zip(g.get(n, [math.inf] * 3), v[:3]))
+            moved = max(abs(x) for w in want for v in w.values() for x in v[:3])
+            ok = err <= 1e-9 * moved and moved > 1e-3 and mark in runs[0][1] and not runs[0][2]
+            twin = ("skin as a C3D8I layer" if ref.startswith("layer") else "set nodes tied by equations"
+                    if kind == "nset_plane" else "set nodes merged")
+            print(f"{'PASS' if ok else 'FAIL'}  tie_leftovers_{kind} ({what}): the loaded nodes as the "
+                  f"{twin} in both "
+                  f"steps ({err:.1e} apart; |u| {moved:.6g}; before: {before})")
+        failures += 0 if ok else 1
+    # a TIED contact pair, written as a *TIE: its slave surface (a 100 x 100 plate's top) trimmed
+    # to the faces near the 20 x 20 block, as tie_slave_trimmed's; the same answer as the pair
+    # whose ADJUST reaches every face (nothing trimmed)
+    text = open(os.path.join(EXAMPLES, "tie_slave_trimmed.inp"), encoding="utf-8").read()
+    pair = text.replace("*Tie, name=BlockOnPlate, adjust=no\n",
+                        "*Surface Interaction, name=GLUE\n*Contact Pair, interaction=GLUE, tied\n")
+    runs = [run("tl_pair_trimmed", pair),
+            run("tl_pair_whole", pair.replace("interaction=GLUE, tied", "interaction=GLUE, tied, adjust=1000."))]
+    ok = pair != text and all(runs) and runs[0][0] and len(runs[0][0][-1]) == 25
+    if ok:
+        got, want = runs[0][0][-1], runs[1][0][-1]
+        err = max(abs(a - b) for n, v in want.items() for a, b in zip(got.get(n, [math.inf] * 3), v))
+        moved = max(abs(x) for v in want.values() for x in v)
+        ok = err <= 1e-12 * moved and moved > 1e-4 and runs[0][3] < runs[1][3] and \
+            "*CONTACT PAIR, TIED: slave surface PLATETOP -> PLATETOP_NEAR" in runs[0][1]
+        print(f"{'PASS' if ok else 'FAIL'}  tie_leftovers_pair_trimmed (a TIED *CONTACT PAIR of a plate's "
+              f"whole top on a small block): the block nodes as the untrimmed pair ({err:.1e} apart; |u| "
+              f"{moved:.4g}); 'no tied MPC' warnings {runs[0][3]} instead of {runs[1][3]}")
+    failures += 0 if ok else 1
     return failures
 
 

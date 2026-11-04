@@ -1215,6 +1215,156 @@ def test_tie_slave_surface_trimmed_to_the_faces_near_its_master():
     assert "undefined node" in rep.text()
 
 
+def test_tied_contact_pair_slave_surface_trimmed_as_a_ties():
+    # a TIED *CONTACT PAIR is written as a *TIE, for which ccx prints 'no tied MPC generated' for
+    # every slave node away from the master: its slave surface is trimmed as a *TIE's
+    # (validate_with_ccx.py tie_leftovers_pair_trimmed: the same answer, 16 warnings for 112)
+    text = open(os.path.join(EXAMPLES, "tie_slave_trimmed.inp"), encoding="utf-8").read()
+    pair = text.replace("*Tie, name=BlockOnPlate, adjust=no\n",
+                        "*Surface Interaction, name=GLUE\n*Contact Pair, interaction=GLUE, tied\n")
+    assert pair != text
+    body, conv, rep = convert_str(pair)
+    faces = re.search(r"\*SURFACE, NAME=PLATETOP_NEAR, TYPE=ELEMENT\n((?:\d+, S2\n)+)", body)
+    assert faces and len(faces.group(1).splitlines()) == 16, body[:200]
+    assert re.search(r"\*TIE, NAME=ABQ2CCX_TIED\d+\nPLATETOP_NEAR, BLOCKBASE\n", body)
+    assert "*CONTACT PAIR, TIED: slave surface PLATETOP -> PLATETOP_NEAR, the 16 of its 100 faces" in rep.text()
+    assert not conv.reduced_physics
+    # an ADJUST that reaches every slave face: the deck's surface
+    body, _, _ = convert_str(pair.replace("interaction=GLUE, tied", "interaction=GLUE, tied, adjust=1000."))
+    assert "_NEAR" not in body and re.search(r"POSITION TOLERANCE=1000\.?\nPLATETOP, BLOCKBASE\n", body)
+
+
+TIED_NSET_BLOCKS = (HEX + "*NODE\n15, 0.,0.,{z}\n16, 1.,0.,{z}\n17, 1.,1.,{z}\n18, 0.,1.,{z}\n"
+                    "19, 0.,0.,2.\n20, 1.,0.,2.\n21, 1.,1.,2.\n22, 0.,1.,2.\n"
+                    "*ELEMENT, TYPE=C3D8, ELSET=UP\n2, 15, 16, 17, 18, 19, 20, 21, 22\n*ELSET, ELSET=LOWE\n1\n"
+                    "*SURFACE, NAME=SL{slave}\n*SURFACE, NAME=MA\nLOWE, S2\n*SOLID SECTION, ELSET=EALL, "
+                    "MATERIAL=M\n*SOLID SECTION, ELSET=UP, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+                    "{tie}*STEP\n*STATIC\n*BOUNDARY\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*END STEP\n")
+
+
+def test_tie_tied_nset_ties_the_sets_slave_nodes_whatever_their_distance():
+    # Abaqus ties the slave nodes in TIED NSET, whatever their distance from the master: a node
+    # surface of them, with a POSITION TOLERANCE reaching them (5 % past the farthest, 0.3 here;
+    # Abaqus' default 10 % of the facet diagonal at least); a set node off the slave surface stays
+    # out (validate_with_ccx.py tie_leftovers_nset / _nset_skin: the set's nodes merged)
+    deck = TIED_NSET_BLOCKS.format(z="1.3", slave="\nUP, S1",
+                                   tie="*NSET, NSET=TN\n15, 16, 20\n*TIE, NAME=GLUE, TIED NSET=TN\nSL, MA\n")
+    body, conv, rep = convert_str(deck)
+    assert "*SURFACE, NAME=SL_TIED, TYPE=NODE\n15\n16\n*TIE, NAME=GLUE, POSITION TOLERANCE=0.315\nSL_TIED, MA\n" in body
+    assert "TIED NSET" not in body and "TIED NSET dropped" not in rep.text()
+    assert "TIED NSET=TN -> slave node surface SL_TIED of the 2 node(s) of SL in that set" in rep.text()
+    assert not conv.reduced_physics
+    # a node-based slave surface alike; on the master: Abaqus' default tolerance
+    body, _, _ = convert_str(TIED_NSET_BLOCKS.format(
+        z="1.", slave=", TYPE=NODE\n15\n16\n17\n18", tie="*NSET, NSET=TN\n17\n*TIE, NAME=GLUE, TIED NSET=TN\nSL, MA\n"))
+    assert "*SURFACE, NAME=SL_TIED, TYPE=NODE\n17\n*TIE, NAME=GLUE, POSITION TOLERANCE=0.0707107\nSL_TIED, MA\n" in body
+    # no slave node in the set: Abaqus ties none
+    body, _, rep = convert_str(TIED_NSET_BLOCKS.format(
+        z="1.3", slave="\nUP, S1", tie="*NSET, NSET=TN\n19, 20\n*TIE, NAME=GLUE, TIED NSET=TN\nSL, MA\n"))
+    assert "*TIE" not in body.replace("** abq2ccx: *TIE", "")
+    assert "** abq2ccx: *TIE GLUE: no slave node of SL but those of MA is in its TIED NSET" in body
+    # an undefined set: warned, the line kept
+    body, _, rep = convert_str(TIED_NSET_BLOCKS.format(
+        z="1.", slave="\nUP, S1", tie="*TIE, NAME=GLUE, TIED NSET=NOPE\nSL, MA\n"))
+    assert "*TIE, NAME=GLUE\nSL, MA\n" in body and "its TIED NSET NOPE is not a node set" in rep.text()
+    # a plane element's node off the master: ccx's ADJUST moves the node, not the solid it expands
+    # the element to (11 % off), so flagged; ADJUST=NO ties it where it is, as Abaqus (exact)
+    plane = ("*NODE\n1, 0., 0.\n2, 1., 0.\n3, 1., 1.\n4, 0., 1.\n5, 0., 1.1\n6, 1., 1.1\n7, 1., 2.1\n"
+             "8, 0., 2.1\n*ELEMENT, TYPE=CPS4, ELSET=LOW\n1, 1, 2, 3, 4\n*ELEMENT, TYPE=CPS4, ELSET=UP\n"
+             "2, 5, 6, 7, 8\n*SOLID SECTION, ELSET=LOW, MATERIAL=M\n1.\n*SOLID SECTION, ELSET=UP, MATERIAL=M\n"
+             "1.\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n*SURFACE, NAME=SL\nUP, S1\n*SURFACE, NAME=MA\n"
+             "LOW, S3\n*NSET, NSET=TN\n5\n*TIE, NAME=GLUE, TIED NSET=TN{}\nSL, MA\n*STEP\n*STATIC\n"
+             "*BOUNDARY\n1, 1, 2\n2, 1, 2\n*END STEP\n")
+    body, conv, rep = convert_str(plane.format(""))
+    assert "SL_TIED, MA" in body and "lie off the master surface on plane" in rep.text()
+    assert conv.reduced_physics == ["*TIE, TIED NSET: slave nodes of expanded elements moved onto the master"]
+    body, conv, rep = convert_str(plane.format(", ADJUST=NO"))
+    assert "SL_TIED, MA" in body and not conv.reduced_physics
+    # set nodes beyond the master's edge: Abaqus ties them to its nearest point (the edge), ccx
+    # to nothing ('no opposite master face'): warned, reduced physics, not "Exact"
+    wide = TIED_NSET_BLOCKS.replace("*ELEMENT, TYPE=C3D8, ELSET=UP\n2, 15, 16, 17, 18, 19, 20, 21, 22\n",
+                                    "23, 2.,0.,{z}\n24, 2.,1.,{z}\n25, 2.,0.,2.\n26, 2.,1.,2.\n"
+                                    "*ELEMENT, TYPE=C3D8, ELSET=UP\n2, 15, 16, 17, 18, 19, 20, 21, 22\n"
+                                    "3, 16, 23, 24, 17, 20, 25, 26, 21\n")
+    body, conv, rep = convert_str(wide.format(z="1.", slave="\nUP, S1", tie="*NSET, NSET=TN\n15, 16, 17, 18, 23, "
+                                              "24\n*TIE, NAME=GLUE, TIED NSET=TN, ADJUST=NO\nSL, MA\n"))
+    assert "SL_TIED, MA" in body and "2 of its slave node(s) (e.g. node 23) have no master face" in rep.text()
+    assert conv.reduced_physics == ["*TIE, TIED NSET: slave nodes beyond the master's edge left untied"]
+    assert "in that set (not on MA)" in rep.text() and "TIED NSET). Exact." not in rep.text()
+    # a convex ring master of 10 deg facets: a node above a ridge two facets share has a face
+    # opposite it in ccx (its search bisects the ridge), so only the slave nodes past the ring's
+    # two ends, and those at its end angles (0.5 off radially, past the end edge in the facet's
+    # plane), are beyond: ccx's own untied nodes, 2001-2002, 2011-2012, 2061-2062, 2071-2072
+    nodes, els = [], []
+    for k, deg in enumerate(range(-10, 70, 10)):
+        c, s_ = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+        for j, r in enumerate((9.0, 10.0, 10.5, 11.5)):
+            for h in (0, 1):
+                nodes.append(f"{1000 * j + 10 * k + h + 1}, {r * c:.12g}, {r * s_:.12g}, {h}.")
+    ring = lambda j, k: [1000 * j + 10 * k + h + 1 for h in (0, 1)]                    # noqa: E731
+    for k in range(7):
+        for j, base in ((0, 1), (2, 101)):
+            if j == 0 and k in (0, 6):
+                continue                            # (the master spans 0-50 deg, the slave -10-60)
+            quad = (ring(j, k), ring(j + 1, k), ring(j + 1, k + 1), ring(j, k + 1))   # (inner, outer)
+            els.append(f"{base + k}, " + ", ".join(str(c[h]) for h in (0, 1) for c in quad))
+    deck = ("*NODE\n" + "\n".join(nodes) + "\n*ELEMENT, TYPE=C3D8, ELSET=ALL\n" + "\n".join(els) +
+            "\n*ELSET, ELSET=MB\n" + ", ".join(str(1 + k) for k in range(1, 6)) + "\n*ELSET, ELSET=SB\n" +
+            ", ".join(str(101 + k) for k in range(7)) + "\n*SURFACE, NAME=MA\nMB, S4\n*SURFACE, NAME=SL\nSB, S6\n"
+            "*NSET, NSET=TN\n" + "\n".join(f"{2000 + 10 * k + h + 1}" for k in range(8) for h in (0, 1)) +
+            "\n*SOLID SECTION, ELSET=ALL, MATERIAL=M\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+            "*TIE, NAME=GLUE, TIED NSET=TN, ADJUST=NO\nSL, MA\n*STEP\n*STATIC\n*END STEP\n")
+    body, conv, rep = convert_str(deck)
+    assert "SL_TIED, MA" in body and "8 of its slave node(s) (e.g. node 2011) have no master face" in rep.text()
+
+
+def test_tie_tied_nset_of_an_instance():
+    # an instance-qualified TIED NSET (CAE's *NSET in a part) resolves like a data-line member
+    part = ("*PART, NAME={0}\n*NODE\n1, 0.,0.,{1}\n2, 1.,0.,{1}\n3, 1.,1.,{1}\n4, 0.,1.,{1}\n5, 0.,0.,{2}\n"
+            "6, 1.,0.,{2}\n7, 1.,1.,{2}\n8, 0.,1.,{2}\n*ELEMENT, TYPE=C3D8, ELSET=E\n1, 1,2,3,4,5,6,7,8\n{3}"
+            "*SOLID SECTION, ELSET=E, MATERIAL=M\n*END PART\n")
+    deck = (part.format("LOW", "0.", "1.", "*SURFACE, NAME=MA\nE, S2\n*NSET, NSET=BASE\n1, 2, 3, 4\n") +
+            part.format("UP", "1.3", "2.3", "*SURFACE, NAME=SL\nE, S1\n*NSET, NSET=TN\n1, 2\n") +
+            "*ASSEMBLY, NAME=A\n*INSTANCE, NAME=L1, PART=LOW\n*END INSTANCE\n*INSTANCE, NAME=U1, PART=UP\n"
+            "*END INSTANCE\n*TIE, NAME=GLUE, TIED NSET=U1.TN\nU1.SL, L1.MA\n*END ASSEMBLY\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n100., 0.3\n*STEP\n*STATIC\n*BOUNDARY\nL1.BASE, 1, 3\n*END STEP\n")
+    body, conv, rep = convert_str(deck)
+    assert "*SURFACE, NAME=U1_SL_TIED, TYPE=NODE\n9\n10\n*TIE, NAME=GLUE, POSITION TOLERANCE=0.315\n" \
+        "U1_SL_TIED, L1_MA\n" in body
+    assert "is not a node set" not in rep.text() and not conv.reduced_physics
+
+
+def test_offset_shell_nodes_on_solids_get_knot_beams():
+    # ccx joins a solid to the midsurface of a shell node it shares that is no knot, whatever
+    # the section's OFFSET; Abaqus to the node (the reference surface): each such node gets a
+    # knot beam, its drilling rotation held (validate_with_ccx.py tie_leftovers_offset_*: the skin
+    # as a layer of C3D8I exactly; before 11 % off)
+    deck = (HEX + "*ELEMENT, TYPE=S4, ELSET=SKIN\n2, 5, 6, 7, 8\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n"
+            "*SHELL SECTION, ELSET=SKIN, MATERIAL=M{off}\n0.1\n*MATERIAL, NAME=M\n*ELASTIC\n100., 0.3\n"
+            "*DENSITY\n1e-9\n*BOUNDARY\n1, 1, 3\n2, 1, 3\n3, 1, 3\n4, 1, 3\n*STEP\n{step}\n*CLOAD\n7, 1, 1.\n"
+            "*END STEP\n")
+    for off in (", OFFSET=-0.5", ", OFFSET=SNEG", ", OFFSET=0.25"):
+        body, conv, rep = convert_str(deck.format(off=off, step="*STATIC"))
+        assert sorted(conv._knots) == [5, 6, 7, 8], off
+        assert "ELSET=ABQ2CCX_KNOT" in body and "joins the solid at the node" in rep.text()
+        assert "the drilling rotation of knot beams' knots on shell nodes held" in body
+        assert all(f"\n{n}, 6, 6\n" in body for n in (5, 6, 7, 8))
+        assert not conv.reduced_physics
+    body, conv, rep = convert_str(deck.format(off="", step="*STATIC"))        # OFFSET 0: exact as it is
+    assert not conv._knots and "ABQ2CCX_KNOT" not in body
+    body, conv, rep = convert_str(deck.format(off=", OFFSET=SPOS", step="*DYNAMIC, EXPLICIT\n, 1e-3"))
+    assert not conv._knots and "The knot beams that join it at the node were not added" in rep.text()
+    assert "shell OFFSET at nodes shared with solids (ccx joins the midsurface)" in conv.reduced_physics
+    # these knots turn linearly in a step ccx iterates without NLGEOM (a never-reached *PLASTIC:
+    # probed equal to the layer twin at 0.1 rad), not in a *DYNAMIC step (7e-3 at 0.17 rad)
+    turned = "shell/beam rotations turned with the finite rotation in a geometrically linear step"
+    plastic = deck.replace("*ELASTIC\n100., 0.3\n", "*ELASTIC\n100., 0.3\n*PLASTIC\n1e9, 0.\n")
+    body, conv, rep = convert_str(plastic.format(off=", OFFSET=-0.5", step="*STATIC"))
+    assert sorted(conv._knots) == [5, 6, 7, 8] and turned not in conv.reduced_physics
+    body, conv, rep = convert_str(deck.format(off=", OFFSET=-0.5", step="*DYNAMIC\n0.1, 1."))
+    assert sorted(conv._knots) == [5, 6, 7, 8] and turned in conv.reduced_physics
+
+
 def test_tie_slave_trimming_on_a_shell_master_with_a_section_thickness():
     # a master on conventional shells with a section thickness is trimmed (its expanded face
     # lies the half thickness off, which the boxes include), so the restriction to bounded
