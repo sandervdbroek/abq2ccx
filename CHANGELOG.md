@@ -53,6 +53,10 @@ entries. The GitHub release notes use the same section.
 * **Shell strips under `--approximate`.** An `S8R` strip one element wide drifts in ccx's
   nonlinear solver (up to many times its deflection); `--approximate` now writes it as `S8`,
   which keeps the right answer.
+* **Continuum-shell stacks judged by their middle.** A plastic or creeping continuum shell is
+  now flagged where the middle of its stack's thickness crosses it: alone through the thickness
+  (1.155 times the fully plastic moment) or the middle one of an odd stack (1.017 for 3), not in
+  an even stack, nor in two shells bonded by a cohesive layer.
 * **Shell strips flagged in linear models too.** An `S8R` strip one element wide is now
   flagged in every model, not only where ccx iterates: its displacements carry a spurious pinch
   through the thickness (up to twice the true largest displacement), and `*BUCKLE` can find
@@ -212,10 +216,20 @@ entries. The GitHub release notes use the same section.
   continuum shell carries 1.15 times its limit load (probed on a strip in 4-point bending). A
   creeping `*SHELL SECTION` (a nonlinear creep law in a deck that creeps; judged on the shells
   as written, after `--approximate`'s `S4R` / `S3` rewrites), a plastic or creeping continuum
-  shell one element through the thickness (stacked ones integrate at 4 or more points), and a
-  composite section whose plastic or creeping layer the middle crosses (continuum shells too)
+  shell the middle of the thickness crosses (one element through it, or the middle one of an
+  odd stack: see below), and a composite section whose plastic or creeping layer the middle crosses (continuum shells too)
   are now reduced physics, as plastic sheet shells already were; linear creep and a `SECTION
   INTEGRATION=GAUSS` rule with ccx's points are not.
+* **Continuum-shell stacks** — continuum shells stacked through the thickness are now judged
+  by the middle of the stack: 2 Gauss points per element integrate the fully plastic stress
+  exactly in an element on one side of it, so k equal elements carry 1 + 0.155 / k^2 times the
+  fully plastic moment for odd k and exactly it for even k (probed in pure bending, 1-5
+  elements: 1.1547 / 1.0000 / 1.0172 / 1.0000 / 1.0062; in creep, 3 elements bend at 0.97 / 0.94
+  times the exact rate at stress exponent 3 / 5). The element the middle crosses is flagged with
+  the section's factor (an odd or unequal stack included); a stack whose middle lies between
+  two elements is not. Elements joined through a cohesive layer (`COH3D8` / `COH3D6`) count as
+  one stack: two `SC8R` bonded by a thin glue layer carried 0.9999 of the fully plastic moment
+  and were flagged before (`validate_with_ccx.py sc_stacks`).
 * **Stabilization on `*VISCO` and coupled steps** — `STABILIZE`, `FACTOR`, `ALLSDTOL` and
   `CONTINUE` on `*VISCO` and `*COUPLED TEMPERATURE-DISPLACEMENT` went to ccx, which ignores
   them; they are now dropped with a warning, and a stabilized step ccx iterates is reduced
