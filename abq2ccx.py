@@ -25892,9 +25892,10 @@ class _Dofs:
         first.  ccx ramps the angles where Abaqus ramps the rotation vector: equal at the end
         of the step, the director's path in between a little apart.
 
-        Rewritten: the states (_rot_bc_walk) of a general NLGEOM step before the first *DYNAMIC
-        step (ccx knots the node there and keeps the knot, which reads the values as Abaqus
-        does) holding all three rotations, or the two off the normal with the free one along it
+        Rewritten, at a node whose rotational BCs ccx first reads in a step other than a
+        *DYNAMIC one (there ccx knots the node and keeps the knot, which reads the values as
+        Abaqus does), the states (_rot_bc_walk) of a general NLGEOM step before the next
+        *DYNAMIC step (likewise) holding all three rotations, or the two off the normal with the free one along it
         (exact to first order only: Abaqus' normal turns with that free drilling rotation too,
         which ccx's shell node lacks: taken as zero), on the step's own amplitude.  The nodes:
         as _plan_shell_rotation_pairs (not its 'pair' nodes).  Warned (reduced physics) where
@@ -25903,9 +25904,8 @@ class _Dofs:
         a velocity-type BC, a director turned 90 deg or more."""
         if getattr(self.opt, "solid_dof", False) or not self._mechanical or self._has_normal:
             return
-        first = min((st.no for st in self.steps if st.proc == "DYNAMIC"), default=None)
-        nl = {st.no for st in self.steps if st.nlgeom and not st.perturbation and
-              (first is None or st.no < first)}
+        dyns = {st.no for st in self.steps if st.proc == "DYNAMIC"}
+        nl = {st.no for st in self.steps if st.nlgeom and not st.perturbation and st.no not in dyns}
         if not nl:
             return
         sheet = {n for typ, conn in self.geom.elements.values() if ccx_type(typ) in SHEET_SHELLS
@@ -25914,7 +25914,6 @@ class _Dofs:
                 self._rot_mode.get(n) in (None, "keep")}
         cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]] = []
         step = 0
-        dyn = first is not None
         for b in blocks:
             if b.keyword == "STEP":
                 step += 1
@@ -25936,7 +25935,7 @@ class _Dofs:
             nrm = self._ccx_shell_normal(n, at)
             if nrm is None:
                 continue
-            got = self._rot_finite_lines(n, axes, nrm, list(self._rot_bc_walk(n, cards, acts)), nl, dyn)
+            got = self._rot_finite_lines(n, axes, nrm, list(self._rot_bc_walk(n, cards, acts)), nl, dyns)
             if isinstance(got, str):
                 hit.setdefault(got, []).append(n)
             elif got:
@@ -25964,12 +25963,19 @@ class _Dofs:
             self._reduces("finite shell rotation BCs about two axes read as projected angles")
 
     def _rot_finite_lines(self, n: int, axes: Tuple[Vec, Vec, Vec], nrm: Vec, walk: list,
-                          nl: set, dyn: bool) -> Union[None, str, Dict[Tuple[int, int], List[str]]]:
+                          nl: set, dyns: set) -> Union[None, str, Dict[Tuple[int, int], List[str]]]:
         """_rot_lines (card, node) of shell node ``n`` (local ``axes``, normal ``nrm``) whose
-        rotational BC states ``walk`` (_rot_bc_walk) an NLGEOM step (``nl``: those before the
-        first *DYNAMIC one) reads as ccx's angles otherwise (_plan_shell_finite_rotations); None
-        where none does, why there is no form where one does and cannot (``dyn``: a *DYNAMIC
-        step follows)."""
+        rotational BC states ``walk`` (_rot_bc_walk) an NLGEOM step (``nl``) reads as ccx's
+        angles otherwise (_plan_shell_finite_rotations); None where none does, why there is
+        no form where one does and cannot.  ``dyns``: the *DYNAMIC steps."""
+        # ccx knots the node in the step that first reads its rotational BCs if that is a
+        # *DYNAMIC one, else in the next *DYNAMIC step: only the NLGEOM states before it
+        read = next((max(s, 1) for _, s, st, _ in walk if st), None)
+        if read is None or read in dyns:
+            return None
+        nxt = min((d for d in dyns if d > read), default=None)
+        dyn = nxt is not None
+        nl = {S for S in nl if nxt is None or S < nxt}
         e1: Optional[Vec] = None
         rows = []                       # (card, step, values, counted DOFs, new values)
         for b, s, st, amp in walk:

@@ -17087,10 +17087,14 @@ def test_shell_finite_rotations_nlgeom():
     carry = strip(step="*Step\n", more="*Step, nlgeom\n*Static\n0.1, 1.\n*Cload\n3, 3, 1.\n*End Step\n")
     # a *DYNAMIC step: ccx knots the node there (and after): as given, not flagged
     for deck in (strip().replace("*Static\n", "*Dynamic\n"),
-                 strip().replace("*Step, nlgeom\n*Static", "*Step, nlgeom\n*Dynamic\n0.1, 1.\n*End Step\n"
-                                 "*Step, nlgeom\n*Static")):
+                 strip("*Boundary\nTIP, 4, 4, 0.1\nTIP, 5, 5, 0.2\nTIP, 6, 6, 0.\n*End Step\n*Step, nlgeom\n"
+                       "*Static\n0.1, 1.\n*Boundary\nTIP, 4, 4, 0.2\n").replace("*Static\n", "*Dynamic\n", 1)):
         body, conv, rep = convert_str(deck)
         assert conv._rot_mode.get(3) is None and not conv.reduced_physics, conv.reduced_physics
+    # a *DYNAMIC step that reads no rotation of the node: ccx makes it no knot, rewritten after
+    body, conv, rep = convert_str(strip().replace("*Step, nlgeom\n*Static", "*Step, nlgeom\n*Dynamic\n0.1, 1.\n"
+                                                  "*End Step\n*Step, nlgeom\n*Static"))
+    assert conv._rot_mode.get(3) == "finite" and not conv.reduced_physics, conv.reduced_physics
     for deck, why in ((amp, "a card on an amplitude"), (dyn, "a *DYNAMIC step follows"),
                       (carry, "carries on into an NLGEOM one")):
         body, conv, rep = convert_str(deck)
