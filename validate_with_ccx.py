@@ -20996,6 +20996,27 @@ def check_spring_dofs_masses(ccx, env, tmp, shared):
     return failures
 
 
+def knot_heat_deck(ssd=True):
+    """An S4 strip 1 x 0.1 x 0.01 off the global axes (E 1.2e7, nu 0), clamped at one end: a
+    steady-state *HEAT TRANSFER step (the clamped end at 20), a *FREQUENCY step and, with
+    ``ssd``, a *STEADY STATE DYNAMICS step loading the tip by moments (knot beams there, held
+    about the normal by a *BOUNDARY on a global rotation).  The *FREQUENCY step prints no
+    output of its own; its eigenvalues go to the .dat."""
+    nodes = "".join(f"{i + 1}, {0.08 * i:.6g}, {0.036 * i:.6g}, {-0.048 * i:.6g}\n"
+                    f"" for i in range(11)) + "".join(
+        f"{i + 12}, {0.08 * i:.6g}, {0.08 + 0.036 * i:.6g}, {0.06 - 0.048 * i:.6g}\n" for i in range(11))
+    elems = "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 13}, {i + 12}\n" for i in range(10))
+    text = ("*NODE\n" + nodes + "*ELEMENT, TYPE=S4, ELSET=E\n" + elems +
+            "*NSET, NSET=TIP\n11, 22\n*NSET, NSET=FIX\n1, 12\n*MATERIAL, NAME=M\n*ELASTIC\n1.2e7, 0.\n"
+            "*DENSITY\n1e-3\n*CONDUCTIVITY\n50.\n*SPECIFIC HEAT\n500.\n*SHELL SECTION, ELSET=E, "
+            "MATERIAL=M\n0.01\n*BOUNDARY\nFIX, 1, 6\n*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 1.\n"
+            "*BOUNDARY\nFIX, 11, 11, 20.\n*END STEP\n*STEP\n*FREQUENCY\n3\n*END STEP\n")
+    if ssd:
+        text += ("*STEP\n*STEADY STATE DYNAMICS\n0.5, 0.5, 1\n*CLOAD\n11, 5, 8e-05\n11, 6, 6e-05\n"
+                 "22, 5, 8e-05\n22, 6, 6e-05\n*END STEP\n")
+    return text
+
+
 @check("shell_knot_limits", "knot drilling holds: *MODAL DYNAMIC decks, *TRANSFORM nodes, BCs in "
        "some steps (a *BOUNDARY on the normal's largest component)")
 def check_shell_knot_limits(ccx, env, tmp, shared):
@@ -21079,6 +21100,24 @@ def check_shell_knot_limits(ccx, env, tmp, shared):
         print(f"{'PASS' if ok else 'FAIL'}  released_knot_oblique (released_knot off the global axes): tip "
               f"u_n {sum(a * c for a, c in zip(got[9], OBLIQUE_PLANE[2])):.6g} as in the xy-plane "
               f"({err:.1e} off in the strip's axes; before: ccx stopped)")
+    failures += 0 if ok else 1
+
+    # a run whose procedures are *HEAT TRANSFER and eigenvalue / modal steps alone: ccx sets it up
+    # as heat transfer, its knots without rotations, and stopped on the knots' drilling hold
+    # ('*ERROR in gen3dboun ... do not have rotational DOFs').  A *STATIC card ahead of the
+    # *FREQUENCY card makes it mechanical too.  Against the strip without the modal step (no
+    # knots), whose run has the heat step too
+    runs = [review_run(knot_heat_deck(s), "knot_heat" + ("" if s else "_ref"),
+                       lambda p: dat_eigen_table(p, "E I G E N V A L U E   O U T P U T") or None)
+            for s in (True, False)]
+    ok = all(runs)
+    if ok:
+        got, ref = runs
+        err = max(abs(a / b - 1.0) for a, b in zip(got, ref)) if len(got) == len(ref) == 3 else math.inf
+        ok = err < 1e-6 and ref[0] > 100.0
+        print(f"{'PASS' if ok else 'FAIL'}  knot_heat (the strip off the axes: *HEAT TRANSFER, *FREQUENCY, "
+              f"tip moments in *STEADY STATE DYNAMICS): ccx runs all three steps, frequencies "
+              f"{', '.join(f'{x:.7g}' for x in got)} as without knots ({err:.1e}; before: ccx stopped)")
     failures += 0 if ok else 1
     return failures
 
