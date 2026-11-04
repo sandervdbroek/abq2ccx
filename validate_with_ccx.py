@@ -332,10 +332,12 @@ def dat_displacement(dat_path, node):
 
 # The element-formulation flags a check's vehicle may carry beside what the check is about:
 # ccx's C3D8 locking where the material keeps its volume, its S3 wedge, a plastic or creeping
-# shell section's (a continuum shell's too) 2 Gauss points through the thickness
-# (Converter._plan_volume_locking, _plan_s3_shells, _plan_plastic_shells, _flag_inelastic_shells)
+# shell section's (a continuum shell's too) 2 Gauss points through the thickness, a linear model's
+# S8R strip one element wide (Converter._plan_volume_locking, _plan_s3_shells,
+# _plan_plastic_shells, _flag_inelastic_shells, _warn_s8r_strips)
 VEHICLE_FLAGS = ("element C3D8 of a ", "element S3 (", "plastic *SHELL SECTION", "creeping *SHELL SECTION",
-                 "plastic continuum shells", "creeping continuum shells", "plastic or creeping continuum shells")
+                 "plastic continuum shells", "creeping continuum shells", "plastic or creeping continuum shells",
+                 "S8R strips one element wide (")
 
 
 def other_reduced(conv):
@@ -14378,9 +14380,9 @@ def check_t150(ccx, env, tmp, shared):
         _rep, conv = convert(src, inp)
         d, status, out = run_ccx(ccx, env, inp)
         t150_dirs.append(d)
-        if status != "solved" or conv.reduced_physics:
+        if status != "solved" or other_reduced(conv):          # (the S8R strip's vehicle flag)
             print(f"FAIL  {tag}: " + (f"did not solve ({status})" if status != "solved" else
-                                      "reduced physics: " + "; ".join(conv.reduced_physics)))
+                                      "reduced physics: " + "; ".join(other_reduced(conv))))
             print("\n".join(l for l in out.splitlines() if "ERROR" in l)[:400])
             return None
         return os.path.join(d, "job.dat")
@@ -18897,14 +18899,17 @@ def check_t116(ccx, env, tmp, shared):
               f"0, 11, 31 too; ccx stopped): left out, u_x = 1 / E ({err:.1e} off)")
     failures += 0 if ok else 1
     # a collapsed S4R / S4 (ccx stopped in gen3dnor): as S3R, exactly; S4 under --approximate
-    # (which writes the triangle and its twin as S6, their neighbour as S8R)
+    # (which writes the triangle and its twin as S6, their neighbour as S8R, a strip one element
+    # wide and so S8: _plan_s8r_strips, task 173)
     S4R_REDUCED = "element S4R (ccx 2.23 bends it only through its C3D8R's hourglass stiffness)"
     S6_APPROX = "--approximate: Element S3 (1 elements) written as S6"
+    S8_APPROX = "--approximate: S8R strips one element wide written as S8"
     for kind, reduced, approx in (("coll_s4r", [S4R_REDUCED], False),
-                                  ("coll_s4", ["--approximate: Collapsed S4 shells written as S3", S6_APPROX], True)):
+                                  ("coll_s4", ["--approximate: Collapsed S4 shells written as S3", S6_APPROX,
+                                               S8_APPROX], True)):
         runs = [t116_run(f"t116_{kind}", kind, reduced, approx),
-                t116_run(f"t116_{kind}_ref", kind + "_ref", [S4R_REDUCED] if kind == "coll_s4r" else [S6_APPROX],
-                         approx)]
+                t116_run(f"t116_{kind}_ref", kind + "_ref", [S4R_REDUCED] if kind == "coll_s4r" else
+                         [S6_APPROX, S8_APPROX], approx)]
         ok = all(r is not None for r in runs)
         if ok:
             got, want = t116_last(runs[0]), t116_last(runs[1])
@@ -20178,7 +20183,7 @@ def check_t155(ccx, env, tmp, shared):
     return failures
 
 
-@check("s8r_strip_s8", "S8R strips one element wide written as S8 under --approximate")
+@check("s8r_strip_s8", "S8R strips one element wide written as S8 under --approximate; *BUCKLE flagged")
 def check_s8r_strip_s8(ccx, env, tmp, shared):
     # --- task 159: an S8R strip one element wide in an NLGEOM step (a load 1e-4 as large, so
     # the answer is the linear one): as written it drifts along the C3D20R's zero-energy mode;
@@ -20203,7 +20208,32 @@ def check_s8r_strip_s8(ccx, env, tmp, shared):
         print(f"{'PASS' if ok else 'FAIL'}  s8r_strip_s8 (an S8R cantilever strip one element wide, "
               f"NLGEOM at a small load): --approximate's S8 {d / m:.1e} of |u| {m:.4g} off its linear "
               f"answer; as written (S8R) {d0 / m0:.3g} off")
-    return 0 if ok else 1
+    # --- task 173: the same strip in axial compression, *BUCKLE (a linear step): as written its
+    # C3D20R pinch mode buckles spuriously, 4-5 times too low (flagged); --approximate's S8 near
+    # a strip four elements across (no strip, S8R) ---
+    def buckle(width):
+        text = t155_s8r_deck(width, False)
+        tip = [ln.split(",")[0] for ln in text.splitlines() if re.fullmatch(r"\d+, 3, [0-9.eE+-]+", ln)]
+        text = re.sub(r"(?m)^\d+, 3, [0-9.eE+-]+\n", "", text)
+        return text.replace("*STATIC\n*CLOAD\n", "*BUCKLE\n2\n*CLOAD\n" + "".join(
+            f"{n}, 1, {-1e-3 / len(tip):.8g}\n" for n in tip))
+    fac = lambda dat: dat_eigen_table(dat, "B U C K L I N G   F A C T O R   O U T P U T")  # noqa: E731
+    bruns = [review_run(buckle(1), "s8r_strip_s8_buckle", fac, approximate=True),
+             review_run(buckle(1), "s8r_strip_s8r_buckle", fac),
+             review_run(buckle(4), "s8r_strip_wide_buckle", fac)]
+    rep, conv = convert(os.path.join(tmp, "s8r_strip_s8r_buckle_src.inp"),
+                        os.path.join(tmp, "s8r_strip_s8r_buckle_flag.inp"))
+    flagged = any(r.startswith("S8R strips one element wide in a *BUCKLE step") for r in conv.reduced_physics)
+    with open(os.path.join(tmp, "s8r_strip_s8_buckle.inp"), encoding="utf-8") as fh:
+        bwritten = "*ELEMENT, TYPE=S8\n" in fh.read()
+    bok = all(bruns) and bwritten and flagged
+    if bok:
+        s8, s8r, ref = (r[0] for r in bruns)
+        bok = abs(s8 / ref - 1) < 0.15 and s8r < 0.5 * ref and ref > 0
+        print(f"{'PASS' if bok else 'FAIL'}  s8r_strip_s8 (the strip in axial compression, *BUCKLE): "
+              f"--approximate's S8 {s8:.4g}, as written (S8R, flagged) {s8r:.4g}, four elements "
+              f"across (S8R) {ref:.4g}")
+    return 0 if ok and bok else 1
 
 
 @check("norton_creep_floor",

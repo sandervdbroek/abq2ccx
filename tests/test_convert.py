@@ -58,13 +58,15 @@ S4R_FLAG = "element S4R (ccx 2.23 bends it only through its C3D8R's hourglass st
 S3_FLAG = "element S3 (ccx 2.23 runs it as one C3D6 wedge, which locks in bending)"
 PLASTIC_SHELL_FLAG = ("plastic *SHELL SECTION (ccx 2.23 integrates it through the thickness at its "
                       "brick's 2 or 3 Gauss points, not at the section's points)")
+# a linear model's S8R strip one element wide (_warn_s8r_strips, task 173): a vehicle's flag
+S8R_STRIP_FLAG = "S8R strips one element wide (C3D20R zero-energy mode in the displacements)"
 
 
 def other_reduced(conv):
     """conv.reduced_physics without the flags every plain S4R deck (_plan_s4r_shells), S3 deck
-    (_plan_s3_shells), plastic shell section (_plan_plastic_shells) and C3D8 cube of a plastic,
+    (_plan_s3_shells), S8R strip (_warn_s8r_strips), plastic shell section (_plan_plastic_shells) and C3D8 cube of a plastic,
     creeping or nearly incompressible material (_plan_volume_locking) carry."""
-    return [r for r in conv.reduced_physics if r not in (S4R_FLAG, S3_FLAG, PLASTIC_SHELL_FLAG)
+    return [r for r in conv.reduced_physics if r not in (S4R_FLAG, S3_FLAG, PLASTIC_SHELL_FLAG, S8R_STRIP_FLAG)
             and not r.startswith("element C3D8 of a ")]
 
 
@@ -9545,10 +9547,10 @@ def test_section_temperature_points_written_as_gradients():
 
     three = "*Shell Section, elset=E, material=M, temperature=3\n0.1\n"
     lines, conv, rep = run(three, "PLATE, 10., 10., 10.")
-    assert lines == ["PLATE, 10."] and not conv.reduced_physics
+    assert lines == ["PLATE, 10."] and not other_reduced(conv)
     assert "*SHELL SECTION, TEMPERATURE=n: the temperature lines on its nodes" in rep.text()
     lines, conv, _ = run(three, "PLATE, 0., 50., 100.", ic="PLATE, 0., 0., 0.")
-    assert lines == ["PLATE, 50., 1000."] and not conv.reduced_physics
+    assert lines == ["PLATE, 50., 1000."] and not other_reduced(conv)
     # not linear: the profile with the same mean and first moment (section forces), reduced
     lines, conv, rep = run(three, "PLATE, 0., 0., 100.")
     assert lines == ["PLATE, 25., 1000."]
@@ -9561,16 +9563,16 @@ def test_section_temperature_points_written_as_gradients():
         "9, 2, 20, 21, 3,", "9, 22, 20, 21, 23,").replace("21, 2., 1., 0.\n", "21, 2., 1., 0.\n22, 1., 0., 0.\n"
                                                            "23, 1., 1., 0.\n"))
     assert _card_at(_step(body, 1), "*TEMPERATURE") == ["PLATE, 66.6666666667, 1000."]
-    assert not conv.reduced_physics
+    assert not other_reduced(conv)
     # (here the C3D8 shares nodes 2 and 3, which keep the line its solid reads: warned)
     lines, conv, _ = run(offset, "PLATE, 0., 100.")
     assert lines == ["PLATE_T, 66.6666666667, 1000.", "PLATE_T~1, 100., 1000."]
     assert conv.geom.nset("PLATE_T~1") == [2, 3]
-    assert conv.reduced_physics == ["temperature gradients on offset shells / beams not exact in ccx"]
+    assert other_reduced(conv) == ["temperature gradients on offset shells / beams not exact in ccx"]
     # composite layers: n points per layer, shared at the interfaces; one per layer for n = 1
     plies = "0.05, 3, M, 0.\n0.05, 3, M, 90.\n"
     lines, conv, _ = run("*Shell Section, elset=E, composite, temperature=2\n" + plies, "PLATE, 0., 50., 100.")
-    assert lines == ["PLATE, 50., 1000."] and not conv.reduced_physics
+    assert lines == ["PLATE, 50., 1000."] and not other_reduced(conv)
     lines, conv, _ = run("*Shell Section, elset=E, composite, temperature=1\n" + plies, "PLATE, 0., 100.")
     assert lines == ["PLATE, 50., 1500."] and conv.reduced_physics
     # a set with other nodes: those keep the line, the shell's get theirs; continuation lines
@@ -17036,7 +17038,7 @@ def test_shell_rotation_pairs_without_transform():
     # *DYNAMIC: ccx makes the nodes knots, which hold the rotations as given -> as they are;
     # a *STATIC step before it holds the pair through mean-rotation MPCs: warned
     body, conv, rep = convert_str(panel("TOP, ZSYMM\n", proc="*Dynamic\n0.1, 1."))
-    assert rot_lines(body) == ["TOP, 4, 5"] and not conv.reduced_physics and one not in rep.text()
+    assert rot_lines(body) == ["TOP, 4, 5"] and not other_reduced(conv) and one not in rep.text()
     body, conv, rep = convert_str(panel("TOP, ZSYMM\n", steps="*Step\n*Dynamic\n0.1, 1.\n*End Step\n"))
     assert rot_lines(body) == ["TOP, 4, 5"] and any(held in r for r in conv.reduced_physics)
 
@@ -17062,7 +17064,7 @@ def test_transformed_shell_corner_bcs_leave_the_transform():
     out = "taken out of the *TRANSFORM, their BCs and loads written in global components"
     held = "translational BC on a transformed S8 / S8R / S6 corner node"
     body, conv, rep = convert_str(plate())
-    assert conv._untr == {3, 5} and out in rep.text() and not conv.reduced_physics
+    assert conv._untr == {3, 5} and out in rep.text() and not other_reduced(conv)
     lines = body.splitlines()
     i = lines.index("*TRANSFORM, NSET=ABQ2CCX_TR1, TYPE=R")       # node 4 (midside) keeps it
     assert lines[i - 2:i] == ["*NSET, NSET=ABQ2CCX_TR1", "4"] and "*TRANSFORM, NSET=TB, TYPE=R" not in lines
@@ -17075,14 +17077,14 @@ def test_transformed_shell_corner_bcs_leave_the_transform():
     # S4: not affected; a radial BC (no global form), an *EQUATION or local printed output:
     # warned (reduced physics)
     body, conv, rep = convert_str(plate(typ="S4"))
-    assert not conv._untr and out not in rep.text() and not conv.reduced_physics
+    assert not conv._untr and out not in rep.text() and not other_reduced(conv)
     for deck in (plate(bc_a="5, 1, 1, 0.01\n"), plate("*Equation\n2\n6, 2, 1., 2, 2, -1.\n"),
                  plate().replace("*End Step", "*Node Print, nset=TA\nU\n*End Step")):
         body, conv, rep = convert_str(deck)
         assert 5 not in conv._untr and any(held in r for r in conv.reduced_physics), deck
         assert "ties such a BC (an MPC in global coordinates) to the node's middle expanded node" in rep.text()
     body, conv, rep = convert_str(plate().replace("*End Step", "*Node Print, nset=TA, global=yes\nU\n*End Step"))
-    assert conv._untr == {3, 5} and not conv.reduced_physics
+    assert conv._untr == {3, 5} and not other_reduced(conv)
     # a knot (an S4 fold) with a transformed BC: ccx misses it in a *DYNAMIC step after a
     # geometrically linear step only -> out of the *TRANSFORM there, not in the other decks
     pts = [(float(i), y, z) for i in range(3) for y, z in ((-0.5, 0.), (0., 0.), (0., 0.5))]
@@ -21219,12 +21221,15 @@ def test_plain_s4r_bends_only_through_hourglass_stiffness():
     body, conv, rep = convert_str(thick.replace("type=S4R", "type=S4RT"), approximate=True)
     assert "*ELEMENT, TYPE=S4\n" in body and conv.geom.elements[1][0] == "S4T"
     # and S8R, as the composite upgrade writes it, where one is wider (10 thicknesses): S4 locks
+    # (this one-wide strip then S8: _plan_s8r_strips, task 173)
     body, conv, rep = convert_str(deck, approximate=True)
-    assert conv.geom.elements[1] == ("S8R", [1, 2, 5, 4, 7, 8, 9, 10])
-    assert "*ELEMENT, TYPE=S8R\n" in body and "TYPE=S4" not in body
+    assert conv.geom.elements[1] == ("S8", [1, 2, 5, 4, 7, 8, 9, 10])
+    assert "*ELEMENT, TYPE=S8\n" in body and "TYPE=S4" not in body
+    assert "[APPROX] S8R strips one element wide written as S8" in rep.text()
     assert "[APPROX] Element S4R (2 elements) written as S8R: ccx 2.23 expands" in rep.text()
     assert "The S8R have a node at the middle of every edge (nodes 7-13)" in rep.text()
-    assert conv.reduced_physics == ["--approximate: Element S4R (2 elements) written as S8R"]
+    assert conv.reduced_physics == ["--approximate: Element S4R (2 elements) written as S8R",
+                                    "--approximate: S8R strips one element wide written as S8"]
     assert _card_at(body, "*NSET, NSET=CLAMP") == ["1, 4, 10"]        # the clamped edge's midside node
     # a composite S4R runs as S8R: no S4R is left to warn about
     body, conv, rep = convert_str(deck.replace("material=CFRP\n0.1", "composite\n0.1, 3, CFRP, 0."))
@@ -21488,8 +21493,9 @@ def test_s3_shells_flagged_s6_under_approximate():
         assert conv.reduced_physics == [S3_FLAG], typ
         assert f"Element {typ} (2 elements): ccx 2.23 expands an S3 into one C3D6 wedge" in rep.text()
     body, conv, rep = convert_str(deck.format(t="S3R"), approximate=True)
-    assert [t for t, _ in conv.geom.elements.values()] == ["S6", "S6", "S8R"]
-    assert conv.reduced_physics == ["--approximate: Element S3R (2 elements) written as S6"]
+    assert [t for t, _ in conv.geom.elements.values()] == ["S6", "S6", "S8"]     # (the S8R a strip)
+    assert conv.reduced_physics == ["--approximate: Element S3R (2 elements) written as S6",
+                                    "--approximate: S8R strips one element wide written as S8"]
     assert "1 other linear shell(s) joined to them by an edge were upgraded too (S4 -> S8R)" in rep.text()
     # STRI3 is flagged for the substitution and for the wedge; an S4 mesh is not
     _, conv, _ = convert_str(deck.format(t="STRI3"))
@@ -25514,7 +25520,8 @@ def test_collapsed_quad_shells_as_triangles():
     body, conv, rep = convert_str(deck.format(t="S4"), approximate=True)
     assert "*ELEMENT, TYPE=S6\n2, 2, 5, 3, 10, 11, 7\n" in body
     assert conv.reduced_physics == ["--approximate: Collapsed S4 shells written as S3",
-                                    "--approximate: Element S3 (1 elements) written as S6"]
+                                    "--approximate: Element S3 (1 elements) written as S6",
+                                    "--approximate: S8R strips one element wide written as S8"]
     # an edge load names its edge by the quadrilateral's number: kept, warned
     body, _, rep = convert_str(deck.format(t="S4R").replace("*Cload\n5, 3, 1e-6\n", "*Dload\n2, EDNOR2, 1.\n"))
     assert "2, 2, 5, 3, 3\n" in body and "names an edge of them" in rep.text()
@@ -26822,10 +26829,14 @@ def test_s8r_strips_one_element_wide_in_iterated_steps_warned():
                 "*Step\n*Static\n*Cload\n" + "".join(f"{n}, 3, 1e-4\n" for (i, j), n in pts.items() if i == 4) +
                 "*End Step\n")
     flag = "S8R strips one element wide in a step ccx iterates (C3D20R zero-energy mode)"
-    for width, plastic, warned in ((1, True, True), (1, False, False), (2, True, False)):
+    linear = "S8R strips one element wide (C3D20R zero-energy mode in the displacements)"
+    # (task 173: a linear model's strip is warned too, for its displacements)
+    for width, plastic, warned, iterated in ((1, True, True, True), (1, False, True, False),
+                                             (2, True, False, False)):
         _, conv, rep = convert_str(strip(width, plastic))
         assert ("2 S8R element(s) (e.g. element 1) have two opposite edges" in rep.text()) == warned
-        assert (flag in conv.reduced_physics) == warned, (width, plastic)
+        assert (flag in conv.reduced_physics) == iterated, (width, plastic)
+        assert (linear in conv.reduced_physics) == (warned and not iterated), (width, plastic)
 
 # silently wrong answers (task 123): a 2 x 1 plate of two 8-node shells, alpha 1e-3
 GRAD_PLATE = ("*Node, nset=NALL\n1, 0, 0, 0.\n2, 0.5, 0, 0.\n3, 1, 0, 0.\n4, 1.5, 0, 0.\n5, 2, 0, 0.\n"
@@ -26888,7 +26899,7 @@ def test_offset_shell_gradients_written_for_the_mid_thickness_node():
     step = "*Step\n*Static\n*Temperature\nNALL, 10., 100.\n*End Step\n"
     body, conv, rep = convert_str(_grad_plate(step, sec=", offset=SPOS"))
     assert _card_at(_step(body, 1), "*TEMPERATURE") == ["NALL, 6.66666666667, 100."]
-    assert "OFFSET shells (S6 / S8 / S8R)" in rep.text() and not conv.reduced_physics
+    assert "OFFSET shells (S6 / S8 / S8R)" in rep.text() and not other_reduced(conv)
     # initial lines too; lines without a gradient and shells without offset as they are
     body, _, _ = convert_str(_grad_plate(step, ic="5., 30.", sec=", offset=-0.25"))
     assert "NALL, 5.5, 30." in body.split("*STEP")[0]
@@ -27593,6 +27604,37 @@ def test_general_contact_flush_faces_warned():
     assert flag not in conv.reduced_physics and "lie on an edge" not in rep.text()
 
 
+def test_s8r_strips_in_linear_and_buckle_steps_flagged():
+    # task 173: the S8R strip's C3D20R pinch mode spoils linear answers too (probed: the
+    # displacements carry a through-thickness pinch up to twice the true largest |u|; *BUCKLE
+    # finds spurious modes at factors 4-5 times too low): flagged in every mechanical model,
+    # S8 under --approximate; a heat-transfer-only model and a model without steps are not
+    nodes = "".join(f"{n}, {x}, {y}, 0.\n" for n, x, y in
+                    ((1, 0, 0), (2, 1, 0), (3, 1, 1), (4, 0, 1), (5, 0.5, 0), (6, 1, 0.5), (7, 0.5, 1),
+                     (8, 0, 0.5), (9, 2, 0), (10, 2, 1), (11, 1.5, 0), (12, 2, 0.5), (13, 1.5, 1)))
+    model = ("*Node\n" + nodes + "*Element, type=S8R, elset=E\n1, 1, 2, 3, 4, 5, 6, 7, 8\n"
+             "2, 2, 9, 10, 3, 11, 12, 13, 6\n*Shell Section, elset=E, material=M\n0.1\n"
+             "*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-6\n*Conductivity\n1.\n"
+             "*Specific Heat\n1.\n*Boundary\n1, 1, 6\n4, 1, 6\n8, 1, 6\n")
+    steps = {"freq": "*Step\n*Frequency\n4\n*End Step\n",
+             "buckle": "*Step\n*Buckle\n2\n*Cload\n9, 1, -1.\n10, 1, -1.\n*End Step\n",
+             "heat": "*Step\n*Heat Transfer, steady state\n*Boundary\n9, 11, 11, 1.\n*End Step\n",
+             "none": ""}
+    linear = "S8R strips one element wide (C3D20R zero-energy mode in the displacements)"
+    buckle = "S8R strips one element wide in a *BUCKLE step (C3D20R zero-energy mode: spurious buckling modes)"
+    for kind, flags in (("freq", [linear]), ("buckle", [buckle]), ("heat", []), ("none", [])):
+        body, conv, rep = convert_str(model + steps[kind])
+        got = [r for r in conv.reduced_physics if r.startswith("S8R strips")]
+        assert got == flags, (kind, got)
+        if flags:
+            assert "2 S8R element(s) (e.g. element 1) have two opposite edges" in rep.text()
+            assert ("*BUCKLE finds spurious modes of that pinch" in rep.text()) == (kind == "buckle")
+            body, conv, rep = convert_str(model + steps[kind], approximate=True)
+            assert "*ELEMENT, TYPE=S8\n" in body and not any(r.startswith("S8R strips")
+                                                               for r in conv.reduced_physics)
+            assert "--approximate: S8R strips one element wide written as S8" in conv.reduced_physics
+
+
 def test_s8r_strips_written_as_s8_under_approximate():
     # task 159: --approximate writes the drifting S8R strips (_plan_s8r_strips) as S8, ccx's C3D20
     # expansion without the zero-energy mode (probed: NLGEOM steps on S8's linear answer to 2e-6;
@@ -27624,10 +27666,11 @@ def test_s8r_strips_written_as_s8_under_approximate():
     # as written: warned, naming the cure
     _, conv, rep = convert_str(strip(1))
     assert flag in conv.reduced_physics and "Rerun with --approximate to write them as S8" in rep.text()
-    # two elements across, or no step ccx iterates: S8R stays, nothing to say
-    for deck in (strip(2), strip(1, nlgeom=False)):
-        body, conv, rep = convert_str(deck, approximate=True)
-        assert "TYPE=S8R" in body and "S8R strips" not in rep.text()
+    # two elements across: S8R stays, nothing to say; a linear model's strip is S8 too (task 173)
+    body, conv, rep = convert_str(strip(2), approximate=True)
+    assert "TYPE=S8R" in body and "S8R strips" not in rep.text()
+    body, conv, rep = convert_str(strip(1, nlgeom=False), approximate=True)
+    assert "*ELEMENT, TYPE=S8\n" in body and "a linear step's stresses, reactions" in rep.text()
     # a composite section (ccx: S8R / S6 only) and a creeping material stay S8R, flagged; without
     # --approximate they are not told it would cure them (code review)
     comp = strip(1, sec="*Shell Section, elset=E, composite\n0.05, 3, M\n0.05, 3, M\n")

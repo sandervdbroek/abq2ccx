@@ -14372,25 +14372,34 @@ class _Mesh:
         """``_s8r_strips``: (the S8R elements _warn_s8r_strips reports as left, those written as
         S8, those of the left --approximate keeps).
         An S8R element with two opposite edges that no other shell shares — a strip one
-        element wide, a lone element, one hanging off a plate by an edge — drifts in a model
-        with a step ccx runs through its nonlinear solver (_solver_steps, NLGEOM too): ccx 2.23
-        expands an S8R into one C3D20R brick, whose zero-energy mode such an element leaves
-        free; the linear solve stays on the right answer, the iterations drift along the mode
-        (probed against the linear *STATIC step, cantilever strips of 1 x 1 to 1 x 8 elements,
-        an L of strips: 6-410 % of max |u| under a never-reached *PLASTIC, 12 % to 86 times
-        under NLGEOM at a load 1e-4 as small, 60-25000 x in a *DYNAMIC step of near-zero mass;
-        holding the long edges in z makes it worse; two elements across, a plate's corner
-        elements and S8 on any mesh exact).  Under --approximate they become S8 (ccx's C3D20
-        expansion, fully integrated: no zero-energy mode, exact in the nonlinear solver; a
-        stiffer element than S8R: a cantilever strip of 4 x 1 elements 2-7 % stiffer for
-        elements 5-50 thicknesses wide, of one element 11-17 %), but for those of a composite section (ccx runs composite shells on S8R
-        and S6 only) or of a plastic or nonlinearly creeping material (whose through-thickness
-        rule, 2 Gauss points on S8R and 3 on S8, _plan_plastic_shells flags or layers); and
-        none of a *RIGID BODY, whose stiffness plays no part.  After
-        _plan_solver_facts, before the planners that read the final element types."""
+        element wide, a lone element, one hanging off a plate by an edge — carries a zero-energy
+        mode in ccx 2.23, which expands an S8R into one C3D20R brick: a pinch through the
+        thickness at the free edges' midside nodes.  Probed (cantilever strips of 1 x 1 to 8 x 1
+        elements; 4 elements across, S8 and a plate's corner elements free of it):
+        * a linear step's stresses, reactions, frequencies and corner-node displacements are
+          right, its displacements are not: the top and bottom surface nodes at the free edges'
+          midsides move apart by up to twice the true largest displacement under any load and
+          in every mode shape (the 3-D results' largest |U| 1.5-10 times the true one; the
+          shell-node means move in plane up to 1.5 times the largest deflection);
+        * *BUCKLE finds spurious modes of that pinch, at buckling factors 4-5 times too low (a
+          cantilever strip in axial compression: 0.66-0.80 against 3.28);
+        * a step ccx runs through its nonlinear solver (_solver_steps, NLGEOM too) drifts along
+          it (against the linear *STATIC step: 6-410 % of max |u| under a never-reached
+          *PLASTIC, 12 % to 86 times under NLGEOM at a load 1e-4 as small, 60-25000 x in a
+          *DYNAMIC step of near-zero mass; holding the long edges in z makes it worse).
+        Under --approximate they become S8 (ccx's C3D20 expansion, fully integrated: no
+        zero-energy mode, exact in the nonlinear solver, buckling factors 3.35-3.46 on the 4 x 1
+        / 8 x 1 strips; a stiffer element than S8R: a cantilever strip of 4 x 1 elements 2-7 %
+        stiffer for elements 5-50 thicknesses wide, of one element 11-17 %), but for those of a
+        composite section (ccx runs composite shells on S8R and S6 only) or of a plastic or
+        nonlinearly creeping material (whose through-thickness rule, 2 Gauss points on S8R and
+        3 on S8, _plan_plastic_shells flags or layers); and none of a *RIGID BODY, whose
+        stiffness plays no part.  After _plan_solver_facts, before the planners that read the
+        final element types."""
         self._s8r_strips = ([], [], [])
-        if not any(self._solver_steps) or not self._mechanical:
+        if not self._mechanical or not self.steps.procs:
             return
+        self._s8r_strip_buckle = "BUCKLE" in self.steps.procs
         rigid = self._rigid_body_elements(blocks)
         hit = [e for e in self._s8r_strip_elements() if e not in rigid]
         if not hit:
@@ -26992,18 +27001,31 @@ class _Constraints:
         left, made, kept = self._s8r_strips
         if not (left or made):
             return
-        why = next(w for w in self._solver_steps if w)
-        drift = ("ccx expands an S8R into one C3D20R brick, whose zero-energy mode such an element "
-                 "leaves free, and the iterations drift along it (probed against the linear step: "
-                 "6-410 % of max |u| with a never-reached *PLASTIC, 12 % to 86 times under NLGEOM, far "
-                 "off in *DYNAMIC; two elements across, or S8, exact)")
+        why = next((w for w in self._solver_steps if w), "")
+        buckle = self._s8r_strip_buckle
+        mode = ("ccx expands an S8R into one C3D20R brick, whose zero-energy mode such an element "
+                "leaves free: a pinch through the thickness at the free edges' midside nodes")
+        parts = [("a linear step's stresses, reactions, frequencies and corner-node displacements are "
+                  "right, its displacements are not (probed on cantilever strips: the top and bottom "
+                  "surface nodes there move apart by up to twice the true largest displacement, in "
+                  "every mode shape too; the largest |U| 1.5-10 times the true one)")]
+        if buckle:
+            parts.append("*BUCKLE finds spurious modes of that pinch, at buckling factors 4-5 times too "
+                         "low (probed: a strip in axial compression, 0.66-0.80 against 3.28)")
+        if why:
+            parts.append("the iterations of a step ccx runs through its nonlinear solver drift along "
+                         "it (probed against the linear step: 6-410 % of max |u| with a never-reached "
+                         "*PLASTIC, 12 % to 86 times under NLGEOM, far off in *DYNAMIC)")
+        drift = f"{mode}; {'; '.join(parts)}; two elements across, or S8, are free of it"
         what = ("have two opposite edges that no other shell shares (a strip one element wide, a lone "
-                f"element), in a model with {why}, which ccx 2.23 runs through its nonlinear solver")
+                "element)" + (f", in a model with {why}, which ccx 2.23 runs through its nonlinear "
+                              f"solver" if why else ""))
         if made:
             self.report.warn(f"[APPROX] S8R strips one element wide written as S8: {len(made)} S8R "
                              f"element(s) (e.g. "
                              f"element {min(made)}) {what}: {drift}. ccx's S8 is a C3D20 brick, fully "
-                             f"integrated, without that mode, so the iterations keep the linear answer; "
+                             f"integrated, without that mode (the strip buckles at 3.35-3.46, the "
+                             f"iterations keep the linear answer); "
                              f"it is a stiffer element than S8R (a cantilever strip of 4 x 1 elements "
                              f"bends 2-7 % less, of one element 11-17 %).", once=True)
         if left:
@@ -27021,7 +27043,13 @@ class _Constraints:
                       f"elements wide.")
             self.report.warn(f"{len(left)} S8R element(s) (e.g. element {min(left)}) {what}: {drift}. "
                              f"{advice}", once=True)
-            self._reduces("S8R strips one element wide in a step ccx iterates (C3D20R zero-energy mode)")
+            if why:
+                self._reduces("S8R strips one element wide in a step ccx iterates (C3D20R zero-energy mode)")
+            if buckle:
+                self._reduces("S8R strips one element wide in a *BUCKLE step (C3D20R zero-energy mode: "
+                              "spurious buckling modes)")
+            if not (why or buckle):
+                self._reduces("S8R strips one element wide (C3D20R zero-energy mode in the displacements)")
 
     def handle_mpc(self, b: Block) -> List[str]:
         """Abaqus ``*MPC``, converted line by line (a line ccx cannot take is commented out
@@ -46873,6 +46901,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._solver_why = ""
         self._solver_steps: List[str] = []         # per step: that why, or "" (_plan_solver_facts)
         self._s8r_strips: Tuple[List[int], List[int], List[int]] = ([], [], [])    # (_plan_s8r_strips)
+        self._s8r_strip_buckle = False                  # (_plan_s8r_strips: a *BUCKLE step)
         self._expanded: set = set()                # nodes of elements ccx expands to 3-D
         # *BOUNDARY, TYPE=VELOCITY / ACCELERATION (see _plan_velocity_bcs): what replaces each
         # such card, what each step appends for the ones it keeps, the amplitudes only they
