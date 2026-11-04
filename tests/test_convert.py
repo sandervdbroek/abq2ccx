@@ -25430,6 +25430,31 @@ def test_fixed_unknown_transformed_translations_through_helper_nodes():
     assert "does not apply there: BCs on its rotations" in rep.text()
 
 
+def test_transformed_bcs_through_helper_nodes_where_op_new_would_loosen_equations():
+    # ccx 2.23 writes a BC on a *TRANSFORM node's local DOF as an equation, substitutes it into
+    # the node's other equations, and a later *BOUNDARY, OP=NEW deletes or loosens those with it
+    # (probed): the node's translation BCs go to a helper node (_opnew_loosened)
+    eq = "*Equation\n2\n6, 1, 1., 7, 1, -1.\n"
+    s1 = "*Step\n*Static\n*Boundary\n7, 2, 2, 0.01\n*Cload\n7, 3, -1.\n*End Step\n"
+    s2 = "*Step\n*Static\n*Boundary, op=NEW\nBOT, 1, 3\n*Cload, op=NEW\n6, 2, 1.\n*End Step\n"
+    body, conv, rep = convert_str(FIXED_TR_HEX + eq + s1 + s2)
+    assert "*BOUNDARY\n9, 2, 2, 0.01\n" in _step(body, 1) and "7, 2, 2" not in body
+    assert "*EQUATION\n2\n7, 2, 1., 9, 2, -1.\n*STEP" in body and not conv.reduced_physics
+    assert "(node 7 (*EQUATION terms)): written on a helper node" in rep.text()
+    # no later OP=NEW, or a BC along a local axis that shares no global component with the
+    # equation's: as written
+    flat = FIXED_TR_HEX.replace("1., 1., 0.5, -1., 1., 1.", "1., 1., 0., -1., 1., 0.")
+    for deck in (FIXED_TR_HEX + eq + s1 + s2.replace(", op=NEW", ""),
+                 flat + eq + s1.replace("7, 2, 2, 0.01", "7, 3, 3, 0.01") + s2):
+        body, conv, _ = convert_str(deck)
+        assert "helper" not in body and not conv.reduced_physics
+    # where the helper form does not apply (an explicit deck): warned, reduced physics
+    body, conv, rep = convert_str(FIXED_TR_HEX + eq + (s1 + s2).replace("*Static", "*Dynamic, explicit\n, 0.001"))
+    assert "helper" not in body and "does not apply there: the deck has an explicit step" in rep.text()
+    assert "*EQUATION / *TIE on a *TRANSFORM node with BCs of its own, loose after a later " \
+        "*BOUNDARY, OP=NEW (ccx 2.23)" in conv.reduced_physics
+
+
 def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
     # FIXED in a linear perturbation step holds the base state: 0, which a static perturbation
     # step's restore adds the base value to (a rotation was written as that value, then doubled)
