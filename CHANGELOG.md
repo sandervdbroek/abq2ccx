@@ -53,6 +53,11 @@ entries. The GitHub release notes use the same section.
 * **Shell strips under `--approximate`.** An `S8R` strip one element wide drifts in ccx's
   nonlinear solver (up to many times its deflection); `--approximate` now writes it as `S8`,
   which keeps the right answer.
+* **Shell strips flagged in linear models too.** An `S8R` strip one element wide is now
+  flagged in every model, not only where ccx iterates: its displacements carry a spurious pinch
+  through the thickness (up to twice the true largest displacement), and `*BUCKLE` can find
+  spurious modes at buckling factors 4-5 times too low; its stresses, reactions and frequencies
+  are right. `--approximate` writes such strips as `S8` in every model.
 * **More correct answers.** `*BOUNDARY, FIXED` on a translation of a node with a `*TRANSFORM`,
   where earlier loads moved it, now holds the node where the step finds it. ccx held it at the
   wrong value (the global component read as the local one), with a warning.
@@ -221,6 +226,18 @@ entries. The GitHub release notes use the same section.
   on a strip of 4 elements (elements 5–50 thicknesses wide), 11–17 % on one; composite and
   plastic or nonlinearly creeping sections stay `S8R`, and strips of a `*RIGID BODY` are left
   alone (`validate_with_ccx.py s8r_strip_s8`).
+* **`S8R` strips in linear steps** — the `C3D20R`'s zero-energy mode shows in linear answers
+  too, as a pinch through the thickness at the free edges' midside nodes (probed on cantilever
+  strips of 1 x 1 to 8 x 1 elements against `S8` and four elements across): the top and bottom
+  surface nodes there move apart by up to twice the true largest displacement, under any load
+  and in every mode shape (the largest |U| 1.5-10 times the true one), and `*BUCKLE` can find
+  spurious modes of it, depending on round-off (a strip in axial compression: 0.66-0.80
+  against 3.28 on macOS arm64; the true factor on Linux x86_64); stresses,
+  reactions, eigenfrequencies and corner-node displacements are right. Such strips are now
+  warned and flagged as reduced physics in every mechanical model (a flag of its own in a model
+  with a `*BUCKLE` step), and `--approximate` writes them as `S8` there too (the strip buckles at
+  3.35-3.46). `validate_with_ccx.py s8r_strip_s8` gains a `*BUCKLE` case: as written 9.3, `S8`
+  61.2, four elements across 56.2.
 
 * **`*BOUNDARY, FIXED` on `*TRANSFORM` translations moved by loads** — where the held value is
   unknown, the node now gets a helper node without a `*TRANSFORM`, tied to its local DOFs by
