@@ -46598,7 +46598,8 @@ class _PostPasses:
         cylindrical *TRANSFORM by its axes at the node: one along global y exact, an oblique
         one 25 % off).  ccx
         starts the extra node that carries such a BC's value from the node's global
-        displacement (bounadd.f).  No exact form is known (the helper node of
+        displacement (bounadd.f), so a local axis along the negative global one of its number
+        is off too (-x 5.0 %, -y 8.7 %; probed).  No exact form is known (the helper node of
         _plan_fixed_helpers is off there too): warned, with reduced physics; FIXED lines that
         planner took (_fixed_unknown) are warned there."""
         cards = deck.cards
@@ -46654,14 +46655,15 @@ class _PostPasses:
         if hits:
             self.report.warn(f"*BOUNDARY on translations of *TRANSFORM nodes, new in implicit *DYNAMIC "
                              f"steps after the node could move ({', '.join(hits[:4])}"
-                             f"{', ...' if len(hits) > 4 else ''}): ccx 2.23 stops a moving DOF along "
-                             f"an axis other than the global one of its number otherwise than along a "
-                             f"global axis (probed on one C3D8 against the model turned into the "
-                             f"node's axes: 55 % of the peak displacement off at 20 increments a step, "
-                             f"6 % at 80, 13 % for axes along permuted global ones). Held from the "
+                             f"{', ...' if len(hits) > 4 else ''}): ccx 2.23 stops a moving DOF whose "
+                             f"local axis is not the positive global axis of its number otherwise than "
+                             f"the model turned into the node's axes (probed on one C3D8: 55 % of the "
+                             f"peak displacement off at 20 increments a step, 6 % at 80, 13 % for axes "
+                             f"along permuted global ones, 5-9 % along negative ones). Held from the "
                              f"start of the analysis instead, it is exact.", once=True)
             self._reduces("*BOUNDARY on a *TRANSFORM translation new in an implicit *DYNAMIC step "
-                          "(ccx 2.23 stops the DOF otherwise than along a global axis)")
+                          "(ccx 2.23 stops the DOF otherwise than along the positive global axis of "
+                          "its number)")
 
     def _warn_strain_free_adds(self, deck: EmittedDeck) -> None:
         """Warn of a *MODEL CHANGE, TYPE=ELEMENT that adds elements strain free (ADD without a

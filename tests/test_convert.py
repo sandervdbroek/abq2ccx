@@ -25747,11 +25747,11 @@ def test_transformed_bcs_through_helper_nodes_where_op_new_would_loosen_equation
 
 def test_transform_bc_warnings_dynamic_stops_and_kinematic_op_new():
     # implicit *DYNAMIC: a BC on an oblique *TRANSFORM translation new after the node could
-    # move is answered otherwise than along a global axis (probed): warned, reduced physics
+    # move is answered otherwise than along the positive global axis (probed): warned, reduced physics
     dyn = "*Step\n*Dynamic, direct\n0.05, 1.\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Dynamic, direct\n" \
         "0.05, 1.\n*Boundary\n7, 2, 2, 0.01\n*End Step\n"
     flag = "*BOUNDARY on a *TRANSFORM translation new in an implicit *DYNAMIC step (ccx 2.23 stops " \
-        "the DOF otherwise than along a global axis)"
+        "the DOF otherwise than along the positive global axis of its number)"
     body, conv, rep = convert_str(FIXED_TR_HEX + dyn)
     assert "new in implicit *DYNAMIC steps after the node could move (node 7 DOF 2 (step 2))" in rep.text()
     assert flag in conv.reduced_physics
@@ -25778,6 +25778,22 @@ def test_transform_bc_warnings_dynamic_stops_and_kinematic_op_new():
     assert "(node 7 DOF 1 (step 2))" in rep.text() and flag in conv.reduced_physics
     body, conv, rep = convert_str(cyl + dyn)
     assert "*TRANSFORM, NSET=N7, TYPE=C" in body and flag not in conv.reduced_physics
+
+
+def test_transform_bc_warning_dynamic_negative_global_axes():
+    # a local axis along the negative global axis of its number is not exact in a *DYNAMIC
+    # step either (ccx starts the BC's extra node at +u for a -u BC; probed: -x 5.0 %, -y 8.7 %):
+    # warned, reduced physics; an axis along the positive global one of its number is quiet
+    dyn = "*Step\n*Dynamic, direct\n0.05, 1.\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Dynamic, direct\n" \
+        "0.05, 1.\n*Boundary\n7, {d}, {d}, 0.01\n*End Step\n"
+    flag = "*BOUNDARY on a *TRANSFORM translation new in an implicit *DYNAMIC step (ccx 2.23 stops " \
+        "the DOF otherwise than along the positive global axis of its number)"
+    for ab, d, warned in (("-1., 0., 0., 0., -1., 0.", 1, True), ("-1., 0., 0., 0., -1., 0.", 2, True),
+                          ("-1., 0., 0., 0., -1., 0.", 3, False),       # (local -x, -y, +z)
+                          ("-1., 0., 0., 0., 1., 0.", 2, False), ("-1., 0., 0., 0., 1., 0.", 3, True)):  # (-x, +y, -z)
+        body, conv, rep = convert_str(FIXED_TR_HEX.replace("1., 1., 0.5, -1., 1., 1.", ab) + dyn.format(d=d))
+        assert (f"(node 7 DOF {d} (step 2))" in rep.text()) == warned, (ab, d)
+        assert (flag in conv.reduced_physics) == warned, (ab, d)
 
 
 def test_fixed_in_perturbation_steps_is_a_zero_perturbation():

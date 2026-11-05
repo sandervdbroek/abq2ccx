@@ -365,13 +365,13 @@ entries. The GitHub release notes use the same section.
   load_cases_hold`: the second load case holds node 6's y at 0.02175, both ccx case steps equal
   the hand-written single-case steps (0.0 apart; the old form 2.2e-2 off).
 * **`*TRANSFORM` BC warnings** — in an implicit `*DYNAMIC` step, a `*BOUNDARY` on a translation of
-  a `*TRANSFORM` node whose local axis is not the global one of its number, new after the node
-  could move (after a step that moves the model, not *FREQUENCY steps alone, or with an
-  initial velocity), stops the DOF otherwise than one
-  along a global axis in ccx 2.23: probed on one C3D8, held at the value it had reached, against
-  the model turned into the node's axes, 55 % of the peak displacement off at 20 increments a
-  step, 6 % at 80, 13 % for axes along permuted global ones; exact for local axes equal to the
-  global ones and for a BC held from a rest start, driven from it or released. ccx starts the
+  a `*TRANSFORM` node whose local axis is not the positive global axis of its number, new after
+  the node could move (after a step that moves the model, not *FREQUENCY steps alone, or with
+  an initial velocity), stops the DOF otherwise than the model turned into the node's axes in
+  ccx 2.23: probed on one C3D8, held at the value it had reached, 55 % of the peak displacement
+  off at 20 increments a step, 6 % at 80, 13 % for axes along permuted global ones, 5-9 % along
+  negative ones; exact for local axes equal to the global ones and for a BC held from a rest
+  start, driven from it or released. ccx starts the
   extra node that carries the BC's value from the node's global displacement (bounadd.f); no
   exact form is known (the helper node form is off there too). Warned, reduced physics.
   `*BOUNDARY, OP=NEW` in a deck with a `*KINEMATIC` coupling and any `*TRANSFORM` stops ccx
