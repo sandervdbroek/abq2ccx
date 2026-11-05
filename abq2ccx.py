@@ -46839,6 +46839,34 @@ class _PostPasses:
     # cards whose ccx constraints may carry an SPC its nonlinear solver updates (nonlinmpc)
     _NONLINEAR_SPC_CARDS = frozenset(("RIGID BODY", "MPC", "COUPLING", "DISTRIBUTING COUPLING"))
 
+    # procedures whose results depend on the mass matrix (_warn_truss_heat_mass)
+    _MASS_PROCS = ("FREQUENCY", "MODAL DYNAMIC", "STEADY STATE DYNAMICS", "COMPLEX FREQUENCY",
+                   "DYNAMIC")
+
+    def _warn_truss_heat_mass(self, deck: EmittedDeck) -> None:
+        """Warn (reduced physics) of truss elements in a run with a *HEAT TRANSFER step and a
+        step that reads the mass: ccx 2.23 sets such a run up as thermal and mechanical
+        (readinput.c, ithermal(2) = 3; the heat-only setup leaves the trusses' hinges out
+        altogether, _mechanical_run_type), and then runs trusses with another mass: a T3D2 grid's
+        first eigenvalue 1.356e10 for 5.566e9, the same with a real *STATIC step and with the
+        heat step at 0, while its static deflection is exact (probed; cause in gen3dtruss.f's
+        hinge MPCs over DOFs 0-3 suspected, not found)."""
+        procs = [s.proc.keyword for s in deck.steps if s.proc is not None]
+        mass = [s.number for s in deck.steps if s.proc is not None and s.proc.keyword in self._MASS_PROCS]
+        if "HEAT TRANSFER" not in procs or not mass:
+            return
+        truss = next((e for e, (typ, _c) in self.geom.elements.items()
+                      if ccx_type(typ) in self._CCX_TRUSSES), None)
+        if truss is None:
+            return
+        self.report.warn(f"Truss elements (e.g. element {truss}) in a run with a *HEAT TRANSFER step: ccx "
+                         f"2.23 runs trusses there with another mass, so the results of step(s) "
+                         f"{', '.join(map(str, mass))}, which read the mass, are not the deck's (probed: a "
+                         f"T3D2 grid's first eigenvalue 1.356e10 for 5.566e9, any temperature; static "
+                         f"results exact). Run the heat transfer step in an analysis of its own.", once=True)
+        self._reduces("truss elements in a run with a *HEAT TRANSFER step (ccx's thermal setup "
+                      "changes their mass)")
+
     def _truss_bc_index(self, deck: EmittedDeck) -> EmittedDeck:
         """ccx 2.23 overwrites one entry of its boundary-condition index per truss node:
         gen3dtruss.f ends with ``ilboun(id)=nboun``, ``id`` a place in its MPC list (the MPCs
@@ -48209,6 +48237,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_knot_equations(blocks, deck)     # after _settle_dependents: the terms as written
         self._warn_modal_knot_mpcs(blocks, deck)
         self._warn_strain_free_adds(deck)       # (reads the cards as written)
+        self._warn_truss_heat_mass(deck)
         deck = self._initial_gradients_back(deck)   # after the audit: the initial state is no load
         deck = self._shift_total_time(deck)     # after every pass that writes load cards
         self._warn_transform_bc_traps(deck)     # (BCs on the nodes, as every pass wrote them)

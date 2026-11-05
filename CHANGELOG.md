@@ -95,6 +95,11 @@ entries. The GitHub release notes use the same section.
   the shell and beam joints. A heat transfer step is no longer taken for one that turns those
   joints, so such models are no longer flagged for it.
 
+* **Honest flags for weaker physics.** A model with truss elements and a heat transfer step is
+  now warned where a step depends on the mass (frequency, modal and dynamic steps): ccx runs
+  trusses with another mass there (a truss grid's first eigenvalue 2.4 times too high), while
+  static results stay exact.
+
 ### Details
 
 * **Terminal report wrapping** — lines are wrapped one column short of the terminal's width: a
@@ -383,6 +388,12 @@ entries. The GitHub release notes use the same section.
   heat step). `validate_with_ccx.py shell_knot_limits knot_heat`: a strip off the axes with
   heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
   without knots (before: ccx stopped).
+
+* **Trusses in a run with a heat transfer step** — ccx 2.23 sets a run with a `*HEAT TRANSFER`
+  step up as thermal and mechanical, and then runs truss elements with another mass: a T3D2
+  grid's first eigenvalue 1.356e10 for 5.566e9, the same with a real `*STATIC` step and with the
+  heat step at 0, while its static deflection is exact. Warned, reduced physics, where a
+  `*FREQUENCY`, modal, steady-state or `*DYNAMIC` step reads the mass.
 
 ## 1.7.0 (November 2026)
 
