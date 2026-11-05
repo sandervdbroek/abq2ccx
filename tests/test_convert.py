@@ -25349,6 +25349,23 @@ def test_heat_transfer_run_gets_a_static_card_for_its_knots():
     assert KNOT_WARN in rep.text() and "*STATIC written ahead of step 2's" in rep.text()
 
 
+def test_temperature_dependent_material_gets_initial_temperature_zero():
+    # temperature-dependent material data and no initial temperatures: Abaqus reads them at 0,
+    # ccx 2.23 at the first row (a cube twice as soft, PR #35 review): every node at 0
+    cube = (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3, -100.\n"
+            "3000., 0.3, 100.\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n*Step\n*Static\n*Cload\n7, 3, 1.\n*End Step\n")
+    out, _, rep = convert_str(cube)
+    assert "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nABQ2CCX_TABLE_T, 0.\n" in out
+    assert "\n1, 2, 3, 4, 5, 6, 7, 8\n" in out.split("*NSET, NSET=ABQ2CCX_TABLE_T")[1]
+    assert "written for every node at 0, Abaqus' default" in rep.text()
+    # not for a constant material, nor where the deck gives initial temperatures
+    ic = "*Nset, nset=ALLN, generate\n1, 8, 1\n*Initial Conditions, type=temperature\nALLN, 50.\n"
+    for text in (cube.replace("1000., 0.3, -100.\n3000., 0.3, 100.\n", "1000., 0.3\n"),
+                 cube.replace("*Step", ic + "*Step", 1)):
+        out, _, rep = convert_str(text)
+        assert "ABQ2CCX_TABLE_T" not in out, text
+
+
 def test_mass_member_tetrahedron_left_out_where_ccx_exits_on_it():
     # B08: a *MASS-only member of a rigid body with shell members, every *FREQUENCY step after
     # a step ccx runs through its nonlinear solver: ccx exits 255 on the massless tetrahedron

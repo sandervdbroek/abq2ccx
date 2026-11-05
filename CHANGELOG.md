@@ -95,6 +95,10 @@ entries. The GitHub release notes use the same section.
   the shell and beam joints. A heat transfer step is no longer taken for one that turns those
   joints, so such models are no longer flagged for it.
 
+* **More correct answers.** A model whose elastic, density or expansion data depend on
+  temperature, without initial temperatures, is now read at temperature 0 as in Abaqus: ccx
+  took the data's first row (a test cube came out twice as soft), without a message.
+
 ### Details
 
 * **Terminal report wrapping** — lines are wrapped one column short of the terminal's width: a
@@ -383,6 +387,14 @@ entries. The GitHub release notes use the same section.
   heat step). `validate_with_ccx.py shell_knot_limits knot_heat`: a strip off the axes with
   heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
   without knots (before: ccx stopped).
+
+* **Temperature-dependent material data without initial temperatures** — Abaqus' temperature
+  is 0 where none is given, and temperature-dependent `*ELASTIC`, `*DENSITY`, `*EXPANSION`,
+  `*HYPERELASTIC` and `*HYPERFOAM` data are read there; ccx 2.23 without any temperature takes
+  the table's first row. Every node now gets an initial temperature of 0 in such a model (ccx
+  wants one at every node once any is given). `validate_with_ccx.py table_temperatures`: a cube
+  with E 1000 at -100 and 3000 at 100 deflects as with E 2000 (0.0 apart; before: twice as
+  much).
 
 ## 1.7.0 (November 2026)
 

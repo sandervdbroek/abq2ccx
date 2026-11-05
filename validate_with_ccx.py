@@ -21265,6 +21265,30 @@ def check_shell_knot_limits(ccx, env, tmp, shared):
     return failures
 
 
+@check("table_temperatures", "temperature-dependent material data without initial temperatures")
+def check_table_temperatures(ccx, env, tmp, shared):
+    # Abaqus reads temperature-dependent material data at 0 where no temperature is given, ccx
+    # 2.23 at the table's first row: a cube with E 1000 at -100 and 3000 at 100 deflected as
+    # E 1000.  The converter gives every node 0.  Against the same cube with E 2000
+    review_run = shared["review_run"]
+    cube = ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n5, 0.,0.,1.\n6, 1.,0.,1.\n"
+            "7, 1.,1.,1.\n8, 0.,1.,1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1,2,3,4,5,6,7,8\n"
+            "*NSET, NSET=NALL, GENERATE\n1, 8, 1\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n{e}*BOUNDARY\n1, 1, 3\n2, 2, 3\n4, 3\n*STEP\n*STATIC\n*CLOAD\n7, 3, 1.\n"
+            "*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+    got = review_run(cube.format(e="1000., 0.3, -100.\n3000., 0.3, 100.\n"), "table_temperatures", dat_node_blocks)
+    ref = review_run(cube.format(e="2000., 0.3\n"), "table_temperatures_ref", dat_node_blocks)
+    ok = bool(got and ref)
+    if ok:
+        err = max(abs(a - b) for n, v in ref[-1].items() for a, b in zip(got[-1][n], v))
+        moved = max(abs(x) for v in ref[-1].values() for x in v)
+        ok = err <= 1e-9 * moved and moved > 1e-3
+        print(f"{'PASS' if ok else 'FAIL'}  table_temperatures (a cube, E 1000 at -100 and 3000 at 100, no "
+              f"initial temperatures): as with E 2000, Abaqus' value at 0 ({err:.1e} apart, |u| {moved:.4g}; "
+              f"before: twice as soft)")
+    return 0 if ok else 1
+
+
 @check("other_decks", "other decks: confirm they are accepted and solve")
 def check_other_decks(ccx, env, tmp, shared):
     # --- other decks: confirm they are accepted and solve ----------------------
