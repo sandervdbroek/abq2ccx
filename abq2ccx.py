@@ -45195,18 +45195,21 @@ class _PostPasses:
         return deck.edited()
 
     def _table_temperatures(self, blocks: List[Block], deck: EmittedDeck) -> EmittedDeck:
-        """A model whose *ELASTIC, *DENSITY, *EXPANSION, *HYPERELASTIC or *HYPERFOAM tabulates its
-        values over temperature, with no initial temperatures: Abaqus' temperature is then 0
-        everywhere and the properties are read there; ccx 2.23 without any temperature takes the
-        table's first row (PR #35 review: a cube, E 1000 at -100 and 3000 at 100, deflected
-        0.03255 where E 2000 gives 0.01628).  Every node of the emitted *NODE cards gets 0
-        (ccx wants one at each node once any is given: checktemp), so ccx interpolates at 0 as
-        Abaqus does; a temperature-independent model is unchanged by it."""
+        """A model whose *ELASTIC, *DENSITY, *HYPERELASTIC or *HYPERFOAM tabulates its values over
+        temperature, with no temperatures at all: Abaqus' temperature is then 0 everywhere and
+        the properties are read there; ccx 2.23 without any temperature takes the table's first
+        row (PR #35 review: a cube, E 1000 at -100 and 3000 at 100, deflected 0.03255 where E
+        2000 gives 0.01628).  Every node of the emitted *NODE cards gets 0 (ccx wants one at each
+        node once any is given: checktemp), so ccx interpolates at 0 as Abaqus does; a
+        temperature-independent model is unchanged by it.  Left alone: a deck with a step
+        *TEMPERATURE (an earlier pass gives it the default initial temperatures, or, for FILE=,
+        deliberately none, so that ccx stops instead of running at undefined temperatures), and
+        an *EXPANSION table alone (no temperature, no thermal strain: the answers are the same)."""
         if any(c.keyword == "INITIAL CONDITIONS" and c.uparam("TYPE") == "TEMPERATURE" for c in deck.cards) \
-                or not deck.steps:
+                or any(c.keyword == "TEMPERATURE" for c in deck.cards) or not deck.steps:
             return deck
         dep = next((b for b in model_data(blocks) if b.keyword in
-                    ("ELASTIC", "DENSITY", "EXPANSION", "HYPERELASTIC", "HYPERFOAM")
+                    ("ELASTIC", "DENSITY", "HYPERELASTIC", "HYPERFOAM")
                     and temperature_dependent(b)), None)
         if dep is None:
             return deck

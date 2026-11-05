@@ -25358,10 +25358,14 @@ def test_temperature_dependent_material_gets_initial_temperature_zero():
     assert "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nABQ2CCX_TABLE_T, 0.\n" in out
     assert "\n1, 2, 3, 4, 5, 6, 7, 8\n" in out.split("*NSET, NSET=ABQ2CCX_TABLE_T")[1]
     assert "written for every node at 0, Abaqus' default" in rep.text()
-    # not for a constant material, nor where the deck gives initial temperatures
+    # not for a constant material, nor where the deck gives initial temperatures, nor with a step
+    # *TEMPERATURE (FILE=: no initial temperatures on purpose, ccx stops), nor for an *EXPANSION
+    # table alone (no temperature, no thermal strain)
     ic = "*Nset, nset=ALLN, generate\n1, 8, 1\n*Initial Conditions, type=temperature\nALLN, 50.\n"
-    for text in (cube.replace("1000., 0.3, -100.\n3000., 0.3, 100.\n", "1000., 0.3\n"),
-                 cube.replace("*Step", ic + "*Step", 1)):
+    const = cube.replace("1000., 0.3, -100.\n3000., 0.3, 100.\n", "1000., 0.3\n")
+    for text in (const, cube.replace("*Step", ic + "*Step", 1),
+                 cube.replace("*Cload", "*Temperature, file=heat\n*Cload"),
+                 const.replace("*Boundary", "*Expansion\n1e-5, -100.\n2e-5, 100.\n*Boundary")):
         out, _, rep = convert_str(text)
         assert "ABQ2CCX_TABLE_T" not in out, text
 
