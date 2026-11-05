@@ -6834,20 +6834,27 @@ BEAM_TIP = ("*Node\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n13, 1., 1., 0.
 def test_nonlinear_dashpot_as_its_slope_at_zero():
     # ccx 2.23 has no nonlinear dashpot: it damps with the last line's force as the coefficient
     # (a table of slope 2 to (4, 2) damped as 4) -> the slope at zero velocity, per temperature:
-    # exact for a straight table through zero (DASHPOTA and DASHPOT1), else warned + reduced
+    # Abaqus' damping for a straight table through zero on both sides (while the velocity stays
+    # within it: Abaqus holds the end forces beyond), else warned + reduced
     deck = ("*Node\n1, 0., 0., 0.\n2, -10., 0., 0.\n*Element, type={typ}, elset=D\n1, 1{n2}\n"
             "*Dashpot, elset=D, nonlinear\n{first}\n{tab}*Element, type=MASS, elset=M\n2, 1\n*Mass, elset=M\n1.\n"
-            "*Boundary\n1, 2, 3\n2, 1, 3\n*Step\n*Dynamic\n0.01, 1.\n*Cload\n1, 1, 1.\n*End Step\n")
+            "*Boundary\n1, 2, 3\n2, 1, 3\n*Step\n*Dynamic\n0.01, 1.\n*Cload\n1, 1, 1.\n{temp}*End Step\n")
+    two = "-4., -2.\n0., 0.\n4., 2.\n"
     for typ, n2, first in (("DASHPOTA", ", 2", ""), ("DASHPOT1", "", "1")):
-        body, conv, rep = convert_str(deck.format(typ=typ, n2=n2, first=first, tab="0., 0.\n2., 1.\n4., 2.\n"))
+        body, conv, rep = convert_str(deck.format(typ=typ, n2=n2, first=first, tab=two, temp=""))
         assert re.search(r"\*DASHPOT, ELSET=D\n2\.\n", body) and "NONLINEAR" not in body.split("*DASHPOT")[-1][:30]
-        assert not rep.reduced and "a linear dashpot of its slope" in rep.text()
-    body, conv, rep = convert_str(deck.format(typ="DASHPOTA", n2=", 2", first="",
-                                              tab="-2., -1., 20.\n2., 1., 20.\n-6., -1., 80.\n6., 1., 80.\n"))
+        assert not rep.reduced and "within the table's range" in rep.text()
+    # (the BC-driven-node cure takes the slope written, not none)
+    card = A.Block("DASHPOT", A.OrderedDict(ELSET="D", NONLINEAR=None), ["", "-4., -2.", "0., 0.", "4., 2."])
+    assert conv._dashpot_coefficients([card], {1: (1, 2)}) == {1: 2.0}
+    tab = "-2., -1., 20\n2., 1., 20.\n-6., -1., 80.\n6., 1., 80.\n"
+    body, conv, rep = convert_str(deck.format(typ="DASHPOTA", n2=", 2", first="", tab=tab, temp="*Temperature\n1, 50.\n2, 50.\n"))
     assert "*DASHPOT, ELSET=D\n2., 0., 20.\n6., 0., 80.\n" in body and not rep.reduced
-    body, conv, rep = convert_str(deck.format(typ="DASHPOTA", n2=", 2", first="", tab="0., 0.\n1., 0.5\n1.5, 1.5\n"))
-    assert "*DASHPOT, ELSET=D\n2.\n" in body and "written as a linear one" in rep.text()
-    assert rep.reduced == ["*DASHPOT, NONLINEAR as a linear dashpot"]
+    for tab, why in ((tab, "no step *TEMPERATURE"), ("0., 0.\n2., 1.\n4., 2.\n", "one side of zero only"),
+                     ("2., 1.\n", "one-line table"), ("-1.5, -1.5\n-1., -0.5\n0., 0.\n1., 0.5\n1.5, 1.5\n",
+                                                       "not one straight line")):
+        body, conv, rep = convert_str(deck.format(typ="DASHPOTA", n2=", 2", first="", tab=tab, temp=""))
+        assert why in rep.text() and rep.reduced == ["*DASHPOT, NONLINEAR as a linear dashpot"], why
     # a nonlinear connector spring is not written as a spring at all (the connector is left out,
     # warned): nothing for the nonlinear-spring warning to catch there
     body, conv, rep = convert_str(BUSH.format(typ="Cartesian", beh="*Connector Elasticity, component=1, "

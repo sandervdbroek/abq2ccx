@@ -11524,8 +11524,8 @@ class _Mesh:
 
     def _dashpot_coefficients(self, blocks: List[Block], ends: Dict[int, tuple]) -> Dict[int, float]:
         """DASHPOTA element -> its coefficient: a *DASHPOT card's one data line after the blank
-        (or DOF) line Abaqus puts first; none for a NONLINEAR card or several lines (frequency
-        or temperature dependence)."""
+        (or DOF) line Abaqus puts first, a NONLINEAR card's slope at zero (_linear_dashpot); none
+        for several lines (frequency or temperature dependence)."""
         out: Dict[int, float] = {}
         for b in blocks:
             if b.keyword != "DASHPOT":
@@ -11539,6 +11539,9 @@ class _Mesh:
                     if len(lines) == 1 and not b.has("NONLINEAR") else None
             except (IndexError, ValueError):
                 c = None
+            if b.has("NONLINEAR"):              # (_linear_dashpot writes its slope at zero)
+                got = self._dashpot_table(b, lines)
+                c = got[0][0][1] if got and len(got[0]) == 1 else None
             for e in self.geom.elset((b.param("ELSET") or "").strip()):
                 if e in ends and c is not None:
                     out.setdefault(e, c)
@@ -11732,54 +11735,80 @@ class _Mesh:
         nb = self._linear_dashpot(Block(b.keyword, params, b.data[1:]), b.data[1:])
         return [emit_keyword("DASHPOT", nb.params)] + list(nb.data)
 
-    def _linear_dashpot(self, b: Block, lines: List[str]) -> Block:
-        """*DASHPOT ``b`` with data lines ``lines`` (no DOF line), NONLINEAR ones (force, velocity,
-        temperature) as ccx's linear 'coefficient, frequency, temperature': ccx 2.23 has no
-        nonlinear dashpot — it warns of the parameter and damps with the last line's force as
-        the coefficient (probed: a table of slope 2 to (4, 2) damped as 4).  Per temperature, the
-        table's slope at zero velocity: exact for a straight line through zero, else warned,
-        reduced physics.  A table with field variables stays as it is, warned."""
-        if not b.has("NONLINEAR"):
-            return b
-        groups: "OrderedDict[str, List[Tuple[float, float]]]" = OrderedDict()
+    def _dashpot_table(self, b: Block, lines: List[str]) -> Optional[Tuple[List[Tuple[Optional[float], float]], List[str]]]:
+        """*DASHPOT, NONLINEAR ``b``'s table (``lines``: force, velocity, temperature) as ccx's
+        linear dashpot: [(temperature or None, the slope at zero velocity)] and why that is not
+        Abaqus' damping (none: exact while the relative velocity stays within the table's range;
+        Abaqus holds the end forces beyond it, manual 'Dashpots'); None where it does not read
+        (field variables)."""
+        groups: Dict[Optional[float], List[Tuple[float, float]]] = OrderedDict()
         try:
             for ln in lines:
                 f = trimmed_fields(ln.split(","))
                 if len(f) > 3:
-                    raise ValueError
+                    return None
                 if any(x.strip() for x in f):
-                    groups.setdefault(f[2].strip() if len(f) > 2 else "", []).append((pf(f[0]), pf(f[1])))
+                    t = pf(f[2]) if len(f) > 2 and f[2].strip() else None
+                    groups.setdefault(t, []).append((pf(f[0]), pf(f[1])))
         except (ValueError, IndexError):
-            groups = OrderedDict()
+            return None
         if not groups:
-            self.report.warn(f"*DASHPOT, NONLINEAR (ELSET={b.param('ELSET') or ''}) whose table the "
-                             f"converter does not read (field variables): ccx 2.23 has no nonlinear "
-                             f"dashpot and damps with the last line's force as the coefficient.", at=b)
-            self._reduces("*DASHPOT, NONLINEAR not converted")
-            return b
-        out, bent = [], False
+            return None
+        out: List[Tuple[Optional[float], float]] = []
+        why: List[str] = []
         for temp, pts in groups.items():
             pts.sort(key=lambda p: p[1])
             top = max(pts, key=lambda p: abs(p[1]))
             big = max(abs(fo) for fo, _v in pts) or 1.0
             if len(pts) == 1:
                 c = pts[0][0] / pts[0][1] if pts[0][1] else 0.0
+                why.append("a one-line table (Abaqus: a constant force)")
             else:
-                i = next((k for k in range(len(pts) - 1) if pts[k + 1][1] > 0.0), len(pts) - 2)
-                (f0, v0), (f1, v1) = pts[i], pts[i + 1]
+                k = next((m for m in range(len(pts) - 1) if pts[m + 1][1] > 0.0), len(pts) - 2)
+                (f0, v0), (f1, v1) = pts[k], pts[k + 1]
                 c = (f1 - f0) / (v1 - v0) if v1 != v0 else 0.0
-            bent = bent or top[1] == 0.0 or any(abs(fo - top[0] / top[1] * v) > 1e-9 * big for fo, v in pts)
-            out.append(dotted_number(short_real(c, 12)) + (f", 0., {temp}" if temp else ""))
-        if bent:
+                if not pts[0][1] < 0.0 < pts[-1][1]:
+                    why.append("velocities on one side of zero only (Abaqus holds the end force "
+                               "beyond the table: no damping the other way)")
+                if top[1] == 0.0 or any(abs(fo - top[0] / top[1] * v) > 1e-9 * big for fo, v in pts):
+                    why.append("a table that is not one straight line through zero")
+            out.append((temp, c))
+        if len(out) > 1 and not any(c.keyword == "TEMPERATURE" for st in self.steps for c in st.cards):
+            why.append("temperature-dependent, but no step *TEMPERATURE: ccx's dashpots then damp "
+                       "at the table's coefficient for temperature 0")
+        return out, dedup(why)
+
+    def _linear_dashpot(self, b: Block, lines: List[str]) -> Block:
+        """*DASHPOT ``b`` with data lines ``lines`` (no DOF line), NONLINEAR ones (force, velocity,
+        temperature) as ccx's linear 'coefficient, frequency, temperature' (_dashpot_table): ccx
+        2.23 has no nonlinear dashpot — it warns of the parameter and damps with the last line's
+        force as the coefficient (probed: a table of slope 2 to (4, 2) damped as 4).  Exact for
+        a straight table through zero on both sides while the velocity stays within its range;
+        else warned, reduced physics.  A table with field variables stays as it is, warned."""
+        if not b.has("NONLINEAR"):
+            return b
+        got = self._dashpot_table(b, lines)
+        if got is None:
+            self.report.warn(f"*DASHPOT, NONLINEAR (ELSET={b.param('ELSET') or ''}) whose table the "
+                             f"converter does not read (field variables): ccx 2.23 has no nonlinear "
+                             f"dashpot and damps with the last line's force as the coefficient.", at=b)
+            self._reduces("*DASHPOT, NONLINEAR not converted")
+            return b
+        table, why = got
+        if why:
             self.report.warn(f"*DASHPOT, NONLINEAR (ELSET={b.param('ELSET') or ''}): ccx 2.23 has no "
                              f"nonlinear dashpot (it damps with the last line's force as the "
                              f"coefficient), so it is written as a linear one at the table's slope at "
-                             f"zero velocity; Abaqus follows the table.", at=b)
+                             f"zero velocity, which is not Abaqus' damping here: {'; '.join(why)}.", at=b)
             self._reduces("*DASHPOT, NONLINEAR as a linear dashpot")
         else:
-            self.report.note("*DASHPOT, NONLINEAR whose table is one straight line through zero -> a "
-                             "linear dashpot of its slope (ccx 2.23 has no nonlinear dashpot and would "
-                             "damp with the last line's force as the coefficient): exact.", once=True)
+            self.report.note("*DASHPOT, NONLINEAR whose table is one straight line through zero on both "
+                             "sides of it -> a linear dashpot of its slope (ccx 2.23 has no nonlinear "
+                             "dashpot and would damp with the last line's force as the coefficient): "
+                             "Abaqus' damping in implicit steps while the relative velocity stays within "
+                             "the table's range, beyond which Abaqus holds the end forces.", once=True)
+        out = [dotted_number(short_real(c, 12)) + ("" if t is None else f", 0., {dotted_number(short_real(t, 12))}")
+               for t, c in table]
         return Block(b.keyword, OrderedDict((k, v) for k, v in b.params.items() if k != "NONLINEAR"), out)
 
     def _warn_dashpot_steps(self, blocks: List[Block]) -> None:
