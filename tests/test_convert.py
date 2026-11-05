@@ -27847,10 +27847,11 @@ def test_odd_and_bonded_continuum_shell_stacks():
             zs.append(zs[-1] + h)
         nodes = "".join(f"{4 * k + i + 1}, {x}, {y}, {z!r}\n" for k, z in enumerate(zs)
                         for i, (x, y) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1))))
-        els = "".join(f"*Element, type={t}, elset={'C' if t.startswith('COH') else 'S'}{k}\n{k + 1}, "
+        els = "".join(f"*Element, type={t}, elset={'S' if t == 'SC8R' else 'C'}{k}\n{k + 1}, "
                       + ", ".join(str(4 * k + i) for i in (1, 2, 3, 4, 5, 6, 7, 8)) + "\n"
                       for k, (t, _h) in enumerate(layers))
         secs = "".join(f"*Shell Section, elset=S{k}, material=M\n{h!r}\n" if t == "SC8R" else
+                       f"*Solid Section, elset=C{k}, material=G\n" if t == "C3D8" else
                        f"*Cohesive Section, elset=C{k}, material=G, response=continuum\n"
                        for k, (t, h) in enumerate(layers))
         return ("*Node\n" + nodes + els + secs + "*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n1., 0.\n"
@@ -27862,12 +27863,36 @@ def test_odd_and_bonded_continuum_shell_stacks():
     for layers, factor in (([sc], "1.155"), ([sc] * 2, None), ([sc] * 3, "1.017"), ([sc] * 4, None),
                            ([sc] * 5, "1.006"), ([sc, ("SC8R", 0.3)], "1.025"),
                            ([sc, ("COH3D8", 0.0), sc], None), ([sc, ("COH3D8", 0.002), sc], None),
-                           ([sc, ("COH3D8", 0.0), sc, ("COH3D8", 0.0), sc], "1.017")):
+                           ([sc, ("COH3D8", 0.0), sc, ("COH3D8", 0.0), sc], "1.017"),
+                           # a solid core continues the stack (item 9, probed: SC8R skins on a soft
+                           # C3D8 core carry 1.0005-1.0010 of the fully plastic moment)
+                           ([sc, ("C3D8", 0.2), sc], None), ([sc, ("C3D8", 0.1), ("C3D8", 0.1), sc], None),
+                           ([("SC8R", 0.3), ("C3D8", 0.1)], "1.025")):
         _, conv, rep = convert_str(deck(layers))
         assert (flag in conv.reduced_physics) == (factor is not None), layers
         if factor:
             assert f"plastic, the section carries {factor} times the fully plastic moment here" in rep.text()
             assert "; 1 elements that the middle of the thickness crosses" in rep.text(), layers
+    # solid cores, pinned from PR #33's review: a solid below as above, a core listed top face
+    # first, two hexes on one face (a branching column: both skins alone), a solid touching a
+    # skin by an edge only, a collapsed C3D8 core (its top face no skin's: the top skin alone)
+    def extra(text, cards):
+        return text.replace("*Material, name=M", cards + "*Material, name=M", 1)
+    core = deck([sc, ("C3D8", 0.2), sc])
+    for text, want in ((deck([("C3D8", 0.1), ("SC8R", 0.3)]), ("1", "1.025")),
+                       (core.replace("2, 5, 6, 7, 8, 9, 10, 11, 12\n", "2, 9, 10, 11, 12, 5, 6, 7, 8\n"), None),
+                       (extra(core, "*Element, type=C3D8, elset=X\n9, 5, 6, 7, 8, 9, 10, 11, 12\n"
+                                    "*Solid Section, elset=X, material=G\n"), ("2", "1.155")),
+                       (extra(deck([sc]), "*Node\n101, 2, 0, 0.1\n102, 2, 1, 0.1\n103, 1, 0, 0.2\n"
+                                          "104, 2, 0, 0.2\n105, 2, 1, 0.2\n106, 1, 1, 0.2\n*Element, type=C3D8, "
+                                          "elset=X\n9, 6, 101, 102, 7, 103, 104, 105, 106\n"
+                                          "*Solid Section, elset=X, material=G\n"), ("1", "1.155")),
+                       (core.replace("2, 5, 6, 7, 8, 9, 10, 11, 12\n", "2, 5, 6, 7, 8, 9, 10, 11, 11\n"),
+                        ("1", "1.155"))):
+        _, conv, rep = convert_str(text)
+        got = re.search(r"; (\d+) elements that the middle.*?carries (\S+) times", rep.text())
+        assert (got.groups() if got else None) == want, (want, got and got.groups())
+        assert (flag in conv.reduced_physics) == (want is not None)
     # an element of no resolved stack counts as alone (code review, PR #22): a branching column
     # (a second element on the same face) and one of no thickness are flagged at 1.155
     branch = deck([sc, sc]).replace("*Shell Section, elset=S0", "*Element, type=SC8R, elset=S1\n"

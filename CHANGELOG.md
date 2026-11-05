@@ -260,7 +260,10 @@ entries. The GitHub release notes use the same section.
   times the exact rate at stress exponent 3 / 5). The element the middle crosses is flagged with
   the section's factor (an odd or unequal stack included); a stack whose middle lies between
   two elements is not, and an element of no stack the converter can follow (a branching column,
-  one of no thickness) counts as alone through the thickness. Elements joined through a cohesive layer (`COH3D8` / `COH3D6`) count as
+  one of no thickness) counts as alone through the thickness. A stack runs on through solid
+  hexes joined face to face, such as a sandwich's core: skins on a soft core carried 1.0005-1.0010
+  of the fully plastic moment and are not flagged. The stack's middle assumes plane sections
+  through the whole stack, not a core so soft that each skin bends about its own middle. Elements joined through a cohesive layer (`COH3D8` / `COH3D6`) count as
   one stack: two `SC8R` bonded by a thin glue layer carried 0.9999 of the fully plastic moment
   and were flagged before (`validate_with_ccx.py sc_stacks`).
 * **Stabilization on `*VISCO` and coupled steps** — `STABILIZE`, `FACTOR`, `ALLSDTOL` and
