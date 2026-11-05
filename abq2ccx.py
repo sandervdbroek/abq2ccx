@@ -46594,7 +46594,9 @@ class _PostPasses:
         (probed on one C3D8 against the model turned into the node's axes, the DOF held at the
         value it had reached: 55 % of the peak displacement off at 20 increments a step, 6 % at
         80; axes along permuted global ones 13 %; exact for local axes equal to the global ones,
-        for a BC held from a rest start, driven from it on a ramp (0.1 %) or released).  ccx
+        for a BC held from a rest start, driven from it on a ramp (0.1 %) or released; a
+        cylindrical *TRANSFORM by its axes at the node: one along global y exact, an oblique
+        one 25 % off).  ccx
         starts the extra node that carries such a BC's value from the node's global
         displacement (bounadd.f).  No exact form is known (the helper node of
         _plan_fixed_helpers is off there too): warned, with reduced physics; FIXED lines that
