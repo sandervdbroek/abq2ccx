@@ -2970,6 +2970,16 @@ def vunit(a: Vec) -> Vec:
     return vscale(a, 1.0 / n) if n else a
 
 
+def vrotate(theta: Vec, v: Vec) -> Vec:
+    """``v`` turned by the rotation vector ``theta`` (Rodrigues)."""
+    phi = vnorm(theta)
+    if phi == 0.0:
+        return v
+    k = vscale(theta, 1.0 / phi)
+    return vadd(vadd(vscale(v, math.cos(phi)), vscale(vcross(k, v), math.sin(phi))),
+                vscale(k, vdot(k, v) * (1.0 - math.cos(phi))))
+
+
 def null_space(rows: Sequence[Vec], rel: float = 1e-9) -> List[Vec]:
     """An orthonormal basis of the vectors x with r . x = 0 for every row r; a row's part
     outside the others' span below ``rel`` times the longest row counts as zero."""
@@ -26137,6 +26147,191 @@ class _Dofs:
                                for j, v in sorted(vals.items())]
         return out
 
+    def _plan_shell_finite_rotations(self, blocks: List[Block]) -> None:
+        """Rotational BCs of a shell node in an NLGEOM step.  Abaqus/Standard reads the values
+        as the components of the node's total rotation vector at the end of the step (Analysis
+        User's Guide 1.2.2 "Conventions").  At a shell node that is no knot ccx 2.23 makes them
+        mean-rotation MPCs (gen3dboun, umpc_mean_rot) about e1, the axis of the first rotational
+        BC it reads there projected on the shell plane, and e2 = n x e1, holding at v.e1 and
+        v.e2 (v: the values' vector projected on the plane) the angles of the director (the
+        line through the node's expanded nodes) projected on the plane normal to each axis:
+        the same to first order, but a finite rotation about two axes at once comes out
+        differently (probed: an S4 strip's tip edge given (0.1, 0.2, 0) 0.4 %, (0.3, 0.4, 0)
+        3 %, (-0.5, 0.25, 0) 6.5 % of max |u| off the same rotation vector through a knot).
+        Exact form: values on the DOFs ccx counts (the least change) whose angles are those
+        of the director n' = R(theta) n, alpha1 = atan2(-n'.e2, n'.n), alpha2 =
+        atan2(n'.e1, n'.n) (probed 2e-7 to 5e-6 of max |u| from the knot), so the node's lines
+        are written per card in DOF order (_rot_mode 'finite', _rot_lines), e1 from the
+        first.  ccx ramps the angles where Abaqus ramps the rotation vector: equal at the end
+        of the step, the director's path in between a little apart.
+
+        Rewritten, at a node whose rotational BCs ccx first reads in a step other than a
+        *DYNAMIC one (there ccx knots the node and keeps the knot, which reads the values as
+        Abaqus does), the states (_rot_bc_walk) of a general NLGEOM step before the next
+        *DYNAMIC step (likewise) holding all three rotations, or the two off the normal with the free one along it
+        (exact to first order only: Abaqus' normal turns with that free drilling rotation too,
+        which ccx's shell node lacks: taken as zero), on the step's own amplitude.  The nodes:
+        as _plan_shell_rotation_pairs (not its 'pair' nodes).  Warned (reduced physics) where
+        such a state has no such form: a *DYNAMIC step after it (it would carry the angles into
+        the knot), a card on an amplitude, a value carried on from a geometrically linear step,
+        a velocity-type BC, a director turned 90 deg or more."""
+        if getattr(self.opt, "solid_dof", False) or not self._mechanical or self._has_normal:
+            return
+        dyns = {st.no for st in self.steps if st.proc == "DYNAMIC"}
+        nl = {st.no for st in self.steps if st.nlgeom and not st.perturbation and st.no not in dyns}
+        if not nl:
+            return
+        sheet = {n for typ, conn in self.geom.elements.values() if ccx_type(typ) in SHEET_SHELLS
+                 for n in conn}
+        cand = {n for n in sheet if n not in self._knots and n not in self._rb_rot and
+                self._rot_mode.get(n) in (None, "keep")}
+        cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]] = []
+        step = 0
+        for b in blocks:
+            if b.keyword == "STEP":
+                step += 1
+            elif b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2:
+                cards.append((b, step, self._rot_items(b, cand)))
+        used = sorted({n for _, _, items in cards for n in items})
+        if not used:
+            return
+        at = self._elements_at(set(used))
+        sections = self._knot_sections(blocks)
+        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks=blocks)
+        ident: Tuple[Vec, Vec, Vec] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        done: List[int] = []
+        hit: Dict[str, List[int]] = {}
+        for n in used:
+            axes = self._local_axes(n) if n in self._transformed else ident
+            if isinstance(axes, str) or not self._ccx_plain_shell_node(n, sections, at):
+                continue
+            nrm = self._ccx_shell_normal(n, at)
+            if nrm is None:
+                continue
+            got = self._rot_finite_lines(n, axes, nrm, list(self._rot_bc_walk(n, cards, acts)), nl, dyns)
+            if isinstance(got, str):
+                hit.setdefault(got, []).append(n)
+            elif got:
+                self._rot_mode[n] = "finite"
+                self._rot_lines.update(got)
+                self._rot_lines_to_pieces(list(got))
+                done.append(n)
+        if done:
+            self.report.note(f"Rotational BCs on {len(done)} shell node(s) (e.g. node {done[0]}) "
+                             f"about two axes at once in an NLGEOM step: written as the angles "
+                             f"ccx 2.23's mean-rotation MPCs hold there (of the shell normal "
+                             f"projected about each axis), those of the normal turned by the "
+                             f"rotation vector the values are in Abaqus (the deck's values read "
+                             f"as such angles are 0.4-6.5 % off at 0.2-0.6 rad; probed). Exact "
+                             f"at the end of each step where they hold all three rotations; with "
+                             f"the rotation about the normal free, Abaqus' normal turns with it "
+                             f"too (second order), which ccx's shell node lacks.", once=True)
+        for why, ns in hit.items():
+            self.report.warn(f"Rotational BCs on {len(ns)} shell node(s) (e.g. node {ns[0]}) about "
+                             f"two axes at once in an NLGEOM step, which Abaqus reads as the "
+                             f"components of the rotation vector: ccx 2.23's mean-rotation MPCs "
+                             f"hold the angles of the shell normal projected about each axis "
+                             f"instead (0.4-6.5 % of max |u| at 0.2-0.6 rad; probed), and the "
+                             f"values cannot be written as those angles here: {why}.")
+            self._reduces("finite shell rotation BCs about two axes read as projected angles")
+
+    def _rot_finite_lines(self, n: int, axes: Tuple[Vec, Vec, Vec], nrm: Vec, walk: list,
+                          nl: set, dyns: set) -> Union[None, str, Dict[Tuple[int, int], List[str]]]:
+        """_rot_lines (card, node) of shell node ``n`` (local ``axes``, normal ``nrm``) whose
+        rotational BC states ``walk`` (_rot_bc_walk) an NLGEOM step (``nl``) reads as ccx's
+        angles otherwise (_plan_shell_finite_rotations); None where none does, why there is
+        no form where one does and cannot.  ``dyns``: the *DYNAMIC steps."""
+        # ccx knots the node in the step that first reads its rotational BCs if that is a
+        # *DYNAMIC one, else in the next *DYNAMIC step: only the NLGEOM states before it
+        read = next((max(s, 1) for _, s, st, _ in walk if st), None)
+        if read is None or read in dyns:
+            return None
+        nxt = min((d for d in dyns if d > read), default=None)
+        dyn = nxt is not None
+        nl = {S for S in nl if nxt is None or S < nxt}
+        e1: Optional[Vec] = None
+        rows = []                       # (card, step, values, counted DOFs, new values)
+        for b, s, st, amp in walk:
+            if isinstance(st, str):
+                rows.append((b, s, None, (), st))
+                continue
+            vals = {j: e[0] for j, e in st.items()}
+            if any(math.isnan(v) for v in vals.values()):
+                return None
+            cnt = [j for j in sorted(vals) if abs(vdot(axes[j - 4], nrm)) <= 0.999]
+            if e1 is None and cnt:      # ccx's e1: the first rotational BC it reads there
+                a = axes[cnt[0] - 4]
+                e1 = vunit(vsub(a, vscale(nrm, vdot(a, nrm))))
+            # (model data's BCs act from step 1 on)
+            new = self._finite_rot_values(vals, axes, nrm, e1, cnt) if max(s, 1) in nl and e1 else None
+            if isinstance(new, dict) and (amp is not None or any(v != 0.0 and a0 is not None
+                                                                 for v, a0, _ in st.values())):
+                new = "a card on an amplitude, which ccx would apply to the angles"
+            rows.append((b, s, vals, cnt, new))
+        if e1 is None:
+            return None
+        carried = False                 # a state carried into an NLGEOM step from a linear one
+        for S in sorted(nl):
+            prev = [r for r in rows if r[1] <= S and r[1] not in self._pert_idx and r[2] is not None]
+            carried |= bool(prev) and max(prev[-1][1], 1) < S and max(prev[-1][1], 1) not in nl and isinstance(
+                self._finite_rot_values(prev[-1][2], axes, nrm, e1, prev[-1][3]), dict)
+        if not carried and not any(isinstance(r[4], dict) for r in rows):
+            return next((r[4] for r in rows if isinstance(r[4], str) and r[2] is not None), None)
+        if dyn:
+            return ("a *DYNAMIC step follows, where ccx makes the node a knot, which would read "
+                    "the angles as the rotation vector")
+        why = next((r[4] for r in rows if isinstance(r[4], str)), None)
+        if why is not None:
+            return why
+        if carried:
+            return "a value given in a geometrically linear step carries on into an NLGEOM one"
+        out: Dict[Tuple[int, int], List[str]] = {}
+        for b, s, vals, cnt, new in rows:
+            got = new if isinstance(new, dict) else vals
+            scale = max([abs(v) for v in vals.values()] + [1e-300])
+            out[(id(b), n)] = [f"{n}, {j}, {j}" + (", " + self._fmt_rot(v, scale) if v != 0.0 else "")
+                               for j, v in sorted(got.items())]
+        return out
+
+    @staticmethod
+    def _finite_rot_values(vals: Dict[int, float], axes: Tuple[Vec, Vec, Vec], nrm: Vec, e1: Vec,
+                           cnt: List[int]) -> Union[None, str, Dict[int, float]]:
+        """The values on local DOFs 4-6 (``vals``, the node's ``axes``, normal ``nrm``) that
+        make ccx's mean-rotation angles about ``e1`` and n x e1 those of the normal turned by
+        the rotation vector ``vals`` (_plan_shell_finite_rotations), the least change on the
+        DOFs ccx counts (``cnt``); None where they hold no full rotation or need no change,
+        why not where the normal turns 90 deg or more."""
+        held = sorted(vals)
+        if not any(vals.values()):
+            return None
+        if len(held) == 2:
+            if abs(vdot(axes[15 - sum(held) - 4], nrm)) <= 0.999 or len(cnt) != 2:
+                return None
+        elif len(held) != 3 or len(cnt) < 2:
+            return None
+        theta: Vec = (0.0, 0.0, 0.0)
+        for j in held:
+            theta = vadd(theta, vscale(axes[j - 4], vals[j]))
+        d = vrotate(theta, nrm)
+        e2 = vcross(nrm, e1)
+        c3 = vdot(d, nrm)
+        if c3 <= 1e-6:
+            return "the shell normal turns 90 deg or more, beyond ccx's mean-rotation MPC"
+        m = {j: (vdot(axes[j - 4], e1), vdot(axes[j - 4], e2)) for j in cnt}
+        r1 = math.atan2(-vdot(d, e2), c3) - sum(vals[j] * m[j][0] for j in cnt)
+        r2 = math.atan2(vdot(d, e1), c3) - sum(vals[j] * m[j][1] for j in cnt)
+        g11, g22 = sum(x * x for x, _ in m.values()), sum(y * y for _, y in m.values())
+        g12 = sum(x * y for x, y in m.values())
+        det = g11 * g22 - g12 * g12
+        if det <= 1e-12:
+            return None
+        y1, y2 = (g22 * r1 - g12 * r2) / det, (g11 * r2 - g12 * r1) / det
+        new = dict(vals)
+        for j in cnt:
+            new[j] += m[j][0] * y1 + m[j][1] * y2
+        scale = max(abs(v) for v in vals.values())
+        return new if any(abs(new[j] - vals[j]) > 1e-9 * scale for j in cnt) else None
+
     # cards that read a node's DOFs in its *TRANSFORM axes, or tie its DOFs to others, which
     # _plan_transformed_corners does not rewrite
     _UNTR_BLOCKERS = ("EQUATION", "MPC", "COUPLING", "KINEMATIC COUPLING", "RIGID BODY", "TIE",
@@ -35712,11 +35907,11 @@ class _Loads:
         if hi < 4 or lo > 6:
             return None
         nodes = self._resolve_nodes(spec)
-        planned = [n for n in nodes if self._rot_mode.get(n) in ("global", "refuse", "pair")]
+        planned = [n for n in nodes if self._rot_mode.get(n) in ("global", "refuse", "pair", "finite")]
         if planned:
             # rotations of a transformed shell/beam / kinematic reference node, of a shell node
-            # holding two: the card's lines for them come at its end
-            # (_plan_transformed_rotations, _plan_shell_rotation_pairs)
+            # holding two or turned about two axes: the card's lines for them come at its end
+            # (_plan_transformed_rotations, _plan_shell_rotation_pairs, _plan_shell_finite_rotations)
             self.emit.rot_hit += [n for n in planned if n not in self.emit.rot_hit]
             out = [line(spec, lo, 3)] if lo <= 3 else []
             if hi >= 7:
@@ -48231,6 +48426,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_transformed_corners(blocks)      # after it: its 'keep' nodes
         self._plan_shell_rotation_pairs(blocks)     # after both: their 'keep' / 'untr' nodes
+        self._plan_shell_finite_rotations(blocks)   # after it: its 'pair' nodes
         self._plan_beam_section_axes(blocks)        # after them (_untr); may add knot beams
         self._warn_beam_moment_stops(blocks)        # after it: its knot beams
         self._warn_finite_rotations(blocks)         # after every planner adding knot beams

@@ -9717,6 +9717,28 @@ def along(plane, node, k, v):
     return "".join(f"{node}, {g + 1}, {v * c:.15g}\n" for g, c in enumerate(axis) if c)
 
 
+def turned_tip_strip_deck(theta, plane=None, coupled=False):
+    """An S4 cantilever strip (1 x 0.2, 8 x 2 cells, nu = 0, in ``plane`` — in_plane — or the
+    xy-plane), clamped at x = 0, whose tip edge is turned by the rotation vector ``theta``
+    (global components) in an NLGEOM step: BCs on the tip nodes' DOFs 4-6, or (``coupled``)
+    on a reference node that a *KINEMATIC coupling of their rotations (4, 6) ties them to."""
+    nid = lambda i, j: j * 9 + i + 1
+    out = ["*Heading", "turned tip", "*Node"]
+    out += [f"{nid(i, j)}, {in_plane(plane, i / 8.0, 0.1 * j)}" for j in range(3) for i in range(9)]
+    out += [f"900, {in_plane(plane, 1.0, 0.1)}", "*Element, type=S4, elset=SH"]
+    out += [f"{j * 8 + i + 1}, {nid(i, j)}, {nid(i + 1, j)}, {nid(i + 1, j + 1)}, {nid(i, j + 1)}"
+            for j in range(2) for i in range(8)]
+    out += ["*Shell Section, elset=SH, material=M", "0.01", "*Material, name=M", "*Elastic",
+            "1e5, 0.", "*Nset, nset=ROOT", "1, 10, 19", "*Nset, nset=TIP", "9, 18, 27"]
+    if coupled:
+        out += ["*Surface, type=node, name=ST", "TIP",
+                "*Coupling, constraint name=C, ref node=900, surface=ST", "*Kinematic", "4, 6"]
+    out += ["*Step, nlgeom, inc=1000", "*Static", "0.05, 1., 1e-6, 0.05", "*Boundary", "ROOT, 1, 6"]
+    out += [f"{900 if coupled else 'TIP'}, {k}, {k}, {v!r}" for k, v in zip((4, 5, 6), theta)]
+    out += ["*Node Print, nset=TIP", "U", "*End Step"]
+    return "\n".join(out) + "\n"
+
+
 def released_knot_deck(twin=False, plane=None):
     """An S4 strip 0.8 x 0.1 (thickness 0.01, E 6e6) clamped at both ends in a first step; a
     second, NLGEOM step releases the far end by *BOUNDARY, OP=NEW and pulls it up by 0.1, its
@@ -21293,6 +21315,34 @@ def check_shell_knot_limits(ccx, env, tmp, shared):
               f"tip moments in *STEADY STATE DYNAMICS): ccx runs all three steps, frequencies "
               f"{', '.join(f'{x:.7g}' for x in got)} as without knots ({err:.1e}; before: ccx stopped)")
     failures += 0 if ok else 1
+    return failures
+
+
+@check("shell_finite_rotation", "shell-node rotations about two axes under NLGEOM: the rotation vector "
+       "as ccx's mean-rotation angles")
+def check_shell_finite_rotation(ccx, env, tmp, shared):
+    # --- finite shell-node rotation BCs: Abaqus' rotation vector ------------------------------
+    # ccx's mean-rotation MPCs read the deck's values as the angles of the shell normal projected
+    # about each axis: the tip edge turned 3-6.5 % off.  Against the same rotation vector through
+    # a rotation-only kinematic coupling (knots: the rotation vector, kinematic_rotation_only)
+    review_run = shared["review_run"]
+    failures = 0
+    e1, e2, _ = OBLIQUE_PLANE
+    for tag, theta, plane in (("xy", (0.3, -0.4, 0.0), None),
+                              ("oblique", tuple(0.5 * a - 0.3 * b for a, b in zip(e1, e2)), OBLIQUE_PLANE)):
+        runs = [review_run(turned_tip_strip_deck(theta, plane, c), f"turned_tip_{tag}" + ("_coupled" if c else ""),
+                           dat_displacements) for c in (False, True)]
+        if not all(runs):
+            failures += 1
+            continue
+        got, ref = runs
+        err = max(abs(a - b) for n in ref for a, b in zip(got.get(n, [math.inf] * 3), ref[n]))
+        moved = max(abs(x) for v in ref.values() for x in v)
+        ok = err < 1e-5 * moved and moved > 0.1 and len(got) == len(ref) == 3
+        print(f"{'PASS' if ok else 'FAIL'}  turned_tip_{tag} (an S4 cantilever{' off the global axes' if plane else ''}, "
+              f"its tip nodes' BCs the rotation vector ({', '.join(f'{x:.3g}' for x in theta)}), NLGEOM): the tip as "
+              f"through a rotation-only coupling ({err:.1e} off; |u| {moved:.4g})")
+        failures += 0 if ok else 1
     return failures
 
 
