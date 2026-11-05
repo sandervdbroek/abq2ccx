@@ -6545,6 +6545,12 @@ def test_rotated_instance_dofs_without_a_global_form():
     assert "node set MIX has nodes with and without a part-level *TRANSFORM" in rep.text()
     assert "\n5, 2, 1., 11, 1, 1., 11, 2, -1.\n" in body
     assert conv.reduced_physics == ["part-level *EQUATION of rotated *INSTANCE I not turned"]
+    # with nothing else in the instance's axes (the SPRING1 on DOF 3, which a turn about z keeps):
+    # neither those axes nor a note that the left-out springs are turned
+    body, conv, rep = convert_str(_instanced(part.replace("*Spring, elset=SPR\n2\n", "*Spring, elset=SPR\n3\n"),
+                                             "0., 0., 0., 0., 0., 1., 30.", tail=ROT_TAIL))
+    assert "** *SPRING, ELSET=I_SP2\n** 5, 5\n" in body and "ABQ2CCX_AXES" not in body
+    assert "SPRING1 / SPRING2 elements are turned" not in rep.text() and "act about the instance's axes" not in rep.text()
 
 
 def test_part_section_options_follow_their_section():

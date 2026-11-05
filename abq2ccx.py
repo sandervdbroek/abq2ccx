@@ -11100,12 +11100,41 @@ class _Mesh:
                              f"2.23's springs ignore (probed) -> a SPRINGA from a helper node whose DOF 1 "
                              f"an *EQUATION ties to the rotation (on the ROT NODE, the reference node's "
                              f"or a knot's DOFs 4-6), held across it, to a held node: exact for small "
-                             f"rotations (validate_with_ccx.py spring_rotation_*); a beam node's knot "
+                             f"rotations (validate_with_ccx.py spring_dofs_masses); a beam node's knot "
                              f"holds its section rigid there, which stiffens a coarse beam a little "
                              f"(probed: 3 % with one element, 0.03 % with four).", once=True)
         if approx:
             self.report.warn("[APPROX] Rotational SPRING1 / SPRING2 under NLGEOM written in their linear "
                              "form: exact for small rotations only.", once=True)
+
+    def _settle_instance_axes(self, blocks: List[Block]) -> None:
+        """Rotational SPRING1 / SPRING2 cards that _turn_instance_dofs gave a rotated instance's
+        axes (ORIENTATION=<instance>_ABQ2CCX_AXES; their DOFs lie along no global axis) without
+        its note: one _plan_springs writes gets the note; an axes *ORIENTATION that only such
+        cards name, all of whose elements _plan_springs left out (springs on solid nodes, which
+        have no rotations), is not written (handle_orientation)."""
+        suffix = AXES_ORIENTATION.upper()
+        axes = {b.uparam("NAME") for b in blocks if b.keyword == "ORIENTATION" and b.uparam("NAME").endswith(suffix)}
+        if not axes:
+            return
+        live: set = set()
+        for b in blocks:
+            if b.keyword in ("CONNECTOR SECTION", "JOINT"):
+                live |= {n for n in axes if any(n in ln.upper() for ln in b.data)}
+                continue
+            name = b.uparam("ORIENTATION")
+            if name not in axes:
+                continue
+            if b.keyword == "SPRING" and id(b) in self._spring_cards:
+                if not self._elset_types(b):
+                    continue                    # (left out whole)
+                self.report.note(f"Rotational SPRING1 / SPRING2 elements of a rotated *INSTANCE "
+                                 f"(*SPRING, ELSET={b.param('ELSET') or ''}): their part's DOFs lie "
+                                 f"along no global axis, so they act about the instance's axes "
+                                 f"(ORIENTATION={b.param('ORIENTATION')}), as in Abaqus "
+                                 f"(validate_with_ccx.py spring_rotated_instance).", once=True)
+            live.add(name)
+        self._axes_unused = axes - live
 
     def _warn_linear_nonlinear_springs(self, blocks: List[Block]) -> None:
         """A *SPRING, NONLINEAR whose table is not one straight line through zero, in a deck with
@@ -11702,8 +11731,10 @@ class _Mesh:
             return self._joint_subcard(b)
         if id(b) in self._spring_cards:         # (_plan_springs: SPRINGAs now)
             if not self._elset_types(b):
+                kept = OrderedDict((k, v) for k, v in b.params.items()       # (_settle_instance_axes)
+                                   if not (k == "ORIENTATION" and v.strip().upper() in self._axes_unused))
                 return self._comment_out("*SPRING card of SPRING1 / SPRING2 elements all left out (see "
-                                         "above): commented out.", [emit_keyword("SPRING", b.params)] +
+                                         "above): commented out.", [emit_keyword("SPRING", kept)] +
                                          list(b.data), False, warn=False)
             params = OrderedDict((k, v) for k, v in b.params.items() if k != "ORIENTATION")
             s = self._spring_scale.get(id(b))
@@ -23876,6 +23907,8 @@ class _Axes:
                                   f"orientation).", reduces=f"*ORIENTATION {name} (no axes ccx can take)")
 
     def handle_orientation(self, b: Block) -> List[str]:
+        if b.uparam("NAME") in self._axes_unused:
+            return []                           # (_settle_instance_axes)
         definition = (b.param("DEFINITION") or "COORDINATES").strip().upper()
         if definition.startswith("OFFSET"):
             why = self._offset_why.get(b.uparam("NAME"), "it is not written")
@@ -47317,6 +47350,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._conn_sets: "OrderedDict[Tuple[str, float], str]" = OrderedDict()
         self._conn_sets_written: set = set()
         self._conn_dashpots: set = set()
+        self._axes_unused: set = set()          # instance-axes *ORIENTATIONs not written (_settle_instance_axes)
         # id(*SPRING / *DASHPOT option of a *JOINT) -> id(that *JOINT); id(card of a *CONNECTOR
         # BEHAVIOR) -> its name; name -> the plans of the sections that use it
         self._joint_cards: Dict[int, int] = {}
@@ -47992,6 +48026,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_print_sets(blocks)           # after the mesh planners: their nodes and elements
         self._plan_dashpots(blocks)             # after the planners above: the nodes' *TRANSFORM axes
         self._plan_springs(blocks)              # likewise
+        self._settle_instance_axes(blocks)
         self._warn_linear_nonlinear_springs(blocks)
         self._plan_anisotropic_masses(blocks)   # after _plan_node_classes: the nodes with rotations
         self._plan_free_masses(blocks)          # after it and the planners adding elements above
@@ -49781,7 +49816,12 @@ def _turn_instance_dofs(blocks: Sequence[Block], geo, axes: Tuple[Vec, Vec, Vec]
             nb = _turn_spring_dofs(b, axes)
             if nb is not b:
                 out[id(b)] = nb or oriented(b)
-                what.append("SPRING1 / SPRING2 elements")
+                try:
+                    rot_only = all(pint(x) > 3 for x in trimmed_fields(b.data[0].split(",")) if x)
+                except ValueError:
+                    rot_only = False
+                if nb is not None or not rot_only:      # (else Converter._settle_instance_axes)
+                    what.append("SPRING1 / SPRING2 elements")
         elif kw == "MASS" and b.uparam("TYPE").startswith("ANISO") and not b.param("ORIENTATION") and \
                 b.data and len({x.strip() for x in trimmed_fields(b.data[0].split(","))[:3]}) > 1:
             out[id(b)] = oriented(b)                 # (principal axes along the part's: _plan_anisotropic_masses)

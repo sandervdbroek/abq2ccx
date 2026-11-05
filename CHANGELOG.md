@@ -370,12 +370,15 @@ entries. The GitHub release notes use the same section.
   without knots (before: ccx stopped).
 
 * **Rotational springs in rotated instances** — a part's `SPRING1` / `SPRING2` on DOFs 4-6 whose
-  turned axis lies along no global one now gets the instance's axes (`ORIENTATION=`), as
-  translational ones already did, and the converter writes it about them (the rotational spring
-  form takes an orientation's axes): exact. It was left about the global axes with a warning and
-  reduced physics, also on solid nodes, where it is left out exactly (`validate_with_ccx.py
-  spring_rotated_instance`: tips 0.01156509 / 0.002013496 in a 30-degree instance, as unturned;
-  before 0.01997954 / 0.001319979).
+  turned DOFs have no global form (an axis along no global one, a `SPRING2` whose two axes turn
+  to opposite senses, a nonlinear spring whose axis turns to its opposite) now gets the
+  instance's axes (`ORIENTATION=`), as translational ones already did, and the converter writes
+  it about them (the rotational spring form takes an orientation's axes): exact. It was left
+  about the global axes with a warning and reduced physics, also on solid nodes, where it is
+  left out exactly; there neither the instance's axes nor a note that it is turned is written now
+  (`validate_with_ccx.py spring_rotated_instance`: tips 0.01156509 / 0.002013496 in instances
+  turned 30 degrees about z and 40 about (1, 1, 1), as unturned; before 0.01997954 / 0.001319979
+  at 30 degrees).
 
 ## 1.7.0 (November 2026)
 
