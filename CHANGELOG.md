@@ -39,6 +39,9 @@ entries. The GitHub release notes use the same section.
   plane or axisymmetric elements now ties them. ccx tied none of those faces' nodes, so the model
   was singular (answers some 1e14 times too large). Such a tie that should carry temperatures, or
   move slave nodes onto the master, is warned and flagged: ccx does neither for these elements.
+* **Fewer ccx failures.** A tied contact pair whose slave surface shares nodes with its master
+  no longer makes ccx loop without end; the shared nodes stay out of the tie, as Abaqus leaves
+  them, as for a `*TIE`.
 * **Leaner tie output.** Tied contact pairs get the slave-surface trimming that `*TIE` got in
   1.7.0: the same answers without a ccx warning for every slave node away from the master.
 * **More correct answers.** Shells joined at a knot (where the converter attaches a small helper
@@ -197,6 +200,12 @@ entries. The GitHub release notes use the same section.
   where Abaqus' `ADJUST` moves them (a `*TIE` unless `ADJUST=NO`, a tied pair with `ADJUST`): ccx
   does not move their elements (2-4 % off for strips 0.02-0.04 apart; `ADJUST=NO` exact). The gap
   is measured to a quadratic master edge's curve, not its chord. `tie_2d_faces` also runs CPE4 and CAX8R at nu 0.3.
+* **Tied contact pairs sharing master nodes** — a `*CONTACT PAIR, TIED` written as a `*TIE` gets
+  the `*TIE`'s step for a slave surface that shares nodes with the master's faces: a node surface
+  of its other nodes (Abaqus ties no shared node; ccx 2.23 ties each to the face it lies on and
+  loops without end, 'zero coefficient on the dependent side'). `validate_with_ccx.py
+  tied_pair_shared` (C3D8 blocks sharing a node line): the blocks merged, exactly; before ccx
+  looped.
 * **Tied contact pairs trimmed** — a `*CONTACT PAIR, TIED` on deformable surfaces, written as a
   `*TIE`, gets the `*TIE`'s trimmed slave surface (`validate_with_ccx.py
   tie_leftovers_pair_trimmed`: the same answer, 16 'no tied MPC' warnings instead of 112).

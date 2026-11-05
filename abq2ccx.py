@@ -13094,6 +13094,22 @@ class _Mesh:
                     tol = self._membrane_tie_tolerance(adj, f[0].strip(), f[1].strip(), b, True)
                     params["POSITION TOLERANCE"] = short_real(tol, 6)
                     self._plane_tie_checks(f[0].strip(), slave, f[1].strip(), b, True, tol)
+                if slave is None:                   # (a slave sharing master nodes: as a *TIE's)
+                    slave, cards = self._shared_tie_slave(f[0].strip(), f[1].strip())
+                    if slave == "?":
+                        out += self._comment_out(
+                            f"*CONTACT PAIR, TIED: slave surface {f[0].strip()} shares nodes with the faces "
+                            f"of master surface {f[1].strip()}. Abaqus does not tie those nodes; ccx 2.23 ties "
+                            f"each one to the face it lies on and loops without end ('zero coefficient on "
+                            f"the dependent side of an equation'; probed). The converter has no node form "
+                            f"for this element family, so the line is left out: leave the shared nodes out "
+                            f"of the slave surface.", [emit_keyword("TIE", params), f"{f[0]}, {f[1]}"],
+                            "*TIE whose slave surface shares nodes with its master (left out)")
+                        continue
+                    if slave == "":
+                        out.append(f"** abq2ccx: *CONTACT PAIR, TIED: every slave node of {f[0].strip()} is "
+                                   f"a node of {f[1].strip()}, which joins them already")
+                        continue
                 if slave is None:                   # (the deck's surfaces: as a *TIE's)
                     tol = params.get("POSITION TOLERANCE")
                     slave, cards = self._trimmed_tie_slave(f[0].strip(), f[1].strip(),

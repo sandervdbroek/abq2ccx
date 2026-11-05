@@ -25983,6 +25983,11 @@ def test_tie_on_one_surface_or_on_shared_nodes():
     assert "*SURFACE, NAME=BBOT_NODES, TYPE=NODE\n17\n18\n*TIE, NAME=T1\nBBOT_NODES, ATOP\n" in body
     assert "shares 2 node(s) with the faces of master surface ATOP" in rep.text()
     assert not conv.reduced_physics
+    # a TIED contact pair, written as a *TIE, likewise (ccx looped without end on it; probed)
+    body, conv, _ = convert_str(two.replace("*Tie, name=T1\n", "*Surface Interaction, name=SI\n"
+                                                                 "*Contact Pair, interaction=SI, tied\n"))
+    assert "*SURFACE, NAME=BBOT_NODES, TYPE=NODE\n17\n18\n" in body and "\nBBOT_NODES, ATOP\n" in body
+    assert not conv.reduced_physics
     plane = ("*Node\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n12,1,0\n13,1,1\n5,2,0\n6,2,1\n"
              "*Element, type=CPS4, elset=A\n1,1,2,3,4\n*Element, type=CPS4, elset=B\n2,2,5,6,13\n"
              "*Surface, name=AR\nA, S2\n*Surface, name=BL\nB, S4\n*Tie, name=T1\nBL, AR\n"
