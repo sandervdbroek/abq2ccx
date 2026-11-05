@@ -77,8 +77,9 @@ beam, buckling and statics references above; *EL FILE requests ccx stopped or cr
 and the same decks without them; *EL PRINT ELKE in a linear static and a *BUCKLE step against
 u0 cos 100 t and the same deck without it, and after a *FREQUENCY step against A cos 100 t and
 u0; *CONTACT PRINT CFN for every pair against a rigid punch's reaction; TABULAR and
-EXPONENTIAL pressure-overclosure laws and *GAP CONDUCTANCE against clearance on two pressed
-cubes against Abaqus' laws; and decks a code review
+EXPONENTIAL pressure-overclosure laws (face-to-face pairs under --approximate too) and *GAP
+CONDUCTANCE against clearance (also before the *SURFACE BEHAVIOR) on two pressed cubes against
+Abaqus' laws; and decks a code review
 found converted wrongly:
 a planar beam's coupled tip, a velocity BC a coupling implies, amplitude points 1e-4 apart at
 time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank Poisson's ratio,
@@ -8955,6 +8956,43 @@ def shell_tie_deck(kind, typ="S4"):
     raise ValueError(kind)
 
 
+def tie_2d_face_deck(typ, merged, pair=False, nu=0.0):
+    """Two 4 x 1 strips of ``typ`` (CPS4 / CPE4 / CAX4, or quadratic CAX8R; x 0-2, r 1-3), the
+    lower's base held, the upper on its top: the upper's bottom faces (S1) tied to the lower's
+    top faces (S3) — by a *TIE, or a TIED *CONTACT PAIR (``pair``) — or ``merged``, the strips
+    sharing those nodes; the upper's top pulled along x, then along y; Poisson's ratio ``nu``."""
+    quad = typ.endswith(("8", "8R"))
+    h = 2 if quad else 1                                    # (grid steps per element)
+    x0 = 1.0 if typ.startswith("CAX") else 0.0
+    keep = lambda i, k: not quad or i % 2 == 0 or k % 2 == 0                     # noqa: E731
+    lo = {(i, k): 1 + i + 9 * k for i in range(4 * h + 1) for k in range(h + 1) if keep(i, k)}
+    up = {(i, k): (lo[(i, h)] if merged and k == 0 else 101 + i + 9 * k) for (i, k) in lo}
+    xyz = {n: (x0 + 0.5 * i / h, k / h) for (i, k), n in lo.items()}
+    xyz.update({n: (x0 + 0.5 * i / h, 1.0 + k / h) for (i, k), n in up.items()})
+    els = []
+    for g, base in ((lo, 1), (up, 11)):
+        for e in range(4):
+            i = h * e
+            c = [g[(i, 0)], g[(i + h, 0)], g[(i + h, h)], g[(i, h)]]
+            c += [g[(i + 1, 0)], g[(i + 2, 1)], g[(i + 1, 2)], g[(i, 1)]] if quad else []
+            els.append(f"{base + e}, " + ", ".join(map(str, c)))
+    top = [up[(i, h)] for i in range(4 * h + 1)]
+    out = ["*HEADING", f"plane face tie {typ}", "*NODE"] + [f"{n}, {x:g}, {y:g}" for n, (x, y) in sorted(xyz.items())]
+    out += [f"*ELEMENT, TYPE={typ}, ELSET=ALL"] + els + [
+        f"*SOLID SECTION, ELSET=ALL, MATERIAL=M\n{'' if typ.startswith('CAX') else '1.'}", "*MATERIAL, NAME=M",
+        "*ELASTIC", f"200000., {nu:g}", "*NSET, NSET=TOP\n" + ", ".join(map(str, top)),
+        "*NSET, NSET=BASE\n" + ", ".join(str(lo[(i, 0)]) for i in range(4 * h + 1))]
+    if not merged:
+        out += ["*SURFACE, NAME=SL\n11, S1\n12, S1\n13, S1\n14, S1", "*SURFACE, NAME=MA\n1, S3\n2, S3\n3, S3\n4, S3",
+                "*SURFACE INTERACTION, NAME=SI\n*CONTACT PAIR, INTERACTION=SI, TIED\nSL, MA" if pair else
+                "*TIE, NAME=T1\nSL, MA"]
+    out += ["*BOUNDARY\nBASE, 1, 2"]
+    for d in (1, 2):
+        out += ["*STEP", "*STATIC", "*CLOAD, OP=NEW"] + [f"{n}, {d}, 20." for n in top] + \
+            ["*NODE PRINT, NSET=TOP", "U", "*END STEP"]
+    return "\n".join(out) + "\n"
+
+
 def tie_offset_deck(spos, merged):
     """An S4 skin (t 0.1, nu 0) on the top of a C3D8 block (x 0-2, y 0-1, z 0-1; 4 x 2 x 1, its base
     clamped), its edge x = 2 pulled along x, then pushed along z (the PR #8 reviewer's deck):
@@ -9401,7 +9439,7 @@ def t155_temperatures(dat_path):
 
 def sc_stack_bend_deck(layers, nx=4):
     """Pure bending of a continuum-shell block 0.4 long, 0.1 wide, 0.1 thick, ``layers`` (type,
-    thickness) bottom to top (SC8R of an elastic-plastic material, E 1000, nu 0, sigma_y 1,
+    thickness) bottom to top (C3D8: a soft elastic core, E 0.01; SC8R of an elastic-plastic material, E 1000, nu 0, sigma_y 1,
     hardening 0.01, at most 5e-4 at the curvature reached, so ccx's iterations keep a tangent; COH3D8 of a soft elastic glue, E 1, *COHESIVE SECTION, RESPONSE=CONTINUUM):
     the end x = 0 held in x, the end x = 0.4 moved u_x = theta z (plane sections), theta 50
     times first yield, so the section is all but fully plastic (M_p = 2.5e-4)."""
@@ -9421,9 +9459,10 @@ def sc_stack_bend_deck(layers, nx=4):
                 (a, 0, li), (a + 1, 0, li), (a + 1, 1, li), (a, 1, li),
                 (a, 0, li + 1), (a + 1, 0, li + 1), (a + 1, 1, li + 1), (a, 1, li + 1))))
         out += ([f"*SHELL SECTION, ELSET=L{li}, MATERIAL=M", f"{h!r}"] if t == "SC8R" else
+                [f"*SOLID SECTION, ELSET=L{li}, MATERIAL=CORE"] if t == "C3D8" else
                 [f"*COHESIVE SECTION, ELSET=L{li}, MATERIAL=GLUE, RESPONSE=CONTINUUM"])
     out += ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.", "*PLASTIC", "1., 0.", "1.01, 1.", "*MATERIAL, NAME=GLUE",
-            "*ELASTIC", "1., 0."]
+            "*ELASTIC", "1., 0.", "*MATERIAL, NAME=CORE", "*ELASTIC", "0.01, 0."]
     left = [n for n, p in nodes.items() if p[0] == 0.0]
     right = [n for n, p in nodes.items() if p[0] == 0.4]
     out += ["*NSET, NSET=RIGHT"] + [", ".join(map(str, right))]
@@ -9699,6 +9738,28 @@ def along(plane, node, k, v):
     ``plane`` (None: the global axes)."""
     axis = (plane or ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))[k]
     return "".join(f"{node}, {g + 1}, {v * c:.15g}\n" for g, c in enumerate(axis) if c)
+
+
+def turned_tip_strip_deck(theta, plane=None, coupled=False):
+    """An S4 cantilever strip (1 x 0.2, 8 x 2 cells, nu = 0, in ``plane`` — in_plane — or the
+    xy-plane), clamped at x = 0, whose tip edge is turned by the rotation vector ``theta``
+    (global components) in an NLGEOM step: BCs on the tip nodes' DOFs 4-6, or (``coupled``)
+    on a reference node that a *KINEMATIC coupling of their rotations (4, 6) ties them to."""
+    nid = lambda i, j: j * 9 + i + 1
+    out = ["*Heading", "turned tip", "*Node"]
+    out += [f"{nid(i, j)}, {in_plane(plane, i / 8.0, 0.1 * j)}" for j in range(3) for i in range(9)]
+    out += [f"900, {in_plane(plane, 1.0, 0.1)}", "*Element, type=S4, elset=SH"]
+    out += [f"{j * 8 + i + 1}, {nid(i, j)}, {nid(i + 1, j)}, {nid(i + 1, j + 1)}, {nid(i, j + 1)}"
+            for j in range(2) for i in range(8)]
+    out += ["*Shell Section, elset=SH, material=M", "0.01", "*Material, name=M", "*Elastic",
+            "1e5, 0.", "*Nset, nset=ROOT", "1, 10, 19", "*Nset, nset=TIP", "9, 18, 27"]
+    if coupled:
+        out += ["*Surface, type=node, name=ST", "TIP",
+                "*Coupling, constraint name=C, ref node=900, surface=ST", "*Kinematic", "4, 6"]
+    out += ["*Step, nlgeom, inc=1000", "*Static", "0.05, 1., 1e-6, 0.05", "*Boundary", "ROOT, 1, 6"]
+    out += [f"{900 if coupled else 'TIP'}, {k}, {k}, {v!r}" for k, v in zip((4, 5, 6), theta)]
+    out += ["*Node Print, nset=TIP", "U", "*End Step"]
+    return "\n".join(out) + "\n"
 
 
 def released_knot_deck(twin=False, plane=None):
@@ -19834,7 +19895,11 @@ def check_contact_property_tables(ccx, env, tmp, shared):
              ", TYPE=SURFACE TO SURFACE", 1e-3,
              lambda f: (None, 100.0 / (2.0 + 1.0 / (50.0 + 0.1 * f))),
              "a clearance *GAP CONDUCTANCE after a PRESSURE one, face-to-face",
-             "0: ccx read the later card against pressure")):
+             "0: ccx read the later card against pressure"),
+            ("gap_conductance_first", clearance + hard, "", 1e-3,
+             lambda f: (None, 100.0 / (2.0 + 1.0 / 100.0)),
+             "the clearance *GAP CONDUCTANCE before the *SURFACE BEHAVIOR",
+             "ccx stopped: 'should be preceded by a *SURFACE BEHAVIOR card'")):
         res = review_run(pressed_cubes_deck(inter, pair, tag.startswith("gap"), push), tag, cubes_totals)
         (f, q), (f0, q0) = res or (0.0, None), want(res[0] if res else 0.0)
         got, ref = (q, q0) if f0 is None else (f, f0)
@@ -19847,6 +19912,32 @@ def check_contact_property_tables(ccx, env, tmp, shared):
                   f"Abaqus' law ({err:.1e} apart; pressed by a force {f:.6g}; before: {before})")
         elif res:
             print(f"FAIL  {tag}: no heat flux printed")
+        failures += 0 if ok else 1
+    # --approximate: face-to-face pairs with a TABULAR / EXPONENTIAL law written node-to-surface,
+    # which reads Abaqus' curve (ccx's face-to-face contact: no TABULAR table, its own exponential)
+    pts = ((0.0, 0.0), (50.0, 0.005), (200.0, 0.01))
+
+    def tab3(h):
+        if h <= 0.0:
+            return 0.0
+        for (p1, h1), (p2, h2) in zip(pts, pts[1:]):
+            if h <= h2:
+                return p1 + (p2 - p1) * (h - h1) / (h2 - h1)
+        return 200.0 + 3e4 * (h - 0.01)
+    for tag, inter, push, law, tol, before in (
+            ("contact_tabular_s2s_approx", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR\n"
+             "0., 0.\n50., 0.005\n200., 0.01\n", 0.03, tab3, 1e-4, "0: no TABULAR table face-to-face"),
+            ("contact_exponential_s2s_approx", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL\n"
+             "2e-4, 100.\n", 1e-3, abq_exponential, 3e-3,
+             "ccx's own law face-to-face: too many cutbacks")):
+        res = review_run(pressed_cubes_deck(inter, ", TYPE=SURFACE TO SURFACE", False, push), tag,
+                         cubes_totals, approximate=True)
+        ref = pressed_cubes_force(law, push)
+        err = abs(ccx_ratio(res[0], ref) - 1) if res else math.inf
+        ok = err < tol and ref > 1.0
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (a SURFACE TO SURFACE pair, --approximate: node-to-"
+              f"surface): contact force {res[0] if res else math.nan:.7g} vs {ref:.7g} for Abaqus' "
+              f"law ({err:.1e} apart; before: {before})")
         failures += 0 if ok else 1
     # code check G2-4: ccx's node-to-surface springs reach a clearance of 1e-3 sqrt(A) (here
     # 5e-4): a TABULAR curve's pressure at larger clearances is lost there, reduced physics
@@ -20005,6 +20096,45 @@ def check_tie_offset_knots(ccx, env, tmp, shared):
                   f"tied by its {tag.upper()} face to a block, its edge pulled, then pushed): the block's "
                   f"edge nodes as the skin merged with its nodes, knotted, in both steps ({err:.1e} apart; "
                   f"|u| {moved:.4g} at least; before: {before})")
+        failures += 0 if ok else 1
+    return failures
+
+
+@check("tie_2d_faces", "*TIE slaves on plane / axisymmetric element faces: a node surface of their nodes")
+def check_tie_2d_faces(ccx, env, tmp, shared):
+    # --- ccx 2.23 ties none of the face nodes of the solids it expands plane / axisymmetric
+    # elements to (singular); a node surface of the edges' nodes ties them as Abaqus does
+    failures = 0
+
+    def run(tag, deck):
+        src, inp = os.path.join(tmp, f"{tag}_src.inp"), os.path.join(tmp, f"{tag}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(deck)
+        rep, conv = convert(src, inp)
+        d, status, out = run_ccx(ccx, env, inp)
+        res = (dat_node_blocks(os.path.join(d, "job.dat")), " ".join(rep.text().split()),
+               list(conv.reduced_physics)) if status == "solved" else None
+        shutil.rmtree(d, ignore_errors=True)
+        if res is None:
+            print(f"FAIL  {tag}: did not solve ({status})")
+        return res
+    for typ, pair, nu, tol in (("CPS4", False, 0.0, 1e-9), ("CPS4", True, 0.0, 1e-9), ("CPE4", False, 0.3, 1e-9),
+                               ("CAX4", False, 0.0, 3e-4), ("CAX8R", False, 0.3, 3e-4)):
+        tag = f"{typ}{'_pair' if pair else ''}{'_nu' if nu else ''}"
+        runs = [run(f"t2f_{tag}", tie_2d_face_deck(typ, False, pair, nu)),
+                run(f"t2f_{tag}_ref", tie_2d_face_deck(typ, True, nu=nu))]
+        ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) == 2
+        if ok:
+            got, want = runs[0][0], runs[1][0]
+            err = max(abs(a - b) for g, w in zip(got, want) for n, v in w.items()
+                      for a, b in zip(g.get(n, [math.inf] * 3), v[:3]))
+            moved = min(max(abs(x) for v in w.values() for x in v[:3]) for w in want)
+            ok = err <= tol * moved and moved > 1e-5 and not runs[0][2] and \
+                "on plane / axisymmetric elements -> node surface SL_NODES" in runs[0][1]
+            print(f"{'PASS' if ok else 'FAIL'}  tie_2d_faces_{tag} ({typ} strips, the upper's bottom faces "
+                  f"tied to the lower's top{' by a TIED *CONTACT PAIR' if pair else ''}, nu {nu:g}, pulled along "
+                  f"x, then y): its top nodes as the strips merged in both steps ({err:.1e} apart; |u| {moved:.4g} "
+                  f"at least{'; CAX: its wedge' if typ.startswith('CAX') else ''}; before: singular, 7e14 x |u|)")
         failures += 0 if ok else 1
     return failures
 
@@ -20420,7 +20550,9 @@ def check_sc_stacks(ccx, env, tmp, shared):
     for name, layers, want, flagged in (
             ("k1", [sc], 2 / math.sqrt(3), True), ("k2", [("SC8R", 0.05)] * 2, 1.0, False),
             ("k3", [("SC8R", 0.1 / 3)] * 3, 1 + (1 / math.sqrt(3) - 0.5) * 4 / 9 / 2, True),
-            ("bonded", [("SC8R", 0.049), ("COH3D8", 0.002), ("SC8R", 0.049)], 1 - 0.02 ** 2, False)):
+            ("bonded", [("SC8R", 0.049), ("COH3D8", 0.002), ("SC8R", 0.049)], 1 - 0.02 ** 2, False),
+            # skins on a solid core: one stack, each skin wholly on one side of the middle
+            ("sandwich", [("SC8R", 0.02), ("C3D8", 0.06), ("SC8R", 0.02)], 1 - 0.6 ** 2, False)):
         text, z = sc_stack_bend_deck(layers)
         tag = f"sc_stacks_{name}"
         res = review_run(text, tag, lambda dat: (dat_node_blocks(dat), dat_node_blocks(dat, "forces")))
@@ -20431,7 +20563,9 @@ def check_sc_stacks(ccx, env, tmp, shared):
             m = sum(v[0] * z[n] for n, v in res[1][-1].items()) / 2.5e-4
             w = res[0][-1][min(res[0][-1])][2]
             ok = abs(m - want) < 2e-3 and got_flag == flagged and abs(w) > 1e-3
-            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({'two SC8R bonded by a COH3D8 layer' if name == 'bonded' else f'{name[1]} SC8R'} "
+            what = {"bonded": "two SC8R bonded by a COH3D8 layer",
+                    "sandwich": "two SC8R skins on a C3D8 core"}.get(name, f"{name[1:]} SC8R")
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what} "
                   f"through the thickness in pure bending): M / M_p {m:.4f} vs {want:.4f}, "
                   f"{'flagged' if got_flag else 'not flagged'}; the free mid-span top node moved w {w:.4g}")
         failures += 0 if ok else 1
@@ -21235,6 +21369,34 @@ def check_shell_knot_limits(ccx, env, tmp, shared):
               f"tip moments in *STEADY STATE DYNAMICS): ccx runs all three steps, frequencies "
               f"{', '.join(f'{x:.7g}' for x in got)} as without knots ({err:.1e}; before: ccx stopped)")
     failures += 0 if ok else 1
+    return failures
+
+
+@check("shell_finite_rotation", "shell-node rotations about two axes under NLGEOM: the rotation vector "
+       "as ccx's mean-rotation angles")
+def check_shell_finite_rotation(ccx, env, tmp, shared):
+    # --- finite shell-node rotation BCs: Abaqus' rotation vector ------------------------------
+    # ccx's mean-rotation MPCs read the deck's values as the angles of the shell normal projected
+    # about each axis: the tip edge turned 3-6.5 % off.  Against the same rotation vector through
+    # a rotation-only kinematic coupling (knots: the rotation vector, kinematic_rotation_only)
+    review_run = shared["review_run"]
+    failures = 0
+    e1, e2, _ = OBLIQUE_PLANE
+    for tag, theta, plane in (("xy", (0.3, -0.4, 0.0), None),
+                              ("oblique", tuple(0.5 * a - 0.3 * b for a, b in zip(e1, e2)), OBLIQUE_PLANE)):
+        runs = [review_run(turned_tip_strip_deck(theta, plane, c), f"turned_tip_{tag}" + ("_coupled" if c else ""),
+                           dat_displacements) for c in (False, True)]
+        if not all(runs):
+            failures += 1
+            continue
+        got, ref = runs
+        err = max(abs(a - b) for n in ref for a, b in zip(got.get(n, [math.inf] * 3), ref[n]))
+        moved = max(abs(x) for v in ref.values() for x in v)
+        ok = err < 1e-5 * moved and moved > 0.1 and len(got) == len(ref) == 3
+        print(f"{'PASS' if ok else 'FAIL'}  turned_tip_{tag} (an S4 cantilever{' off the global axes' if plane else ''}, "
+              f"its tip nodes' BCs the rotation vector ({', '.join(f'{x:.3g}' for x in theta)}), NLGEOM): the tip as "
+              f"through a rotation-only coupling ({err:.1e} off; |u| {moved:.4g})")
+        failures += 0 if ok else 1
     return failures
 
 
