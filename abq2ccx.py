@@ -489,6 +489,11 @@ def brick_locks(typ: str) -> bool:
 # Continuum shells under a composite section: one ccx solid per ply (_plan_ply_split); the
 # default limit on the solids that adds (--max-ply-elements)
 PLY_SOLID = {"SC8R": "C3D8I", "SC6R": "C3D6"}
+# the fully plastic moment a continuum shell alone through the thickness carries in ccx 2.23 (one
+# C3D8I / C3D6, 2 Gauss points through it), over the exact one (_flag_inelastic_shells)
+SC_ALONE = 2.0 / math.sqrt(3.0)
+# the 12 edges of an 8-node hex, 0-based corner positions (_sc_stack_middles)
+HEX_EDGES = ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7))
 PLY_SPLIT_LIMIT = 1000000
 # Quadratic membranes, which ccx 2.23 expands with a mid-thickness node free in each element
 # (_plan_quadratic_membranes) -> the solid the converter writes each element as; M3D9 / M3D9R
@@ -2968,6 +2973,16 @@ def vnorm(a: Vec) -> float:
 def vunit(a: Vec) -> Vec:
     n = vnorm(a)
     return vscale(a, 1.0 / n) if n else a
+
+
+def vrotate(theta: Vec, v: Vec) -> Vec:
+    """``v`` turned by the rotation vector ``theta`` (Rodrigues)."""
+    phi = vnorm(theta)
+    if phi == 0.0:
+        return v
+    k = vscale(theta, 1.0 / phi)
+    return vadd(vadd(vscale(v, math.cos(phi)), vscale(vcross(k, v), math.sin(phi))),
+                vscale(k, vdot(k, v) * (1.0 - math.cos(phi))))
 
 
 def null_space(rows: Sequence[Vec], rel: float = 1e-9) -> List[Vec]:
@@ -11207,12 +11222,43 @@ class _Mesh:
                              f"2.23's springs ignore (probed) -> a SPRINGA from a helper node whose DOF 1 "
                              f"an *EQUATION ties to the rotation (on the ROT NODE, the reference node's "
                              f"or a knot's DOFs 4-6), held across it, to a held node: exact for small "
-                             f"rotations (validate_with_ccx.py spring_rotation_*); a beam node's knot "
+                             f"rotations (validate_with_ccx.py spring_dofs_masses); a beam node's knot "
                              f"holds its section rigid there, which stiffens a coarse beam a little "
                              f"(probed: 3 % with one element, 0.03 % with four).", once=True)
         if approx:
             self.report.warn("[APPROX] Rotational SPRING1 / SPRING2 under NLGEOM written in their linear "
                              "form: exact for small rotations only.", once=True)
+
+    def _settle_instance_axes(self, blocks: List[Block]) -> None:
+        """Rotational SPRING1 / SPRING2 cards that _turn_instance_dofs gave a rotated instance's
+        axes (ORIENTATION=<instance>_ABQ2CCX_AXES; their DOFs lie along no global axis) without
+        its note: one _plan_springs writes gets the note; an axes *ORIENTATION that only such
+        cards name, all of whose elements _plan_springs left out (springs on solid nodes, which
+        have no rotations), is not written (handle_orientation)."""
+        suffix = AXES_ORIENTATION.upper()
+        axes = {b.uparam("NAME") for b in blocks if b.keyword == "ORIENTATION" and b.uparam("NAME").endswith(suffix)}
+        if not axes:
+            return
+        live: set = set()
+        for b in blocks:
+            if b.keyword in ("CONNECTOR SECTION", "JOINT"):
+                live |= {n for n in axes if any(n in ln.upper() for ln in b.data)}
+                if b.uparam("ORIENTATION") in axes:      # _emit_instance's ORIENTATION= on a *JOINT
+                    live.add(b.uparam("ORIENTATION"))
+                continue
+            name = b.uparam("ORIENTATION")
+            if name not in axes:
+                continue
+            if b.keyword == "SPRING" and id(b) in self._spring_cards:
+                if not self._elset_types(b):
+                    continue                    # (left out whole)
+                self.report.note(f"Rotational SPRING1 / SPRING2 elements of a rotated *INSTANCE "
+                                 f"(*SPRING, ELSET={b.param('ELSET') or ''}): their part's DOFs lie "
+                                 f"along no global axis, so they act about the instance's axes "
+                                 f"(ORIENTATION={b.param('ORIENTATION')}), as in Abaqus "
+                                 f"(validate_with_ccx.py spring_rotated_instance).", once=True)
+            live.add(name)
+        self._axes_unused = axes - live
 
     def _warn_linear_nonlinear_springs(self, blocks: List[Block]) -> None:
         """A *SPRING, NONLINEAR whose table is not one straight line through zero, in a deck with
@@ -11809,8 +11855,10 @@ class _Mesh:
             return self._joint_subcard(b)
         if id(b) in self._spring_cards:         # (_plan_springs: SPRINGAs now)
             if not self._elset_types(b):
+                kept = OrderedDict((k, v) for k, v in b.params.items()       # (_settle_instance_axes)
+                                   if not (k == "ORIENTATION" and v.strip().upper() in self._axes_unused))
                 return self._comment_out("*SPRING card of SPRING1 / SPRING2 elements all left out (see "
-                                         "above): commented out.", [emit_keyword("SPRING", b.params)] +
+                                         "above): commented out.", [emit_keyword("SPRING", kept)] +
                                          list(b.data), False, warn=False)
             params = OrderedDict((k, v) for k, v in b.params.items() if k != "ORIENTATION")
             s = self._spring_scale.get(id(b))
@@ -12017,7 +12065,7 @@ class _Mesh:
         if empty:
             return ["** abq2ccx: *CONTACT PAIR " + (b.param("INTERACTION") or "") + ": its slave "
                     "nodes are members of the rigid body of its master surface"] + comments
-        return self._contact_pair_lines(nb) + comments
+        return self._contact_pair_lines(nb, id(b) in self._n2s_pairs) + comments
 
     # ccx's 'S, S' surface-to-surface self-contact against symmetric pairs (Abaqus' self-contact),
     # measured on 2.23: a C-shaped strip whose arm tip closes a gap 0.2 by 0.05 / 0.2 / 0.4,
@@ -13063,7 +13111,9 @@ class _Mesh:
                                      list(b.data), False, warn=False)
         return self.passthrough(b)
 
-    def _contact_pair_lines(self, b: Block) -> List[str]:
+    def _contact_pair_lines(self, b: Block, n2s: bool = False) -> List[str]:
+        """``*CONTACT PAIR`` card ``b`` as ccx lines (``n2s``: as NODE TO SURFACE,
+        _plan_table_pairs)."""
         if b.has("TIED"):
             out: List[str] = []
             adj = (b.param("ADJUST") or "").strip()
@@ -13120,6 +13170,8 @@ class _Mesh:
             self.report.note("*CONTACT PAIR without TYPE -> TYPE=NODE TO SURFACE (the Abaqus/Standard "
                              "default; ccx requires it explicitly). If ccx struggles to converge, "
                              "try TYPE=SURFACE TO SURFACE (ccx's face-to-face contact).", once=True)
+        if n2s:
+            keep["TYPE"] = "NODE TO SURFACE"
         if "SMALL SLIDING" in keep and (keep.get("TYPE") or "").upper().replace(" ", "") == \
                 "SURFACETOSURFACE":
             del keep["SMALL SLIDING"]
@@ -13442,6 +13494,95 @@ class _Mesh:
                              "faces in ccx).", once=True)
         return f"S{k + 2}"
 
+    def _order_gap_conductance(self, blocks: List[Block]) -> List[Block]:
+        """``blocks`` with each *SURFACE INTERACTION's model-data *GAP CONDUCTANCE cards that
+        come before its first *SURFACE BEHAVIOR moved to right after it: Abaqus takes an
+        interaction's cards in any order, ccx 2.23 stops on a *GAP CONDUCTANCE before the
+        *SURFACE BEHAVIOR ("should be preceded by a *SURFACE BEHAVIOR card", gapconductances.f;
+        probed).  An interaction without one gets HARD after its *SURFACE INTERACTION card
+        (handle_surface_interaction)."""
+        first_sb: Dict[int, int] = {}           # interaction card's index -> its first SB's
+        moved: Dict[int, List[Block]] = {}      # SB index -> the cards that follow it
+        skip = set()
+        for scan in (1, 2):
+            si = None
+            for i, b in enumerate(blocks):
+                if b.keyword == "STEP":
+                    break
+                if b.keyword == "SURFACE INTERACTION":
+                    si = i
+                elif si is None:
+                    continue
+                elif scan == 1 and b.keyword == "SURFACE BEHAVIOR":
+                    first_sb.setdefault(si, i)
+                elif scan == 2 and b.keyword == "GAP CONDUCTANCE" and i < first_sb.get(si, -1):
+                    moved.setdefault(first_sb[si], []).append(b)
+                    skip.add(i)
+                    self.report.note(f"*GAP CONDUCTANCE of interaction {blocks[si].param('NAME')} "
+                                     f"written after its *SURFACE BEHAVIOR (ccx stops on one "
+                                     f"before it; Abaqus takes the cards in any order).", at=b)
+        if not moved:
+            return blocks
+        return [c for i, b in enumerate(blocks) if i not in skip for c in [b] + moved.get(i, [])]
+
+    def _ccx_f2f(self, b: Block) -> bool:
+        """Whether ccx gets *CONTACT PAIR card ``b`` as face-to-face contact: TYPE=SURFACE TO
+        SURFACE, unless _plan_table_pairs writes it node-to-surface."""
+        return id(b) not in self._n2s_pairs and \
+            b.uparam("TYPE").replace(" ", "") == "SURFACETOSURFACE"
+
+    @staticmethod
+    def _tabular_line(pts: Sequence[Tuple[float, float]]) -> float:
+        """K where TABULAR (pressure, overclosure) points ``pts`` lie on p = K h through the
+        origin (K > 0), else 0."""
+        k = pts[-1][0] / pts[-1][1] if pts[0] == (0.0, 0.0) and pts[-1][1] > 0.0 else 0.0
+        return k if k > 0.0 and all(abs(p - k * h) <= 1e-9 * abs(pts[-1][0]) for p, h in pts) \
+            else 0.0
+
+    def _plan_table_pairs(self, blocks: List[Block]) -> None:
+        """--approximate: ccx 2.23's face-to-face contact reads no TABULAR pressure-overclosure
+        table (no contact force; handle_surface_behavior) and no form of Abaqus' EXPONENTIAL
+        curve; its node-to-surface contact reads both (probed on two pressed cubes: 754.67 for
+        Abaqus' 754.72, and 431.20 for 431.41 where face-to-face ccx's own exponential law did
+        not converge).  So where a SURFACE TO SURFACE pair's interaction has such a law (not a
+        TABULAR line through the origin, which is LINEAR there exactly), every face-to-face pair
+        is written NODE TO SURFACE (_n2s_pairs, [APPROX]): ccx takes one TYPE for all of a
+        deck's pairs (the last card's, contactpairs.f).  Not where a self-contact pair needs
+        face-to-face contact (_self_approx: node-to-surface 'S, S' is unusable)."""
+        self._n2s_pairs = set()
+        if not self._approx:
+            return
+        lossy, si = set(), None
+        for b in blocks:
+            if b.keyword == "STEP":
+                break
+            if b.keyword == "SURFACE INTERACTION":
+                si = b.uparam("NAME")
+            elif b.keyword == "SURFACE BEHAVIOR" and si:
+                law = (b.param("PRESSURE-OVERCLOSURE") or "").replace(" ", "").upper()
+                try:
+                    recs = [fields_at(r, 2) for r in merged_data_records(b) if r]
+                except ValueError:
+                    recs = []
+                if law == "TABULAR" and not (len(recs) > 1 and self._tabular_line(
+                        [(p, h) for p, h in recs])) or law == "EXPONENTIAL" and recs and \
+                        min(recs[0]) > 0.0 and not b.has("NO SEPARATION") and \
+                        not has_field_dependence(b):
+                    lossy.add(si)
+        pairs = [b for b in blocks if b.keyword == "CONTACT PAIR" and not b.has("TIED") and
+                 any(x.strip() for x in b.data) and self._ccx_f2f(b)]
+        hit = sorted({b.uparam("INTERACTION") for b in pairs} & lossy)
+        if not hit or any(id(b) in self._self_approx for b in pairs):
+            return
+        self._n2s_pairs = {id(b) for b in pairs}
+        self.report.warn(f"[APPROX] *CONTACT PAIR, TYPE=SURFACE TO SURFACE written as NODE TO "
+                         f"SURFACE (interaction {', '.join(hit)}: ccx's face-to-face contact reads "
+                         f"no TABULAR pressure-overclosure table and not Abaqus' EXPONENTIAL curve, "
+                         f"its node-to-surface contact reads both; ccx takes one TYPE for all "
+                         f"pairs, so every face-to-face pair is written so): node-to-surface "
+                         f"contact acts at the slave nodes, Abaqus' surface-to-surface over the "
+                         f"slave faces.", once=True)
+
     def _plan_surface_behavior(self, blocks: List[Block]) -> None:
         """The interactions with no *SURFACE BEHAVIOR (``_si_missing_behavior``): Abaqus'
         default is hard contact, ccx errors without the card, so handle_surface_interaction
@@ -13465,8 +13606,7 @@ class _Mesh:
                 self._si_cards.setdefault(cur_si, []).append(blk)
                 self._card_si[id(blk)] = cur_si
             elif blk.keyword == "CONTACT PAIR" and not blk.has("TIED"):
-                kind = "F2F" if (blk.param("TYPE") or "").replace(" ", "").upper() == \
-                    "SURFACETOSURFACE" else "N2F"
+                kind = "F2F" if self._ccx_f2f(blk) else "N2F"
                 for rec in merged_data_records(blk):
                     if rec and rec[0]:
                         self._si_pairs.setdefault(blk.uparam("INTERACTION"), []).append(
@@ -13571,7 +13711,9 @@ class _Mesh:
                                  f"clearance d: 1 % of p0 at c0, never zero; Abaqus': zero at c0), "
                                  f"and its face-to-face contact reads no TABULAR form of "
                                  f"Abaqus' curve (ccx 2.23: no contact force); kept as ccx's law. "
-                                 f"A NODE TO SURFACE pair takes Abaqus' curve exactly.", once=True)
+                                 f"A NODE TO SURFACE pair takes Abaqus' curve exactly"
+                                 f"{'' if self._approx else ' (--approximate writes the pairs so)'}.",
+                                 once=True)
                 self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL on a face-to-"
                               "face pair (ccx's exponential law differs)")
                 return self.passthrough(b)
@@ -13600,9 +13742,8 @@ class _Mesh:
         (pa, ha), (pb, hb) = pts[-2], pts[-1]
         slope = (pb - pa) / (hb - ha)
         if "F2F" in kinds:
-            k = pts[-1][0] / pts[-1][1] if pts[0] == (0.0, 0.0) and pts[-1][1] > 0.0 else 0.0
-            if k > 0.0 and "N2F" not in kinds and all(
-                    abs(p - k * h) <= 1e-9 * abs(pts[-1][0]) for p, h in pts):
+            k = self._tabular_line(pts)
+            if k > 0.0 and "N2F" not in kinds:
                 self.report.note(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR of interaction "
                                  f"{si}: the straight line p = {short_real(k, 9)} h through the "
                                  f"origin, written as ccx's LINEAR law (its face-to-face contact "
@@ -13612,7 +13753,9 @@ class _Mesh:
             self.report.warn(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR of interaction {si} "
                              f"on a SURFACE TO SURFACE pair: ccx 2.23's face-to-face contact reads "
                              f"no TABULAR table (probed: no contact force), so that pair transmits "
-                             f"no pressure. A NODE TO SURFACE pair reads it.", once=True)
+                             f"no pressure. A NODE TO SURFACE pair reads it"
+                             f"{'' if self._approx else ' (--approximate writes the pairs so)'}.",
+                             once=True)
             self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR on a face-to-face pair "
                           "(no contact pressure in ccx 2.23)")
         # pressure at a clearance (soft contact from a negative overclosure on): up to the
@@ -15324,10 +15467,12 @@ class _Mesh:
             if self._continuum_shell_elset(elset):
                 if middles is None:
                     middles = self._sc_stack_middles(blocks)
-                single = [e for e in self._existing(elset) if e in middles]
+                # (an element of no resolved stack — alone, or one _sc_stack_middles leaves out —
+                # counts as alone through the thickness: 2 / sqrt(3))
+                single = [e for e in self._existing(elset) if middles.get(e, SC_ALONE) is not None]
                 if single and not (gauss and npts == 2):
                     cont.append((elset, len(single), rule, "plastic" if mat in plastic else "creeping",
-                                 max(middles[e] for e in single)))
+                                 max(middles.get(e) or SC_ALONE for e in single)))
                 continue
             if mat in plastic:
                 continue                            # (_plan_plastic_shells)
@@ -15390,17 +15535,21 @@ class _Mesh:
             self._reduces(f"{what} continuum shells SC6R / SC8R (ccx 2.23 integrates them through the "
                           f"thickness at 2 Gauss points, not at the section's points)")
 
-    def _sc_stack_middles(self, blocks: List[Block]) -> Dict[int, float]:
-        """The continuum shells (SC6R / SC8R of a *SHELL SECTION) the middle of their stack's
-        thickness crosses -> the fully plastic moment of that stack with the element's 2 Gauss
-        points through its thickness, over the exact one (_flag_inelastic_shells).  A stack is
+    def _sc_stack_middles(self, blocks: List[Block]) -> Dict[int, Optional[float]]:
+        """The continuum shells (SC6R / SC8R of a *SHELL SECTION) of the stacks resolved here ->
+        for the one the middle of its stack's thickness crosses, the fully plastic moment of
+        that stack with the element's 2 Gauss points through its thickness, over the exact one;
+        None for the others (_flag_inelastic_shells, which takes an element left out as alone
+        through the thickness, SC_ALONE).  A stack is
         a column of such elements through the thickness, each one's top face (_sc_stack_faces,
         by its section's stacking) the next one's bottom face, or joined through a cohesive
         element's (COH3D*, a *COHESIVE SECTION's stacking: two SC8R bonded by a glue layer are
-        one stack), each element as thick as its faces lie apart.  An element alone through
+        one stack) or a solid hex's (a sandwich's core), each element as thick as its faces lie
+        apart.  An element alone through
         the thickness: 2 / sqrt(3); the middle one of k equal ones: 1 + 0.155 / k^2; where the
         middle lies at a face between two elements, none.  A branching column (a face of three
-        elements) leaves its elements out."""
+        elements) or one of no thickness leaves its elements out, and so does an element without
+        its section, nodes or 6 / 8 corners."""
         P = self.geom.nodes
         sec: Dict[int, Block] = {}
         for b in blocks:
@@ -15419,11 +15568,38 @@ class _Mesh:
             n, _c = self._stack_geometry(bot, top)
             h = sum(vdot(vsub(P[y], P[x]), n) for x, y in zip(bot, top)) / len(bot)
             cells[e] = (frozenset(bot), frozenset(top), max(h, 0.0))
+        # solid hexes (any C3D* element of 8 or 20 nodes: C3D8, C3D8R / I / H / T, C3D20, C3D20R,
+        # ...) joined face to face continue a column — a sandwich's core, a substrate (probed:
+        # SC8R skins on a soft C3D8 core in pure bending carry 1.0005-1.0010 of the exact fully
+        # plastic moment, where each skin alone would be flagged at 1.155) —, each reached
+        # through one face, its opposite face the corners across its other edges.  The middle
+        # of the column assumes plane sections through the whole stack; a soft core that bends
+        # locally (each skin about its own middle) is not judged so
+        hexes: Dict[frozenset, List[Tuple[int, Tuple[int, ...]]]] = {}
+        for e, (typ, conn) in self.geom.elements.items():
+            if e not in cells and typ.upper().startswith("C3D") and len(conn) in (8, 20) and \
+                    all(n in P for n in conn[:8]):
+                for pos in FACE_NODES["HEX"].values():
+                    hexes.setdefault(frozenset(conn[q - 1] for q in pos[:4]), []).append((e, pos[:4]))
+        todo = [f for bot, top, _h in cells.values() for f in (bot, top)] if hexes else []
+        while todo:
+            for e, pos in hexes.get(todo.pop(), []):
+                if e in cells:
+                    continue
+                conn = self.geom.elements[e][1]
+                face = {q - 1 for q in pos}
+                across = {i: j for a, b in HEX_EDGES for i, j in ((a, b), (b, a)) if i in face and j not in face}
+                bot = [conn[q - 1] for q in pos]
+                top = [conn[across[q - 1]] for q in pos]
+                n, _c = self._stack_geometry(bot, top)
+                h = sum(vdot(vsub(P[y], P[x]), n) for x, y in zip(bot, top)) / len(bot)
+                cells[e] = (frozenset(bot), frozenset(top), max(h, 0.0))
+                todo.append(cells[e][1])
         faces: Dict[frozenset, List[int]] = {}
         for e, (bot, top, _h) in cells.items():
             faces.setdefault(bot, []).append(e)
             faces.setdefault(top, []).append(e)
-        out: Dict[int, float] = {}
+        out: Dict[int, Optional[float]] = {}
         seen: set = set()
         for start in cells:
             if start in seen:
@@ -15450,6 +15626,7 @@ class _Mesh:
             total = sum(cells[x][2] for x in order)
             if not total > 0.0:
                 continue
+            out.update((x, None) for x in order if self.geom.elements[x][0].upper() in PLY_SOLID)
             mid, z, tol = 0.5 * total, 0.0, 1e-6 * total
             for x in order:
                 z0, z = z, z + cells[x][2]
@@ -23984,6 +24161,8 @@ class _Axes:
                                   f"orientation).", reduces=f"*ORIENTATION {name} (no axes ccx can take)")
 
     def handle_orientation(self, b: Block) -> List[str]:
+        if b.uparam("NAME") in self._axes_unused:
+            return []                           # (_settle_instance_axes)
         definition = (b.param("DEFINITION") or "COORDINATES").strip().upper()
         if definition.startswith("OFFSET"):
             why = self._offset_why.get(b.uparam("NAME"), "it is not written")
@@ -26041,6 +26220,191 @@ class _Dofs:
             out[(id(b), n)] = [f"{n}, {j}, {j}" + (", " + self._fmt_rot(v, scale) if v != 0.0 else "")
                                for j, v in sorted(vals.items())]
         return out
+
+    def _plan_shell_finite_rotations(self, blocks: List[Block]) -> None:
+        """Rotational BCs of a shell node in an NLGEOM step.  Abaqus/Standard reads the values
+        as the components of the node's total rotation vector at the end of the step (Analysis
+        User's Guide 1.2.2 "Conventions").  At a shell node that is no knot ccx 2.23 makes them
+        mean-rotation MPCs (gen3dboun, umpc_mean_rot) about e1, the axis of the first rotational
+        BC it reads there projected on the shell plane, and e2 = n x e1, holding at v.e1 and
+        v.e2 (v: the values' vector projected on the plane) the angles of the director (the
+        line through the node's expanded nodes) projected on the plane normal to each axis:
+        the same to first order, but a finite rotation about two axes at once comes out
+        differently (probed: an S4 strip's tip edge given (0.1, 0.2, 0) 0.4 %, (0.3, 0.4, 0)
+        3 %, (-0.5, 0.25, 0) 6.5 % of max |u| off the same rotation vector through a knot).
+        Exact form: values on the DOFs ccx counts (the least change) whose angles are those
+        of the director n' = R(theta) n, alpha1 = atan2(-n'.e2, n'.n), alpha2 =
+        atan2(n'.e1, n'.n) (probed 2e-7 to 5e-6 of max |u| from the knot), so the node's lines
+        are written per card in DOF order (_rot_mode 'finite', _rot_lines), e1 from the
+        first.  ccx ramps the angles where Abaqus ramps the rotation vector: equal at the end
+        of the step, the director's path in between a little apart.
+
+        Rewritten, at a node whose rotational BCs ccx first reads in a step other than a
+        *DYNAMIC one (there ccx knots the node and keeps the knot, which reads the values as
+        Abaqus does), the states (_rot_bc_walk) of a general NLGEOM step before the next
+        *DYNAMIC step (likewise) holding all three rotations, or the two off the normal with the free one along it
+        (exact to first order only: Abaqus' normal turns with that free drilling rotation too,
+        which ccx's shell node lacks: taken as zero), on the step's own amplitude.  The nodes:
+        as _plan_shell_rotation_pairs (not its 'pair' nodes).  Warned (reduced physics) where
+        such a state has no such form: a *DYNAMIC step after it (it would carry the angles into
+        the knot), a card on an amplitude, a value carried on from a geometrically linear step,
+        a velocity-type BC, a director turned 90 deg or more."""
+        if getattr(self.opt, "solid_dof", False) or not self._mechanical or self._has_normal:
+            return
+        dyns = {st.no for st in self.steps if st.proc == "DYNAMIC"}
+        nl = {st.no for st in self.steps if st.nlgeom and not st.perturbation and st.no not in dyns}
+        if not nl:
+            return
+        sheet = {n for typ, conn in self.geom.elements.values() if ccx_type(typ) in SHEET_SHELLS
+                 for n in conn}
+        cand = {n for n in sheet if n not in self._knots and n not in self._rb_rot and
+                self._rot_mode.get(n) in (None, "keep")}
+        cards: List[Tuple[Block, int, Dict[int, List[Tuple[int, float]]]]] = []
+        step = 0
+        for b in blocks:
+            if b.keyword == "STEP":
+                step += 1
+            elif b.keyword == "BOUNDARY" and id(b) not in self.steps.lc2:
+                cards.append((b, step, self._rot_items(b, cand)))
+        used = sorted({n for _, _, items in cards for n in items})
+        if not used:
+            return
+        at = self._elements_at(set(used))
+        sections = self._knot_sections(blocks)
+        acts = self.steps.acting(("BOUNDARY", "CLOAD"), self.steps.lc2, blocks=blocks)
+        ident: Tuple[Vec, Vec, Vec] = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        done: List[int] = []
+        hit: Dict[str, List[int]] = {}
+        for n in used:
+            axes = self._local_axes(n) if n in self._transformed else ident
+            if isinstance(axes, str) or not self._ccx_plain_shell_node(n, sections, at):
+                continue
+            nrm = self._ccx_shell_normal(n, at)
+            if nrm is None:
+                continue
+            got = self._rot_finite_lines(n, axes, nrm, list(self._rot_bc_walk(n, cards, acts)), nl, dyns)
+            if isinstance(got, str):
+                hit.setdefault(got, []).append(n)
+            elif got:
+                self._rot_mode[n] = "finite"
+                self._rot_lines.update(got)
+                self._rot_lines_to_pieces(list(got))
+                done.append(n)
+        if done:
+            self.report.note(f"Rotational BCs on {len(done)} shell node(s) (e.g. node {done[0]}) "
+                             f"about two axes at once in an NLGEOM step: written as the angles "
+                             f"ccx 2.23's mean-rotation MPCs hold there (of the shell normal "
+                             f"projected about each axis), those of the normal turned by the "
+                             f"rotation vector the values are in Abaqus (the deck's values read "
+                             f"as such angles are 0.4-6.5 % off at 0.2-0.6 rad; probed). Exact "
+                             f"at the end of each step where they hold all three rotations; with "
+                             f"the rotation about the normal free, Abaqus' normal turns with it "
+                             f"too (second order), which ccx's shell node lacks.", once=True)
+        for why, ns in hit.items():
+            self.report.warn(f"Rotational BCs on {len(ns)} shell node(s) (e.g. node {ns[0]}) about "
+                             f"two axes at once in an NLGEOM step, which Abaqus reads as the "
+                             f"components of the rotation vector: ccx 2.23's mean-rotation MPCs "
+                             f"hold the angles of the shell normal projected about each axis "
+                             f"instead (0.4-6.5 % of max |u| at 0.2-0.6 rad; probed), and the "
+                             f"values cannot be written as those angles here: {why}.")
+            self._reduces("finite shell rotation BCs about two axes read as projected angles")
+
+    def _rot_finite_lines(self, n: int, axes: Tuple[Vec, Vec, Vec], nrm: Vec, walk: list,
+                          nl: set, dyns: set) -> Union[None, str, Dict[Tuple[int, int], List[str]]]:
+        """_rot_lines (card, node) of shell node ``n`` (local ``axes``, normal ``nrm``) whose
+        rotational BC states ``walk`` (_rot_bc_walk) an NLGEOM step (``nl``) reads as ccx's
+        angles otherwise (_plan_shell_finite_rotations); None where none does, why there is
+        no form where one does and cannot.  ``dyns``: the *DYNAMIC steps."""
+        # ccx knots the node in the step that first reads its rotational BCs if that is a
+        # *DYNAMIC one, else in the next *DYNAMIC step: only the NLGEOM states before it
+        read = next((max(s, 1) for _, s, st, _ in walk if st), None)
+        if read is None or read in dyns:
+            return None
+        nxt = min((d for d in dyns if d > read), default=None)
+        dyn = nxt is not None
+        nl = {S for S in nl if nxt is None or S < nxt}
+        e1: Optional[Vec] = None
+        rows = []                       # (card, step, values, counted DOFs, new values)
+        for b, s, st, amp in walk:
+            if isinstance(st, str):
+                rows.append((b, s, None, (), st))
+                continue
+            vals = {j: e[0] for j, e in st.items()}
+            if any(math.isnan(v) for v in vals.values()):
+                return None
+            cnt = [j for j in sorted(vals) if abs(vdot(axes[j - 4], nrm)) <= 0.999]
+            if e1 is None and cnt:      # ccx's e1: the first rotational BC it reads there
+                a = axes[cnt[0] - 4]
+                e1 = vunit(vsub(a, vscale(nrm, vdot(a, nrm))))
+            # (model data's BCs act from step 1 on)
+            new = self._finite_rot_values(vals, axes, nrm, e1, cnt) if max(s, 1) in nl and e1 else None
+            if isinstance(new, dict) and (amp is not None or any(v != 0.0 and a0 is not None
+                                                                 for v, a0, _ in st.values())):
+                new = "a card on an amplitude, which ccx would apply to the angles"
+            rows.append((b, s, vals, cnt, new))
+        if e1 is None:
+            return None
+        carried = False                 # a state carried into an NLGEOM step from a linear one
+        for S in sorted(nl):
+            prev = [r for r in rows if r[1] <= S and r[1] not in self._pert_idx and r[2] is not None]
+            carried |= bool(prev) and max(prev[-1][1], 1) < S and max(prev[-1][1], 1) not in nl and isinstance(
+                self._finite_rot_values(prev[-1][2], axes, nrm, e1, prev[-1][3]), dict)
+        if not carried and not any(isinstance(r[4], dict) for r in rows):
+            return next((r[4] for r in rows if isinstance(r[4], str) and r[2] is not None), None)
+        if dyn:
+            return ("a *DYNAMIC step follows, where ccx makes the node a knot, which would read "
+                    "the angles as the rotation vector")
+        why = next((r[4] for r in rows if isinstance(r[4], str)), None)
+        if why is not None:
+            return why
+        if carried:
+            return "a value given in a geometrically linear step carries on into an NLGEOM one"
+        out: Dict[Tuple[int, int], List[str]] = {}
+        for b, s, vals, cnt, new in rows:
+            got = new if isinstance(new, dict) else vals
+            scale = max([abs(v) for v in vals.values()] + [1e-300])
+            out[(id(b), n)] = [f"{n}, {j}, {j}" + (", " + self._fmt_rot(v, scale) if v != 0.0 else "")
+                               for j, v in sorted(got.items())]
+        return out
+
+    @staticmethod
+    def _finite_rot_values(vals: Dict[int, float], axes: Tuple[Vec, Vec, Vec], nrm: Vec, e1: Vec,
+                           cnt: List[int]) -> Union[None, str, Dict[int, float]]:
+        """The values on local DOFs 4-6 (``vals``, the node's ``axes``, normal ``nrm``) that
+        make ccx's mean-rotation angles about ``e1`` and n x e1 those of the normal turned by
+        the rotation vector ``vals`` (_plan_shell_finite_rotations), the least change on the
+        DOFs ccx counts (``cnt``); None where they hold no full rotation or need no change,
+        why not where the normal turns 90 deg or more."""
+        held = sorted(vals)
+        if not any(vals.values()):
+            return None
+        if len(held) == 2:
+            if abs(vdot(axes[15 - sum(held) - 4], nrm)) <= 0.999 or len(cnt) != 2:
+                return None
+        elif len(held) != 3 or len(cnt) < 2:
+            return None
+        theta: Vec = (0.0, 0.0, 0.0)
+        for j in held:
+            theta = vadd(theta, vscale(axes[j - 4], vals[j]))
+        d = vrotate(theta, nrm)
+        e2 = vcross(nrm, e1)
+        c3 = vdot(d, nrm)
+        if c3 <= 1e-6:
+            return "the shell normal turns 90 deg or more, beyond ccx's mean-rotation MPC"
+        m = {j: (vdot(axes[j - 4], e1), vdot(axes[j - 4], e2)) for j in cnt}
+        r1 = math.atan2(-vdot(d, e2), c3) - sum(vals[j] * m[j][0] for j in cnt)
+        r2 = math.atan2(vdot(d, e1), c3) - sum(vals[j] * m[j][1] for j in cnt)
+        g11, g22 = sum(x * x for x, _ in m.values()), sum(y * y for _, y in m.values())
+        g12 = sum(x * y for x, y in m.values())
+        det = g11 * g22 - g12 * g12
+        if det <= 1e-12:
+            return None
+        y1, y2 = (g22 * r1 - g12 * r2) / det, (g11 * r2 - g12 * r1) / det
+        new = dict(vals)
+        for j in cnt:
+            new[j] += m[j][0] * y1 + m[j][1] * y2
+        scale = max(abs(v) for v in vals.values())
+        return new if any(abs(new[j] - vals[j]) > 1e-9 * scale for j in cnt) else None
 
     # cards that read a node's DOFs in its *TRANSFORM axes, or tie its DOFs to others, which
     # _plan_transformed_corners does not rewrite
@@ -35617,11 +35981,11 @@ class _Loads:
         if hi < 4 or lo > 6:
             return None
         nodes = self._resolve_nodes(spec)
-        planned = [n for n in nodes if self._rot_mode.get(n) in ("global", "refuse", "pair")]
+        planned = [n for n in nodes if self._rot_mode.get(n) in ("global", "refuse", "pair", "finite")]
         if planned:
             # rotations of a transformed shell/beam / kinematic reference node, of a shell node
-            # holding two: the card's lines for them come at its end
-            # (_plan_transformed_rotations, _plan_shell_rotation_pairs)
+            # holding two or turned about two axes: the card's lines for them come at its end
+            # (_plan_transformed_rotations, _plan_shell_rotation_pairs, _plan_shell_finite_rotations)
             self.emit.rot_hit += [n for n in planned if n not in self.emit.rot_hit]
             out = [line(spec, lo, 3)] if lo <= 3 else []
             if hi >= 7:
@@ -42599,7 +42963,7 @@ class _Loads:
         for b in blocks:
             if b.keyword != "CONTACT PAIR" or b.has("TIED"):
                 continue
-            f2f = (b.param("TYPE") or "").replace(" ", "").upper() == "SURFACETOSURFACE"
+            f2f = self._ccx_f2f(b)
             coef = self.CONTACT_MASS_AREA["F2F" if f2f else "N2F"]
             kpen = k_of.get(b.uparam("INTERACTION")) or k_hard
             for rec in merged_data_records(b):
@@ -43407,15 +43771,13 @@ class _Output:
         self._out_contact = {           # the contact ccx gets (_contact_output_issues)
             "abaqus": any(b.keyword in ("CONTACT PAIR", "CONTACT") for b in blocks),
             "pairs": len(pairs),
-            "nts": any(b.uparam("TYPE").replace(" ", "") != "SURFACETOSURFACE"
-                       for b in pairs),
+            "nts": any(not self._ccx_f2f(b) for b in pairs),
             # elements whose expanded nodes only a 3-D .frd (a beam or shell model) holds
             "flat": not frd3d and any(c.startswith(PLANE_ELEM_PREFIXES + ("M3D",))
                                       for c in types.values()),
             "axi": any(c.startswith("CAX") for c in types.values()),
             # (slave, master, face-to-face) of each ccx contact pair, for *CONTACT PRINT
-            "pair_list": [(f[0].strip(), f[1].strip(),
-                           b.uparam("TYPE").replace(" ", "") == "SURFACETOSURFACE")
+            "pair_list": [(f[0].strip(), f[1].strip(), self._ccx_f2f(b))
                           for b in pairs for f in merged_data_records(b) if len(f) > 1 and
                           not {f[0].strip().upper(), f[1].strip().upper()} & set(self._analytic_skipped)]}
         steps = self._step_output_requests(blocks, quiet)
@@ -46267,9 +46629,12 @@ class _PostPasses:
         (probed on one C3D8 against the model turned into the node's axes, the DOF held at the
         value it had reached: 55 % of the peak displacement off at 20 increments a step, 6 % at
         80; axes along permuted global ones 13 %; exact for local axes equal to the global ones,
-        for a BC held from a rest start, driven from it on a ramp (0.1 %) or released).  ccx
+        for a BC held from a rest start, driven from it on a ramp (0.1 %) or released; a
+        cylindrical *TRANSFORM by its axes at the node: one along global y exact, an oblique
+        one 25 % off).  ccx
         starts the extra node that carries such a BC's value from the node's global
-        displacement (bounadd.f).  No exact form is known (the helper node of
+        displacement (bounadd.f), so a local axis along the negative global one of its number
+        is off too (-x 5.0 %, -y 8.7 %; probed).  No exact form is known (the helper node of
         _plan_fixed_helpers is off there too): warned, with reduced physics; FIXED lines that
         planner took (_fixed_unknown) are warned there."""
         cards = deck.cards
@@ -46325,14 +46690,15 @@ class _PostPasses:
         if hits:
             self.report.warn(f"*BOUNDARY on translations of *TRANSFORM nodes, new in implicit *DYNAMIC "
                              f"steps after the node could move ({', '.join(hits[:4])}"
-                             f"{', ...' if len(hits) > 4 else ''}): ccx 2.23 stops a moving DOF along "
-                             f"an axis other than the global one of its number otherwise than along a "
-                             f"global axis (probed on one C3D8 against the model turned into the "
-                             f"node's axes: 55 % of the peak displacement off at 20 increments a step, "
-                             f"6 % at 80, 13 % for axes along permuted global ones). Held from the "
+                             f"{', ...' if len(hits) > 4 else ''}): ccx 2.23 stops a moving DOF whose "
+                             f"local axis is not the positive global axis of its number otherwise than "
+                             f"the model turned into the node's axes (probed on one C3D8: 55 % of the "
+                             f"peak displacement off at 20 increments a step, 6 % at 80, 13 % for axes "
+                             f"along permuted global ones, 5-9 % along negative ones). Held from the "
                              f"start of the analysis instead, it is exact.", once=True)
             self._reduces("*BOUNDARY on a *TRANSFORM translation new in an implicit *DYNAMIC step "
-                          "(ccx 2.23 stops the DOF otherwise than along a global axis)")
+                          "(ccx 2.23 stops the DOF otherwise than along the positive global axis of "
+                          "its number)")
 
     def _warn_strain_free_adds(self, deck: EmittedDeck) -> None:
         """Warn of a *MODEL CHANGE, TYPE=ELEMENT that adds elements strain free (ADD without a
@@ -47275,6 +47641,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._si_cards: Dict[str, List[Block]] = {}     # interaction -> its *SURFACE BEHAVIOR /
         self._card_si: Dict[int, str] = {}             # *GAP CONDUCTANCE cards; card -> it
         self._si_pairs: Dict[str, List[Tuple[str, str]]] = {}   # -> (N2F / F2F, slave)
+        self._n2s_pairs: set = set()        # face-to-face pairs written node-to-surface (_plan_table_pairs)
         # *BOUNDARY on rigid-coupling members (see _plan_coupled_bcs)
         self._bc_drop: Dict[int, set] = {}         # id(*BOUNDARY) -> (node, dof) taken off it
         self._bc_lines: Dict[int, List[List[str]]] = {}   # id(*BOUNDARY) -> its records after that
@@ -47425,6 +47792,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._conn_sets: "OrderedDict[Tuple[str, float], str]" = OrderedDict()
         self._conn_sets_written: set = set()
         self._conn_dashpots: set = set()
+        self._axes_unused: set = set()          # instance-axes *ORIENTATIONs not written (_settle_instance_axes)
         # id(*SPRING / *DASHPOT option of a *JOINT) -> id(that *JOINT); id(card of a *CONNECTOR
         # BEHAVIOR) -> its name; name -> the plans of the sections that use it
         self._joint_cards: Dict[int, int] = {}
@@ -47998,6 +48366,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         blocks = self._blank_periods(blocks)          # before the step model reads the periods
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
         blocks = self._plan_self_contact(blocks)      # before anything reads contact pairs
+        blocks = self._order_gap_conductance(blocks)  # before anything reads interaction cards
         self._plan_deck_facts(blocks)
         self.build_geometry(blocks, imperfect=True)
         blocks = self._split_coupling_refs(blocks)
@@ -48100,6 +48469,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_print_sets(blocks)           # after the mesh planners: their nodes and elements
         self._plan_dashpots(blocks)             # after the planners above: the nodes' *TRANSFORM axes
         self._plan_springs(blocks)              # likewise
+        self._settle_instance_axes(blocks)
         self._warn_linear_nonlinear_springs(blocks)
         self._plan_anisotropic_masses(blocks)   # after _plan_node_classes: the nodes with rotations
         self._plan_free_masses(blocks)          # after it and the planners adding elements above
@@ -48136,13 +48506,15 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_transformed_corners(blocks)      # after it: its 'keep' nodes
         self._plan_shell_rotation_pairs(blocks)     # after both: their 'keep' / 'untr' nodes
+        self._plan_shell_finite_rotations(blocks)   # after it: its 'pair' nodes
         self._plan_beam_section_axes(blocks)        # after them (_untr); may add knot beams
         self._warn_beam_moment_stops(blocks)        # after it: its knot beams
         self._warn_finite_rotations(blocks)         # after every planner adding knot beams
         self._warn_s8r_strips()                     # _plan_s8r_strips' strips
         self._warn_dashpot_steps(blocks)            # after _plan_dashpots: its rows
         self._plan_circ_explicit_increment(blocks)
-        self._plan_rigid_contact_increment(blocks)
+        self._plan_table_pairs(blocks)          # after _plan_base_state_facts: the deck's TYPEs
+        self._plan_rigid_contact_increment(blocks)  # after it: the TYPEs ccx gets
         self._complete_temperature_ic()         # after every planner that adds knot nodes
         self._plan_output(blocks)               # last: it reads the final mesh (knot beams too)
         self._plan_surface_behavior(blocks)
@@ -49884,16 +50256,17 @@ def _turn_instance_dofs(blocks: Sequence[Block], geo, axes: Tuple[Vec, Vec, Vec]
         elif kw == "SPRING" and not b.param("ORIENTATION") and any(
                 (geo.elements.get(e) or ("",))[0].upper() in ("SPRING1", "SPRING2")
                 for e in geo.elset((b.param("ELSET") or "").strip())) and on_local(b, 2) is not True:
+            # (rotational DOFs too: _plan_springs writes them about the ORIENTATION's axes, and
+            # leaves them out on a node without rotations, a solid's)
             nb = _turn_spring_dofs(b, axes)
-            if nb is None and b.data and any(pint(x) > 3 for x in
-                                             trimmed_fields(b.data[0].split(",")) if x):
-                report.warn(f"*INSTANCE {name} is rotated, but the rotational DOFs of its "
-                            f"SPRING1 / SPRING2 elements (*SPRING, ELSET={b.param('ELSET')}) "
-                            f"have no global form: they act about the global axes.", once=True)
-                report.reduce(f"rotational springs of rotated *INSTANCE {name} not turned")
-            elif nb is not b:
+            if nb is not b:
                 out[id(b)] = nb or oriented(b)
-                what.append("SPRING1 / SPRING2 elements")
+                try:
+                    rot_only = all(pint(x) > 3 for x in trimmed_fields(b.data[0].split(",")) if x)
+                except ValueError:
+                    rot_only = False
+                if nb is not None or not rot_only:      # (else Converter._settle_instance_axes)
+                    what.append("SPRING1 / SPRING2 elements")
         elif kw == "MASS" and b.uparam("TYPE").startswith("ANISO") and not b.param("ORIENTATION") and \
                 b.data and len({x.strip() for x in trimmed_fields(b.data[0].split(","))[:3]}) > 1:
             out[id(b)] = oriented(b)                 # (principal axes along the part's: _plan_anisotropic_masses)

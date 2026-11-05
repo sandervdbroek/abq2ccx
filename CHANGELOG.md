@@ -84,6 +84,12 @@ entries. The GitHub release notes use the same section.
   now holds it there: ccx held it where the previous load case left it (in a test cube, off by
   nearly the load case's whole response). A load case's own output requests no longer carry
   into the later load cases, and a card Abaqus does not allow inside a load case is warned.
+* **Fewer ccx failures.** A `*GAP CONDUCTANCE` written before its interaction's `*SURFACE
+  BEHAVIOR` no longer stops ccx: it is written after it.
+* **New `--approximate` form.** Surface-to-surface contact pairs with a `TABULAR` or
+  `EXPONENTIAL` pressure-overclosure law are written node-to-surface. ccx's face-to-face contact
+  carried no force with a `TABULAR` law and did not converge with `EXPONENTIAL`; node-to-surface
+  contact gives Abaqus' force.
 * **New warnings.** Two ccx traps around nodes with a `*TRANSFORM` are now reported: in a
   dynamic step, holding such a node along one of its turned axes after it has started moving
   gives a different motion than in Abaqus (flagged as reduced physics); and in a model with a
@@ -94,6 +100,13 @@ entries. The GitHub release notes use the same section.
   or a rotation constraint: ccx set such a run up as heat transfer alone, with no rotations at
   the shell and beam joints. A heat transfer step is no longer taken for one that turns those
   joints, so such models are no longer flagged for it.
+* **More correct answers.** A rotational spring (`SPRING1` / `SPRING2` on DOFs 4-6) in a part
+  whose instance is rotated now acts about the part's turned axes. It acted about the global axes
+  and was flagged (a beam tip 1.7 times too far); on solid nodes it is left out without the flag.
+
+* **More correct answers.** A rotation prescribed on a shell node about two axes at once in a
+  geometrically nonlinear step now turns the shell as the rotation vector Abaqus reads it.
+  ccx read the same values as other angles: a test strip's turned edge came out 3-7 % off.
 
 ### Details
 
@@ -249,7 +262,11 @@ entries. The GitHub release notes use the same section.
   elements: 1.1547 / 1.0000 / 1.0172 / 1.0000 / 1.0062; in creep, 3 elements bend at 0.97 / 0.94
   times the exact rate at stress exponent 3 / 5). The element the middle crosses is flagged with
   the section's factor (an odd or unequal stack included); a stack whose middle lies between
-  two elements is not. Elements joined through a cohesive layer (`COH3D8` / `COH3D6`) count as
+  two elements is not, and an element of no stack the converter can follow (a branching column,
+  one of no thickness) counts as alone through the thickness. A stack runs on through solid
+  hexes joined face to face, such as a sandwich's core: skins on a soft core carried 1.0005-1.0010
+  of the fully plastic moment and are not flagged. The stack's middle assumes plane sections
+  through the whole stack, not a core so soft that each skin bends about its own middle. Elements joined through a cohesive layer (`COH3D8` / `COH3D6`) count as
   one stack: two `SC8R` bonded by a thin glue layer carried 0.9999 of the fully plastic moment
   and were flagged before (`validate_with_ccx.py sc_stacks`).
 * **Stabilization on `*VISCO` and coupled steps** — `STABILIZE`, `FACTOR`, `ALLSDTOL` and
@@ -351,13 +368,13 @@ entries. The GitHub release notes use the same section.
   load_cases_hold`: the second load case holds node 6's y at 0.02175, both ccx case steps equal
   the hand-written single-case steps (0.0 apart; the old form 2.2e-2 off).
 * **`*TRANSFORM` BC warnings** — in an implicit `*DYNAMIC` step, a `*BOUNDARY` on a translation of
-  a `*TRANSFORM` node whose local axis is not the global one of its number, new after the node
-  could move (after a step that moves the model, not *FREQUENCY steps alone, or with an
-  initial velocity), stops the DOF otherwise than one
-  along a global axis in ccx 2.23: probed on one C3D8, held at the value it had reached, against
-  the model turned into the node's axes, 55 % of the peak displacement off at 20 increments a
-  step, 6 % at 80, 13 % for axes along permuted global ones; exact for local axes equal to the
-  global ones and for a BC held from a rest start, driven from it or released. ccx starts the
+  a `*TRANSFORM` node whose local axis is not the positive global axis of its number, new after
+  the node could move (after a step that moves the model, not *FREQUENCY steps alone, or with
+  an initial velocity), stops the DOF otherwise than the model turned into the node's axes in
+  ccx 2.23: probed on one C3D8, held at the value it had reached, 55 % of the peak displacement
+  off at 20 increments a step, 6 % at 80, 13 % for axes along permuted global ones, 5-9 % along
+  negative ones; exact for local axes equal to the global ones and for a BC held from a rest
+  start, driven from it or released. ccx starts the
   extra node that carries the BC's value from the node's global displacement (bounadd.f); no
   exact form is known (the helper node form is off there too). Warned, reduced physics.
   `*BOUNDARY, OP=NEW` in a deck with a `*KINEMATIC` coupling and any `*TRANSFORM` stops ccx
@@ -383,6 +400,45 @@ entries. The GitHub release notes use the same section.
   heat step). `validate_with_ccx.py shell_knot_limits knot_heat`: a strip off the axes with
   heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
   without knots (before: ccx stopped).
+
+* **Rotational springs in rotated instances** — a part's `SPRING1` / `SPRING2` on DOFs 4-6 whose
+  turned DOFs have no global form (an axis along no global one, a `SPRING2` whose two axes turn
+  to opposite senses, a nonlinear spring whose axis turns to its opposite) now gets the
+  instance's axes (`ORIENTATION=`), as translational ones already did, and the converter writes
+  it about them (the rotational spring form takes an orientation's axes): exact. It was left
+  about the global axes with a warning and reduced physics, also on solid nodes, where it is
+  left out exactly; there neither the instance's axes nor a note that it is turned is written now
+  (`validate_with_ccx.py spring_rotated_instance`: tips 0.01156509 / 0.002013496 in instances
+  turned 30 degrees about z and 40 about (1, 1, 1), as unturned; before 0.01997954 / 0.001319979
+  at 30 degrees).
+* **Finite shell rotation BCs** — Abaqus/Standard reads a shell node's rotational BCs in an
+  NLGEOM step as the components of its total rotation vector; at a shell node that is no knot
+  ccx 2.23 holds, by two mean-rotation MPCs, the angles of the shell normal projected about the
+  first BC's axis e1 and about n x e1. The same to first order; about two axes at once the
+  edge of a strip turned (0.1, 0.2, 0) came out 0.4 % of max |u| off, (-0.5, 0.25, 0) 6.5 %.
+  Where a step's BCs hold all three rotations, or the two off the normal, the values are now
+  written as the angles of the normal turned by that rotation vector: exact at the end of each
+  step where all three are held (ccx ramps the angles, so the path in between differs a
+  little); with the rotation about the normal free, to first order (Abaqus' normal turns with
+  it too, which ccx's shell node lacks). On an amplitude, before a `*DYNAMIC` step (where ccx
+  makes the node a knot, which reads the values as Abaqus does) or carried on from a linear
+  step, warned as reduced physics.
+  `validate_with_ccx.py shell_finite_rotation`: a cantilever's tip turned by (0.3, -0.4, 0),
+  also off the global axes, as through a rotation-only coupling (3e-7, 5e-7; before 3 %, 7 %).
+* **`*GAP CONDUCTANCE` card order** — Abaqus takes an interaction's cards in any order; ccx
+  stops on a `*GAP CONDUCTANCE` before the interaction's `*SURFACE BEHAVIOR` ("should be preceded
+  by a *SURFACE BEHAVIOR card"). Such cards are now written right after the `*SURFACE BEHAVIOR`
+  (a note says so). `validate_with_ccx.py contact_property_tables gap_conductance_first`: heat
+  flux 49.75124 across two pressed cubes, Abaqus' 100 / (2 + 1/100) (ccx stopped before).
+* **Face-to-face TABULAR / EXPONENTIAL contact under `--approximate`** — ccx's surface-to-surface
+  contact reads no `TABULAR` table (no contact force) and only its own exponential law; its
+  node-to-surface contact reads both. Where a `SURFACE TO SURFACE` pair's interaction has such a
+  law (other than a `TABULAR` line through the origin, written as `LINEAR` exactly),
+  `--approximate` writes every surface-to-surface pair `NODE TO SURFACE` ([APPROX]; ccx takes
+  one `TYPE` for all pairs), except where a self-contact pair needs surface-to-surface contact.
+  Without the option the warning names it. `validate_with_ccx.py contact_property_tables
+  contact_tabular_s2s_approx` / `contact_exponential_s2s_approx`: 754.67 for Abaqus' 754.72 (was
+  0) and 431.20 for 431.41 (ccx's own law did not converge).
 
 ## 1.7.0 (November 2026)
 
