@@ -80,6 +80,10 @@ entries. The GitHub release notes use the same section.
   now holds it there: ccx held it where the previous load case left it (in a test cube, off by
   nearly the load case's whole response). A load case's own output requests no longer carry
   into the later load cases, and a card Abaqus does not allow inside a load case is warned.
+* **New warnings.** Two ccx traps around nodes with a `*TRANSFORM` are now reported: in a
+  dynamic step, holding such a node along one of its turned axes after it has started moving
+  gives a different motion than in Abaqus (flagged as reduced physics); and in a model with a
+  kinematic coupling, ccx stops at a `*BOUNDARY, OP=NEW`.
 
 * **Fewer ccx failures.** A model with a heat transfer step whose other steps are only
   frequency, buckling or modal steps no longer stops ccx where shells or beams carry a moment
@@ -328,6 +332,21 @@ entries. The GitHub release notes use the same section.
   warned (Abaqus rejects it) and kept as that case's own. `validate_with_ccx.py review1
   load_cases_hold`: the second load case holds node 6's y at 0.02175, both ccx case steps equal
   the hand-written single-case steps (0.0 apart; the old form 2.2e-2 off).
+* **`*TRANSFORM` BC warnings** — in an implicit `*DYNAMIC` step, a `*BOUNDARY` on a translation of
+  a `*TRANSFORM` node whose local axis is not the global one of its number, new after the node
+  could move (after a step that moves the model, not *FREQUENCY steps alone, or with an
+  initial velocity), stops the DOF otherwise than one
+  along a global axis in ccx 2.23: probed on one C3D8, held at the value it had reached, against
+  the model turned into the node's axes, 55 % of the peak displacement off at 20 increments a
+  step, 6 % at 80, 13 % for axes along permuted global ones; exact for local axes equal to the
+  global ones and for a BC held from a rest start, driven from it or released. ccx starts the
+  extra node that carries the BC's value from the node's global displacement (bounadd.f); no
+  exact form is known (the helper node form is off there too). Warned, reduced physics.
+  `*BOUNDARY, OP=NEW` in a deck with a `*KINEMATIC` coupling and any `*TRANSFORM` stops ccx
+  2.23 ('*ERROR reading *BOUNDARY'): it registers the coupling's reference-rotation equations
+  under DOFs 4-6 but writes their first terms on 5-7 (couplings.f), and OP=NEW re-indexes the
+  equations by their first terms when the deck has a `*TRANSFORM` (probed: the `*TRANSFORM` on
+  the reference node, a coupled node or an unconnected one, OP=NEW in step 1 or later). Warned.
 
 * **Heat transfer runs with eigenvalue steps** — ccx 2.23 decides from the procedure cards
   alone, before any step, whether a run is mechanical: a `*HEAT TRANSFER` card with no
