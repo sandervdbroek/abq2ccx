@@ -84,6 +84,12 @@ entries. The GitHub release notes use the same section.
   now holds it there: ccx held it where the previous load case left it (in a test cube, off by
   nearly the load case's whole response). A load case's own output requests no longer carry
   into the later load cases, and a card Abaqus does not allow inside a load case is warned.
+* **Fewer ccx failures.** A `*GAP CONDUCTANCE` written before its interaction's `*SURFACE
+  BEHAVIOR` no longer stops ccx: it is written after it.
+* **New `--approximate` form.** Surface-to-surface contact pairs with a `TABULAR` or
+  `EXPONENTIAL` pressure-overclosure law are written node-to-surface. ccx's face-to-face contact
+  carried no force with a `TABULAR` law and did not converge with `EXPONENTIAL`; node-to-surface
+  contact gives Abaqus' force.
 * **New warnings.** Two ccx traps around nodes with a `*TRANSFORM` are now reported: in a
   dynamic step, holding such a node along one of its turned axes after it has started moving
   gives a different motion than in Abaqus (flagged as reduced physics); and in a model with a
@@ -383,6 +389,21 @@ entries. The GitHub release notes use the same section.
   heat step). `validate_with_ccx.py shell_knot_limits knot_heat`: a strip off the axes with
   heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
   without knots (before: ccx stopped).
+
+* **`*GAP CONDUCTANCE` card order** — Abaqus takes an interaction's cards in any order; ccx
+  stops on a `*GAP CONDUCTANCE` before the interaction's `*SURFACE BEHAVIOR` ("should be preceded
+  by a *SURFACE BEHAVIOR card"). Such cards are now written right after the `*SURFACE BEHAVIOR`
+  (a note says so). `validate_with_ccx.py contact_property_tables gap_conductance_first`: heat
+  flux 49.75124 across two pressed cubes, Abaqus' 100 / (2 + 1/100) (ccx stopped before).
+* **Face-to-face TABULAR / EXPONENTIAL contact under `--approximate`** — ccx's surface-to-surface
+  contact reads no `TABULAR` table (no contact force) and only its own exponential law; its
+  node-to-surface contact reads both. Where a `SURFACE TO SURFACE` pair's interaction has such a
+  law (other than a `TABULAR` line through the origin, written as `LINEAR` exactly),
+  `--approximate` writes every surface-to-surface pair `NODE TO SURFACE` ([APPROX]; ccx takes
+  one `TYPE` for all pairs), except where a self-contact pair needs surface-to-surface contact.
+  Without the option the warning names it. `validate_with_ccx.py contact_property_tables
+  contact_tabular_s2s_approx` / `contact_exponential_s2s_approx`: 754.67 for Abaqus' 754.72 (was
+  0) and 431.20 for 431.41 (ccx's own law did not converge).
 
 ## 1.7.0 (November 2026)
 
