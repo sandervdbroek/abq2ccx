@@ -6994,6 +6994,24 @@ def spring_rotation_beam_deck(twin=False):
                   "*NODE PRINT, NSET=TIPS\nU\n*END STEP\n")
 
 
+def spring_rotated_instance_deck(angle):
+    """spring_rotation_beam_deck's first two cantilevers in a part (tip 5 on a SPRING1 of 1 on
+    its DOF 5, tips 5 and 15 joined by a SPRING2 of 1 on DOFs 5, 5), in an instance turned
+    ``angle`` degrees about z, tip 5 pushed 0.01 along z: the same tips at any angle (the
+    springs act about the part's y axis, which turns with the instance)."""
+    nodes = "".join(f"{10 * b + i + 1}, {0.25 * i:g}, {b}., 0.\n" for b in range(2) for i in range(5))
+    els = "".join(f"{10 * b + i + 1}, {10 * b + i + 1}, {10 * b + i + 2}\n" for b in range(2) for i in range(4))
+    turn = f"0., 0., 0.\n0., 0., 0., 0., 0., 1., {angle:g}\n" if angle else ""
+    return ("*Part, name=P\n*Node\n" + nodes + "*Element, type=B31, elset=BEAMS\n" + els +
+            "*Element, type=SPRING1, elset=KR1\n31, 5\n*Spring, elset=KR1\n5\n1.\n"
+            "*Element, type=SPRING2, elset=KR2\n32, 5, 15\n*Spring, elset=KR2\n5, 5\n1.\n"
+            "*Beam Section, elset=BEAMS, material=STEEL, section=RECT\n0.1, 0.1\n0., 0., 1.\n"
+            "*Nset, nset=TIPS\n5, 15\n*Nset, nset=ROOTS\n1, 11\n*End Part\n*Assembly, name=A\n"
+            "*Instance, name=I, part=P\n" + turn + "*End Instance\n*End Assembly\n*Material, name=STEEL\n"
+            "*Elastic\n1.e4, 0.3\n*Boundary\nI.ROOTS, ENCASTRE\n*Step\n*Static\n*Cload\nI.5, 3, 0.01\n"
+            "*Node Print, nset=I.TIPS\nU\n*End Step\n")
+
+
 def spring_rotation_ref_deck():
     """A C3D8 unit cube as a *RIGID BODY on reference node 100 at its centre, and a second one
     whose nodes a kinematic coupling (*COUPLING, *KINEMATIC 1-3) ties to reference node 200 at
@@ -20957,6 +20975,27 @@ def check_connector_large_motion(ccx, env, tmp, shared):
             print(f"FAIL  connector_large_{kind}: {runs}")
         failures += 0 if ok else 1
     return failures
+
+
+@check("spring_rotated_instance", "rotational springs of a part in an instance turned 30 degrees")
+def check_spring_rotated_instance(ccx, env, tmp, shared):
+    # the part's DOF 5 lies along no global axis in the turned instance: the springs act about
+    # the instance's axes (before: warned, about the global y axis: tips 0.01998 / 0.00132)
+    review_run = shared["review_run"]
+    runs = [review_run(spring_rotated_instance_deck(a), f"spring_rotated_instance_{a}", dat_displacements)
+            for a in (0, 30)]
+    ok = all(runs) and all(n in r for r in runs for n in (5, 15))
+    if ok:
+        ref, got = ([r[n][2] for n in (5, 15)] for r in runs)
+        err = max(abs(a - b) for a, b in zip(got, ref)) / max(abs(x) for x in ref)
+        ok = err < 1e-9 and got[1] > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  spring_rotated_instance (B31 tips on a rotational SPRING1 and "
+              f"SPRING2 about the part's y axis, the instance turned 30 degrees about z): tips "
+              f"{got[0]:.7g}, {got[1]:.7g}, the unturned instance's {ref[0]:.7g}, {ref[1]:.7g} "
+              f"({err:.1e} off; the second beam moves through the SPRING2 alone)")
+    else:
+        print(f"FAIL  spring_rotated_instance: {runs}")
+    return 0 if ok else 1
 
 
 @check("spring_dofs_masses",

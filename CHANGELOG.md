@@ -90,6 +90,9 @@ entries. The GitHub release notes use the same section.
   or a rotation constraint: ccx set such a run up as heat transfer alone, with no rotations at
   the shell and beam joints. A heat transfer step is no longer taken for one that turns those
   joints, so such models are no longer flagged for it.
+* **More correct answers.** A rotational spring (`SPRING1` / `SPRING2` on DOFs 4-6) in a part
+  whose instance is rotated now acts about the part's turned axes. It acted about the global axes
+  and was flagged (a beam tip 1.7 times too far); on solid nodes it is left out without the flag.
 
 ### Details
 
@@ -365,6 +368,14 @@ entries. The GitHub release notes use the same section.
   heat step). `validate_with_ccx.py shell_knot_limits knot_heat`: a strip off the axes with
   heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
   without knots (before: ccx stopped).
+
+* **Rotational springs in rotated instances** — a part's `SPRING1` / `SPRING2` on DOFs 4-6 whose
+  turned axis lies along no global one now gets the instance's axes (`ORIENTATION=`), as
+  translational ones already did, and the converter writes it about them (the rotational spring
+  form takes an orientation's axes): exact. It was left about the global axes with a warning and
+  reduced physics, also on solid nodes, where it is left out exactly (`validate_with_ccx.py
+  spring_rotated_instance`: tips 0.01156509 / 0.002013496 in a 30-degree instance, as unturned;
+  before 0.01997954 / 0.001319979).
 
 ## 1.7.0 (November 2026)
 

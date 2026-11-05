@@ -49776,14 +49776,10 @@ def _turn_instance_dofs(blocks: Sequence[Block], geo, axes: Tuple[Vec, Vec, Vec]
         elif kw == "SPRING" and not b.param("ORIENTATION") and any(
                 (geo.elements.get(e) or ("",))[0].upper() in ("SPRING1", "SPRING2")
                 for e in geo.elset((b.param("ELSET") or "").strip())) and on_local(b, 2) is not True:
+            # (rotational DOFs too: _plan_springs writes them about the ORIENTATION's axes, and
+            # leaves them out on a node without rotations, a solid's)
             nb = _turn_spring_dofs(b, axes)
-            if nb is None and b.data and any(pint(x) > 3 for x in
-                                             trimmed_fields(b.data[0].split(",")) if x):
-                report.warn(f"*INSTANCE {name} is rotated, but the rotational DOFs of its "
-                            f"SPRING1 / SPRING2 elements (*SPRING, ELSET={b.param('ELSET')}) "
-                            f"have no global form: they act about the global axes.", once=True)
-                report.reduce(f"rotational springs of rotated *INSTANCE {name} not turned")
-            elif nb is not b:
+            if nb is not b:
                 out[id(b)] = nb or oriented(b)
                 what.append("SPRING1 / SPRING2 elements")
         elif kw == "MASS" and b.uparam("TYPE").startswith("ANISO") and not b.param("ORIENTATION") and \
