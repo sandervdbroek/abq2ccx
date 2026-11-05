@@ -25597,6 +25597,13 @@ def test_transform_bc_warnings_dynamic_stops_and_kinematic_op_new():
     assert "*KINEMATIC" in body and stop in rep.text()
     body, conv, rep = convert_str(VEL_HEX + kin + steps)
     assert "*KINEMATIC" in body and stop not in rep.text()
+    # a cylindrical *TRANSFORM: the axes at the node decide (probed in ccx against the model
+    # turned into them): local u1 is oblique there, warned; local u2 is global y, exact, quiet
+    cyl = FIXED_TR_HEX.replace("*Transform, nset=N7\n", "*Transform, nset=N7, type=C\n")
+    body, conv, rep = convert_str(cyl + dyn.replace("7, 2, 2, 0.01", "7, 1, 1, 0.01"))
+    assert "(node 7 DOF 1 (step 2))" in rep.text() and flag in conv.reduced_physics
+    body, conv, rep = convert_str(cyl + dyn)
+    assert "*TRANSFORM, NSET=N7, TYPE=C" in body and flag not in conv.reduced_physics
 
 
 def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
