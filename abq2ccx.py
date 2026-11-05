@@ -15290,19 +15290,25 @@ class _Mesh:
         points give 0.98.  Probed on 2.23 (a strip, b = t, in 4-point bending): plastic SC8R
         carries 1.15 times its limit load, elastic to the end; creeping S8R and SC8R bend at
         0.705 / 0.52 times the exact rate, linear creep (n = 1) exactly.  Continuum shells
-        stacked two or more through the thickness (one's top face another's bottom) are not
-        flagged: their solids give 4 or more Gauss points through it, the fully plastic moment
-        exactly (code review: C3D8I in pure bending, 1 / 2 / 4 elements: 1.1547 / 1.0000 /
-        1.0000 times it).  Reduced physics, unless the deck asks for as many Gauss points as ccx
-        takes (SECTION INTEGRATION=GAUSS).  After the planners that retype the shells
+        stacked through the thickness (one's top face another's bottom, or a cohesive layer's
+        between them: _sc_stack_middles) are flagged only where the middle of the stack crosses
+        one: 2 Gauss points integrate the fully plastic |z| exactly in an element on one side of
+        the middle, so a stack of k equal elements carries 1 + 0.155 / k^2 times the fully
+        plastic moment for odd k (the middle one's points), exactly for even k (probed: C3D8I in
+        pure bending, 1 / 2 / 3 / 4 / 5 elements: 1.1547 / 1.0000 / 1.0172 / 1.0000 / 1.0062;
+        a plate 4 thicknesses wide in 4-point bending, 1 / 2 / 3: 1.155 / 1.000 / 1.017 of its
+        plane-strain limit; two SC8R bonded by a thin cohesive layer of a soft material: 0.9999),
+        and creeps at 0.97 / 0.94 times the exact rate at stress exponent 3 / 5 for 3 (section
+        theory; within 1.2 % for even k).  Reduced physics, unless the deck asks for as many
+        Gauss points as ccx takes (SECTION INTEGRATION=GAUSS).  After the planners that retype the shells
         (_plan_s4r_shells, _plan_s3_shells): the points of the shells as written."""
         plastic = self._plastic_materials(blocks) if self._steps_can_yield(blocks) else set()
         creeping = self._nonlinear_creep_materials(blocks)
         if not (plastic or creeping):
             return
         sheet: List[Tuple[str, Dict[str, int], str]] = []
-        cont: List[Tuple[str, int, str, str]] = []
-        stacked: Optional[set] = None
+        cont: List[Tuple[str, int, str, str, float]] = []
+        middles: Optional[Dict[int, float]] = None
         for b in blocks:
             mat = b.uparam("MATERIAL")
             elset = (b.param("ELSET") or "").strip()
@@ -15316,11 +15322,12 @@ class _Mesh:
                 npts = 3 if gauss else 5
             rule = f"{npts} {'Gauss' if gauss else 'Simpson'}"
             if self._continuum_shell_elset(elset):
-                if stacked is None:
-                    stacked = self._stacked_continuum_shells(blocks)
-                single = [e for e in self._existing(elset) if e not in stacked]
+                if middles is None:
+                    middles = self._sc_stack_middles(blocks)
+                single = [e for e in self._existing(elset) if e in middles]
                 if single and not (gauss and npts == 2):
-                    cont.append((elset, len(single), rule, "plastic" if mat in plastic else "creeping"))
+                    cont.append((elset, len(single), rule, "plastic" if mat in plastic else "creeping",
+                                 max(middles[e] for e in single)))
                 continue
             if mat in plastic:
                 continue                            # (_plan_plastic_shells)
@@ -15361,37 +15368,100 @@ class _Mesh:
                           "brick's Gauss points, not at the section's points)")
         if cont:
             what = " or ".join(sorted({r[3] for r in cont}, reverse=True))
+            worst = max(r[4] for r in cont if r[3] == "plastic") if "plastic" in what else 0.0
             self.report.warn(f"Continuum shells (SC6R / SC8R) of a {what} material ({len(cont)} "
-                             f"section(s): {sets(cont)}; {sum(r[1] for r in cont)} elements, one "
-                             f"through the thickness): ccx 2.23 "
-                             f"runs each as one C3D8I / C3D6 solid through the thickness, integrated "
+                             f"section(s): {sets(cont)}; {sum(r[1] for r in cont)} elements that the "
+                             f"middle of the thickness crosses: alone through it, or in a stack of "
+                             f"an odd number of equal ones or of unequal ones): ccx 2.23 "
+                             f"runs each as one C3D8I / C3D6 solid through its thickness, integrated "
                              f"at 2 Gauss points there, Abaqus at the section's "
                              f"{' / '.join(sorted({r[2] for r in cont}))} points, so in bending they "
                              f"part: "
-                             + ("plastic, 2 Gauss points stay elastic up to 1.73 times the first-"
-                                "yield moment and carry 1.155 times the fully plastic one (probed: a "
-                                "strip in 4-point bending reaches 1.15 times its limit load)"
-                                if "plastic" in what else "")
+                             + (f"plastic, the section carries {worst:.4g} times the fully plastic "
+                                f"moment here (one element through the thickness 1.155, elastic up to "
+                                f"1.73 times the first-yield moment; the middle one of 3 / 5 equal "
+                                f"ones 1.017 / 1.006; probed: a strip in 4-point bending reaches 1.15 "
+                                f"times its limit load)" if "plastic" in what else "")
                              + ("; creeping, " if what == "plastic or creeping" else "")
-                             + (creep_why if "creeping" in what else "") + "; stretched, they agree.")
+                             + (creep_why + " (the middle one of 3 equal ones: 0.97 / 0.94)"
+                                if "creeping" in what else "")
+                             + "; stretched, they agree. A stack with an even number of equal "
+                               "elements through the thickness avoids it.")
             self._reduces(f"{what} continuum shells SC6R / SC8R (ccx 2.23 integrates them through the "
                           f"thickness at 2 Gauss points, not at the section's points)")
 
-    def _stacked_continuum_shells(self, blocks: List[Block]) -> set:
-        """The continuum shells (SC6R / SC8R) whose bottom or top face (_sc_stack_faces, by
-        their section's stacking) is another continuum shell's: two or more through the
-        thickness."""
+    def _sc_stack_middles(self, blocks: List[Block]) -> Dict[int, float]:
+        """The continuum shells (SC6R / SC8R of a *SHELL SECTION) the middle of their stack's
+        thickness crosses -> the fully plastic moment of that stack with the element's 2 Gauss
+        points through its thickness, over the exact one (_flag_inelastic_shells).  A stack is
+        a column of such elements through the thickness, each one's top face (_sc_stack_faces,
+        by its section's stacking) the next one's bottom face, or joined through a cohesive
+        element's (COH3D*, a *COHESIVE SECTION's stacking: two SC8R bonded by a glue layer are
+        one stack), each element as thick as its faces lie apart.  An element alone through
+        the thickness: 2 / sqrt(3); the middle one of k equal ones: 1 + 0.155 / k^2; where the
+        middle lies at a face between two elements, none.  A branching column (a face of three
+        elements) leaves its elements out."""
+        P = self.geom.nodes
         sec: Dict[int, Block] = {}
         for b in blocks:
-            if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION"):
+            if b.keyword in ("SHELL SECTION", "SHELL GENERAL SECTION", "COHESIVE SECTION"):
                 for e in self.geom.elset((b.param("ELSET") or "").strip()):
                     sec[e] = b
-        faces: Dict[frozenset, List[int]] = {}
+        cells: Dict[int, Tuple[frozenset, frozenset, float]] = {}
         for e, (typ, conn) in self.geom.elements.items():
-            if typ.upper() in PLY_SOLID and e in sec:
-                for f in self._sc_stack_faces(sec[e], list(conn)):
-                    faces.setdefault(frozenset(f), []).append(e)
-        return {e for es in faces.values() if len(es) > 1 for e in es}
+            t = typ.upper()
+            b = sec.get(e)
+            if b is None or len(conn) not in (6, 8) or any(n not in P for n in conn) or not (
+                    (t in PLY_SOLID and b.keyword != "COHESIVE SECTION") or
+                    (t.startswith("COH3D") and b.keyword == "COHESIVE SECTION")):
+                continue
+            bot, top = self._sc_stack_faces(b, list(conn))
+            n, _c = self._stack_geometry(bot, top)
+            h = sum(vdot(vsub(P[y], P[x]), n) for x, y in zip(bot, top)) / len(bot)
+            cells[e] = (frozenset(bot), frozenset(top), max(h, 0.0))
+        faces: Dict[frozenset, List[int]] = {}
+        for e, (bot, top, _h) in cells.items():
+            faces.setdefault(bot, []).append(e)
+            faces.setdefault(top, []).append(e)
+        out: Dict[int, float] = {}
+        seen: set = set()
+        for start in cells:
+            if start in seen:
+                continue
+            column, todo, ok = [], [start], True        # the column: its elements, linked by faces
+            while todo:
+                e = todo.pop()
+                if e in seen:
+                    continue
+                seen.add(e)
+                column.append(e)
+                for f in cells[e][:2]:
+                    if len(faces[f]) > 2:
+                        ok = False
+                    todo += [x for x in faces[f] if x not in seen]
+            ends = [e for e in column if sum(len(faces[f]) == 1 for f in cells[e][:2]) >= 1]
+            if not ok or len(ends) not in (1, 2) or (len(column) > 1 and len(ends) != 2):
+                continue                                # (branching or closed: left out)
+            order, prev, e = [], None, ends[0]
+            while e is not None:
+                order.append(e)
+                nxt = [x for f in cells[e][:2] for x in faces[f] if x != e and x != prev]
+                prev, e = e, (nxt[0] if nxt else None)
+            total = sum(cells[x][2] for x in order)
+            if not total > 0.0:
+                continue
+            mid, z, tol = 0.5 * total, 0.0, 1e-6 * total
+            for x in order:
+                z0, z = z, z + cells[x][2]
+                if z0 + tol < mid < z - tol:
+                    if self.geom.elements[x][0].upper() in PLY_SOLID:
+                        h = z - z0
+                        zc, g = 0.5 * (z0 + z) - mid, h / (2.0 * math.sqrt(3.0))
+                        gauss = 0.5 * h * (abs(zc - g) + abs(zc + g))
+                        exact = 0.5 * ((mid - z0) ** 2 + (z - mid) ** 2)
+                        out[x] = 1.0 + (gauss - exact) / (total * total / 4.0)
+                    break
+        return out
 
     def _plan_quadratic_shells(self, blocks: List[Block]) -> None:
         """Composite shells ccx cannot run -> the quadratic shells it can.  ccx 2.23 reads
@@ -45069,6 +45139,61 @@ class _PostPasses:
                              once=True)
         return deck.edited()
 
+    # the procedure cards from which ccx 2.23 tells a mechanical run (readinput.c), the
+    # eigenvalue procedures that take a *STATIC card ahead of their own unchanged (probed)
+    _RUN_MECHANICAL = ("STATIC", "VISCO", "DYNAMIC")
+    _RUN_COUPLED = ("COUPLED TEMPERATURE-DISPLACEMENT", "UNCOUPLED TEMPERATURE-DISPLACEMENT",
+                    "ELECTROMAGNETICS")
+
+    def _mechanical_run_type(self, deck: EmittedDeck) -> EmittedDeck:
+        """ccx 2.23 sets a run up as heat transfer alone, before any step, when its keyword lines
+        hold a *HEAT TRANSFER card and no *STATIC, *VISCO or *DYNAMIC card after it (nor one
+        anywhere with initial temperatures) or coupled step: *FREQUENCY, *BUCKLE and the modal
+        procedures do not count (readinput.c, ithermal(2) = 2).  Its shell and beam knots then
+        get no rotational DOFs (gen3dnor: rig = -1), and ccx stops on a rotational BC, moment
+        or equation on one ('*ERROR in gen3dboun / gen3dforc / gen3dmpc: ... the elements to
+        which this node belongs do not have rotational DOFs'; probed on the converter's knot
+        beams and drilling holds, and on a *RIGID BODY of knotted shell nodes).  ccx runs a
+        step's last procedure card, so a *STATIC card right before the first *FREQUENCY or
+        *BUCKLE card after the first *HEAT TRANSFER card makes the run mechanical too and the
+        step what it was (probed: the same eigenvalues and buckling factors to every digit).
+        Without such a step, a warning."""
+        state, init, heat = 0, False, None
+        for c in deck.cards:
+            kw = c.keyword
+            if kw == "INITIAL CONDITIONS" and c.uparam("TYPE") == "TEMPERATURE":
+                init = True
+            elif kw in self._RUN_MECHANICAL:
+                state = (1 if init else 0) if state == 0 else 3 if state == 2 else state
+            elif kw == "HEAT TRANSFER":
+                state, heat = state + 2 if state < 2 else state, heat or c
+            elif kw in self._RUN_COUPLED:
+                state = 3
+        mech = [s for s in deck.steps if s.proc is not None and s.proc.keyword in self._EIGEN_PROCS]
+        if state != 2 or not mech:
+            return deck
+        at = next((s.proc for s in deck.steps if s.proc is not None and s.proc.index > heat.index
+                   and s.proc.keyword in ("FREQUENCY", "BUCKLE")), None)
+        if at is None:
+            self.report.warn(f"ccx 2.23 sets this run up as a heat transfer analysis (its procedure "
+                             f"cards hold *HEAT TRANSFER and no *STATIC, *VISCO or *DYNAMIC after it; "
+                             f"step(s) {', '.join(str(s.number) for s in mech)} do not count): shell and "
+                             f"beam knots get no rotational DOFs there, and ccx stops on a rotational "
+                             f"BC, moment or equation on one. Put a *FREQUENCY or *BUCKLE step after "
+                             f"the first *HEAT TRANSFER step.", once=True)
+            return deck
+        deck.insert_before(at, ["** abq2ccx: *STATIC ahead of the step's own procedure (ccx runs the "
+                                "last one): it makes ccx set the run up as a mechanical one too",
+                                "*STATIC"])
+        self.report.note(f"*STATIC written ahead of step {at.step}'s *{at.keyword} card: ccx 2.23 sets a "
+                         f"run up as heat transfer alone where its procedure cards hold *HEAT TRANSFER "
+                         f"and no *STATIC, *VISCO or *DYNAMIC after it (*FREQUENCY and the modal "
+                         f"procedures do not count), and then gives shell and beam knots no rotational "
+                         f"DOFs: it stops on a rotational BC, moment or equation on one (probed). ccx "
+                         f"runs the step's last procedure card, so the step is what it was (probed: "
+                         f"the same eigenvalues and buckling factors).", once=True)
+        return deck.edited()
+
     def _no_analysis_segfaults(self, deck: EmittedDeck) -> EmittedDeck:
         """The first step ccx stops at (*NO ANALYSIS: _no_analysis) in a deck with a material
         card of NO_ANALYSIS_SEGFAULTS, on which ccx 2.23 segfaults there: as the first step it
@@ -46045,11 +46170,14 @@ class _PostPasses:
         if not eig or not self._mechanical:
             return
         hit = self._knot_mpc_dependents(blocks, deck)
-        gauged = [n for n in self._knot_gauges if n not in hit]
+        # (a *HEAT TRANSFER step turns no knot: a gauge stays exact after it, probed)
+        g_first, g_why, g_eig = self._eigen_after_solver(heat=False)
+        gauged = [n for n in self._knot_gauges if n not in hit] if g_eig else []
         procs = dedup(f"*{self.steps.steps[s - 1].proc}" for s in eig)
         if gauged:
-            self.report.warn(f"{' / '.join(procs)} step(s) {', '.join(map(str, eig))} after step {first} "
-                             f"({why}, which ccx 2.23 runs through its nonlinear solver), with "
+            g_procs = dedup(f"*{self.steps.steps[s - 1].proc}" for s in g_eig)
+            self.report.warn(f"{' / '.join(g_procs)} step(s) {', '.join(map(str, g_eig))} after step "
+                             f"{g_first} ({g_why}, which ccx 2.23 runs through its nonlinear solver), with "
                              f"{len(gauged)} knot(s) of the converter's knot beams on shell nodes whose "
                              f"normal is off the global axes (e.g. node {gauged[0]}), held about the "
                              f"normal by a *BOUNDARY on a global rotation: once the knot has turned, ccx "
@@ -46059,7 +46187,7 @@ class _PostPasses:
                              f"(probed: a strip bent 0.45 rad, its frequencies squared 0.3-1.0 % low, a "
                              f"steady-state response 3 % off). Those eigenvalues, modes and later linear "
                              f"results are not the deck's; the steps before are exact. Run those steps "
-                             f"before step {first}, or in an analysis of their own.", once=True)
+                             f"before step {g_first}, or in an analysis of their own.", once=True)
             self._reduces("knot drilling holds off the global axes wrong in the eigenvalue / modal "
                           "steps after a step ccx runs through its nonlinear solver")
         if not hit:
@@ -46120,6 +46248,91 @@ class _PostPasses:
     _CCX_NONLINEAR_MATERIAL_CARDS = frozenset((
         "PLASTIC", "CREEP", "HYPERELASTIC", "HYPERFOAM", "DEFORMATION PLASTICITY", "MOHR COULOMB",
         "MOHR COULOMB HARDENING", "RATE DEPENDENT", "USER MATERIAL"))
+
+    def _warn_transform_bc_traps(self, deck: EmittedDeck) -> None:
+        """Warn of two ccx 2.23 traps around *TRANSFORM nodes, read on the converted deck (after
+        every pass that writes *BOUNDARY, before _fixed_helper_nodes moves lines to helpers).
+
+        *KINEMATIC: every *KINEMATIC coupling registers the equations that tie its reference
+        node's rotations under DOFs 4-6 but writes their first terms on DOFs 5-7 (couplings.f);
+        in a deck with any *TRANSFORM, *BOUNDARY, OP=NEW re-indexes all equations by their
+        first terms (boundarys.f) and stops there, '*ERROR reading *BOUNDARY' (probed: the
+        *TRANSFORM on the reference node, a coupled node or an unconnected one, with or without
+        BCs on the reference node, OP=NEW in step 1 or later; without a *TRANSFORM it runs).
+
+        Implicit *DYNAMIC: a BC on a translation of a *TRANSFORM node whose local axis is not
+        the global one of that number, new in a step after one that moves the model (or on a
+        node with an initial velocity; not after *FREQUENCY steps alone, which leave it at rest),
+        stops a moving DOF otherwise than one along a global axis
+        (probed on one C3D8 against the model turned into the node's axes, the DOF held at the
+        value it had reached: 55 % of the peak displacement off at 20 increments a step, 6 % at
+        80; axes along permuted global ones 13 %; exact for local axes equal to the global ones,
+        for a BC held from a rest start, driven from it on a ramp (0.1 %) or released).  ccx
+        starts the extra node that carries such a BC's value from the node's global
+        displacement (bounadd.f).  No exact form is known (the helper node of
+        _plan_fixed_helpers is off there too): warned, with reduced physics; FIXED lines that
+        planner took (_fixed_unknown) are warned there."""
+        cards = deck.cards
+        if not any(c.keyword == "TRANSFORM" for c in cards):
+            return
+        renew = sorted({c.step for c in cards if c.keyword == "BOUNDARY" and c.step >= 1 and
+                        c.uparam("OP") == "NEW"})
+        if renew and any(c.keyword == "KINEMATIC" for c in cards):
+            self.report.warn(f"*BOUNDARY, OP=NEW (step {', '.join(map(str, renew))}) in a deck with a "
+                             f"*KINEMATIC coupling and a *TRANSFORM: ccx 2.23 stops there ('*ERROR "
+                             f"reading *BOUNDARY'): it registers the coupling's rotation equations "
+                             f"under other DOFs than it writes them on, and OP=NEW re-indexes all "
+                             f"equations when the deck has a *TRANSFORM (probed).", once=True)
+        if not self._transformed:
+            return
+        sets = self._mesh_sets.read(deck)
+        dyn = {c.step for c in cards if c.keyword == "DYNAMIC" and c.step >= 1 and not c.has("EXPLICIT")}
+        if not dyn:
+            return
+        moving = set()                          # nodes with an initial velocity
+        for c in cards:
+            if c.keyword == "INITIAL CONDITIONS" and c.uparam("TYPE").startswith("VELOCITY"):
+                for rec in c.records():
+                    if rec and rec[0].strip():
+                        moving.update(sets.members("NSET", rec[0].strip()) or ())
+        moves = {c.step for c in cards if c.step >= 1 and c.keyword in (       # (a *FREQUENCY step
+            "STATIC", "DYNAMIC", "VISCO", "MODAL DYNAMIC", "COUPLED TEMPERATURE-DISPLACEMENT",
+            "UNCOUPLED TEMPERATURE-DISPLACEMENT")}                              # leaves it at rest)
+        skip = {(n, d) for n, d, _s in self._fixed_unknown}
+        held: set = set()                       # (node, DOF) in force so far
+        step, before, hits = 0, set(), []
+        for c in cards:
+            if c.step > step:
+                step, before = c.step, set(held)
+            if c.keyword != "BOUNDARY" or c.step < 0:
+                continue
+            if c.uparam("OP") == "NEW":
+                held = set()
+            for j in c.rows:
+                f = trimmed_fields(deck.lines[j].split(","))
+                ns = sets.members("NSET", f[0]) if f else None
+                rng = bc_dof_range(f) if ns is not None else None
+                for n in [n for n in ns if n in self._transformed] if rng else ():
+                    ax = self._local_axes(n)
+                    for d in range(max(rng[0], 1), min(rng[1], 3) + 1):
+                        if step in dyn and (n, d) not in before and \
+                                (n in moving or any(k < step for k in moves)) and \
+                                isinstance(ax, tuple) and ax[d - 1][d - 1] < 1 - 1e-9 and \
+                                not (c.has("FIXED") and (n, d) in skip):
+                            hits.append(f"node {n} DOF {d} (step {step})")
+                        held.add((n, d))
+        hits = list(dict.fromkeys(hits))
+        if hits:
+            self.report.warn(f"*BOUNDARY on translations of *TRANSFORM nodes, new in implicit *DYNAMIC "
+                             f"steps after the node could move ({', '.join(hits[:4])}"
+                             f"{', ...' if len(hits) > 4 else ''}): ccx 2.23 stops a moving DOF along "
+                             f"an axis other than the global one of its number otherwise than along a "
+                             f"global axis (probed on one C3D8 against the model turned into the "
+                             f"node's axes: 55 % of the peak displacement off at 20 increments a step, "
+                             f"6 % at 80, 13 % for axes along permuted global ones). Held from the "
+                             f"start of the analysis instead, it is exact.", once=True)
+            self._reduces("*BOUNDARY on a *TRANSFORM translation new in an implicit *DYNAMIC step "
+                          "(ccx 2.23 stops the DOF otherwise than along a global axis)")
 
     def _warn_strain_free_adds(self, deck: EmittedDeck) -> None:
         """Warn of a *MODEL CHANGE, TYPE=ELEMENT that adds elements strain free (ADD without a
@@ -47998,8 +48211,10 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_strain_free_adds(deck)       # (reads the cards as written)
         deck = self._initial_gradients_back(deck)   # after the audit: the initial state is no load
         deck = self._shift_total_time(deck)     # after every pass that writes load cards
+        self._warn_transform_bc_traps(deck)     # (BCs on the nodes, as every pass wrote them)
         deck = self._fixed_helper_nodes(deck)   # after every other pass that writes *BOUNDARY
         deck = self._truss_bc_index(deck)       # after every pass that writes *BOUNDARY
+        deck = self._mechanical_run_type(deck)  # last: it adds a procedure card ahead of a step's own
         out = self._short_fields(deck.render())     # last: every card is written
         if self.reduced_physics:
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "
@@ -48445,17 +48660,17 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
     # the steps ccx 2.23 solves on the eigenmodes of its linear system (_eigen_after_solver)
     _EIGEN_PROCS = ("FREQUENCY", "BUCKLE", "MODAL DYNAMIC", "STEADY STATE DYNAMICS", "COMPLEX FREQUENCY")
 
-    def _eigen_after_solver(self) -> Tuple[int, str, List[int]]:
-        """The first step ccx 2.23 runs through its nonlinear solver (``_solver_steps``, or a
-        *HEAT TRANSFER step, which it runs there too), why, and the eigenvalue and modal steps
-        after it (step numbers): ccx carries an equation on a knot wrongly into those
-        (_warn_knot_equations); (0, "", []) where there are none."""
+    def _eigen_after_solver(self, heat: bool = True) -> Tuple[int, str, List[int]]:
+        """The first step ccx 2.23 runs through its nonlinear solver (``_solver_steps``, or,
+        with ``heat``, a *HEAT TRANSFER step, which it runs there too), why, and the eigenvalue
+        and modal steps after it (step numbers): ccx carries an equation on a knot wrongly into
+        those (_warn_knot_equations); (0, "", []) where there are none."""
         first, why = 0, ""
         for step, it in zip(self.steps, self._solver_steps):
             if why and step.proc in self._EIGEN_PROCS:
                 return first, why, [s.no for s in self.steps
                                     if s.no >= step.no and s.proc in self._EIGEN_PROCS]
-            if not why and (it or step.proc == "HEAT TRANSFER"):
+            if not why and (it or heat and step.proc == "HEAT TRANSFER"):
                 first, why = step.no, it or "a *HEAT TRANSFER step"
         return 0, "", []
 
