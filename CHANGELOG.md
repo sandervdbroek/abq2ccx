@@ -97,7 +97,8 @@ entries. The GitHub release notes use the same section.
 
 * **Fewer ccx failures.** A model with a static step and then a heat transfer step, and no
   initial temperatures, no longer crashes ccx in the heat step. Shell or beam models with
-  rotation constraints, where ccx still stops in such a heat step, are now warned.
+  rotation constraints or moments, where ccx still stops in such a heat step after a linear
+  step, are now warned.
 
 ### Details
 
@@ -393,9 +394,10 @@ entries. The GitHub release notes use the same section.
   otherwise it sets the run up as heat transfer alone, solves the static step and crashes in the
   heat step (exit 250). Every node now gets an initial temperature of 0, the default of Abaqus
   and ccx (ccx wants one at every node once any is given), so the run is mechanical too.
-  Where plain shell or beam nodes have rotational BCs, ccx then stops in the heat step on the
-  mean-rotation MPCs it makes of them ('*ERROR in meanrotmpc: MPC has wrong number of
-  terms'): warned. `validate_with_ccx.py static_then_heat`: a cube's static step, then a heat
+  Where plain shell or beam nodes have rotational BCs or moments and a step ccx solves
+  linearly comes before the heat step, ccx then stops in the heat step on the mean-rotation
+  MPCs it makes of them ('*ERROR in meanrotmpc: MPC has wrong number of terms', or an abort):
+  warned (after an NLGEOM or `*DYNAMIC` step it runs). `validate_with_ccx.py static_then_heat`: a cube's static step, then a heat
   step, both run, the static step as alone (0.0 apart), the heat step at 20 everywhere.
 
 ## 1.7.0 (November 2026)
