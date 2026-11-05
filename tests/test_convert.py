@@ -25659,6 +25659,21 @@ def test_transform_bc_warnings_dynamic_stops_and_kinematic_op_new():
     assert "*KINEMATIC" in body and stop not in rep.text()
 
 
+def test_transform_bc_warning_dynamic_negative_global_axes():
+    # a local axis along the negative global axis of its number is not exact in a *DYNAMIC
+    # step either (ccx starts the BC's extra node at +u for a -u BC; probed: -x 5.0 %, -y 8.7 %):
+    # warned, reduced physics; the axis along +z of the same *TRANSFORM is quiet
+    dyn = "*Step\n*Dynamic, direct\n0.05, 1.\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Dynamic, direct\n" \
+        "0.05, 1.\n*Boundary\n7, {d}, {d}, 0.01\n*End Step\n"
+    flip = FIXED_TR_HEX.replace("1., 1., 0.5, -1., 1., 1.", "-1., 0., 0., 0., -1., 0.")
+    for d, warned in ((1, True), (2, True), (3, False)):
+        body, conv, rep = convert_str(flip + dyn.format(d=d))
+        assert (f"(node 7 DOF {d} (step 2))" in rep.text()) == warned, d
+        assert bool(conv.reduced_physics and "*BOUNDARY on a *TRANSFORM translation new in an implicit "
+                    "*DYNAMIC step (ccx 2.23 stops the DOF otherwise than along a global axis)"
+                    in conv.reduced_physics) == warned, d
+
+
 def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
     # FIXED in a linear perturbation step holds the base state: 0, which a static perturbation
     # step's restore adds the base value to (a rotation was written as that value, then doubled)

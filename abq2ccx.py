@@ -46269,7 +46269,8 @@ class _PostPasses:
         80; axes along permuted global ones 13 %; exact for local axes equal to the global ones,
         for a BC held from a rest start, driven from it on a ramp (0.1 %) or released).  ccx
         starts the extra node that carries such a BC's value from the node's global
-        displacement (bounadd.f).  No exact form is known (the helper node of
+        displacement (bounadd.f), so a local axis along the negative global one of its number
+        is off too (-x 5.0 %, -y 8.7 %; probed).  No exact form is known (the helper node of
         _plan_fixed_helpers is off there too): warned, with reduced physics; FIXED lines that
         planner took (_fixed_unknown) are warned there."""
         cards = deck.cards
