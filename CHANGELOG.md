@@ -95,6 +95,10 @@ entries. The GitHub release notes use the same section.
   the shell and beam joints. A heat transfer step is no longer taken for one that turns those
   joints, so such models are no longer flagged for it.
 
+* **Fewer ccx failures.** A model with a static step and then a heat transfer step, and no
+  initial temperatures, no longer crashes ccx in the heat step. Shell or beam models with
+  rotation constraints, where ccx still stops in such a heat step, are now warned.
+
 ### Details
 
 * **Terminal report wrapping** — lines are wrapped one column short of the terminal's width: a
@@ -383,6 +387,16 @@ entries. The GitHub release notes use the same section.
   heat step). `validate_with_ccx.py shell_knot_limits knot_heat`: a strip off the axes with
   heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
   without knots (before: ccx stopped).
+
+* **Static, then heat transfer** — ccx 2.23 counts a `*STATIC`, `*VISCO` or `*DYNAMIC` card
+  before the `*HEAT TRANSFER` card in its run type only where initial temperatures are given;
+  otherwise it sets the run up as heat transfer alone, solves the static step and crashes in the
+  heat step (exit 250). Every node now gets an initial temperature of 0, the default of Abaqus
+  and ccx (ccx wants one at every node once any is given), so the run is mechanical too.
+  Where plain shell or beam nodes have rotational BCs, ccx then stops in the heat step on the
+  mean-rotation MPCs it makes of them ('*ERROR in meanrotmpc: MPC has wrong number of
+  terms'): warned. `validate_with_ccx.py static_then_heat`: a cube's static step, then a heat
+  step, both run, the static step as alone (0.0 apart), the heat step at 20 everywhere.
 
 ## 1.7.0 (November 2026)
 

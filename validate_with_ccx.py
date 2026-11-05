@@ -21265,6 +21265,37 @@ def check_shell_knot_limits(ccx, env, tmp, shared):
     return failures
 
 
+@check("static_then_heat", "a *STATIC step, then *HEAT TRANSFER, no initial temperatures")
+def check_static_then_heat(ccx, env, tmp, shared):
+    # ccx 2.23 counts a *STATIC card before the *HEAT TRANSFER card in its run type only with
+    # initial temperatures: without, it set the run up as heat transfer alone and crashed in the
+    # heat step (exit 250).  The converter gives every node the default 0.  Against the static
+    # step alone; the heat step's steady temperature is the held 20 everywhere
+    review_run = shared["review_run"]
+    cube = ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n5, 0.,0.,1.\n6, 1.,0.,1.\n"
+            "7, 1.,1.,1.\n8, 0.,1.,1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1,2,3,4,5,6,7,8\n"
+            "*NSET, NSET=NALL, GENERATE\n1, 8, 1\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n1000., 0.3\n*CONDUCTIVITY\n50.\n*EXPANSION\n1e-5\n*BOUNDARY\n1, 1, 3\n2, 2, 3\n4, 3\n"
+            "*STEP\n*STATIC\n*CLOAD\n7, 3, 1.\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+    heat = ("*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 1.\n*BOUNDARY\n1, 11, 11, 20.\n"
+            "*NODE PRINT, NSET=NALL\nNT\n*END STEP\n")
+    got = review_run(cube + heat, "static_then_heat",
+                     lambda p: (dat_node_blocks(p), [{int(r[0]): r[1:] for r in rows} for _s, title, _n, _t, rows
+                                                     in A.dat_blocks(p) if title.startswith("temperatures")]))
+    ref = review_run(cube, "static_then_heat_ref", dat_node_blocks)
+    ok = bool(got and ref and got[0] and got[1])
+    if ok:
+        (u, temps), uref = got, ref
+        err = max(abs(a - b) for n, v in uref[-1].items() for a, b in zip(u[0][n], v))
+        moved = max(abs(x) for v in uref[-1].values() for x in v)
+        terr = max(abs(v[0] - 20.0) for v in temps[-1].values())
+        ok = err <= 1e-12 * moved and moved > 1e-4 and terr < 1e-6 and len(temps[-1]) == 8
+        print(f"{'PASS' if ok else 'FAIL'}  static_then_heat (a cube's *STATIC step, then *HEAT TRANSFER, "
+              f"no initial temperatures): both steps run, the static step as alone ({err:.1e} apart, "
+              f"|u| {moved:.3g}), the heat step at 20 everywhere ({terr:.1e}; before: ccx crashed)")
+    return 0 if ok else 1
+
+
 @check("other_decks", "other decks: confirm they are accepted and solve")
 def check_other_decks(ccx, env, tmp, shared):
     # --- other decks: confirm they are accepted and solve ----------------------
