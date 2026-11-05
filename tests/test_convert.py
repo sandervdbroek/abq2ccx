@@ -25454,6 +25454,44 @@ def test_eigen_steps_after_a_nonlinear_solver_step_warn_of_equations_on_knots():
     assert KNOT_WARN not in rep.text(), rep.text()
 
 
+def test_static_then_heat_transfer_run_type():
+    # a *STATIC card before the *HEAT TRANSFER card counts in ccx 2.23's run type only with
+    # initial temperatures: without, ccx crashed in the heat step (exit 250); every node gets 0,
+    # the default.  Shell rotational BCs: ccx stops in the heat step on its mean-rotation MPCs
+    # (meanrotmpc) - warned
+    cube = (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Conductivity\n50.\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n")
+    static = "*Step\n*Static\n*Cload\n7, 3, 1.\n*End Step\n"
+    heat = "*Step\n*Heat Transfer, steady state\n1., 1.\n*Boundary\n1, 11, 11, 20.\n*End Step\n"
+    out, _, rep = convert_str(cube + static + heat)
+    assert "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nABQ2CCX_INITIAL_T, 0.\n" in out
+    assert "\n1, 2, 3, 4, 5, 6, 7, 8\n" in out.split("ABQ2CCX_INITIAL_T")[1]
+    assert "written for every node at 0" in rep.text() and "meanrotmpc" not in rep.text()
+    # not with initial temperatures, the heat step first, or a *STATIC step after the heat step
+    ic = "*Nset, nset=ALLN, generate\n1, 8, 1\n*Initial Conditions, type=temperature\nALLN, 5.\n"
+    for text in (cube + ic + static + heat, cube + heat + static):
+        out, _, rep = convert_str(text)
+        assert "ABQ2CCX_INITIAL_T" not in out, text
+    # an S4 strip with rotational BCs: the stop warned
+    strip = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, elset=E\n"
+             "1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1000., 0.\n*Conductivity\n50.\n*Shell Section, "
+             "elset=E, material=M\n0.01\n*Boundary\n1, 1, 6\n4, 1, 6\n")
+    warn = "ccx writes those as mean-rotation MPCs and stops"
+    _, _, rep = convert_str(strip + static.replace("7, 3", "3, 3") + heat)
+    assert warn in " ".join(rep.text().split()), rep.text()
+    # not after a step ccx solves through its nonlinear solver (NLGEOM, *DYNAMIC: ccx runs the
+    # heat step then; PR #35 review), nor without a mechanical step before the heat step
+    for text in (strip + static.replace("*Step\n", "*Step, nlgeom\n").replace("7, 3", "3, 3") + heat,
+                 strip + "*Step\n*Dynamic\n0.01, 0.1\n*Cload\n3, 3, 1.\n*End Step\n" + heat,
+                 strip + heat, strip + heat + static.replace("7, 3", "3, 3")):
+        _, _, rep = convert_str(text)
+        assert "meanrotmpc" not in rep.text(), text
+    # a moment on a plain shell node (gen3dforc's mean-rotation MPC) stops it too: warned
+    plate = strip.replace("*Boundary\n1, 1, 6\n4, 1, 6\n", "*Boundary\n1, 1, 3\n4, 1, 3\n")
+    _, _, rep = convert_str(plate + static.replace("7, 3, 1.", "2, 5, 0.1") + heat)
+    assert warn in " ".join(rep.text().split()), rep.text()
+
+
 def test_heat_transfer_run_gets_a_static_card_for_its_knots():
     # ccx 2.23 sets a run up as heat transfer alone where its procedure cards hold *HEAT
     # TRANSFER and no *STATIC / *VISCO / *DYNAMIC after it (eigenvalue and modal procedures do

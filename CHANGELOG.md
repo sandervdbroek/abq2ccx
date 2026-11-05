@@ -113,6 +113,11 @@ entries. The GitHub release notes use the same section.
   geometrically nonlinear step now turns the shell as the rotation vector Abaqus reads it.
   ccx read the same values as other angles: a test strip's turned edge came out 3-7 % off.
 
+* **Fewer ccx failures.** A model with a static step and then a heat transfer step, and no
+  initial temperatures, no longer crashes ccx in the heat step. Shell or beam models with
+  rotation constraints or moments, where ccx still stops in such a heat step after a linear
+  step, are now warned.
+
 ### Details
 
 * **Terminal report wrapping** — lines are wrapped one column short of the terminal's width: a
@@ -415,6 +420,16 @@ entries. The GitHub release notes use the same section.
   heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
   without knots (before: ccx stopped).
 
+* **Static, then heat transfer** — ccx 2.23 counts a `*STATIC`, `*VISCO` or `*DYNAMIC` card
+  before the `*HEAT TRANSFER` card in its run type only where initial temperatures are given;
+  otherwise it sets the run up as heat transfer alone, solves the static step and crashes in the
+  heat step (exit 250). Every node now gets an initial temperature of 0, the default of Abaqus
+  and ccx (ccx wants one at every node once any is given), so the run is mechanical too.
+  Where plain shell or beam nodes have rotational BCs or moments and a step ccx solves
+  linearly comes before the heat step, ccx then stops in the heat step on the mean-rotation
+  MPCs it makes of them ('*ERROR in meanrotmpc: MPC has wrong number of terms', or an abort):
+  warned (after an NLGEOM or `*DYNAMIC` step it runs). `validate_with_ccx.py static_then_heat`: a cube's static step, then a heat
+  step, both run, the static step as alone (0.0 apart), the heat step at 20 everywhere.
 * **Rotational springs in rotated instances** — a part's `SPRING1` / `SPRING2` on DOFs 4-6 whose
   turned DOFs have no global form (an axis along no global one, a `SPRING2` whose two axes turn
   to opposite senses, a nonlinear spring whose axis turns to its opposite) now gets the
