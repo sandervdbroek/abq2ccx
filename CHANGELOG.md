@@ -205,7 +205,9 @@ entries. The GitHub release notes use the same section.
   of its other nodes (Abaqus ties no shared node; ccx 2.23 ties each to the face it lies on and
   loops without end, 'zero coefficient on the dependent side'). `validate_with_ccx.py
   tied_pair_shared` (C3D8 blocks sharing a node line): the blocks merged, exactly; before ccx
-  looped.
+  looped. A slave tied to several masters (several lines or cards) leaves out the nodes of
+  all of them on each line (ccx looped on a node of one tied to another; `tied_pair_shared_multi`:
+  exact).
 * **Tied contact pairs trimmed** — a `*CONTACT PAIR, TIED` on deformable surfaces, written as a
   `*TIE`, gets the `*TIE`'s trimmed slave surface (`validate_with_ccx.py
   tie_leftovers_pair_trimmed`: the same answer, 16 'no tied MPC' warnings instead of 112).

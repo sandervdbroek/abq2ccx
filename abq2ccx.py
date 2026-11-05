@@ -10197,7 +10197,9 @@ class _Mesh:
         is tied through its expanded faces, not its nodes: no loop there, so the notes claim
         neither the loop nor exactness (_shell_tie_slave warns of such a master)."""
         sd = self.surfaces.get(slave.upper())
-        shared = set(self._surface_member_nodes(master))
+        # (the nodes of every master this slave is tied to, on any line: _plan_tie_masters)
+        shared = {n for m in {master.upper()} | self._tie_masters.get(slave.upper(), set())
+                  for n in self._surface_member_nodes(m)}
         nodes = self._surface_member_nodes(slave)
         if sd is None or not shared.intersection(nodes):
             return None, []
@@ -34612,6 +34614,22 @@ class _Constraints:
                          f"about it (probed: the skin as a layer of its expansion elements exactly).",
                          once=True)
 
+    def _plan_tie_masters(self, blocks: List[Block]) -> None:
+        """Slave surface -> the master surfaces of every *TIE / TIED *CONTACT PAIR line that
+        ties it (_shared_tie_slave): a slave tied to several masters (a block on two others)
+        leaves out the nodes of all of them on each line — Abaqus ties none of them; ccx 2.23,
+        given a node of one master to tie to another, loops without end (probed: 'dependent
+        node: 9 direction: 1')."""
+        self._tie_masters = {}
+        for b in blocks:
+            pair = b.keyword == "CONTACT PAIR" and b.has("TIED")
+            if not (b.keyword == "TIE" or pair) or b.has("CYCLIC SYMMETRY") or b.has("MULTISTAGE"):
+                continue
+            for rec in merged_data_records(b):
+                f = [x.strip().upper() for x in rec if x.strip()]
+                if len(f) >= 2 and f[0] != f[1]:
+                    self._tie_masters.setdefault(f[0], set()).add(f[1])
+
     def _plan_offset_tie_knots(self, blocks: List[Block]) -> None:
         """Slave nodes of *TIE / TIED *CONTACT PAIR lines on conventional shells with a section
         OFFSET that lie on solid master faces (_shell_tie_slave's node form): Abaqus ties the
@@ -47246,6 +47264,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._sect_axes: Dict[int, Tuple[Vec, Vec, Vec]] = {}
         self._still_knots: set = set()             # ... and their knot beams held at zero throughout
         self._offset_knots: set = set()            # knots of offset shells on solids (_plan_offset_solid_knots)
+        self._tie_masters: Dict[str, set] = {}     # tie slave surface -> its masters (_plan_tie_masters)
         self._coupling_plan: Dict[int, dict] = {}  # id(*COUPLING / *KINEMATIC COUPLING) -> plan
         # *DISTRIBUTION orientations (see _plan_distributions)
         self._dist_cards: Dict[str, Block] = {}    # NAME -> *DISTRIBUTION, "" too (_plan_deck_facts)
@@ -48155,6 +48174,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._plan_modal_knots(blocks)          # before _plan_op_new_rotations: its knots stay knots
         self._plan_offset_solid_knots(blocks)   # likewise
         self._plan_offset_tie_knots(blocks)     # likewise; after it (its knots)
+        self._plan_tie_masters(blocks)
         self._plan_op_new_rotations(blocks)     # after the planar BCs, which OP=NEW removes too
         self._plan_transformed_rotations(blocks)    # after every other planner adding knot beams
         self._plan_transformed_corners(blocks)      # after it: its 'keep' nodes

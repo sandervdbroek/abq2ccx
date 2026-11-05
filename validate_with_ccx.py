@@ -8975,8 +8975,8 @@ def tied_pair_shared_deck(form):
     and z: ``form`` "pair" — B's bottom faces tied to A's top by a TIED *CONTACT PAIR, its x = 0
     nodes A's (shared), the others coincident; "ref" — B on A's top nodes."""
     a = lambda i, j, k: 1 + i + 3 * j + 6 * k                                    # noqa: E731
-    b = lambda i, j, k: (a(i, j, 1) if k == 0 and (form == "ref" or i == 0) else  # noqa: E731
-                         101 + i + 3 * j + 6 * k)
+    b = lambda i, j, k: (a(i, j, 1) if k == 0 and (form == "ref" or i == 0 or  # noqa: E731
+                                                   (form == "multi" and i == 2)) else 101 + i + 3 * j + 6 * k)
     xyz = {}
     for i in range(3):
         for j in range(2):
@@ -8998,6 +8998,9 @@ def tied_pair_shared_deck(form):
     if form == "pair":
         out += ["*SURFACE, NAME=ATOP\nA, S2", "*SURFACE, NAME=BBOT\nB, S1", "*SURFACE INTERACTION, NAME=SI",
                 "*CONTACT PAIR, INTERACTION=SI, TIED\nBBOT, ATOP"]
+    elif form == "multi":                   # (A's two elements, two masters; B shares x = 0 and x = 2)
+        out += ["*SURFACE, NAME=ATOP1\n1, S2", "*SURFACE, NAME=ATOP2\n2, S2", "*SURFACE, NAME=BBOT\nB, S1",
+                "*TIE, NAME=T1\nBBOT, ATOP1\nBBOT, ATOP2"]
     out += ["*BOUNDARY\nBASE, 1, 3", "*STEP", "*STATIC", "*CLOAD"] + \
         [f"{b(i, j, 1)}, 1, 1.\n{b(i, j, 1)}, 3, {0.5 * i:g}" for i in range(3) for j in range(2)] + \
         ["*NODE PRINT, NSET=TOP", "U", "*END STEP"]
@@ -20102,7 +20105,7 @@ def check_tied_pair_shared(ccx, env, tmp, shared):
     # --- ccx 2.23 loops without end on a tie whose slave nodes lie on the master's faces; the
     # converter writes a node surface of the slave's other nodes, as for a *TIE
     runs = []
-    for form in ("pair", "ref"):
+    for form in ("pair", "multi", "ref"):
         src, inp = os.path.join(tmp, f"tps_{form}_src.inp"), os.path.join(tmp, f"tps_{form}.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(tied_pair_shared_deck(form))
@@ -20113,16 +20116,20 @@ def check_tied_pair_shared(ccx, env, tmp, shared):
         shutil.rmtree(d, ignore_errors=True)
         if status != "solved":
             print(f"FAIL  tied_pair_shared_{form}: did not solve ({status})")
-    ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) == 1
-    if ok:
-        got, want = runs[0][0][0], runs[1][0][0]
-        err = max(abs(a - b) for n, v in want.items() for a, b in zip(got.get(n, [math.inf] * 3), v[:3]))
-        moved = max(abs(x) for v in want.values() for x in v[:3])
-        ok = err <= 1e-9 * moved and moved > 1e-3 and "BBOT_NODES" in runs[0][1]
-        print(f"{'PASS' if ok else 'FAIL'}  tied_pair_shared (C3D8 blocks, a TIED *CONTACT PAIR whose slave shares "
-              f"a node line with the master): the top nodes as the blocks merged ({err:.1e} apart; |u| "
-              f"{moved:.4g}; before: ccx looped without end)")
-    return 0 if ok else 1
+    failures = 0
+    for i, what in ((0, "a TIED *CONTACT PAIR whose slave shares a node line with the master"),
+                    (1, "a two-line *TIE of one slave on two masters, sharing a node line with each")):
+        ok = runs[i] is not None and runs[2] is not None and len(runs[i][0]) == len(runs[2][0]) == 1
+        if ok:
+            got, want = runs[i][0][0], runs[2][0][0]
+            err = max(abs(a - b) for n, v in want.items() for a, b in zip(got.get(n, [math.inf] * 3), v[:3]))
+            moved = max(abs(x) for v in want.values() for x in v[:3])
+            ok = err <= 1e-9 * moved and moved > 1e-3 and "BBOT_NODES" in runs[i][1]
+            print(f"{'PASS' if ok else 'FAIL'}  tied_pair_shared{'_multi' if i else ''} (C3D8 blocks, {what}): the "
+                  f"top nodes as the blocks merged ({err:.1e} apart; |u| {moved:.4g}; before: ccx looped without "
+                  f"end)")
+        failures += 0 if ok else 1
+    return failures
 
 
 @check("midside_bc", "a card that moves one end of an edge the converter put a node on")

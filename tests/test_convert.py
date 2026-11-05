@@ -25994,6 +25994,18 @@ def test_tie_on_one_surface_or_on_shared_nodes():
         "*Tie, name=T1\n", "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\n"))
     assert "every slave node of BBOT is a node of ATOP" in body and "\nBBOT, ATOP" not in body
     assert "*CONTACT PAIR, TIED slave surface BBOT: every node of it" in rep.text() and not conv.reduced_physics
+    # one slave on two masters (A's elements), sharing x = 0 with one and x = 2 with the other:
+    # each line leaves out the nodes of both (ccx looped on a node of one tied to the other)
+    multi = ("*Node\n1,0,0,0\n2,1,0,0\n3,2,0,0\n4,0,1,0\n5,1,1,0\n6,2,1,0\n7,0,0,1\n8,1,0,1\n9,2,0,1\n"
+             "10,0,1,1\n11,1,1,1\n12,2,1,1\n102,1,0,1\n105,1,1,1\n107,0,0,2\n108,1,0,2\n109,2,0,2\n110,0,1,2\n"
+             "111,1,1,2\n112,2,1,2\n*Element, type=C3D8, elset=A\n1,1,2,5,4,7,8,11,10\n2,2,3,6,5,8,9,12,11\n"
+             "*Element, type=C3D8, elset=B\n11,7,102,105,10,107,108,111,110\n12,102,9,12,105,108,109,112,111\n"
+             "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=A, material=M\n*Solid Section, "
+             "elset=B, material=M\n*Surface, name=AT1\n1, S2\n*Surface, name=AT2\n2, S2\n*Surface, name=BB\n"
+             "B, S1\n*Tie, name=T1\nBB, AT1\nBB, AT2\n")
+    body, conv, _ = convert_str(multi)
+    assert _card_at(body, "*SURFACE, NAME=BB_NODES, TYPE=NODE") == ["102", "105"]
+    assert {"BB_NODES, AT1", "BB_NODES, AT2"} <= set(body.splitlines()) and not conv.reduced_physics
     plates = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,2,0,0\n6,2,1,0\n*Element, type=S4, elset=A\n"
               "1,1,2,3,4\n*Element, type=S4, elset=B\n2,2,5,6,3\n*Surface, name=AT\nA, SPOS\n"
               "*Surface, name=BT\nB, SPOS\n*Material, name=M\n*Elastic\n1000., 0.3\n*Shell Section, "
