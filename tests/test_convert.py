@@ -27673,10 +27673,11 @@ def test_odd_and_bonded_continuum_shell_stacks():
             zs.append(zs[-1] + h)
         nodes = "".join(f"{4 * k + i + 1}, {x}, {y}, {z!r}\n" for k, z in enumerate(zs)
                         for i, (x, y) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1))))
-        els = "".join(f"*Element, type={t}, elset={'C' if t.startswith('COH') else 'S'}{k}\n{k + 1}, "
+        els = "".join(f"*Element, type={t}, elset={'S' if t == 'SC8R' else 'C'}{k}\n{k + 1}, "
                       + ", ".join(str(4 * k + i) for i in (1, 2, 3, 4, 5, 6, 7, 8)) + "\n"
                       for k, (t, _h) in enumerate(layers))
         secs = "".join(f"*Shell Section, elset=S{k}, material=M\n{h!r}\n" if t == "SC8R" else
+                       f"*Solid Section, elset=C{k}, material=G\n" if t == "C3D8" else
                        f"*Cohesive Section, elset=C{k}, material=G, response=continuum\n"
                        for k, (t, h) in enumerate(layers))
         return ("*Node\n" + nodes + els + secs + "*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n1., 0.\n"
@@ -27688,7 +27689,11 @@ def test_odd_and_bonded_continuum_shell_stacks():
     for layers, factor in (([sc], "1.155"), ([sc] * 2, None), ([sc] * 3, "1.017"), ([sc] * 4, None),
                            ([sc] * 5, "1.006"), ([sc, ("SC8R", 0.3)], "1.025"),
                            ([sc, ("COH3D8", 0.0), sc], None), ([sc, ("COH3D8", 0.002), sc], None),
-                           ([sc, ("COH3D8", 0.0), sc, ("COH3D8", 0.0), sc], "1.017")):
+                           ([sc, ("COH3D8", 0.0), sc, ("COH3D8", 0.0), sc], "1.017"),
+                           # a solid core continues the stack (item 9, probed: SC8R skins on a soft
+                           # C3D8 core carry 1.0005-1.0010 of the fully plastic moment)
+                           ([sc, ("C3D8", 0.2), sc], None), ([sc, ("C3D8", 0.1), ("C3D8", 0.1), sc], None),
+                           ([("SC8R", 0.3), ("C3D8", 0.1)], "1.025")):
         _, conv, rep = convert_str(deck(layers))
         assert (flag in conv.reduced_physics) == (factor is not None), layers
         if factor:

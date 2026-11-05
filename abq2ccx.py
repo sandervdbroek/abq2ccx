@@ -492,6 +492,8 @@ PLY_SOLID = {"SC8R": "C3D8I", "SC6R": "C3D6"}
 # the fully plastic moment a continuum shell alone through the thickness carries in ccx 2.23 (one
 # C3D8I / C3D6, 2 Gauss points through it), over the exact one (_flag_inelastic_shells)
 SC_ALONE = 2.0 / math.sqrt(3.0)
+# the 12 edges of an 8-node hex, 0-based corner positions (_sc_stack_middles)
+HEX_EDGES = ((0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7))
 PLY_SPLIT_LIMIT = 1000000
 # Quadratic membranes, which ccx 2.23 expands with a mid-thickness node free in each element
 # (_plan_quadratic_membranes) -> the solid the converter writes each element as; M3D9 / M3D9R
@@ -15296,7 +15298,8 @@ class _Mesh:
         a column of such elements through the thickness, each one's top face (_sc_stack_faces,
         by its section's stacking) the next one's bottom face, or joined through a cohesive
         element's (COH3D*, a *COHESIVE SECTION's stacking: two SC8R bonded by a glue layer are
-        one stack), each element as thick as its faces lie apart.  An element alone through
+        one stack) or a solid hex's (a sandwich's core), each element as thick as its faces lie
+        apart.  An element alone through
         the thickness: 2 / sqrt(3); the middle one of k equal ones: 1 + 0.155 / k^2; where the
         middle lies at a face between two elements, none.  A branching column (a face of three
         elements) or one of no thickness leaves its elements out, and so does an element without
@@ -15319,6 +15322,30 @@ class _Mesh:
             n, _c = self._stack_geometry(bot, top)
             h = sum(vdot(vsub(P[y], P[x]), n) for x, y in zip(bot, top)) / len(bot)
             cells[e] = (frozenset(bot), frozenset(top), max(h, 0.0))
+        # solid hexes (C3D8* / C3D20*) joined face to face continue a column — a sandwich's core,
+        # a substrate (probed: SC8R skins on a soft C3D8 core in pure bending carry 1.0005-1.0010
+        # of the exact fully plastic moment, where each skin alone would be flagged at 1.155) —,
+        # each reached through one face, its opposite face the corners across its other edges
+        hexes: Dict[frozenset, List[Tuple[int, Tuple[int, ...]]]] = {}
+        for e, (typ, conn) in self.geom.elements.items():
+            if e not in cells and typ.upper().startswith("C3D") and len(conn) in (8, 20) and \
+                    all(n in P for n in conn[:8]):
+                for pos in FACE_NODES["HEX"].values():
+                    hexes.setdefault(frozenset(conn[q - 1] for q in pos[:4]), []).append((e, pos[:4]))
+        todo = [f for bot, top, _h in cells.values() for f in (bot, top)] if hexes else []
+        while todo:
+            for e, pos in hexes.get(todo.pop(), []):
+                if e in cells:
+                    continue
+                conn = self.geom.elements[e][1]
+                face = {q - 1 for q in pos}
+                across = {i: j for a, b in HEX_EDGES for i, j in ((a, b), (b, a)) if i in face and j not in face}
+                bot = [conn[q - 1] for q in pos]
+                top = [conn[across[q - 1]] for q in pos]
+                n, _c = self._stack_geometry(bot, top)
+                h = sum(vdot(vsub(P[y], P[x]), n) for x, y in zip(bot, top)) / len(bot)
+                cells[e] = (frozenset(bot), frozenset(top), max(h, 0.0))
+                todo.append(cells[e][1])
         faces: Dict[frozenset, List[int]] = {}
         for e, (bot, top, _h) in cells.items():
             faces.setdefault(bot, []).append(e)
