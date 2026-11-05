@@ -25488,6 +25488,25 @@ def test_eigen_steps_after_a_nonlinear_solver_step_warn_of_equations_on_knots():
     assert KNOT_WARN not in rep.text(), rep.text()
 
 
+def test_truss_heat_mass_warned():
+    # ccx 2.23 runs trusses with another mass in a run with a *HEAT TRANSFER step (a T3D2 grid:
+    # first eigenvalue 1.356e10 for 5.566e9; its static deflection exact): warned, reduced
+    # physics, where a step reads the mass
+    deck = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n*Element, type=T3D2, elset=E\n1, 1, 2\n"
+            "2, 2, 3\n3, 1, 3\n*Solid Section, elset=E, material=M\n0.01\n*Material, name=M\n*Elastic\n"
+            "210000., 0.3\n*Density\n7.85e-9\n*Conductivity\n50.\n")
+    heat = "*Step\n*Heat Transfer, steady state\n1., 1.\n*Boundary\n1, 11, 11, 20.\n*End Step\n"
+    freq = "*Step\n*Frequency\n2\n*Boundary\n1, 1, 3\n2, 2, 3\n3, 3\n*End Step\n"
+    static = freq.replace("*Frequency\n2", "*Static").replace("*End Step", "*Cload\n3, 2, 1.\n*End Step")
+    flag = "truss elements in a run with a *HEAT TRANSFER step (ccx's thermal setup changes their mass)"
+    _, conv, rep = convert_str(deck + heat + freq)
+    assert flag in conv.reduced_physics and "run trusses there with another mass" not in rep.text()
+    assert "runs trusses there with another mass, so the results of step(s) 2" in rep.text()
+    for text in (deck + freq, deck + heat + static):
+        _, conv, rep = convert_str(text)
+        assert flag not in conv.reduced_physics, text
+
+
 def test_static_then_heat_transfer_run_type():
     # a *STATIC card before the *HEAT TRANSFER card counts in ccx 2.23's run type only with
     # initial temperatures: without, ccx crashed in the heat step (exit 250); every node gets 0,

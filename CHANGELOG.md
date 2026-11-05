@@ -129,6 +129,11 @@ entries. The GitHub release notes use the same section.
   rotation constraints or moments, where ccx still stops in such a heat step after a linear
   step, are now warned.
 
+* **Honest flags for weaker physics.** A model with truss elements and a heat transfer step is
+  now warned where a step depends on the mass (frequency, modal and dynamic steps): ccx runs
+  trusses with another mass there (a truss grid's first eigenvalue 2.4 times too high), while
+  static results stay exact.
+
 ### Details
 
 * **Terminal report wrapping** — lines are wrapped one column short of the terminal's width: a
@@ -447,6 +452,11 @@ entries. The GitHub release notes use the same section.
   heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
   without knots (before: ccx stopped).
 
+* **Trusses in a run with a heat transfer step** — ccx 2.23 sets a run with a `*HEAT TRANSFER`
+  step up as thermal and mechanical, and then runs truss elements with another mass: a T3D2
+  grid's first eigenvalue 1.356e10 for 5.566e9, the same with a real `*STATIC` step and with the
+  heat step at 0, while its static deflection is exact. Warned, reduced physics, where a
+  `*FREQUENCY`, modal, steady-state or `*DYNAMIC` step reads the mass.
 * **Nonlinear dashpots** — ccx 2.23 has no `*DASHPOT, NONLINEAR`: it warns of the parameter and
   reads each 'force, velocity' line as 'coefficient, frequency', damping with the last line's
   force (probed: a table of slope 2 to (4, 2) damped as 4). The card is now written as a linear
