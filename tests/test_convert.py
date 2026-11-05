@@ -23854,6 +23854,12 @@ def test_tie_of_shells_with_a_section_offset_knots_their_nodes():
                                     "knot beams that would make it the reference point stop ccx's "
                                     "explicit solver)"]
     assert "No ccx form is exact" in rep.text()
+    # a TIED NSET slave gets no knot beams: the warning says so, not 'explicit' / 'U1 beams'
+    _, conv, _ = convert_str(_skin(face=", SNEG", off=", offset=SNEG", tie="*Nset, nset=TN\n2, 3, 5, 6\n"
+                                                                          "*Tie, name=T1, tied nset=TN\nSKIN, TOP\n"))
+    assert conv.reduced_physics == ["*TIE on conventional shells: a shell section OFFSET at the master "
+                                    "(Abaqus ties the reference surface, ccx's node its midsurface; the "
+                                    "converter adds no knot beams for a TIED NSET slave)"]
 
 
 def test_tie_of_shells_with_no_exact_ccx_form_is_reduced():

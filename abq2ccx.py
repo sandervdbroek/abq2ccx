@@ -10530,13 +10530,18 @@ class _Mesh:
             elif plan is not None:
                 plan.extend(turned)
                 return None
-            elif set(turned) <= set(self._knots):   # (_plan_offset_tie_knots)
+            elif set(turned) <= set(self._knots):   # (_plan_offset_tie_knots; no planner drops a knot)
                 return self._shell_tie_form(slave, master, near, bool(turned), what, tol)
-            else:
+            else:                                   # (the reason _plan_offset_tie_knots added none)
                 why = ("a shell section OFFSET at the master (Abaqus ties the reference surface, "
-                       "ccx's node its midsurface; the knot beams that would make it the reference "
-                       "point stop " + ("ccx's explicit solver" if self._explicit_deck else
-                                        "ccx in a model with U1 beams") + ")")
+                       "ccx's node its midsurface; " + (
+                           "the knot beams that would make it the reference point stop ccx's explicit solver"
+                           if self._explicit_deck else
+                           "the knot beams that would make it the reference point stop ccx in a model with U1 "
+                           "beams" if self._u1 else
+                           "the converter adds no knot beams for a TIED NSET slave" if
+                           (not pair and (b.param("TIED NSET") or "").strip()) else
+                           "the converter added no knot beams there") + ")")
         if plan is not None:
             return None
         self.report.warn(f"{what}: slave {slave} / master {master} on conventional shells — Abaqus "

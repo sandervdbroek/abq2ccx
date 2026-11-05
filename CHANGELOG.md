@@ -195,7 +195,8 @@ entries. The GitHub release notes use the same section.
   (the PR #8 reviewer's skin, loaded at its edge): the block as under the skin merged with its
   nodes, knotted, exactly; before 1.9x off with the loaded edge untied (a second step all zero)
   for SNEG, 0.5-10 % for SPOS. Other offsets, which were warned as reduced physics, are exact the
-  same way; in a deck with an explicit step or U1 beams they still are.
+  same way; in a deck with an explicit step or U1 beams they still are. The warning now names why
+  no knot beams were added (an explicit step, U1 beams, or a `TIED NSET` slave, which gets none).
 * **Ties of plane and axisymmetric faces** — a `*TIE` / TIED `*CONTACT PAIR` whose slave is the
   faces (S1-S4) of CPS / CPE / CAX elements now ties a node surface of those edges' nodes (none
   of the master's), with Abaqus' position tolerance. ccx 2.23 ties none of the face nodes of the
