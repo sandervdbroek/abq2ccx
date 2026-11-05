@@ -134,6 +134,10 @@ entries. The GitHub release notes use the same section.
   trusses with another mass there (a truss grid's first eigenvalue 2.4 times too high), while
   static results stay exact.
 
+* **More correct answers.** A model whose elastic, density or expansion data depend on
+  temperature, without initial temperatures, is now read at temperature 0 as in Abaqus: ccx
+  took the data's first row (a test cube came out twice as soft), without a message.
+
 ### Details
 
 * **Terminal report wrapping** — lines are wrapped one column short of the terminal's width: a
@@ -452,6 +456,13 @@ entries. The GitHub release notes use the same section.
   heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
   without knots (before: ccx stopped).
 
+* **Temperature-dependent material data without initial temperatures** — Abaqus' temperature
+  is 0 where none is given, and temperature-dependent `*ELASTIC`, `*DENSITY`, `*EXPANSION`,
+  `*HYPERELASTIC` and `*HYPERFOAM` data are read there; ccx 2.23 without any temperature takes
+  the table's first row. Every node now gets an initial temperature of 0 in such a model (ccx
+  wants one at every node once any is given). `validate_with_ccx.py table_temperatures`: a cube
+  with E 1000 at -100 and 3000 at 100 deflects as with E 2000 (0.0 apart; before: twice as
+  much).
 * **Trusses in a run with a heat transfer step** — ccx 2.23 sets a run with a `*HEAT TRANSFER`
   step up as thermal and mechanical, and then runs truss elements with another mass: a T3D2
   grid's first eigenvalue 1.356e10 for 5.566e9, the same with a real `*STATIC` step and with the
