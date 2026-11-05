@@ -16159,7 +16159,10 @@ def test_rigid_constraints_in_a_linear_dynamic_deck():
     assert "*RIGID BODY" not in "\n".join(_live(body)) and conv._twins == {9: rot + 1, rot: rot + 2}
     assert len(eqs) == 18 and eqs[6] == [(5, 1, 1.), (rot + 1, 1, -1.), (rot + 2, 2, 1.), (rot + 2, 3, -0.5)]
     assert sorted(eqs[0]) == [(9, 1, 1.), (rot + 1, 1, -0.8), (rot + 1, 2, -0.6)]     # u_twin = u_9
-    assert not conv.reduced_physics
+    # (RP, 1 moves the node along its oblique local x in the *DYNAMIC step: flagged, ccx drives it
+    # slightly otherwise; _warn_transform_bc_motion)
+    assert conv.reduced_physics == ["*BOUNDARY motion along a *TRANSFORM axis in an implicit *DYNAMIC "
+                                    "step (ccx 2.23 drives it slightly otherwise than along a global axis)"]
     # knotted shell members: their translations and (TIE, coupled rotations) rotations follow
     sdyn = "*Step\n*Dynamic\n0.01, 1.\n*Boundary\n1, 1, 6\n4, 1, 6\n*Boundary\nREF, 3, 3, 0.1\n*End Step\n"
     coupling = "*Surface, type=node, name=RS\nR\n*Coupling, constraint name=C, ref node=100, surface=RS\n"
@@ -25682,6 +25685,31 @@ def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
     assert "*BOUNDARY\n2, 5, 5, 0.01\n" in _step(body, 2) and "0.02" not in body
 
 
+def test_transform_bc_motion_in_dynamic_steps_flagged():
+    # prescribed motion along an oblique *TRANSFORM axis in an implicit *DYNAMIC step: ccx drives
+    # it through the BC's equation a little otherwise (probed: 0.1-0.9 % of the peak): warned,
+    # reduced physics; a held value, a zero from rest and static steps are quiet
+    flag = "*BOUNDARY motion along a *TRANSFORM axis in an implicit *DYNAMIC step (ccx 2.23 drives " \
+        "it slightly otherwise than along a global axis)"
+    s1 = "*Step\n*Dynamic, direct\n0.05, 1.\n*Cload\n7, 1, 1.\n*End Step\n"
+    s2 = "*Step\n*Dynamic, direct\n0.05, 1.\n{}*Cload, op=NEW\n6, 2, 1.\n*End Step\n"
+    for model, steps, hits in (
+            ("*Boundary\n7, 2, 2, 0.01\n", s1, "(node 7 DOF 2 (step 1))"),          # from rest at t = 0
+            ("*Boundary\n7, 2, 2, 0.\n", s1 + s2.format("*Boundary\n7, 2, 2, 0.03\n"),   # a changed value
+             "(node 7 DOF 2 (step 2))"),
+            ("*Boundary\n7, 2, 2, 0.\n", s1 + s2.format("*Boundary\n7, 2, 2, 0.\n"), None),  # held
+            ("*Boundary\n7, 2, 2, 0.01\n", s1.replace("*Dynamic, direct\n0.05, 1.", "*Static"), None)):
+        body, conv, rep = convert_str(FIXED_TR_HEX + model + steps)
+        text = rep.text()
+        assert ("*BOUNDARY prescribing motion in implicit *DYNAMIC steps" in text) == bool(hits), steps
+        assert hits is None or f"of their number {hits}" in text, steps
+        assert (flag in conv.reduced_physics) == bool(hits), steps
+    # the value in force given again in step 2 (here 0.01 from rest: step 1's motion only)
+    body, conv, rep = convert_str(FIXED_TR_HEX + "*Boundary\n7, 2, 2, 0.01\n" + s1 +
+                                  s2.format("*Boundary\n7, 2, 2, 0.01\n"))
+    assert "of their number (node 7 DOF 2 (step 1)):" in rep.text()
+
+
 def test_ccx_stop_warnings_trusses_nodal_distributing():
     # trusses stop ccx's explicit solver; a distributing coupling on a node surface kept as
     # ccx's card (NLGEOM) stops ccx ('a nodal surface is not allowed')
@@ -25710,7 +25738,10 @@ def test_transformed_node_bc_ramps_after_perturbation_steps():
                             "1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n*Step\n*Frequency\n2\n*End Step\n*Step\n*Dynamic\n"
                             "0.01, 0.2\n*Boundary\n7, 1, 1, 0.001\n*End Step\n")
     body, conv, _ = convert_str(deck)
-    assert "*BOUNDARY, AMPLITUDE=RAMP12357111317\n7, 1, 1, 0.001\n" in body and not conv.reduced_physics
+    assert "*BOUNDARY, AMPLITUDE=RAMP12357111317\n7, 1, 1, 0.001\n" in body
+    # (motion along the oblique local x in a *DYNAMIC step: ccx drives it 0.1 % otherwise, flagged)
+    assert conv.reduced_physics == ["*BOUNDARY motion along a *TRANSFORM axis in an implicit *DYNAMIC "
+                                    "step (ccx 2.23 drives it slightly otherwise than along a global axis)"]
 
 
 def test_cload_on_dofs_0_11_and_above_30_left_out():

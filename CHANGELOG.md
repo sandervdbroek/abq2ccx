@@ -88,6 +88,9 @@ entries. The GitHub release notes use the same section.
   dynamic step, holding such a node along one of its turned axes after it has started moving
   gives a different motion than in Abaqus (flagged as reduced physics); and in a model with a
   kinematic coupling, ccx stops at a `*BOUNDARY, OP=NEW`.
+* **New warning.** In a dynamic step, moving such a node along one of its turned axes by a
+  prescribed displacement gives a slightly different motion than in Abaqus (under 1 % in a test
+  cube); flagged as reduced physics.
 
 * **Fewer ccx failures.** A model with a heat transfer step whose other steps are only
   frequency, buckling or modal steps no longer stops ccx where shells or beams carry a moment
@@ -365,6 +368,13 @@ entries. The GitHub release notes use the same section.
   under DOFs 4-6 but writes their first terms on 5-7 (couplings.f), and OP=NEW re-indexes the
   equations by their first terms when the deck has a `*TRANSFORM` (probed: the `*TRANSFORM` on
   the reference node, a coupled node or an unconnected one, OP=NEW in step 1 or later). Warned.
+* **Prescribed motion on `*TRANSFORM` axes in `*DYNAMIC`** — a `*BOUNDARY` that moves a translation
+  of a `*TRANSFORM` node along a local axis other than the positive global one of its number in
+  an implicit `*DYNAMIC` step (a value other than the one in force, from rest too, or a deck
+  amplitude) is driven through the equation ccx writes for it, a little otherwise than an SPC:
+  probed on one C3D8 against the model turned into the node's axes, 0.4 % of the peak
+  displacement for 0.01 from rest at the start, 0.1 % for a ramp from rest, 0.9 % for a changed
+  value; a helper node is worse (1.0 / 0.4 / 1.6 %). Warned, reduced physics.
 
 * **Heat transfer runs with eigenvalue steps** — ccx 2.23 decides from the procedure cards
   alone, before any step, whether a run is mechanical: a `*HEAT TRANSFER` card with no

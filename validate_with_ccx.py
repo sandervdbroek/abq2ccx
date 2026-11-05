@@ -19029,7 +19029,10 @@ def check_t116(ccx, env, tmp, shared):
                   f"written ({err:.1e} apart, max |u| {scale:.4g})")
         failures += 0 if ok else 1
     # a *TRANSFORM node's new BC after a *FREQUENCY step (stepped, flagged reduced): ramped
-    runs = [t116_run("t116_tr_freq", "tr_freq"), t116_run("t116_tr_first", "tr_first")]
+    # (motion along the oblique local x in a *DYNAMIC step: ccx drives it 0.1 % otherwise, flagged)
+    motion = ("*BOUNDARY motion along a *TRANSFORM axis in an implicit *DYNAMIC step (ccx 2.23 drives "
+              "it slightly otherwise than along a global axis)",)
+    runs = [t116_run("t116_tr_freq", "tr_freq", motion), t116_run("t116_tr_first", "tr_first", motion)]
     ok = all(r is not None for r in runs)
     if ok:
         mid = [{b[3]: (b[4][0][1] + b[4][0][2]) / math.sqrt(2.) for b in r if b[1] == "displacements"
