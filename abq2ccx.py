@@ -10256,13 +10256,16 @@ class _Mesh:
         if sd is None or sd[0].startswith("NODE"):
             return None, []
         eids = self._surface_elements(surf)
+
+        def plane(e: int) -> bool:          # (a coupling: Abaqus' 2-D names; a tie: what ccx expands)
+            t = self.geom.elements[e][0]
+            return t.upper().startswith(PLANAR_SOLID_PREFIXES) if shells else \
+                ccx_type(t).startswith(PLANE_ELEM_PREFIXES)
         mine = [e for e in eids if e in self._qmem or self.geom.elements[e][0].upper().startswith("M3D")
-                or (shells and (ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS or
-                                self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)))
-                or (not shells and ccx_type(self.geom.elements[e][0]).startswith(PLANE_ELEM_PREFIXES))]
+                or plane(e) or (shells and ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS)]
         if not mine:
             return None, []
-        planar = [e for e in mine if self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)]
+        planar = [e for e in mine if plane(e)]
         if len(mine) < len(eids) and not shells and len(planar) == len(mine):
             return None, []                 # (plane faces and other elements': left as they are)
         if len(mine) < len(eids) and not shells:
@@ -10361,11 +10364,14 @@ class _Mesh:
                 self._reduces("*TIE on plane / axisymmetric faces: slave nodes off the master moved by "
                               "ccx's ADJUST, not their elements")
             return
+        cps = any(ccx_type(els[e][0]).startswith("CPS") for e in eids)
         self.report.note(f"{what}: slave surface {slave} on plane / axisymmetric elements -> node "
                          f"surface {name} of their edges' nodes, which Abaqus ties (ccx 2.23 ties none "
                          f"of the face nodes of the solids it expands them to, 'not active; no tied "
-                         f"constraint': singular; probed: the strips merged there, exactly in plane "
-                         f"strain, plane stress 5e-3 off at nu 0.3).", once=True)
+                         f"constraint': singular; probed: the strips merged there" +
+                         (", plane stress 5e-3 off at nu 0.3, where ccx's merged nodes share the expanded "
+                          "thickness)." if cps else " exactly; axisymmetric within its wedge, 1e-4).") +
+                         ("" if cps else " Exact."), once=True)
 
     def _plane_edge_gap(self, n: int, i: Optional[int], mf: Sequence[Tuple[int, List[int], int]]) -> float:
         """The distance of node ``n`` from the master edges ``mf`` (_facet) next to edge ``i``
