@@ -8993,6 +8993,40 @@ def tie_2d_face_deck(typ, merged, pair=False, nu=0.0):
     return "\n".join(out) + "\n"
 
 
+def tied_pair_shared_deck(form):
+    """Two C3D8 blocks 2 x 1 x 1 (2 x 1 x 1 elements), B on A, A's base held, B's top pulled along x
+    and z: ``form`` "pair" — B's bottom faces tied to A's top by a TIED *CONTACT PAIR, its x = 0
+    nodes A's (shared), the others coincident; "ref" — B on A's top nodes."""
+    a = lambda i, j, k: 1 + i + 3 * j + 6 * k                                    # noqa: E731
+    b = lambda i, j, k: (a(i, j, 1) if k == 0 and (form == "ref" or i == 0) else  # noqa: E731
+                         101 + i + 3 * j + 6 * k)
+    xyz = {}
+    for i in range(3):
+        for j in range(2):
+            for k in range(2):
+                xyz[a(i, j, k)] = (float(i), float(j), float(k))
+                xyz[b(i, j, k)] = (float(i), float(j), 1.0 + k)
+
+    def hexa(f, i):
+        return [f(i, 0, 0), f(i + 1, 0, 0), f(i + 1, 1, 0), f(i, 1, 0), f(i, 0, 1), f(i + 1, 0, 1),
+                f(i + 1, 1, 1), f(i, 1, 1)]
+    out = ["*HEADING", f"tied pair shared {form}", "*NODE"] + \
+        [f"{n}, {x:g}, {y:g}, {z:g}" for n, (x, y, z) in sorted(xyz.items())]
+    out += ["*ELEMENT, TYPE=C3D8, ELSET=A"] + [f"{1 + i}, " + ", ".join(map(str, hexa(a, i))) for i in range(2)]
+    out += ["*ELEMENT, TYPE=C3D8, ELSET=B"] + [f"{11 + i}, " + ", ".join(map(str, hexa(b, i))) for i in range(2)]
+    out += ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3", "*SOLID SECTION, ELSET=A, MATERIAL=M",
+            "*SOLID SECTION, ELSET=B, MATERIAL=M",
+            "*NSET, NSET=BASE\n" + ", ".join(str(a(i, j, 0)) for i in range(3) for j in range(2)),
+            "*NSET, NSET=TOP\n" + ", ".join(str(b(i, j, 1)) for i in range(3) for j in range(2))]
+    if form == "pair":
+        out += ["*SURFACE, NAME=ATOP\nA, S2", "*SURFACE, NAME=BBOT\nB, S1", "*SURFACE INTERACTION, NAME=SI",
+                "*CONTACT PAIR, INTERACTION=SI, TIED\nBBOT, ATOP"]
+    out += ["*BOUNDARY\nBASE, 1, 3", "*STEP", "*STATIC", "*CLOAD"] + \
+        [f"{b(i, j, 1)}, 1, 1.\n{b(i, j, 1)}, 3, {0.5 * i:g}" for i in range(3) for j in range(2)] + \
+        ["*NODE PRINT, NSET=TOP", "U", "*END STEP"]
+    return "\n".join(out) + "\n"
+
+
 def tie_offset_deck(spos, merged):
     """An S4 skin (t 0.1, nu 0) on the top of a C3D8 block (x 0-2, y 0-1, z 0-1; 4 x 2 x 1, its base
     clamped), its edge x = 2 pulled along x, then pushed along z (the PR #8 reviewer's deck):
@@ -20137,6 +20171,34 @@ def check_tie_2d_faces(ccx, env, tmp, shared):
                   f"at least{'; CAX: its wedge' if typ.startswith('CAX') else ''}; before: singular, 7e14 x |u|)")
         failures += 0 if ok else 1
     return failures
+
+
+@check("tied_pair_shared", "a TIED *CONTACT PAIR whose slave shares nodes with its master")
+def check_tied_pair_shared(ccx, env, tmp, shared):
+    # --- ccx 2.23 loops without end on a tie whose slave nodes lie on the master's faces; the
+    # converter writes a node surface of the slave's other nodes, as for a *TIE
+    runs = []
+    for form in ("pair", "ref"):
+        src, inp = os.path.join(tmp, f"tps_{form}_src.inp"), os.path.join(tmp, f"tps_{form}.inp")
+        with open(src, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(tied_pair_shared_deck(form))
+        rep, conv = convert(src, inp)
+        d, status, _out = run_ccx(ccx, env, inp)
+        runs.append((dat_node_blocks(os.path.join(d, "job.dat")), " ".join(rep.text().split()))
+                    if status == "solved" else None)
+        shutil.rmtree(d, ignore_errors=True)
+        if status != "solved":
+            print(f"FAIL  tied_pair_shared_{form}: did not solve ({status})")
+    ok = all(runs) and len(runs[0][0]) == len(runs[1][0]) == 1
+    if ok:
+        got, want = runs[0][0][0], runs[1][0][0]
+        err = max(abs(a - b) for n, v in want.items() for a, b in zip(got.get(n, [math.inf] * 3), v[:3]))
+        moved = max(abs(x) for v in want.values() for x in v[:3])
+        ok = err <= 1e-9 * moved and moved > 1e-3 and "BBOT_NODES" in runs[0][1]
+        print(f"{'PASS' if ok else 'FAIL'}  tied_pair_shared (C3D8 blocks, a TIED *CONTACT PAIR whose slave shares "
+              f"a node line with the master): the top nodes as the blocks merged ({err:.1e} apart; |u| "
+              f"{moved:.4g}; before: ccx looped without end)")
+    return 0 if ok else 1
 
 
 @check("midside_bc", "a card that moves one end of an edge the converter put a node on")
