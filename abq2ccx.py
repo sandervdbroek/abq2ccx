@@ -45043,11 +45043,15 @@ class _PostPasses:
     def _heat_only_loses(self, blocks: List[Block], deck: EmittedDeck) -> Optional[str]:
         """What ccx 2.23's heat-only run setup leaves out of the model (_mechanical_run_type),
         as words for the report, or None: plane, membrane or truss elements (their expansion's
-        mechanical MPCs), or shell and beam knots (_knot_in_run: their rotations and ties)."""
+        mechanical MPCs), *TIE constraints (their displacement ties), or shell and beam knots
+        (_knot_in_run: their rotations and ties)."""
         for e, (typ, _conn) in self.geom.elements.items():
             cc = ccx_type(typ)
             if cc.startswith(self._HEAT_ONLY_UNTIED):
                 return f"{cc} elements (e.g. element {e})"
+        tie = next((c for c in deck.cards if c.keyword == "TIE"), None)
+        if tie is not None:                     # (gentiedmpc: temperatures alone)
+            return f"*TIE constraints (e.g. {tie.param('NAME') or 'the first'})"
         knot = self._knot_in_run(blocks, deck)
         return None if knot is None else f"shell and beam knots (e.g. node {knot}), their rotations too"
 
@@ -45096,10 +45100,11 @@ class _PostPasses:
         Without such a step, a warning.  The heat-only setup also leaves out the mechanical
         MPCs ccx expands plane, membrane and truss elements with (gen3dfrom2d, gen3dmembrane,
         gen3dtruss; PR #27 review: CPS4 / CPE4 / CAX4 / M3D4 / T3D2 strips, first eigenvalue
-        0.135, 0.135, -0.028, 0.949, 0.928 for about 1e10, no message).  So only where the
-        model has such elements or such knots (_heat_only_loses): ccx runs solids and shells
-        and beams without knots alike either way (probed: a C3D8 bar, an S4 strip with
-        rotational BCs, a B31 cantilever, the same eigenvalues)."""
+        0.135, 0.135, -0.028, 0.949, 0.928 for about 1e10, no message), and a *TIE ties only
+        temperatures (gentiedmpc; two tied C3D8 bars: eigenvalues near 0).  The card is written
+        in every such run (where nothing needs it, ccx runs alike either way: a C3D8 bar, an S4
+        strip, a B31 cantilever, the same eigenvalues); its note and the warning only where
+        _heat_only_loses names what needs it."""
         state, init, heat = 0, False, None
         for c in deck.cards:
             kw = c.keyword
@@ -45112,12 +45117,14 @@ class _PostPasses:
             elif kw in self._RUN_COUPLED:
                 state = 3
         mech = [s for s in deck.steps if s.proc is not None and s.proc.keyword in self._EIGEN_PROCS]
-        lost = self._heat_only_loses(blocks, deck) if state == 2 and mech else None
-        if lost is None:
+        if state != 2 or not mech:
             return deck
+        lost = self._heat_only_loses(blocks, deck)
         at = next((s.proc for s in deck.steps if s.proc is not None and s.proc.index > heat.index
                    and s.proc.keyword in ("FREQUENCY", "BUCKLE")), None)
         if at is None:
+            if lost is None:
+                return deck
             self.report.warn(f"ccx 2.23 sets this run up as a heat transfer analysis (its procedure "
                              f"cards hold *HEAT TRANSFER and no *STATIC, *VISCO or *DYNAMIC after it; "
                              f"step(s) {', '.join(str(s.number) for s in mech)} do not count): it leaves "
@@ -45128,6 +45135,8 @@ class _PostPasses:
         deck.insert_before(at, ["** abq2ccx: *STATIC ahead of the step's own procedure (ccx runs the "
                                 "last one): it makes ccx set the run up as a mechanical one too",
                                 "*STATIC"])
+        if lost is None:
+            return deck.edited()
         self.report.note(f"*STATIC written ahead of step {at.step}'s *{at.keyword} card: ccx 2.23 sets a "
                          f"run up as heat transfer alone where its procedure cards hold *HEAT TRANSFER "
                          f"and no *STATIC, *VISCO or *DYNAMIC after it (*FREQUENCY and the modal "

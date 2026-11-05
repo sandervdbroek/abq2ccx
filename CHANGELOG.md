@@ -361,13 +361,14 @@ entries. The GitHub release notes use the same section.
   card; ccx runs the step's last procedure card, so the step is unchanged (the same eigenvalues
   and buckling factors to every digit), and the run is mechanical too. Where the eigenvalue
   steps all come before the heat step, a warning. The heat-only setup also leaves out the
-  mechanical ties ccx expands plane, membrane and truss elements with (CPS4, CPE4, CAX4, M3D4,
-  T3D2 strips: first eigenvalues 0.135, 0.135, -0.028, 0.949 and 0.928 for about 1e10, without
-  a message). So both go into models with such elements or such knots (knot beams, rigid
-  constraints or moments on shell/beam nodes, nodes ccx makes knots); the plane and membrane
-  strips then give the heat-free eigenvalues (a truss with a heat step differs from a heat-free
-  run either way, a separate matter). Solids, and shells or beams without knots, run alike
-  either way and get neither. The warning on drilling holds off the global
+  mechanical ties ccx expands plane, membrane and truss elements with, and a `*TIE` ties
+  temperatures alone (CPS4, CPE4, CAX4, M3D4, T3D2 strips and two tied C3D8 bars: first
+  eigenvalues near 0 for about 1e10, without a message). The card is written in every such run
+  (where nothing needs it, ccx runs alike either way); its note and the warning name the
+  elements, ties or knots that need it (knot beams, rigid constraints or moments on shell/beam
+  nodes, nodes ccx makes knots), and say nothing elsewhere. The plane, membrane and tied
+  models then give the heat-free eigenvalues (a truss with a heat step differs from a
+  heat-free run either way, a separate matter). The warning on drilling holds off the global
   axes in eigenvalue steps after a nonlinear step no longer counts a `*HEAT TRANSFER` step,
   which turns no knot (the eigenvalues after one are those without knots); the warning on
   equations on knots still does (a rigid body of knotted tip nodes: 61 kHz for 462 Hz after a
