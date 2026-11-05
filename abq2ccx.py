@@ -489,6 +489,9 @@ def brick_locks(typ: str) -> bool:
 # Continuum shells under a composite section: one ccx solid per ply (_plan_ply_split); the
 # default limit on the solids that adds (--max-ply-elements)
 PLY_SOLID = {"SC8R": "C3D8I", "SC6R": "C3D6"}
+# the fully plastic moment a continuum shell alone through the thickness carries in ccx 2.23 (one
+# C3D8I / C3D6, 2 Gauss points through it), over the exact one (_flag_inelastic_shells)
+SC_ALONE = 2.0 / math.sqrt(3.0)
 PLY_SPLIT_LIMIT = 1000000
 # Quadratic membranes, which ccx 2.23 expands with a mid-thickness node free in each element
 # (_plan_quadratic_membranes) -> the solid the converter writes each element as; M3D9 / M3D9R
@@ -15216,10 +15219,12 @@ class _Mesh:
             if self._continuum_shell_elset(elset):
                 if middles is None:
                     middles = self._sc_stack_middles(blocks)
-                single = [e for e in self._existing(elset) if e in middles]
+                # (an element of no resolved stack — alone, or one _sc_stack_middles leaves out —
+                # counts as alone through the thickness: 2 / sqrt(3))
+                single = [e for e in self._existing(elset) if middles.get(e, SC_ALONE) is not None]
                 if single and not (gauss and npts == 2):
                     cont.append((elset, len(single), rule, "plastic" if mat in plastic else "creeping",
-                                 max(middles[e] for e in single)))
+                                 max(middles.get(e) or SC_ALONE for e in single)))
                 continue
             if mat in plastic:
                 continue                            # (_plan_plastic_shells)
@@ -15282,17 +15287,20 @@ class _Mesh:
             self._reduces(f"{what} continuum shells SC6R / SC8R (ccx 2.23 integrates them through the "
                           f"thickness at 2 Gauss points, not at the section's points)")
 
-    def _sc_stack_middles(self, blocks: List[Block]) -> Dict[int, float]:
-        """The continuum shells (SC6R / SC8R of a *SHELL SECTION) the middle of their stack's
-        thickness crosses -> the fully plastic moment of that stack with the element's 2 Gauss
-        points through its thickness, over the exact one (_flag_inelastic_shells).  A stack is
+    def _sc_stack_middles(self, blocks: List[Block]) -> Dict[int, Optional[float]]:
+        """The continuum shells (SC6R / SC8R of a *SHELL SECTION) of the stacks resolved here ->
+        for the one the middle of its stack's thickness crosses, the fully plastic moment of
+        that stack with the element's 2 Gauss points through its thickness, over the exact one;
+        None for the others (_flag_inelastic_shells, which takes an element left out as alone
+        through the thickness, SC_ALONE).  A stack is
         a column of such elements through the thickness, each one's top face (_sc_stack_faces,
         by its section's stacking) the next one's bottom face, or joined through a cohesive
         element's (COH3D*, a *COHESIVE SECTION's stacking: two SC8R bonded by a glue layer are
         one stack), each element as thick as its faces lie apart.  An element alone through
         the thickness: 2 / sqrt(3); the middle one of k equal ones: 1 + 0.155 / k^2; where the
         middle lies at a face between two elements, none.  A branching column (a face of three
-        elements) leaves its elements out."""
+        elements) or one of no thickness leaves its elements out, and so does an element without
+        its section, nodes or 6 / 8 corners."""
         P = self.geom.nodes
         sec: Dict[int, Block] = {}
         for b in blocks:
@@ -15315,7 +15323,7 @@ class _Mesh:
         for e, (bot, top, _h) in cells.items():
             faces.setdefault(bot, []).append(e)
             faces.setdefault(top, []).append(e)
-        out: Dict[int, float] = {}
+        out: Dict[int, Optional[float]] = {}
         seen: set = set()
         for start in cells:
             if start in seen:
@@ -15342,6 +15350,7 @@ class _Mesh:
             total = sum(cells[x][2] for x in order)
             if not total > 0.0:
                 continue
+            out.update((x, None) for x in order if self.geom.elements[x][0].upper() in PLY_SOLID)
             mid, z, tol = 0.5 * total, 0.0, 1e-6 * total
             for x in order:
                 z0, z = z, z + cells[x][2]

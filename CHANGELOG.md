@@ -231,7 +231,8 @@ entries. The GitHub release notes use the same section.
   elements: 1.1547 / 1.0000 / 1.0172 / 1.0000 / 1.0062; in creep, 3 elements bend at 0.97 / 0.94
   times the exact rate at stress exponent 3 / 5). The element the middle crosses is flagged with
   the section's factor (an odd or unequal stack included); a stack whose middle lies between
-  two elements is not. Elements joined through a cohesive layer (`COH3D8` / `COH3D6`) count as
+  two elements is not, and an element of no stack the converter can follow (a branching column,
+  one of no thickness) counts as alone through the thickness. Elements joined through a cohesive layer (`COH3D8` / `COH3D6`) count as
   one stack: two `SC8R` bonded by a thin glue layer carried 0.9999 of the fully plastic moment
   and were flagged before (`validate_with_ccx.py sc_stacks`).
 * **Stabilization on `*VISCO` and coupled steps** — `STABILIZE`, `FACTOR`, `ALLSDTOL` and
