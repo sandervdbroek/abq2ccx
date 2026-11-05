@@ -94,6 +94,10 @@ entries. The GitHub release notes use the same section.
   or a rotation constraint: ccx set such a run up as heat transfer alone, with no rotations at
   the shell and beam joints. A heat transfer step is no longer taken for one that turns those
   joints, so such models are no longer flagged for it.
+* **More correct answers.** A nonlinear dashpot (`*DASHPOT, NONLINEAR`), which ccx does not
+  have, damped with the table's last force as its coefficient (twice too much for a table of
+  slope 2 ending at a velocity of 2). It is now a linear dashpot of the table's slope at zero
+  velocity: exact for a straight table, warned for any other.
 
 ### Details
 
@@ -383,6 +387,15 @@ entries. The GitHub release notes use the same section.
   heat step). `validate_with_ccx.py shell_knot_limits knot_heat`: a strip off the axes with
   heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
   without knots (before: ccx stopped).
+
+* **Nonlinear dashpots** — ccx 2.23 has no `*DASHPOT, NONLINEAR`: it warns of the parameter and
+  reads each 'force, velocity' line as 'coefficient, frequency', damping with the last line's
+  force (probed: a table of slope 2 to (4, 2) damped as 4). The card is now written as a linear
+  dashpot of the table's slope at zero velocity, per temperature: exact for a table that is one
+  straight line through zero (`validate_with_ccx.py dashpot_nonlinear`), else warned as reduced
+  physics; one with field variables is left as it is, warned. Nonlinear connector springs and
+  dashpots were and are not written (their connector is commented out, warned), so the
+  nonlinear-spring warning has none to catch.
 
 ## 1.7.0 (November 2026)
 

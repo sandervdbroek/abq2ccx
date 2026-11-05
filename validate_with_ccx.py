@@ -6994,6 +6994,15 @@ def spring_rotation_beam_deck(twin=False):
                   "*NODE PRINT, NSET=TIPS\nU\n*END STEP\n")
 
 
+def dashpot_nonlinear_deck(nonlinear):
+    """A mass of 1 pulled by 1 through a DASHPOTA to ground, implicit *DYNAMIC to t = 1: a
+    NONLINEAR table of slope 2 to (4, 2) (``nonlinear``), else a linear coefficient of 2."""
+    card = "*Dashpot, elset=D, nonlinear\n\n0., 0.\n2., 1.\n4., 2.\n" if nonlinear else "*Dashpot, elset=D\n\n2.\n"
+    return ("*Node, nset=P\n1, 0., 0., 0.\n2, -10., 0., 0.\n*Element, type=DASHPOTA, elset=D\n1, 1, 2\n" + card +
+            "*Element, type=MASS, elset=M\n2, 1\n*Mass, elset=M\n1.\n*Boundary\n1, 2, 3\n2, 1, 3\n"
+            "*Step, inc=1000\n*Dynamic\n0.01, 1.\n*Cload\n1, 1, 1.\n*Node Print, nset=P\nU\n*End Step\n")
+
+
 def spring_rotation_ref_deck():
     """A C3D8 unit cube as a *RIGID BODY on reference node 100 at its centre, and a second one
     whose nodes a kinematic coupling (*COUPLING, *KINEMATIC 1-3) ties to reference node 200 at
@@ -21033,6 +21042,26 @@ def check_connector_large_motion(ccx, env, tmp, shared):
             print(f"FAIL  connector_large_{kind}: {runs}")
         failures += 0 if ok else 1
     return failures
+
+
+@check("dashpot_nonlinear", "a *DASHPOT, NONLINEAR table that is one straight line through zero")
+def check_dashpot_nonlinear(ccx, env, tmp, shared):
+    # ccx 2.23 has no nonlinear dashpot and damped with the table's last force as the
+    # coefficient (4: 0.1885); written as its slope 2 it moves as the linear twin (exact 0.2838,
+    # ccx's time integration 0.2829)
+    review_run = shared["review_run"]
+    runs = [review_run(dashpot_nonlinear_deck(nl), f"dashpot_nonlinear_{int(nl)}", dat_displacements)
+            for nl in (True, False)]
+    ok = all(runs) and all(1 in r for r in runs)
+    if ok:
+        got, ref = (r[1][0] for r in runs)
+        ok = abs(got - ref) < 1e-9 * abs(ref) and abs(ref - 0.2838) < 2e-3
+        print(f"{'PASS' if ok else 'FAIL'}  dashpot_nonlinear (a mass pulled through a DASHPOTA whose "
+              f"NONLINEAR table has slope 2 to (4, 2)): x(1) {got:.7g}, the linear twin's {ref:.7g} "
+              f"(exact 0.2838)")
+    else:
+        print(f"FAIL  dashpot_nonlinear: {runs}")
+    return 0 if ok else 1
 
 
 @check("spring_dofs_masses",

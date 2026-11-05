@@ -11726,10 +11726,61 @@ class _Mesh:
             return self._joint_subcard(b)
         if id(b) not in self._dashpot_cards:
             if len(b.data) > 1 and dof_line(b.data[0]) and self._elset_types(b) == {"DASHPOTA"}:
-                return self.passthrough(Block(b.keyword, b.params, b.data[1:]))
-            return self.passthrough(b)
+                b = Block(b.keyword, b.params, b.data[1:])
+            return self.passthrough(self._linear_dashpot(b, b.data))
         params = OrderedDict((k, v) for k, v in b.params.items() if k != "ORIENTATION")
-        return [emit_keyword("DASHPOT", params)] + list(b.data[1:])
+        nb = self._linear_dashpot(Block(b.keyword, params, b.data[1:]), b.data[1:])
+        return [emit_keyword("DASHPOT", nb.params)] + list(nb.data)
+
+    def _linear_dashpot(self, b: Block, lines: List[str]) -> Block:
+        """*DASHPOT ``b`` with data lines ``lines`` (no DOF line), NONLINEAR ones (force, velocity,
+        temperature) as ccx's linear 'coefficient, frequency, temperature': ccx 2.23 has no
+        nonlinear dashpot — it warns of the parameter and damps with the last line's force as
+        the coefficient (probed: a table of slope 2 to (4, 2) damped as 4).  Per temperature, the
+        table's slope at zero velocity: exact for a straight line through zero, else warned,
+        reduced physics.  A table with field variables stays as it is, warned."""
+        if not b.has("NONLINEAR"):
+            return b
+        groups: "OrderedDict[str, List[Tuple[float, float]]]" = OrderedDict()
+        try:
+            for ln in lines:
+                f = trimmed_fields(ln.split(","))
+                if len(f) > 3:
+                    raise ValueError
+                if any(x.strip() for x in f):
+                    groups.setdefault(f[2].strip() if len(f) > 2 else "", []).append((pf(f[0]), pf(f[1])))
+        except (ValueError, IndexError):
+            groups = OrderedDict()
+        if not groups:
+            self.report.warn(f"*DASHPOT, NONLINEAR (ELSET={b.param('ELSET') or ''}) whose table the "
+                             f"converter does not read (field variables): ccx 2.23 has no nonlinear "
+                             f"dashpot and damps with the last line's force as the coefficient.", at=b)
+            self._reduces("*DASHPOT, NONLINEAR not converted")
+            return b
+        out, bent = [], False
+        for temp, pts in groups.items():
+            pts.sort(key=lambda p: p[1])
+            top = max(pts, key=lambda p: abs(p[1]))
+            big = max(abs(fo) for fo, _v in pts) or 1.0
+            if len(pts) == 1:
+                c = pts[0][0] / pts[0][1] if pts[0][1] else 0.0
+            else:
+                i = next((k for k in range(len(pts) - 1) if pts[k + 1][1] > 0.0), len(pts) - 2)
+                (f0, v0), (f1, v1) = pts[i], pts[i + 1]
+                c = (f1 - f0) / (v1 - v0) if v1 != v0 else 0.0
+            bent = bent or top[1] == 0.0 or any(abs(fo - top[0] / top[1] * v) > 1e-9 * big for fo, v in pts)
+            out.append(dotted_number(short_real(c, 12)) + (f", 0., {temp}" if temp else ""))
+        if bent:
+            self.report.warn(f"*DASHPOT, NONLINEAR (ELSET={b.param('ELSET') or ''}): ccx 2.23 has no "
+                             f"nonlinear dashpot (it damps with the last line's force as the "
+                             f"coefficient), so it is written as a linear one at the table's slope at "
+                             f"zero velocity; Abaqus follows the table.", at=b)
+            self._reduces("*DASHPOT, NONLINEAR as a linear dashpot")
+        else:
+            self.report.note("*DASHPOT, NONLINEAR whose table is one straight line through zero -> a "
+                             "linear dashpot of its slope (ccx 2.23 has no nonlinear dashpot and would "
+                             "damp with the last line's force as the coefficient): exact.", once=True)
+        return Block(b.keyword, OrderedDict((k, v) for k, v in b.params.items() if k != "NONLINEAR"), out)
 
     def _warn_dashpot_steps(self, blocks: List[Block]) -> None:
         """DASHPOTA elements in *DYNAMIC steps where ccx 2.23 does not damp as Abaqus does
