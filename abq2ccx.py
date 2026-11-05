@@ -9860,9 +9860,10 @@ class _Mesh:
             elif name and not membrane:
                 line = ", ".join([name] + f[1:])
             elif name:
-                params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
-                    b.param("POSITION TOLERANCE"), f[0], master, b, False), 6)
+                tol = self._membrane_tie_tolerance(b.param("POSITION TOLERANCE"), f[0], master, b, False)
+                params["POSITION TOLERANCE"] = short_real(tol, 6)
                 line = ", ".join([name] + f[1:])
+                self._plane_tie_checks(f[0], name, master, b, False, tol)
             elif tied is not None:                  # (the line names the set's node surface)
                 cards = tied[1]
                 params["POSITION TOLERANCE"] = short_real(tied[2], 6)
@@ -10191,7 +10192,7 @@ class _Mesh:
         constraints), so a slave surface on solid elements, or a node surface, becomes a node
         surface of its other nodes: (its name, its *SURFACE card), "" with none left (probed:
         the answer of the blocks merged at the interface).  (None, []): nothing shared; ("?",
-        []): shared on another element family (shells, plane elements)."""
+        []): shared on another element family (shells; plane elements: _membrane_node_surface)."""
         sd = self.surfaces.get(slave.upper())
         shared = set(self._surface_member_nodes(master))
         nodes = self._surface_member_nodes(slave)
@@ -10236,8 +10237,18 @@ class _Mesh:
         coupling the faces of shells the converter knotted for it (_plan_rigid_couplings); and
         so do plane and axisymmetric elements, whose faces are edges (_facet): ccx 2.23 couples
         other nodes of the solids it expands them to, for every face label (probed on CPE4 /
-        CAX4: -56 % / -22 %; the edges' nodes are exact).  A tie's surface on membranes and
-        other elements stays as it is, warned.  Nodes of ``exclude`` stay out (a tie's
+        CAX4: -56 % / -22 %; the edges' nodes are exact).  A tie's surface on plane and
+        axisymmetric elements (CPS / CPE / CAX) is one too: ccx 2.23 ties none of the face
+        nodes of the solids it expands them to ('DOF ... of node ... is not active; no tied
+        constraint') and the model is singular (probed on CPS4 / CAX4 strips: 7e14 / 4e13 x the
+        displacements), where a node surface of the edges' nodes ties them as Abaqus does: the
+        strips merged there exactly in plane strain (CAX4 1e-4, its wedge); in plane stress at
+        nu 0.3 5e-3 off, the merged nodes sharing the expanded thickness, which Abaqus' plane
+        stress elements have no nodal DOF for (ccx still says DOF 3, out of the plane, of every
+        such slave node, plane stress, plane strain or axisymmetric, is not active: its own
+        plane MPCs hold it); not where the tie should carry temperatures or move slave nodes
+        (_plane_tie_checks).  A tie's surface on membranes and other elements stays as it is,
+        warned.  Nodes of ``exclude`` stay out (a tie's
         master-face nodes, a coupling's reference node: ccx would tie them to themselves and
         loop in its cascade, "zero coefficient on the dependent side"); with none left the
         name is "" (nothing to tie)."""
@@ -10247,9 +10258,13 @@ class _Mesh:
         eids = self._surface_elements(surf)
         mine = [e for e in eids if e in self._qmem or self.geom.elements[e][0].upper().startswith("M3D")
                 or (shells and (ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS or
-                                self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)))]
+                                self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)))
+                or (not shells and ccx_type(self.geom.elements[e][0]).startswith(PLANE_ELEM_PREFIXES))]
         if not mine:
             return None, []
+        planar = [e for e in mine if self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)]
+        if len(mine) < len(eids) and not shells and len(planar) == len(mine):
+            return None, []                 # (plane faces and other elements': left as they are)
         if len(mine) < len(eids) and not shells:
             self.report.warn(f"{what} surface {surf} lies on membranes and on other elements: ccx "
                              f"skips the membranes' face nodes their hinge to the membrane node "
@@ -10266,7 +10281,9 @@ class _Mesh:
         self._reserve_names()
         name = self._fresh_name(f"{surf}_NODES")
         self._mem_surfaces[key] = name
-        if any(self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES) for e in mine):
+        if planar and not shells:
+            pass                            # (noted or warned with its tolerance: _plane_tie_checks)
+        elif planar:
             self.report.note(f"{what} surface {surf} on plane / axisymmetric elements -> node "
                              f"surface {name} of their edges' nodes, which Abaqus couples (ccx 2.23 "
                              f"couples other nodes of the solids it expands them to, for every face "
@@ -10282,6 +10299,96 @@ class _Mesh:
                              f"SNEG face ties nothing, an SPOS face shears through the thickness; "
                              f"probed).", once=True)
         return name, [f"*SURFACE, NAME={name}, TYPE=NODE"] + [str(n) for n in keep]  # ccx: one per line
+
+    def _plane_tie_checks(self, slave: str, name: str, master: str, b: Block, pair: bool,
+                          tol: float) -> None:
+        """A tie (``pair``: a TIED *CONTACT PAIR) whose slave ``slave`` on plane / axisymmetric
+        elements became node surface ``name`` of their edges' nodes (_membrane_node_surface),
+        its POSITION TOLERANCE ``tol``: noted where that is Abaqus' tie; warned, reduced
+        physics, where it is not —
+        * a step solves for temperatures: ccx ties a 2-D slave node through the middle node of
+          its expansion, whose temperature the expanded elements do not use, so the tie carries
+          none (probed on 2.23: CPE4T strips in a steady coupled step, the interface 0 / 100
+          where the merged strips have 50, 14x off in u_y; DC2D4 heat transfer stopped, 'too
+          many cutbacks', as with the faces);
+        * slave nodes off the master within the tolerance where Abaqus' ADJUST moves them onto
+          it strain free (a *TIE but with ADJUST=NO; a tied pair with an ADJUST: without one it
+          keeps the gap, as ccx does, exactly): ccx 2.23 does not move their elements, at most
+          the node (probed: CPE4 strips 0.02 / 0.04 off at a tolerance of 0.05, 2.0 % / 3.9 % off
+          the nodes moved; CAX4 0.7 %; ADJUST=NO exact).  The gap is measured to a quadratic
+          master edge's parabola, not its chord (a node on a curved edge is on the master)."""
+        els = self.geom.elements
+        eids = [e for e in self._surface_elements(slave) if e in els]
+        if not eids or not all(ccx_type(els[e][0]).startswith(PLANE_ELEM_PREFIXES) for e in eids):
+            return
+        what = "*CONTACT PAIR, TIED" if pair else f"*TIE {b.param('NAME') or ''}".rstrip()
+        md = self.surfaces.get(master.upper())
+        shared = set(self._surface_member_nodes(master))
+        keep = [n for n in self._surface_member_nodes(slave) if n not in shared and n in self.geom.nodes]
+        types: Dict[str, str] = {}
+        mf = [(e,) + self._facet(e, face, types) for token, face in (md[1] if md else [])
+              for e in self._resolve_elements(token) if e in els] if md and not md[0].startswith("NODE") else []
+        reach = self._mean_diagonal([self._face_points(e, face) for token, face in md[1]
+                                     for e in self._resolve_elements(token) if e in els]) if mf else 0.0
+        gaps = self._surface_gaps(keep, mf, tol) if mf and keep else {}
+        # (off by more than 1e-4 of a facet: round-off in the deck's coordinates is not a gap;
+        # the answer moves by about the gap's share of the element)
+        off = [n for n in keep if n in gaps and 1e-4 * (reach or 1.0) < gaps[n][0] <= tol and
+               self._plane_edge_gap(n, gaps[n][1], mf) > 1e-4 * (reach or 1.0)]
+        adj = (b.param("ADJUST") or "").strip()
+        try:
+            moves = pf(adj) > 0.0 if pair else adj.upper() != "NO"
+        except ValueError:
+            moves = bool(adj)                # (a pair's ADJUST=<node set>)
+        why = []
+        if self._mpc_thermal:
+            why.append("a step solves for temperatures, and ccx ties a 2-D slave node through the middle "
+                       "node of its expansion, whose temperature its elements do not use: the tie carries "
+                       "none (probed: CPE4T strips in a coupled step 14x off)")
+        if off and moves:
+            why.append(f"{len(off)} slave node(s) (e.g. node {off[0]}) lie off the master within the "
+                       f"tolerance: Abaqus moves them onto it strain free (ADJUST), ccx 2.23 does not move "
+                       f"their elements, at most the node (probed: CPE4 strips 0.02 / 0.04 off, 2.0 % / "
+                       f"3.9 %; ADJUST=NO exact)")
+        if why:
+            self.report.warn(f"{what}: slave surface {slave} on plane / axisymmetric elements -> node "
+                             f"surface {name} of their edges' nodes (ccx 2.23 ties none of the face "
+                             f"nodes of the solids it expands them to: singular), but " +
+                             "; and ".join(why) + " — verify.", once=True)
+            if self._mpc_thermal:
+                self._reduces("*TIE on plane / axisymmetric faces: no temperatures tied")
+            if off and moves:
+                self._reduces("*TIE on plane / axisymmetric faces: slave nodes off the master moved by "
+                              "ccx's ADJUST, not their elements")
+            return
+        self.report.note(f"{what}: slave surface {slave} on plane / axisymmetric elements -> node "
+                         f"surface {name} of their edges' nodes, which Abaqus ties (ccx 2.23 ties none "
+                         f"of the face nodes of the solids it expands them to, 'not active; no tied "
+                         f"constraint': singular; probed: the strips merged there, exactly in plane "
+                         f"strain, plane stress 5e-3 off at nu 0.3).", once=True)
+
+    def _plane_edge_gap(self, n: int, i: Optional[int], mf: Sequence[Tuple[int, List[int], int]]) -> float:
+        """The distance of node ``n`` from the master edges ``mf`` (_facet) next to edge ``i``
+        (the nearest by its chord, _surface_gaps; and those sharing a node with it), a quadratic
+        edge's parabola (corners, then its midside node) sampled and refined, not its chord."""
+        if i is None:
+            return math.inf
+        xyz, p = self.geom.nodes, self.geom.nodes[n]
+        near = [f for f in mf if set(f[1]).intersection(mf[i][1])]
+
+        def gap(fn: List[int]) -> float:
+            a, b = xyz[fn[0]], xyz[fn[1]]
+            m = xyz[fn[2]] if len(fn) > 2 else vscale(vadd(a, b), 0.5)
+            pt = lambda t: tuple(t * (t - 1) / 2 * a[k] + t * (t + 1) / 2 * b[k] + (1 - t * t) * m[k]  # noqa: E731
+                                 for k in range(3))
+            lo, hi = -1.0, 1.0
+            for _ in range(6):              # (zoom in round the nearest of 17 samples: 8x a round)
+                ts = [lo + (hi - lo) * j / 16 for j in range(17)]
+                t = min(ts, key=lambda u: math.dist(p, pt(u)))
+                step = (hi - lo) / 16
+                lo, hi = max(-1.0, t - step), min(1.0, t + step)
+            return min(math.dist(p, pt(u)) for u in (lo, (lo + hi) / 2, hi))
+        return min(gap(fn) for _e, fn, _c in near if all(x in xyz for x in fn))
 
     def _shell_tie_slave(self, slave: str, master: str, b: Block, pair: bool,
                          plan: Optional[List[int]] = None) -> \
@@ -12986,8 +13093,9 @@ class _Mesh:
                                f"node of {f[1].strip()}, which joins them already")
                     continue
                 if slave and shell is None:
-                    params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
-                        adj, f[0].strip(), f[1].strip(), b, True), 6)
+                    tol = self._membrane_tie_tolerance(adj, f[0].strip(), f[1].strip(), b, True)
+                    params["POSITION TOLERANCE"] = short_real(tol, 6)
+                    self._plane_tie_checks(f[0].strip(), slave, f[1].strip(), b, True, tol)
                 if slave is None:                   # (the deck's surfaces: as a *TIE's)
                     tol = params.get("POSITION TOLERANCE")
                     slave, cards = self._trimmed_tie_slave(f[0].strip(), f[1].strip(),
