@@ -26006,6 +26006,21 @@ def test_tie_on_one_surface_or_on_shared_nodes():
     body, conv, _ = convert_str(multi)
     assert _card_at(body, "*SURFACE, NAME=BB_NODES, TYPE=NODE") == ["102", "105"]
     assert {"BB_NODES, AT1", "BB_NODES, AT2"} <= set(body.splitlines()) and not conv.reduced_physics
+    # but a node of one master that lies on another (B on A1's nodes, A2 a block of its own nodes
+    # beside A1): Abaqus ties it to that other master, so its line keeps it (left out: A2's edge
+    # loose, 22 % off)
+    edge = ("*Node\n1,0,0,0\n2,1,0,0\n3,2,0,0\n4,0,1,0\n5,1,1,0\n6,2,1,0\n7,0,0,1\n8,1,0,1\n9,2,0,1\n"
+            "10,0,1,1\n11,1,1,1\n12,2,1,1\n103,2,0,1\n106,2,1,1\n107,0,0,2\n108,1,0,2\n109,2,0,2\n110,0,1,2\n"
+            "111,1,1,2\n112,2,1,2\n201,1,0,0\n204,1,1,0\n207,1,0,1\n210,1,1,1\n*Element, type=C3D8, elset=A1\n"
+            "1,1,2,5,4,7,8,11,10\n*Element, type=C3D8, elset=A2\n2,201,3,6,204,207,9,12,210\n*Element, "
+            "type=C3D8, elset=B\n11,7,8,11,10,107,108,111,110\n12,8,103,106,11,108,109,112,111\n*Material, "
+            "name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=A1, material=M\n*Solid Section, elset=A2, "
+            "material=M\n*Solid Section, elset=B, material=M\n*Surface, name=AT1\nA1, S2\n*Surface, name=AT2\n"
+            "A2, S2\n*Surface, name=BB\nB, S1\n*Tie, name=T1\nBB, AT1\nBB, AT2\n")
+    body, conv, _ = convert_str(edge)
+    assert _card_at(body, "*SURFACE, NAME=BB_NODES, TYPE=NODE") == ["103", "106"]
+    assert sorted(_card_at(body, "*SURFACE, NAME=BB_NODES~1, TYPE=NODE"), key=int) == ["8", "11", "103", "106"]
+    assert {"BB_NODES, AT1", "BB_NODES~1, AT2"} <= set(body.splitlines()) and not conv.reduced_physics
     plates = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,2,0,0\n6,2,1,0\n*Element, type=S4, elset=A\n"
               "1,1,2,3,4\n*Element, type=S4, elset=B\n2,2,5,6,3\n*Surface, name=AT\nA, SPOS\n"
               "*Surface, name=BT\nB, SPOS\n*Material, name=M\n*Elastic\n1000., 0.3\n*Shell Section, "

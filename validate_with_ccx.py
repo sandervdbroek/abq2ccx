@@ -9007,6 +9007,35 @@ def tied_pair_shared_deck(form):
     return "\n".join(out) + "\n"
 
 
+def tied_pair_edge_deck(twin):
+    """Block B (2 x 1 x 1, two C3D8) on A1 (x 0-1) and A2 (x 1-2), two blocks of their own nodes,
+    A's base held, B's top pulled along x and z: B's bottom on A1's top nodes, its x = 2 nodes its
+    own, tied to both by one TIED *CONTACT PAIR card of two lines (BBOT, ATOP1 / BBOT, ATOP2) —
+    Abaqus ties B's x = 1 nodes, A1's, to A2's edge; ``twin``: A2 and B on those nodes, merged."""
+    xyz = {1: (0, 0, 0), 2: (1, 0, 0), 3: (2, 0, 0), 4: (0, 1, 0), 5: (1, 1, 0), 6: (2, 1, 0), 7: (0, 0, 1),
+           8: (1, 0, 1), 9: (2, 0, 1), 10: (0, 1, 1), 11: (1, 1, 1), 12: (2, 1, 1), 107: (0, 0, 2),
+           108: (1, 0, 2), 109: (2, 0, 2), 110: (0, 1, 2), 111: (1, 1, 2), 112: (2, 1, 2), 201: (1, 0, 0),
+           204: (1, 1, 0)}
+    if not twin:
+        xyz.update({103: (2, 0, 1), 106: (2, 1, 1), 207: (1, 0, 1), 210: (1, 1, 1)})
+    a2 = (207, 9, 12, 210) if not twin else (8, 9, 12, 11)
+    b2 = (8, 103, 106, 11) if not twin else (8, 9, 12, 11)
+    out = ["*HEADING", "tied pair on an edge", "*NODE"] + [f"{n}, {x}, {y}, {z}" for n, (x, y, z) in sorted(xyz.items())]
+    out += ["*ELEMENT, TYPE=C3D8, ELSET=A1\n1, 1, 2, 5, 4, 7, 8, 11, 10",
+            "*ELEMENT, TYPE=C3D8, ELSET=A2\n2, 201, 3, 6, 204, " + ", ".join(map(str, a2)),
+            "*ELEMENT, TYPE=C3D8, ELSET=B\n11, 7, 8, 11, 10, 107, 108, 111, 110\n12, " + ", ".join(map(str, b2)) +
+            ", 108, 109, 112, 111", "*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.3"]
+    out += [f"*SOLID SECTION, ELSET={e}, MATERIAL=M" for e in ("A1", "A2", "B")]
+    out += ["*NSET, NSET=BASE\n1, 2, 201, 204, 3, 4, 5, 6", "*NSET, NSET=TOP\n107, 110, 108, 111, 109, 112"]
+    if not twin:
+        out += ["*SURFACE, NAME=ATOP1\nA1, S2", "*SURFACE, NAME=ATOP2\nA2, S2", "*SURFACE, NAME=BBOT\nB, S1",
+                "*SURFACE INTERACTION, NAME=SI", "*CONTACT PAIR, INTERACTION=SI, TIED\nBBOT, ATOP1\nBBOT, ATOP2"]
+    out += ["*BOUNDARY\nBASE, 1, 3", "*STEP", "*STATIC", "*CLOAD"] + \
+        [f"{n}, 1, 1.\n{n}, 3, {0.5 * xyz[n][0]:g}" for n in (107, 110, 108, 111, 109, 112)] + \
+        ["*NODE PRINT, NSET=TOP", "U", "*END STEP"]
+    return "\n".join(out) + "\n"
+
+
 def tie_offset_deck(spos, merged):
     """An S4 skin (t 0.1, nu 0) on the top of a C3D8 block (x 0-2, y 0-1, z 0-1; 4 x 2 x 1, its base
     clamped), its edge x = 2 pulled along x, then pushed along z (the PR #8 reviewer's deck):
@@ -20105,10 +20134,11 @@ def check_tied_pair_shared(ccx, env, tmp, shared):
     # --- ccx 2.23 loops without end on a tie whose slave nodes lie on the master's faces; the
     # converter writes a node surface of the slave's other nodes, as for a *TIE
     runs = []
-    for form in ("pair", "multi", "ref"):
+    for form in ("pair", "multi", "ref", "edge", "edge_twin"):
         src, inp = os.path.join(tmp, f"tps_{form}_src.inp"), os.path.join(tmp, f"tps_{form}.inp")
         with open(src, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(tied_pair_shared_deck(form))
+            fh.write(tied_pair_edge_deck(form == "edge_twin") if form.startswith("edge") else
+                     tied_pair_shared_deck(form))
         rep, conv = convert(src, inp)
         d, status, _out = run_ccx(ccx, env, inp)
         runs.append((dat_node_blocks(os.path.join(d, "job.dat")), " ".join(rep.text().split()))
@@ -20117,17 +20147,21 @@ def check_tied_pair_shared(ccx, env, tmp, shared):
         if status != "solved":
             print(f"FAIL  tied_pair_shared_{form}: did not solve ({status})")
     failures = 0
-    for i, what in ((0, "a TIED *CONTACT PAIR whose slave shares a node line with the master"),
-                    (1, "a two-line *TIE of one slave on two masters, sharing a node line with each")):
-        ok = runs[i] is not None and runs[2] is not None and len(runs[i][0]) == len(runs[2][0]) == 1
+    for i, j, tag, what in (
+            (0, 2, "", "a TIED *CONTACT PAIR whose slave shares a node line with the master"),
+            (1, 2, "_multi", "a two-line *TIE of one slave on two masters, sharing a node line with each"),
+            (3, 4, "_edge", "a two-line TIED *CONTACT PAIR of a block on the nodes of one master and the edge "
+                            "of another")):
+        ok = runs[i] is not None and runs[j] is not None and len(runs[i][0]) == len(runs[j][0]) == 1
         if ok:
-            got, want = runs[i][0][0], runs[2][0][0]
+            got, want = runs[i][0][0], runs[j][0][0]
             err = max(abs(a - b) for n, v in want.items() for a, b in zip(got.get(n, [math.inf] * 3), v[:3]))
             moved = max(abs(x) for v in want.values() for x in v[:3])
             ok = err <= 1e-9 * moved and moved > 1e-3 and "BBOT_NODES" in runs[i][1]
-            print(f"{'PASS' if ok else 'FAIL'}  tied_pair_shared{'_multi' if i else ''} (C3D8 blocks, {what}): the "
-                  f"top nodes as the blocks merged ({err:.1e} apart; |u| {moved:.4g}; before: ccx looped without "
-                  f"end)")
+            print(f"{'PASS' if ok else 'FAIL'}  tied_pair_shared{tag} (C3D8 blocks, {what}): the top nodes as the "
+                  f"blocks merged ({err:.1e} apart; |u| {moved:.4g}; before: " +
+                  ("exact; a guard: leaving those nodes out ties the edge to nothing, 22 % off)" if tag == "_edge"
+                   else "ccx looped without end)"))
         failures += 0 if ok else 1
     return failures
 

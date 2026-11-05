@@ -9832,7 +9832,8 @@ class _Mesh:
             if shell is not None:                   # (a solid master: counted above)
                 name, cards = shell[0], shell[1]
             elif plain and not membrane:
-                name, cards = self._shared_tie_slave(f[0], master)
+                name, cards = self._shared_tie_slave(f[0], master, tol=self._membrane_tie_tolerance(
+                    b.param("POSITION TOLERANCE"), f[0], master, b, False))
             if name == "?":
                 out += self._comment_out(
                     f"*TIE {params.get('NAME') or ''}: slave surface {f[0]} shares nodes with the "
@@ -10182,7 +10183,8 @@ class _Mesh:
                          f"tolerance). Exact.")
         return name, [f"*SURFACE, NAME={name}, TYPE={card}"] + kept
 
-    def _shared_tie_slave(self, slave: str, master: str, what: str = "*TIE") -> Tuple[Optional[str], List[str]]:
+    def _shared_tie_slave(self, slave: str, master: str, what: str = "*TIE",
+                          tol: Optional[float] = None) -> Tuple[Optional[str], List[str]]:
         """A *TIE slave surface ``slave`` that shares nodes with the faces of ``master``: ccx
         2.23 ties such a node to the master face it lies on, so the tie's dependent DOF is one
         of its own independent terms, and loops without end decascading it ('zero coefficient
@@ -10197,10 +10199,22 @@ class _Mesh:
         is tied through its expanded faces, not its nodes: no loop there, so the notes claim
         neither the loop nor exactness (_shell_tie_slave warns of such a master)."""
         sd = self.surfaces.get(slave.upper())
-        # (the nodes of every master this slave is tied to, on any line: _plan_tie_masters)
-        shared = {n for m in {master.upper()} | self._tie_masters.get(slave.upper(), set())
-                  for n in self._surface_member_nodes(m)}
         nodes = self._surface_member_nodes(slave)
+        # (and the nodes of the other masters this slave is tied to, on any line, _plan_tie_masters,
+        # but those within the position tolerance ``tol`` of this master: Abaqus ties them to it
+        # — a node of one block on the edge of another — and ccx does, exactly; a node of another
+        # master farther off ccx ties all the same and loops on, 'dependent node ...')
+        shared = set(self._surface_member_nodes(master))
+        far = {n for m in self._tie_masters.get(slave.upper(), set()) - {master.upper()}
+               for n in self._surface_member_nodes(m)}.intersection(nodes) - shared
+        md = self.surfaces.get(master.upper())
+        if far and tol is not None and md and not md[0].startswith("NODE"):
+            types: Dict[str, str] = {}
+            mf = [(e,) + self._facet(e, face, types) for token, face in md[1]
+                  for e in self._resolve_elements(token) if e in self.geom.elements]
+            gaps = self._surface_gaps(sorted(far), mf, tol) if mf else {}
+            far = {n for n in far if not (n in gaps and gaps[n][0] <= tol)}
+        shared |= far
         if sd is None or not shared.intersection(nodes):
             return None, []
         keep = [n for n in nodes if n not in shared]
@@ -13104,7 +13118,9 @@ class _Mesh:
                     params["POSITION TOLERANCE"] = short_real(tol, 6)
                     self._plane_tie_checks(f[0].strip(), slave, f[1].strip(), b, True, tol)
                 if slave is None:                   # (a slave sharing master nodes: as a *TIE's)
-                    slave, cards = self._shared_tie_slave(f[0].strip(), f[1].strip(), "*CONTACT PAIR, TIED")
+                    slave, cards = self._shared_tie_slave(f[0].strip(), f[1].strip(), "*CONTACT PAIR, TIED",
+                                                          self._membrane_tie_tolerance(adj, f[0].strip(),
+                                                                                       f[1].strip(), b, True))
                     if slave == "?":
                         out += self._comment_out(
                             f"*CONTACT PAIR, TIED: slave surface {f[0].strip()} shares nodes with the faces "
