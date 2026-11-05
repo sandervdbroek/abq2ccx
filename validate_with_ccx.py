@@ -9379,7 +9379,7 @@ def t155_temperatures(dat_path):
 
 def sc_stack_bend_deck(layers, nx=4):
     """Pure bending of a continuum-shell block 0.4 long, 0.1 wide, 0.1 thick, ``layers`` (type,
-    thickness) bottom to top (SC8R of an elastic-plastic material, E 1000, nu 0, sigma_y 1,
+    thickness) bottom to top (C3D8: a soft elastic core, E 0.01; SC8R of an elastic-plastic material, E 1000, nu 0, sigma_y 1,
     hardening 0.01, at most 5e-4 at the curvature reached, so ccx's iterations keep a tangent; COH3D8 of a soft elastic glue, E 1, *COHESIVE SECTION, RESPONSE=CONTINUUM):
     the end x = 0 held in x, the end x = 0.4 moved u_x = theta z (plane sections), theta 50
     times first yield, so the section is all but fully plastic (M_p = 2.5e-4)."""
@@ -9399,9 +9399,10 @@ def sc_stack_bend_deck(layers, nx=4):
                 (a, 0, li), (a + 1, 0, li), (a + 1, 1, li), (a, 1, li),
                 (a, 0, li + 1), (a + 1, 0, li + 1), (a + 1, 1, li + 1), (a, 1, li + 1))))
         out += ([f"*SHELL SECTION, ELSET=L{li}, MATERIAL=M", f"{h!r}"] if t == "SC8R" else
+                [f"*SOLID SECTION, ELSET=L{li}, MATERIAL=CORE"] if t == "C3D8" else
                 [f"*COHESIVE SECTION, ELSET=L{li}, MATERIAL=GLUE, RESPONSE=CONTINUUM"])
     out += ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.", "*PLASTIC", "1., 0.", "1.01, 1.", "*MATERIAL, NAME=GLUE",
-            "*ELASTIC", "1., 0."]
+            "*ELASTIC", "1., 0.", "*MATERIAL, NAME=CORE", "*ELASTIC", "0.01, 0."]
     left = [n for n, p in nodes.items() if p[0] == 0.0]
     right = [n for n, p in nodes.items() if p[0] == 0.4]
     out += ["*NSET, NSET=RIGHT"] + [", ".join(map(str, right))]
@@ -20398,7 +20399,9 @@ def check_sc_stacks(ccx, env, tmp, shared):
     for name, layers, want, flagged in (
             ("k1", [sc], 2 / math.sqrt(3), True), ("k2", [("SC8R", 0.05)] * 2, 1.0, False),
             ("k3", [("SC8R", 0.1 / 3)] * 3, 1 + (1 / math.sqrt(3) - 0.5) * 4 / 9 / 2, True),
-            ("bonded", [("SC8R", 0.049), ("COH3D8", 0.002), ("SC8R", 0.049)], 1 - 0.02 ** 2, False)):
+            ("bonded", [("SC8R", 0.049), ("COH3D8", 0.002), ("SC8R", 0.049)], 1 - 0.02 ** 2, False),
+            # skins on a solid core: one stack, each skin wholly on one side of the middle
+            ("sandwich", [("SC8R", 0.02), ("C3D8", 0.06), ("SC8R", 0.02)], 1 - 0.6 ** 2, False)):
         text, z = sc_stack_bend_deck(layers)
         tag = f"sc_stacks_{name}"
         res = review_run(text, tag, lambda dat: (dat_node_blocks(dat), dat_node_blocks(dat, "forces")))
@@ -20409,7 +20412,9 @@ def check_sc_stacks(ccx, env, tmp, shared):
             m = sum(v[0] * z[n] for n, v in res[1][-1].items()) / 2.5e-4
             w = res[0][-1][min(res[0][-1])][2]
             ok = abs(m - want) < 2e-3 and got_flag == flagged and abs(w) > 1e-3
-            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({'two SC8R bonded by a COH3D8 layer' if name == 'bonded' else f'{name[1]} SC8R'} "
+            what = {"bonded": "two SC8R bonded by a COH3D8 layer",
+                    "sandwich": "two SC8R skins on a C3D8 core"}.get(name, f"{name[1:]} SC8R")
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what} "
                   f"through the thickness in pure bending): M / M_p {m:.4f} vs {want:.4f}, "
                   f"{'flagged' if got_flag else 'not flagged'}; the free mid-span top node moved w {w:.4g}")
         failures += 0 if ok else 1
