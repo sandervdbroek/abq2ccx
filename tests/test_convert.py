@@ -25276,11 +25276,21 @@ def test_heat_transfer_run_gets_a_static_card_for_its_knots():
     for text in (model + freq + ssd, model + heat + "*STEP\n*STATIC\n*END STEP\n" + freq + ssd):
         out, conv, rep = convert_str(text)
         assert "\n*STATIC\n*FREQUENCY" not in out
-    # a *BUCKLE step takes it too; eigenvalue steps before the heat step only: warned
-    out, _, rep = convert_str(model + heat + "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n11, 1, -1.\n*END STEP\n")
+    # a *BUCKLE step takes it too (a moment on a shell node: a knot); eigenvalue steps before the
+    # heat step only: warned
+    out, _, rep = convert_str(model + heat + "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n11, 5, 1e-4\n*END STEP\n")
     assert "\n*STATIC\n*BUCKLE" in out
-    out, _, rep = convert_str(model + freq + heat)
+    out, _, rep = convert_str(model + freq + ssd + heat)
     assert "*STATIC\n" not in out and "ccx 2.23 sets this run up as a heat transfer analysis" in rep.text()
+    # nothing where the model has no knot: the strip without moments, a solid cube (review of
+    # PR #21: the card, the note and the warning were noise there)
+    cube = MODAL.split("*Step")[0].replace("*Density\n1e-3\n", "*Density\n1e-3\n*Conductivity\n50.\n")
+    cube_heat = "*Step\n*Heat Transfer, steady state\n1., 1.\n*Boundary\n1, 11, 11, 20.\n*End Step\n"
+    assert "*Conductivity" in cube
+    for text in (model + heat + freq, cube + cube_heat + freq, cube + freq + cube_heat):
+        out, _, rep = convert_str(text)
+        assert "*STATIC\n" not in out and "*STATIC written" not in rep.text() and \
+            "sets this run up as a heat transfer analysis" not in rep.text(), text
     # the knot-equation warning still counts a heat step
     rb = "*RIGID BODY, REF NODE=901, TIE NSET=RB\n"
     _, conv, rep = convert_str(KNOT_CANTILEVER.format(

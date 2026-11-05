@@ -358,7 +358,9 @@ entries. The GitHub release notes use the same section.
   goes right before the first `*FREQUENCY` or `*BUCKLE` card after the first `*HEAT TRANSFER`
   card; ccx runs the step's last procedure card, so the step is unchanged (the same eigenvalues
   and buckling factors to every digit), and the run is mechanical too. Where the eigenvalue
-  steps all come before the heat step, a warning. The warning on drilling holds off the global
+  steps all come before the heat step, a warning. Both only in models with such knots (knot
+  beams, rigid constraints or moments on shell/beam nodes, nodes ccx makes knots): solids and
+  plain shells or beams run alike either way, so they get neither. The warning on drilling holds off the global
   axes in eigenvalue steps after a nonlinear step no longer counts a `*HEAT TRANSFER` step,
   which turns no knot (the eigenvalues after one are those without knots); the warning on
   equations on knots still does (a rigid body of knotted tip nodes: 61 kHz for 462 Hz after a
