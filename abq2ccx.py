@@ -45158,7 +45158,8 @@ class _PostPasses:
         *BUCKLE card after the first *HEAT TRANSFER card makes the run mechanical too and the
         step what it was (probed: the same eigenvalues and buckling factors to every digit).
         Without such a step, a warning."""
-        state, init, heat, before = 0, False, None, None
+        state, init, heat = 0, False, None
+        before: Optional[EmittedCard] = None      # a mechanical card before the heat card
         for c in deck.cards:
             kw = c.keyword
             if kw == "INITIAL CONDITIONS" and c.uparam("TYPE") == "TEMPERATURE":
