@@ -6994,13 +6994,18 @@ def spring_rotation_beam_deck(twin=False):
                   "*NODE PRINT, NSET=TIPS\nU\n*END STEP\n")
 
 
-def dashpot_nonlinear_deck(nonlinear):
-    """A mass of 1 pulled by 1 through a DASHPOTA to ground, implicit *DYNAMIC to t = 1: a
-    NONLINEAR table of slope 2 to (4, 2) (``nonlinear``), else a linear coefficient of 2."""
-    card = "*Dashpot, elset=D, nonlinear\n\n0., 0.\n2., 1.\n4., 2.\n" if nonlinear else "*Dashpot, elset=D\n\n2.\n"
+def dashpot_nonlinear_deck(form, sign=1):
+    """A mass of 1 pulled by ``sign`` 1 through a DASHPOTA to ground, implicit *DYNAMIC to t = 1:
+    "two": a NONLINEAR table -4, -2 / 0, 0 / 4, 2 (slope 2 on both sides, the velocity stays
+    below 0.5); "one": 0, 0 / 2, 1 / 4, 2 (positive velocities only: Abaqus holds the force at
+    zero velocity, 0, beyond — pulled the negative way the mass moves undamped, -0.5); "lin":
+    a linear coefficient of 2."""
+    card = {"two": "*Dashpot, elset=D, nonlinear\n\n-4., -2.\n0., 0.\n4., 2.\n",
+            "one": "*Dashpot, elset=D, nonlinear\n\n0., 0.\n2., 1.\n4., 2.\n",
+            "lin": "*Dashpot, elset=D\n\n2.\n"}[form]
     return ("*Node, nset=P\n1, 0., 0., 0.\n2, -10., 0., 0.\n*Element, type=DASHPOTA, elset=D\n1, 1, 2\n" + card +
             "*Element, type=MASS, elset=M\n2, 1\n*Mass, elset=M\n1.\n*Boundary\n1, 2, 3\n2, 1, 3\n"
-            "*Step, inc=1000\n*Dynamic\n0.01, 1.\n*Cload\n1, 1, 1.\n*Node Print, nset=P\nU\n*End Step\n")
+            f"*Step, inc=1000\n*Dynamic\n0.01, 1.\n*Cload\n1, 1, {sign:g}.\n*Node Print, nset=P\nU\n*End Step\n")
 
 
 def spring_rotation_ref_deck():
@@ -21044,24 +21049,34 @@ def check_connector_large_motion(ccx, env, tmp, shared):
     return failures
 
 
-@check("dashpot_nonlinear", "a *DASHPOT, NONLINEAR table that is one straight line through zero")
+@check("dashpot_nonlinear", "*DASHPOT, NONLINEAR tables as linear dashpots")
 def check_dashpot_nonlinear(ccx, env, tmp, shared):
     # ccx 2.23 has no nonlinear dashpot and damped with the table's last force as the
-    # coefficient (4: 0.1885); written as its slope 2 it moves as the linear twin (exact 0.2838,
-    # ccx's time integration 0.2829)
+    # coefficient (4: 0.1885); written as its slope 2, a straight table on both sides of zero
+    # moves as the linear twin (exact 0.2838, ccx's time integration 0.2829); a table of positive
+    # velocities only, pulled the negative way (Abaqus: undamped, -0.5), is flagged
     review_run = shared["review_run"]
-    runs = [review_run(dashpot_nonlinear_deck(nl), f"dashpot_nonlinear_{int(nl)}", dat_displacements)
-            for nl in (True, False)]
+    failures = 0
+    runs = [review_run(dashpot_nonlinear_deck(f), f"dashpot_nonlinear_{f}", dat_displacements) for f in ("two", "lin")]
     ok = all(runs) and all(1 in r for r in runs)
     if ok:
         got, ref = (r[1][0] for r in runs)
         ok = abs(got - ref) < 1e-9 * abs(ref) and abs(ref - 0.2838) < 2e-3
         print(f"{'PASS' if ok else 'FAIL'}  dashpot_nonlinear (a mass pulled through a DASHPOTA whose "
-              f"NONLINEAR table has slope 2 to (4, 2)): x(1) {got:.7g}, the linear twin's {ref:.7g} "
-              f"(exact 0.2838)")
+              f"NONLINEAR table has slope 2 on both sides of zero): x(1) {got:.7g}, the linear twin's "
+              f"{ref:.7g} (exact 0.2838)")
     else:
         print(f"FAIL  dashpot_nonlinear: {runs}")
-    return 0 if ok else 1
+    failures += 0 if ok else 1
+    u = review_run(dashpot_nonlinear_deck("one", -1), "dashpot_nonlinear_one", dat_displacements)
+    path = os.path.join(tmp, "dashpot_nonlinear_one.inp")
+    flagged = os.path.exists(path) and "not Abaqus' damping here" in open(path, encoding="utf-8").read()
+    ok = bool(u) and 1 in u and flagged
+    print(f"{'PASS' if ok else 'FAIL'}  dashpot_nonlinear_one_sided (its table of positive velocities only, "
+          f"pulled the negative way: Abaqus -0.5, undamped): x(1) {u[1][0] if ok else u}, "
+          f"{'flagged' if flagged else 'NOT flagged'}")
+    failures += 0 if ok else 1
+    return failures
 
 
 @check("spring_dofs_masses",
