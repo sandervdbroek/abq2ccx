@@ -77,8 +77,9 @@ beam, buckling and statics references above; *EL FILE requests ccx stopped or cr
 and the same decks without them; *EL PRINT ELKE in a linear static and a *BUCKLE step against
 u0 cos 100 t and the same deck without it, and after a *FREQUENCY step against A cos 100 t and
 u0; *CONTACT PRINT CFN for every pair against a rigid punch's reaction; TABULAR and
-EXPONENTIAL pressure-overclosure laws and *GAP CONDUCTANCE against clearance on two pressed
-cubes against Abaqus' laws; and decks a code review
+EXPONENTIAL pressure-overclosure laws (face-to-face pairs under --approximate too) and *GAP
+CONDUCTANCE against clearance (also before the *SURFACE BEHAVIOR) on two pressed cubes against
+Abaqus' laws; and decks a code review
 found converted wrongly:
 a planar beam's coupled tip, a velocity BC a coupling implies, amplitude points 1e-4 apart at
 time 100, a symmetric layup tied to a rigid plate, --approximate beside a blank Poisson's ratio,
@@ -6994,6 +6995,28 @@ def spring_rotation_beam_deck(twin=False):
                   "*NODE PRINT, NSET=TIPS\nU\n*END STEP\n")
 
 
+def spring_rotated_instance_deck(angle, axis=(0.0, 0.0, 1.0)):
+    """spring_rotation_beam_deck's first two cantilevers in a part (tip 5 on a SPRING1 of 1 on
+    its DOF 5, tips 5 and 15 joined by a SPRING2 of 1 on DOFs 5, 5), in an instance turned
+    ``angle`` degrees about ``axis`` through the origin, tip 5 pushed 0.01 along the part's z
+    axis: in the part's axes the same tips at any turn (the springs act about the part's y
+    axis, which turns with the instance)."""
+    e = _unit(axis)
+    load = _rotate((0.0, 0.0, 0.01), e, math.radians(angle))
+    nodes = "".join(f"{10 * b + i + 1}, {0.25 * i:g}, {b}., 0.\n" for b in range(2) for i in range(5))
+    els = "".join(f"{10 * b + i + 1}, {10 * b + i + 1}, {10 * b + i + 2}\n" for b in range(2) for i in range(4))
+    turn = f"0., 0., 0.\n0., 0., 0., {e[0]:.15g}, {e[1]:.15g}, {e[2]:.15g}, {angle:g}\n" if angle else ""
+    return ("*Part, name=P\n*Node\n" + nodes + "*Element, type=B31, elset=BEAMS\n" + els +
+            "*Element, type=SPRING1, elset=KR1\n31, 5\n*Spring, elset=KR1\n5\n1.\n"
+            "*Element, type=SPRING2, elset=KR2\n32, 5, 15\n*Spring, elset=KR2\n5, 5\n1.\n"
+            "*Beam Section, elset=BEAMS, material=STEEL, section=RECT\n0.1, 0.1\n0., 0., 1.\n"
+            "*Nset, nset=TIPS\n5, 15\n*Nset, nset=ROOTS\n1, 11\n*End Part\n*Assembly, name=A\n"
+            "*Instance, name=I, part=P\n" + turn + "*End Instance\n*End Assembly\n*Material, name=STEEL\n"
+            "*Elastic\n1.e4, 0.3\n*Boundary\nI.ROOTS, ENCASTRE\n*Step\n*Static\n*Cload\n" +
+            "".join(f"I.5, {k + 1}, {load[k]:.15g}\n" for k in range(3) if abs(load[k]) > 1e-15) +
+            "*Node Print, nset=I.TIPS\nU\n*End Step\n")
+
+
 def spring_rotation_ref_deck():
     """A C3D8 unit cube as a *RIGID BODY on reference node 100 at its centre, and a second one
     whose nodes a kinematic coupling (*COUPLING, *KINEMATIC 1-3) ties to reference node 200 at
@@ -9450,7 +9473,7 @@ def t155_temperatures(dat_path):
 
 def sc_stack_bend_deck(layers, nx=4):
     """Pure bending of a continuum-shell block 0.4 long, 0.1 wide, 0.1 thick, ``layers`` (type,
-    thickness) bottom to top (SC8R of an elastic-plastic material, E 1000, nu 0, sigma_y 1,
+    thickness) bottom to top (C3D8: a soft elastic core, E 0.01; SC8R of an elastic-plastic material, E 1000, nu 0, sigma_y 1,
     hardening 0.01, at most 5e-4 at the curvature reached, so ccx's iterations keep a tangent; COH3D8 of a soft elastic glue, E 1, *COHESIVE SECTION, RESPONSE=CONTINUUM):
     the end x = 0 held in x, the end x = 0.4 moved u_x = theta z (plane sections), theta 50
     times first yield, so the section is all but fully plastic (M_p = 2.5e-4)."""
@@ -9470,9 +9493,10 @@ def sc_stack_bend_deck(layers, nx=4):
                 (a, 0, li), (a + 1, 0, li), (a + 1, 1, li), (a, 1, li),
                 (a, 0, li + 1), (a + 1, 0, li + 1), (a + 1, 1, li + 1), (a, 1, li + 1))))
         out += ([f"*SHELL SECTION, ELSET=L{li}, MATERIAL=M", f"{h!r}"] if t == "SC8R" else
+                [f"*SOLID SECTION, ELSET=L{li}, MATERIAL=CORE"] if t == "C3D8" else
                 [f"*COHESIVE SECTION, ELSET=L{li}, MATERIAL=GLUE, RESPONSE=CONTINUUM"])
     out += ["*MATERIAL, NAME=M", "*ELASTIC", "1000., 0.", "*PLASTIC", "1., 0.", "1.01, 1.", "*MATERIAL, NAME=GLUE",
-            "*ELASTIC", "1., 0."]
+            "*ELASTIC", "1., 0.", "*MATERIAL, NAME=CORE", "*ELASTIC", "0.01, 0."]
     left = [n for n, p in nodes.items() if p[0] == 0.0]
     right = [n for n, p in nodes.items() if p[0] == 0.4]
     out += ["*NSET, NSET=RIGHT"] + [", ".join(map(str, right))]
@@ -9748,6 +9772,28 @@ def along(plane, node, k, v):
     ``plane`` (None: the global axes)."""
     axis = (plane or ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)))[k]
     return "".join(f"{node}, {g + 1}, {v * c:.15g}\n" for g, c in enumerate(axis) if c)
+
+
+def turned_tip_strip_deck(theta, plane=None, coupled=False):
+    """An S4 cantilever strip (1 x 0.2, 8 x 2 cells, nu = 0, in ``plane`` — in_plane — or the
+    xy-plane), clamped at x = 0, whose tip edge is turned by the rotation vector ``theta``
+    (global components) in an NLGEOM step: BCs on the tip nodes' DOFs 4-6, or (``coupled``)
+    on a reference node that a *KINEMATIC coupling of their rotations (4, 6) ties them to."""
+    nid = lambda i, j: j * 9 + i + 1
+    out = ["*Heading", "turned tip", "*Node"]
+    out += [f"{nid(i, j)}, {in_plane(plane, i / 8.0, 0.1 * j)}" for j in range(3) for i in range(9)]
+    out += [f"900, {in_plane(plane, 1.0, 0.1)}", "*Element, type=S4, elset=SH"]
+    out += [f"{j * 8 + i + 1}, {nid(i, j)}, {nid(i + 1, j)}, {nid(i + 1, j + 1)}, {nid(i, j + 1)}"
+            for j in range(2) for i in range(8)]
+    out += ["*Shell Section, elset=SH, material=M", "0.01", "*Material, name=M", "*Elastic",
+            "1e5, 0.", "*Nset, nset=ROOT", "1, 10, 19", "*Nset, nset=TIP", "9, 18, 27"]
+    if coupled:
+        out += ["*Surface, type=node, name=ST", "TIP",
+                "*Coupling, constraint name=C, ref node=900, surface=ST", "*Kinematic", "4, 6"]
+    out += ["*Step, nlgeom, inc=1000", "*Static", "0.05, 1., 1e-6, 0.05", "*Boundary", "ROOT, 1, 6"]
+    out += [f"{900 if coupled else 'TIP'}, {k}, {k}, {v!r}" for k, v in zip((4, 5, 6), theta)]
+    out += ["*Node Print, nset=TIP", "U", "*End Step"]
+    return "\n".join(out) + "\n"
 
 
 def released_knot_deck(twin=False, plane=None):
@@ -19883,7 +19929,11 @@ def check_contact_property_tables(ccx, env, tmp, shared):
              ", TYPE=SURFACE TO SURFACE", 1e-3,
              lambda f: (None, 100.0 / (2.0 + 1.0 / (50.0 + 0.1 * f))),
              "a clearance *GAP CONDUCTANCE after a PRESSURE one, face-to-face",
-             "0: ccx read the later card against pressure")):
+             "0: ccx read the later card against pressure"),
+            ("gap_conductance_first", clearance + hard, "", 1e-3,
+             lambda f: (None, 100.0 / (2.0 + 1.0 / 100.0)),
+             "the clearance *GAP CONDUCTANCE before the *SURFACE BEHAVIOR",
+             "ccx stopped: 'should be preceded by a *SURFACE BEHAVIOR card'")):
         res = review_run(pressed_cubes_deck(inter, pair, tag.startswith("gap"), push), tag, cubes_totals)
         (f, q), (f0, q0) = res or (0.0, None), want(res[0] if res else 0.0)
         got, ref = (q, q0) if f0 is None else (f, f0)
@@ -19896,6 +19946,32 @@ def check_contact_property_tables(ccx, env, tmp, shared):
                   f"Abaqus' law ({err:.1e} apart; pressed by a force {f:.6g}; before: {before})")
         elif res:
             print(f"FAIL  {tag}: no heat flux printed")
+        failures += 0 if ok else 1
+    # --approximate: face-to-face pairs with a TABULAR / EXPONENTIAL law written node-to-surface,
+    # which reads Abaqus' curve (ccx's face-to-face contact: no TABULAR table, its own exponential)
+    pts = ((0.0, 0.0), (50.0, 0.005), (200.0, 0.01))
+
+    def tab3(h):
+        if h <= 0.0:
+            return 0.0
+        for (p1, h1), (p2, h2) in zip(pts, pts[1:]):
+            if h <= h2:
+                return p1 + (p2 - p1) * (h - h1) / (h2 - h1)
+        return 200.0 + 3e4 * (h - 0.01)
+    for tag, inter, push, law, tol, before in (
+            ("contact_tabular_s2s_approx", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR\n"
+             "0., 0.\n50., 0.005\n200., 0.01\n", 0.03, tab3, 1e-4, "0: no TABULAR table face-to-face"),
+            ("contact_exponential_s2s_approx", "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL\n"
+             "2e-4, 100.\n", 1e-3, abq_exponential, 3e-3,
+             "ccx's own law face-to-face: too many cutbacks")):
+        res = review_run(pressed_cubes_deck(inter, ", TYPE=SURFACE TO SURFACE", False, push), tag,
+                         cubes_totals, approximate=True)
+        ref = pressed_cubes_force(law, push)
+        err = abs(ccx_ratio(res[0], ref) - 1) if res else math.inf
+        ok = err < tol and ref > 1.0
+        print(f"{'PASS' if ok else 'FAIL'}  {tag} (a SURFACE TO SURFACE pair, --approximate: node-to-"
+              f"surface): contact force {res[0] if res else math.nan:.7g} vs {ref:.7g} for Abaqus' "
+              f"law ({err:.1e} apart; before: {before})")
         failures += 0 if ok else 1
     # code check G2-4: ccx's node-to-surface springs reach a clearance of 1e-3 sqrt(A) (here
     # 5e-4): a TABULAR curve's pressure at larger clearances is lost there, reduced physics
@@ -20536,7 +20612,9 @@ def check_sc_stacks(ccx, env, tmp, shared):
     for name, layers, want, flagged in (
             ("k1", [sc], 2 / math.sqrt(3), True), ("k2", [("SC8R", 0.05)] * 2, 1.0, False),
             ("k3", [("SC8R", 0.1 / 3)] * 3, 1 + (1 / math.sqrt(3) - 0.5) * 4 / 9 / 2, True),
-            ("bonded", [("SC8R", 0.049), ("COH3D8", 0.002), ("SC8R", 0.049)], 1 - 0.02 ** 2, False)):
+            ("bonded", [("SC8R", 0.049), ("COH3D8", 0.002), ("SC8R", 0.049)], 1 - 0.02 ** 2, False),
+            # skins on a solid core: one stack, each skin wholly on one side of the middle
+            ("sandwich", [("SC8R", 0.02), ("C3D8", 0.06), ("SC8R", 0.02)], 1 - 0.6 ** 2, False)):
         text, z = sc_stack_bend_deck(layers)
         tag = f"sc_stacks_{name}"
         res = review_run(text, tag, lambda dat: (dat_node_blocks(dat), dat_node_blocks(dat, "forces")))
@@ -20547,7 +20625,9 @@ def check_sc_stacks(ccx, env, tmp, shared):
             m = sum(v[0] * z[n] for n, v in res[1][-1].items()) / 2.5e-4
             w = res[0][-1][min(res[0][-1])][2]
             ok = abs(m - want) < 2e-3 and got_flag == flagged and abs(w) > 1e-3
-            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({'two SC8R bonded by a COH3D8 layer' if name == 'bonded' else f'{name[1]} SC8R'} "
+            what = {"bonded": "two SC8R bonded by a COH3D8 layer",
+                    "sandwich": "two SC8R skins on a C3D8 core"}.get(name, f"{name[1:]} SC8R")
+            print(f"{'PASS' if ok else 'FAIL'}  {tag} ({what} "
                   f"through the thickness in pure bending): M / M_p {m:.4f} vs {want:.4f}, "
                   f"{'flagged' if got_flag else 'not flagged'}; the free mid-span top node moved w {w:.4g}")
         failures += 0 if ok else 1
@@ -21097,6 +21177,33 @@ def check_connector_large_motion(ccx, env, tmp, shared):
     return failures
 
 
+@check("spring_rotated_instance", "rotational springs of a part in a turned instance")
+def check_spring_rotated_instance(ccx, env, tmp, shared):
+    # the part's DOF 5 lies along no global axis in a turned instance: the springs act about the
+    # instance's axes (before: warned, about the global y axis: tips 0.01998 / 0.00132 at 30
+    # degrees about z); the tips in the part's axes against the unturned instance's, which the
+    # SPRING1 holds below half its spring-free 0.04 and through which the second beam moves
+    review_run = shared["review_run"]
+    turns = ((0.0, (0.0, 0.0, 1.0)), (30.0, (0.0, 0.0, 1.0)), (40.0, (1.0, 1.0, 1.0)))
+    runs = [review_run(spring_rotated_instance_deck(a, ax), f"spring_rotated_instance_{i}", dat_displacements)
+            for i, (a, ax) in enumerate(turns)]
+    ok = all(runs) and all(n in r for r in runs for n in (5, 15))
+    if ok:
+        ref = runs[0]
+        errs = []
+        for (a, ax), r in zip(turns[1:], runs[1:]):
+            back = {n: _rotate(r[n], _unit(ax), -math.radians(a)) for n in (5, 15)}
+            errs.append(max(abs(x - y) for n in (5, 15) for x, y in zip(back[n], ref[n])) / abs(ref[5][2]))
+        ok = max(errs) < 1e-6 and ref[5][2] < 0.5 * 0.04 and ref[15][2] > 1e-4
+        print(f"{'PASS' if ok else 'FAIL'}  spring_rotated_instance (B31 tips on a rotational SPRING1 and "
+              f"SPRING2 about the part's y axis, the instance turned 30 degrees about z and 40 about "
+              f"(1, 1, 1)): tips in the part's axes {ref[5][2]:.7g}, {ref[15][2]:.7g} unturned (0.04 "
+              f"without the springs), {', '.join(f'{e:.1e}' for e in errs)} off turned")
+    else:
+        print(f"FAIL  spring_rotated_instance: {runs}")
+    return 0 if ok else 1
+
+
 @check("spring_dofs_masses",
        "SPRING1 / SPRING2 on rotations and constrained DOFs; point masses only constraints tie")
 def check_spring_dofs_masses(ccx, env, tmp, shared):
@@ -21324,6 +21431,65 @@ def check_shell_knot_limits(ccx, env, tmp, shared):
               f"tip moments in *STEADY STATE DYNAMICS): ccx runs all three steps, frequencies "
               f"{', '.join(f'{x:.7g}' for x in got)} as without knots ({err:.1e}; before: ccx stopped)")
     failures += 0 if ok else 1
+    return failures
+
+
+@check("static_then_heat", "a *STATIC step, then *HEAT TRANSFER, no initial temperatures")
+def check_static_then_heat(ccx, env, tmp, shared):
+    # ccx 2.23 counts a *STATIC card before the *HEAT TRANSFER card in its run type only with
+    # initial temperatures: without, it set the run up as heat transfer alone and crashed in the
+    # heat step (exit 250).  The converter gives every node the default 0.  Against the static
+    # step alone; the heat step's steady temperature is the held 20 everywhere
+    review_run = shared["review_run"]
+    cube = ("*NODE\n1, 0.,0.,0.\n2, 1.,0.,0.\n3, 1.,1.,0.\n4, 0.,1.,0.\n5, 0.,0.,1.\n6, 1.,0.,1.\n"
+            "7, 1.,1.,1.\n8, 0.,1.,1.\n*ELEMENT, TYPE=C3D8, ELSET=EALL\n1, 1,2,3,4,5,6,7,8\n"
+            "*NSET, NSET=NALL, GENERATE\n1, 8, 1\n*SOLID SECTION, ELSET=EALL, MATERIAL=M\n*MATERIAL, NAME=M\n"
+            "*ELASTIC\n1000., 0.3\n*CONDUCTIVITY\n50.\n*EXPANSION\n1e-5\n*BOUNDARY\n1, 1, 3\n2, 2, 3\n4, 3\n"
+            "*STEP\n*STATIC\n*CLOAD\n7, 3, 1.\n*NODE PRINT, NSET=NALL\nU\n*END STEP\n")
+    heat = ("*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 1.\n*BOUNDARY\n1, 11, 11, 20.\n"
+            "*NODE PRINT, NSET=NALL\nNT\n*END STEP\n")
+    got = review_run(cube + heat, "static_then_heat",
+                     lambda p: (dat_node_blocks(p), [{int(r[0]): r[1:] for r in rows} for _s, title, _n, _t, rows
+                                                     in A.dat_blocks(p) if title.startswith("temperatures")]))
+    ref = review_run(cube, "static_then_heat_ref", dat_node_blocks)
+    ok = bool(got and ref and got[0] and got[1])
+    if ok:
+        (u, temps), uref = got, ref
+        err = max(abs(a - b) for n, v in uref[-1].items() for a, b in zip(u[0][n], v))
+        moved = max(abs(x) for v in uref[-1].values() for x in v)
+        terr = max(abs(v[0] - 20.0) for v in temps[-1].values())
+        ok = err <= 1e-12 * moved and moved > 1e-4 and terr < 1e-6 and len(temps[-1]) == 8
+        print(f"{'PASS' if ok else 'FAIL'}  static_then_heat (a cube's *STATIC step, then *HEAT TRANSFER, "
+              f"no initial temperatures): both steps run, the static step as alone ({err:.1e} apart, "
+              f"|u| {moved:.3g}), the heat step at 20 everywhere ({terr:.1e}; before: ccx crashed)")
+    return 0 if ok else 1
+
+
+@check("shell_finite_rotation", "shell-node rotations about two axes under NLGEOM: the rotation vector "
+       "as ccx's mean-rotation angles")
+def check_shell_finite_rotation(ccx, env, tmp, shared):
+    # --- finite shell-node rotation BCs: Abaqus' rotation vector ------------------------------
+    # ccx's mean-rotation MPCs read the deck's values as the angles of the shell normal projected
+    # about each axis: the tip edge turned 3-6.5 % off.  Against the same rotation vector through
+    # a rotation-only kinematic coupling (knots: the rotation vector, kinematic_rotation_only)
+    review_run = shared["review_run"]
+    failures = 0
+    e1, e2, _ = OBLIQUE_PLANE
+    for tag, theta, plane in (("xy", (0.3, -0.4, 0.0), None),
+                              ("oblique", tuple(0.5 * a - 0.3 * b for a, b in zip(e1, e2)), OBLIQUE_PLANE)):
+        runs = [review_run(turned_tip_strip_deck(theta, plane, c), f"turned_tip_{tag}" + ("_coupled" if c else ""),
+                           dat_displacements) for c in (False, True)]
+        if not all(runs):
+            failures += 1
+            continue
+        got, ref = runs
+        err = max(abs(a - b) for n in ref for a, b in zip(got.get(n, [math.inf] * 3), ref[n]))
+        moved = max(abs(x) for v in ref.values() for x in v)
+        ok = err < 1e-5 * moved and moved > 0.1 and len(got) == len(ref) == 3
+        print(f"{'PASS' if ok else 'FAIL'}  turned_tip_{tag} (an S4 cantilever{' off the global axes' if plane else ''}, "
+              f"its tip nodes' BCs the rotation vector ({', '.join(f'{x:.3g}' for x in theta)}), NLGEOM): the tip as "
+              f"through a rotation-only coupling ({err:.1e} off; |u| {moved:.4g})")
+        failures += 0 if ok else 1
     return failures
 
 
