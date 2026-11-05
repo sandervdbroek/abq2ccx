@@ -46893,6 +46893,70 @@ class _PostPasses:
         "PLASTIC", "CREEP", "HYPERELASTIC", "HYPERFOAM", "DEFORMATION PLASTICITY", "MOHR COULOMB",
         "MOHR COULOMB HARDENING", "RATE DEPENDENT", "USER MATERIAL"))
 
+    def _warn_transform_bc_motion(self, deck: EmittedDeck) -> None:
+        """Warn where a *BOUNDARY prescribes motion in an implicit *DYNAMIC step along a local
+        axis of a *TRANSFORM node that is not the positive global axis of its number: a value
+        other than the one in force before the step (0 from rest: model-data lines count in
+        step 1), or a nonzero line with a deck AMPLITUDE (the converter's CCX_RAMP ramps from
+        the value in force: motion only where the value changes).  ccx 2.23 writes such a BC as an equation and
+        drives the motion through it a little otherwise than an SPC along a global axis (probed
+        on one C3D8, the node's oblique local u2, against the model turned into the node's axes:
+        0.01 from rest at the start 0.4 % of the peak displacement off, a ramp from rest 0.1 %,
+        0.01 then 0.03 0.9 %; a helper node tied by an *EQUATION, the BC on it, is worse: 1.0,
+        0.4, 1.6 %).  Holding a value (FIXED, or the value in force), and a BC new after a step
+        that moves the model, are _warn_transform_bc_traps' concern.  Warned, reduced physics."""
+        cards = deck.cards
+        if not self._transformed or not any(c.keyword == "TRANSFORM" for c in cards):
+            return
+        dyn = {c.step for c in cards if c.keyword == "DYNAMIC" and c.step >= 1 and not c.has("EXPLICIT")}
+        if not dyn:
+            return
+        sets = self._mesh_sets.read(deck)
+        moves = {c.step for c in cards if c.step >= 1 and c.keyword in (
+            "STATIC", "DYNAMIC", "VISCO", "MODAL DYNAMIC", "COUPLED TEMPERATURE-DISPLACEMENT",
+            "UNCOUPLED TEMPERATURE-DISPLACEMENT")}
+        val: Dict[Tuple[int, int], float] = {}      # (node, DOF) -> the value in force
+        step, before, hits = 0, {}, []
+        for c in cards:
+            if c.step > step:
+                step, before = c.step, dict(val)
+            if c.keyword != "BOUNDARY" or c.step < 0 or c.has("FIXED"):
+                continue
+            if c.uparam("OP") == "NEW":
+                val = {}
+            amp = (c.param("AMPLITUDE") or "").strip().upper()   # (CCX_RAMP: from the value in force)
+            for j in c.rows:
+                f = trimmed_fields(deck.lines[j].split(","))
+                ns = sets.members("NSET", f[0]) if f else None
+                rng = bc_dof_range(f) if ns is not None else None
+                try:
+                    v = float(f[3]) if rng and len(f) > 3 and f[3] else 0.0
+                except ValueError:
+                    continue
+                for n in [n for n in ns if n in self._transformed] if rng else ():
+                    ax = self._local_axes(n)
+                    for d in range(max(rng[0], 1), min(rng[1], 3) + 1):
+                        at = max(step, 1)               # (model data: in force in step 1)
+                        new = (n, d) not in before          # (after motion: _warn_transform_bc_traps)
+                        if at in dyn and isinstance(ax, tuple) and ax[d - 1][d - 1] < 1 - 1e-9 and \
+                                ((amp not in ("", self.CCX_RAMP) and v != 0.0) or
+                                 v != before.get((n, d), 0.0)) and \
+                                not (new and any(k < at for k in moves)):
+                            hits.append(f"node {n} DOF {d} (step {at})")
+                        val[(n, d)] = v
+        hits = list(dict.fromkeys(hits))
+        if hits:
+            self.report.warn(f"*BOUNDARY prescribing motion in implicit *DYNAMIC steps along local axes "
+                             f"of *TRANSFORM nodes that are not the positive global axis of their "
+                             f"number ({', '.join(hits[:4])}{', ...' if len(hits) > 4 else ''}): ccx "
+                             f"2.23 drives it through the equation it writes for such a BC, a little "
+                             f"otherwise than the model turned into the node's axes (probed on one "
+                             f"C3D8: 0.4 % of the peak displacement for a value from rest at the "
+                             f"start, 0.1 % for a ramp from rest, 0.9 % for a changed value).",
+                             once=True)
+            self._reduces("*BOUNDARY motion along a *TRANSFORM axis in an implicit *DYNAMIC step "
+                          "(ccx 2.23 drives it slightly otherwise than along a global axis)")
+
     def _warn_transform_bc_traps(self, deck: EmittedDeck) -> None:
         """Warn of two ccx 2.23 traps around *TRANSFORM nodes, read on the converted deck (after
         every pass that writes *BOUNDARY, before _fixed_helper_nodes moves lines to helpers).
@@ -48868,6 +48932,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         deck = self._initial_gradients_back(deck)   # after the audit: the initial state is no load
         deck = self._shift_total_time(deck)     # after every pass that writes load cards
         self._warn_transform_bc_traps(deck)     # (BCs on the nodes, as every pass wrote them)
+        self._warn_transform_bc_motion(deck)    # (likewise)
         deck = self._fixed_helper_nodes(deck)   # after every other pass that writes *BOUNDARY
         deck = self._truss_bc_index(deck)       # after every pass that writes *BOUNDARY
         deck = self._mechanical_run_type(blocks, deck)  # last: it adds a procedure card ahead of a step's own
