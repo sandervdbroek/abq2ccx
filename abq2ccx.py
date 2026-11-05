@@ -45194,6 +45194,37 @@ class _PostPasses:
                          f"the same eigenvalues and buckling factors).", once=True)
         return deck.edited()
 
+    def _table_temperatures(self, blocks: List[Block], deck: EmittedDeck) -> EmittedDeck:
+        """A model whose *ELASTIC, *DENSITY, *EXPANSION, *HYPERELASTIC or *HYPERFOAM tabulates its
+        values over temperature, with no initial temperatures: Abaqus' temperature is then 0
+        everywhere and the properties are read there; ccx 2.23 without any temperature takes the
+        table's first row (PR #35 review: a cube, E 1000 at -100 and 3000 at 100, deflected
+        0.03255 where E 2000 gives 0.01628).  Every node of the emitted *NODE cards gets 0
+        (ccx wants one at each node once any is given: checktemp), so ccx interpolates at 0 as
+        Abaqus does; a temperature-independent model is unchanged by it."""
+        if any(c.keyword == "INITIAL CONDITIONS" and c.uparam("TYPE") == "TEMPERATURE" for c in deck.cards) \
+                or not deck.steps:
+            return deck
+        dep = next((b for b in model_data(blocks) if b.keyword in
+                    ("ELASTIC", "DENSITY", "EXPANSION", "HYPERELASTIC", "HYPERFOAM")
+                    and temperature_dependent(b)), None)
+        if dep is None:
+            return deck
+        nodes = sorted({pint(r[0]) for c in deck.cards if c.keyword == "NODE" for r in c.records()
+                        if r and r[0].strip().isdigit()})
+        if not nodes:
+            return deck
+        name = self._fresh_name("ABQ2CCX_TABLE_T")
+        deck.insert_before(deck.steps[0].head, [
+            "** abq2ccx: initial temperature 0 (Abaqus' default), so that ccx reads the temperature-"
+            "dependent material data at 0", f"*NSET, NSET={name}"] + reflow([str(n) for n in nodes], 16) +
+            ["*INITIAL CONDITIONS, TYPE=TEMPERATURE", f"{name}, 0."])
+        self.report.note(f"*INITIAL CONDITIONS, TYPE=TEMPERATURE written for every node at 0, Abaqus' "
+                         f"default: the *{dep.keyword} data depend on temperature, which Abaqus reads at "
+                         f"0 where no temperature is given, ccx 2.23 at its first row (probed: a cube "
+                         f"twice as soft).", once=True)
+        return deck.edited()
+
     def _no_analysis_segfaults(self, deck: EmittedDeck) -> EmittedDeck:
         """The first step ccx stops at (*NO ANALYSIS: _no_analysis) in a deck with a material
         card of NO_ANALYSIS_SEGFAULTS, on which ccx 2.23 segfaults there: as the first step it
@@ -48210,6 +48241,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_modal_knot_mpcs(blocks, deck)
         self._warn_strain_free_adds(deck)       # (reads the cards as written)
         deck = self._initial_gradients_back(deck)   # after the audit: the initial state is no load
+        deck = self._table_temperatures(blocks, deck)   # before _mechanical_run_type reads the ICs
         deck = self._shift_total_time(deck)     # after every pass that writes load cards
         self._warn_transform_bc_traps(deck)     # (BCs on the nodes, as every pass wrote them)
         deck = self._fixed_helper_nodes(deck)   # after every other pass that writes *BOUNDARY
