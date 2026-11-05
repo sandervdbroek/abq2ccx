@@ -25988,6 +25988,20 @@ def test_tie_on_one_surface_or_on_shared_nodes():
                                                                  "*Contact Pair, interaction=SI, tied\n"))
     assert "*SURFACE, NAME=BBOT_NODES, TYPE=NODE\n17\n18\n" in body and "\nBBOT_NODES, ATOP\n" in body
     assert not conv.reduced_physics
+    # every slave node shared: the pair is left out (a comment); a shared slave on shells (an S4
+    # plate on an S4 master, no node form) is commented out and flagged, naming the pair
+    body, conv, rep = convert_str(two.replace("2,5,6,17,18,", "2,5,6,7,8,").replace(
+        "*Tie, name=T1\n", "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\n"))
+    assert "every slave node of BBOT is a node of ATOP" in body and "\nBBOT, ATOP" not in body
+    assert "*CONTACT PAIR, TIED slave surface BBOT: every node of it" in rep.text() and not conv.reduced_physics
+    plates = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,2,0,0\n6,2,1,0\n*Element, type=S4, elset=A\n"
+              "1,1,2,3,4\n*Element, type=S4, elset=B\n2,2,5,6,3\n*Surface, name=AT\nA, SPOS\n"
+              "*Surface, name=BT\nB, SPOS\n*Material, name=M\n*Elastic\n1000., 0.3\n*Shell Section, "
+              "elset=A, material=M\n0.1\n*Shell Section, elset=B, material=M\n0.1\n*Surface Interaction, "
+              "name=SI\n*Contact Pair, interaction=SI, tied\nBT, AT\n")
+    body, conv, rep = convert_str(plates)
+    assert "** BT, AT" in body and "*CONTACT PAIR, TIED: slave surface BT shares nodes" in rep.text()
+    assert "*CONTACT PAIR, TIED whose slave surface shares nodes with its master (left out)" in conv.reduced_physics
     plane = ("*Node\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n12,1,0\n13,1,1\n5,2,0\n6,2,1\n"
              "*Element, type=CPS4, elset=A\n1,1,2,3,4\n*Element, type=CPS4, elset=B\n2,2,5,6,13\n"
              "*Surface, name=AR\nA, S2\n*Surface, name=BL\nB, S4\n*Tie, name=T1\nBL, AR\n"

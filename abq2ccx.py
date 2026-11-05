@@ -10182,7 +10182,7 @@ class _Mesh:
                          f"tolerance). Exact.")
         return name, [f"*SURFACE, NAME={name}, TYPE={card}"] + kept
 
-    def _shared_tie_slave(self, slave: str, master: str) -> Tuple[Optional[str], List[str]]:
+    def _shared_tie_slave(self, slave: str, master: str, what: str = "*TIE") -> Tuple[Optional[str], List[str]]:
         """A *TIE slave surface ``slave`` that shares nodes with the faces of ``master``: ccx
         2.23 ties such a node to the master face it lies on, so the tie's dependent DOF is one
         of its own independent terms, and loops without end decascading it ('zero coefficient
@@ -10192,7 +10192,10 @@ class _Mesh:
         constraints), so a slave surface on solid elements, or a node surface, becomes a node
         surface of its other nodes: (its name, its *SURFACE card), "" with none left (probed:
         the answer of the blocks merged at the interface).  (None, []): nothing shared; ("?",
-        []): shared on another element family (shells; plane elements: _membrane_node_surface)."""
+        []): shared on another element family (shells; plane elements: _membrane_node_surface).
+        ``what`` names the card (a TIED *CONTACT PAIR is written as a *TIE).  A master on shells
+        is tied through its expanded faces, not its nodes: no loop there, so the notes claim
+        neither the loop nor exactness (_shell_tie_slave warns of such a master)."""
         sd = self.surfaces.get(slave.upper())
         shared = set(self._surface_member_nodes(master))
         nodes = self._surface_member_nodes(slave)
@@ -10203,11 +10206,14 @@ class _Mesh:
                 ccx_type(self.geom.elements[e][0]).startswith("C3D")
                 for e in self._surface_elements(slave)):
             return "?", []
+        shells = any(ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS
+                     for e in self._surface_elements(master) if e in self.geom.elements)
         if not keep:
-            self.report.note(f"*TIE slave surface {slave}: every node of it lies on the faces of "
+            self.report.note(f"{what} slave surface {slave}: every node of it lies on the faces of "
                              f"master surface {master}, and Abaqus ties no shared node (Mesh tie "
-                             f"constraints), so the line is left out (ccx 2.23 can loop without end "
-                             f"on such a tie; probed). Exact.", once=True)
+                             f"constraints), so the line is left out" + (
+                                 "." if shells else " (ccx 2.23 can loop without end on such a tie; "
+                                 "probed). Exact."), once=True)
             return "", []
         key = (slave.upper(), tuple(keep))
         if key in self._mem_surfaces:
@@ -10215,10 +10221,11 @@ class _Mesh:
         self._reserve_names()
         name = self._fresh_name(f"{slave}_NODES")
         self._mem_surfaces[key] = name
-        self.report.note(f"*TIE slave surface {slave} shares {len(nodes) - len(keep)} node(s) with "
+        self.report.note(f"{what} slave surface {slave} shares {len(nodes) - len(keep)} node(s) with "
                          f"the faces of master surface {master} -> node surface {name} of its other "
-                         f"nodes: Abaqus ties no shared node (Mesh tie constraints), ccx 2.23 would "
-                         f"tie each one to itself and loop without end (probed). Exact.", once=True)
+                         f"nodes: Abaqus ties no shared node (Mesh tie constraints)" + (
+                             "." if shells else ", ccx 2.23 would tie each one to itself and loop "
+                             "without end (probed). Exact."), once=True)
         return name, [f"*SURFACE, NAME={name}, TYPE=NODE"] + [str(n) for n in keep]
 
     def _membrane_node_surface(self, surf: str, what: str, shells: bool = False,
@@ -13095,7 +13102,7 @@ class _Mesh:
                     params["POSITION TOLERANCE"] = short_real(tol, 6)
                     self._plane_tie_checks(f[0].strip(), slave, f[1].strip(), b, True, tol)
                 if slave is None:                   # (a slave sharing master nodes: as a *TIE's)
-                    slave, cards = self._shared_tie_slave(f[0].strip(), f[1].strip())
+                    slave, cards = self._shared_tie_slave(f[0].strip(), f[1].strip(), "*CONTACT PAIR, TIED")
                     if slave == "?":
                         out += self._comment_out(
                             f"*CONTACT PAIR, TIED: slave surface {f[0].strip()} shares nodes with the faces "
@@ -13104,7 +13111,7 @@ class _Mesh:
                             f"the dependent side of an equation'; probed). The converter has no node form "
                             f"for this element family, so the line is left out: leave the shared nodes out "
                             f"of the slave surface.", [emit_keyword("TIE", params), f"{f[0]}, {f[1]}"],
-                            "*TIE whose slave surface shares nodes with its master (left out)")
+                            "*CONTACT PAIR, TIED whose slave surface shares nodes with its master (left out)")
                         continue
                     if slave == "":
                         out.append(f"** abq2ccx: *CONTACT PAIR, TIED: every slave node of {f[0].strip()} is "
