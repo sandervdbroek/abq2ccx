@@ -27868,6 +27868,17 @@ def test_odd_and_bonded_continuum_shell_stacks():
         if factor:
             assert f"plastic, the section carries {factor} times the fully plastic moment here" in rep.text()
             assert "; 1 elements that the middle of the thickness crosses" in rep.text(), layers
+    # an element of no resolved stack counts as alone (code review, PR #22): a branching column
+    # (a second element on the same face) and one of no thickness are flagged at 1.155
+    branch = deck([sc, sc]).replace("*Shell Section, elset=S0", "*Element, type=SC8R, elset=S1\n"
+                                    "3, 5, 6, 7, 8, 9, 10, 11, 12\n*Shell Section, elset=S0")
+    flat = deck([("SC8R", 0.0)]).replace("*Shell Section, elset=S0, material=M\n0.0\n",
+                                         "*Shell Section, elset=S0, material=M\n0.1\n")
+    for text, n in ((branch, 3), (flat, 1)):
+        _, conv, rep = convert_str(text)
+        assert flag in conv.reduced_physics, text
+        assert f"; {n} elements that the middle of the thickness crosses" in rep.text()
+        assert "plastic, the section carries 1.155 times the fully plastic moment here" in rep.text()
 
 
 def test_plastic_continuum_shell_composites_with_a_middle_layer_flagged():
