@@ -25704,6 +25704,18 @@ def test_transform_bc_motion_in_dynamic_steps_flagged():
         assert ("*BOUNDARY prescribing motion in implicit *DYNAMIC steps" in text) == bool(hits), steps
         assert hits is None or f"of their number {hits}" in text, steps
         assert (flag in conv.reduced_physics) == bool(hits), steps
+    # no motion along an oblique translation in an implicit *DYNAMIC step: quiet
+    amp = "*Amplitude, name=A\n0., 0., 1., 1.\n"
+    for deck in (FIXED_TR_HEX + amp + "*Boundary, amplitude=A\n7, 2, 2, 0.\n" + s1,      # zero, amplitude
+                 FIXED_TR_HEX + "*Boundary\n7, 4, 4, 0.01\n" + s1,                           # a rotation DOF
+                 FIXED_TR_HEX + s1 + "*Step\n*Dynamic, direct\n0.05, 1.\n*Boundary, fixed\n7, 2, 2\n"
+                 "*End Step\n",                                                              # FIXED
+                 FIXED_TR_HEX + "*Boundary\n7, 2, 2, 0.01\n" + s1.replace("*Dynamic, direct\n0.05, 1.",
+                                                                            "*Dynamic, explicit\n, 0.001"),
+                 FIXED_TR_HEX + "*Boundary\n7, 2, 2, 0.01\n*Step\n*Frequency\n3\n*End Step\n*Step\n"
+                 "*Modal Dynamic\n0.05, 1.\n*Cload\n7, 1, 1.\n*End Step\n"):                # *MODAL DYNAMIC
+        body, conv, rep = convert_str(deck)
+        assert "*BOUNDARY prescribing motion" not in rep.text() and flag not in conv.reduced_physics, deck
     # the value in force given again in step 2 (here 0.01 from rest: step 1's motion only)
     body, conv, rep = convert_str(FIXED_TR_HEX + "*Boundary\n7, 2, 2, 0.01\n" + s1 +
                                   s2.format("*Boundary\n7, 2, 2, 0.01\n"))

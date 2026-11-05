@@ -46253,8 +46253,8 @@ class _PostPasses:
         """Warn where a *BOUNDARY prescribes motion in an implicit *DYNAMIC step along a local
         axis of a *TRANSFORM node that is not the positive global axis of its number: a value
         other than the one in force before the step (0 from rest: model-data lines count in
-        step 1), or a line with a deck AMPLITUDE (the converter's CCX_RAMP ramps from the value
-        in force: motion only where the value changes).  ccx 2.23 writes such a BC as an equation and
+        step 1), or a nonzero line with a deck AMPLITUDE (the converter's CCX_RAMP ramps from
+        the value in force: motion only where the value changes).  ccx 2.23 writes such a BC as an equation and
         drives the motion through it a little otherwise than an SPC along a global axis (probed
         on one C3D8, the node's oblique local u2, against the model turned into the node's axes:
         0.01 from rest at the start 0.4 % of the peak displacement off, a ramp from rest 0.1 %,
@@ -46295,7 +46295,8 @@ class _PostPasses:
                         at = max(step, 1)               # (model data: in force in step 1)
                         new = (n, d) not in before          # (after motion: _warn_transform_bc_traps)
                         if at in dyn and isinstance(ax, tuple) and ax[d - 1][d - 1] < 1 - 1e-9 and \
-                                (amp not in ("", self.CCX_RAMP) or v != before.get((n, d), 0.0)) and \
+                                ((amp not in ("", self.CCX_RAMP) and v != 0.0) or
+                                 v != before.get((n, d), 0.0)) and \
                                 not (new and any(k < at for k in moves)):
                             hits.append(f"node {n} DOF {d} (step {at})")
                         val[(n, d)] = v
