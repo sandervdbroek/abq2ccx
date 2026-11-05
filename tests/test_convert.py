@@ -25333,10 +25333,20 @@ def test_static_then_heat_transfer_run_type():
     strip = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, elset=E\n"
              "1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1000., 0.\n*Conductivity\n50.\n*Shell Section, "
              "elset=E, material=M\n0.01\n*Boundary\n1, 1, 6\n4, 1, 6\n")
+    warn = "ccx writes those as mean-rotation MPCs and stops"
     _, _, rep = convert_str(strip + static.replace("7, 3", "3, 3") + heat)
-    assert "ccx 2.23 writes those as mean-rotation MPCs and stops in the heat step" in rep.text()
-    _, _, rep = convert_str(strip + heat)
-    assert "meanrotmpc" not in rep.text()
+    assert warn in " ".join(rep.text().split()), rep.text()
+    # not after a step ccx solves through its nonlinear solver (NLGEOM, *DYNAMIC: ccx runs the
+    # heat step then; PR #35 review), nor without a mechanical step before the heat step
+    for text in (strip + static.replace("*Step\n", "*Step, nlgeom\n").replace("7, 3", "3, 3") + heat,
+                 strip + "*Step\n*Dynamic\n0.01, 0.1\n*Cload\n3, 3, 1.\n*End Step\n" + heat,
+                 strip + heat, strip + heat + static.replace("7, 3", "3, 3")):
+        _, _, rep = convert_str(text)
+        assert "meanrotmpc" not in rep.text(), text
+    # a moment on a plain shell node (gen3dforc's mean-rotation MPC) stops it too: warned
+    plate = strip.replace("*Boundary\n1, 1, 6\n4, 1, 6\n", "*Boundary\n1, 1, 3\n4, 1, 3\n")
+    _, _, rep = convert_str(plate + static.replace("7, 3, 1.", "2, 5, 0.1") + heat)
+    assert warn in " ".join(rep.text().split()), rep.text()
 
 
 def test_heat_transfer_run_gets_a_static_card_for_its_knots():

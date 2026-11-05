@@ -45171,8 +45171,8 @@ class _PostPasses:
                 state, heat = state + 2 if state < 2 else state, heat or c
             elif kw in self._RUN_COUPLED:
                 state = 3
-        if heat is not None and before is not None:
-            self._heat_after_mechanical(deck, before)
+        if heat is not None:
+            self._heat_after_mechanical(deck, heat)
         nodes = sorted({pint(r[0]) for c in deck.cards if c.keyword == "NODE" for r in c.records()
                         if r and r[0].strip().isdigit()}) if state == 2 and before is not None and \
             not init and deck.steps else []
@@ -45180,8 +45180,8 @@ class _PostPasses:
             # (a *STATIC / *VISCO / *DYNAMIC card before the heat card counts only with initial
             # temperatures: every node at ccx's and Abaqus' default 0 (ccx wants one at each node
             # once any is given: checktemp) makes the run mechanical too; probed: a cube's static
-            # step then heat step, exit 250 without, the same static displacements and both steps
-            # with)
+            # step then heat step, exit 250 without; with, both steps, the same static
+            # displacements for a temperature-independent material)
             name = self._fresh_name("ABQ2CCX_INITIAL_T")
             deck.insert_before(deck.steps[0].head, [
                 "** abq2ccx: initial temperature 0 (the default) given, so that ccx sets the run up as "
@@ -45219,24 +45219,29 @@ class _PostPasses:
                          f"the same eigenvalues and buckling factors).", once=True)
         return deck.edited()
 
-    def _heat_after_mechanical(self, deck: EmittedDeck, before: EmittedCard) -> None:
-        """Warn where a *HEAT TRANSFER step follows a *STATIC / *VISCO / *DYNAMIC step in a model
-        whose plain shell or beam nodes have rotational BCs: ccx 2.23 turns those into mean-
-        rotation MPCs (gen3dboun: MEANROTBS), which its nonlinear solver, which runs the heat
-        step, finds with another number of terms there and stops ('*ERROR in meanrotmpc: MPC has
-        wrong number of terms'; probed: an S4 strip clamped at one end, a static step, then a
-        steady-state heat step)."""
+    def _heat_after_mechanical(self, deck: EmittedDeck, heat: EmittedCard) -> None:
+        """Warn where a *HEAT TRANSFER step follows a *STATIC / *VISCO step ccx 2.23 solves
+        linearly (_solver_steps) in a model whose plain shell or beam nodes have rotational BCs
+        or moments: ccx turns those into mean-rotation MPCs (gen3dboun / gen3dforc: MEANROTBS),
+        which its nonlinear solver, which runs the heat step, finds with another number of terms
+        after the linear step and stops ('*ERROR in meanrotmpc: MPC has wrong number of terms',
+        or an abort; probed: an S4 strip clamped at one end, an S4 plate with a moment).  After
+        an NLGEOM or *DYNAMIC step ccx runs it (PR #35 review: S4, B31)."""
+        linear = [s.number for s in deck.steps if s.proc is not None and s.proc.index < heat.index
+                  and s.proc.keyword in ("STATIC", "VISCO") and s.number <= len(self._solver_steps)
+                  and not self._solver_steps[s.number - 1]]
         rot = self._rot_nodes - set(self._knots)
-        if not rot:
+        if not linear or not rot:
             return
         hit = None
         for c in deck.cards:
-            if c.keyword != "BOUNDARY" or c.has("TYPE") and c.uparam("TYPE") != "DISPLACEMENT":
+            if c.keyword not in ("BOUNDARY", "CLOAD") or \
+                    c.keyword == "BOUNDARY" and c.has("TYPE") and c.uparam("TYPE") != "DISPLACEMENT":
                 continue
             for rec in c.records():
                 try:
                     lo = pint(rec[1]) if len(rec) > 1 and rec[1] else 0
-                    hi = pint(rec[2]) if len(rec) > 2 and rec[2] else lo
+                    hi = pint(rec[2]) if c.keyword == "BOUNDARY" and len(rec) > 2 and rec[2] else lo
                 except ValueError:
                     continue
                 if hi >= 4 and lo <= 6:
@@ -45247,11 +45252,12 @@ class _PostPasses:
             if hit is not None:
                 break
         if hit is not None:
-            self.report.warn(f"*HEAT TRANSFER step after step {before.step} (*{before.keyword}) in a model "
-                             f"whose shell or beam nodes have rotational BCs (e.g. node {hit}): ccx 2.23 "
-                             f"writes those as mean-rotation MPCs and stops in the heat step ('*ERROR in "
-                             f"meanrotmpc: MPC has wrong number of terms'; probed). Run the heat "
-                             f"transfer step first, or in an analysis of its own.", once=True)
+            self.report.warn(f"*HEAT TRANSFER step {heat.step} after step {linear[0]}, which ccx 2.23 solves "
+                             f"linearly, in a model whose plain shell or beam nodes have rotational BCs or "
+                             f"moments (e.g. node {hit}): ccx writes those as mean-rotation MPCs and stops "
+                             f"in the heat step ('*ERROR in meanrotmpc: MPC has wrong number of terms', or "
+                             f"an abort; probed). Run the heat transfer step first, or in an analysis of its "
+                             f"own.", once=True)
 
     def _no_analysis_segfaults(self, deck: EmittedDeck) -> EmittedDeck:
         """The first step ccx stops at (*NO ANALYSIS: _no_analysis) in a deck with a material
