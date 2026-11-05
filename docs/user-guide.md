@@ -130,6 +130,9 @@ a different model without saying so. With it, these reframings are made, each wi
 * self-contact (one surface, or the same surface twice) → ccx's `S, S` with
   `TYPE=SURFACE TO SURFACE` (within 0.1 % of symmetric pairs on a mild closure, 10–13 % off
   on a deep one);
+* surface-to-surface contact pairs where one has a `TABULAR` or `EXPONENTIAL`
+  pressure-overclosure law → `TYPE=NODE TO SURFACE`, which reads Abaqus' curve (ccx's
+  face-to-face contact carries no force with a table);
 * `CPE4` / `CAX4` of a plastic, creeping or nearly incompressible material (they lock), and
   such flagged `CPE4R` / `CAX4R` → `CPE8R` / `CAX8R` with midside nodes, their linear
   neighbours too; such `C3D8` → `C3D8I`;
