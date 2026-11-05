@@ -6577,8 +6577,9 @@ def test_rotated_instance_turns_part_dofs():
 
 def test_rotated_instance_dofs_without_a_global_form():
     # a nonlinear SPRING2 along -y (its curve would flip): in the instance's axes; a rotational
-    # spring along a turned axis: warned (ccx's oriented springs are probed for translations);
-    # a set term on nodes with and without a *TRANSFORM: warned, the equation left as it is
+    # spring along a turned axis: in the instance's axes too (_plan_springs writes it about
+    # them, validate spring_rotated_instance); a set term on nodes with and without a
+    # *TRANSFORM: warned, the equation left as it is
     part = ROT_PART.format(nl=", nonlinear", sp2="3, 3", coupling="") \
         .replace("1000.\n*Nset, nset=TR", "-1., -0.1\n1., 0.1\n*Nset, nset=TR")
     body, conv, _ = convert_str(_instanced(part, "0., 0., 0., 1., 0., 0., 90.", tail=ROT_TAIL))
@@ -6587,14 +6588,19 @@ def test_rotated_instance_dofs_without_a_global_form():
     part = ROT_PART.format(nl="", sp2="5, 5", coupling="").replace(
         "2\n2, 1, 1., 4, 3, -1.\n", "2\nMIX, 1, 1., 4, 3, -1.\n*Nset, nset=MIX\n2, 3\n")
     body, conv, rep = convert_str(_instanced(part, "0., 0., 0., 0., 0., 1., 30.", tail=ROT_TAIL))
-    # (on solid nodes, which have no rotations: left out, nothing else stiffens those DOFs)
-    assert "** *SPRING, ELSET=I_SP2\n** 5, 5\n" in body and "on a rotation of a node that has none" in rep.text()
-    assert "the rotational DOFs of its SPRING1 / SPRING2 elements (*SPRING, ELSET=SP2) have no " \
-           "global form" in rep.text()
+    # (on solid nodes, which have no rotations: left out, nothing else stiffens those DOFs — no
+    # flag for the axes)
+    assert "** *SPRING, ELSET=I_SP2, ORIENTATION=I_ABQ2CCX_AXES\n** 5, 5\n" in body and \
+        "on a rotation of a node that has none" in rep.text() and "no global form" not in rep.text()
     assert "node set MIX has nodes with and without a part-level *TRANSFORM" in rep.text()
     assert "\n5, 2, 1., 11, 1, 1., 11, 2, -1.\n" in body
-    assert conv.reduced_physics == ["rotational springs of rotated *INSTANCE I not turned",
-                                    "part-level *EQUATION of rotated *INSTANCE I not turned"]
+    assert conv.reduced_physics == ["part-level *EQUATION of rotated *INSTANCE I not turned"]
+    # with nothing else in the instance's axes (the SPRING1 on DOF 3, which a turn about z keeps):
+    # neither those axes nor a note that the left-out springs are turned
+    body, conv, rep = convert_str(_instanced(part.replace("*Spring, elset=SPR\n2\n", "*Spring, elset=SPR\n3\n"),
+                                             "0., 0., 0., 0., 0., 1., 30.", tail=ROT_TAIL))
+    assert "** *SPRING, ELSET=I_SP2\n** 5, 5\n" in body and "ABQ2CCX_AXES" not in body
+    assert "SPRING1 / SPRING2 elements are turned" not in rep.text() and "act about the instance's axes" not in rep.text()
 
 
 def test_part_section_options_follow_their_section():

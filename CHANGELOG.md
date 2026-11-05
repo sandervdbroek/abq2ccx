@@ -100,6 +100,9 @@ entries. The GitHub release notes use the same section.
   or a rotation constraint: ccx set such a run up as heat transfer alone, with no rotations at
   the shell and beam joints. A heat transfer step is no longer taken for one that turns those
   joints, so such models are no longer flagged for it.
+* **More correct answers.** A rotational spring (`SPRING1` / `SPRING2` on DOFs 4-6) in a part
+  whose instance is rotated now acts about the part's turned axes. It acted about the global axes
+  and was flagged (a beam tip 1.7 times too far); on solid nodes it is left out without the flag.
 
 * **More correct answers.** A rotation prescribed on a shell node about two axes at once in a
   geometrically nonlinear step now turns the shell as the rotation vector Abaqus reads it.
@@ -398,6 +401,16 @@ entries. The GitHub release notes use the same section.
   heat transfer, frequency and steady-state dynamics steps runs; its frequencies equal those
   without knots (before: ccx stopped).
 
+* **Rotational springs in rotated instances** — a part's `SPRING1` / `SPRING2` on DOFs 4-6 whose
+  turned DOFs have no global form (an axis along no global one, a `SPRING2` whose two axes turn
+  to opposite senses, a nonlinear spring whose axis turns to its opposite) now gets the
+  instance's axes (`ORIENTATION=`), as translational ones already did, and the converter writes
+  it about them (the rotational spring form takes an orientation's axes): exact. It was left
+  about the global axes with a warning and reduced physics, also on solid nodes, where it is
+  left out exactly; there neither the instance's axes nor a note that it is turned is written now
+  (`validate_with_ccx.py spring_rotated_instance`: tips 0.01156509 / 0.002013496 in instances
+  turned 30 degrees about z and 40 about (1, 1, 1), as unturned; before 0.01997954 / 0.001319979
+  at 30 degrees).
 * **Finite shell rotation BCs** — Abaqus/Standard reads a shell node's rotational BCs in an
   NLGEOM step as the components of its total rotation vector; at a shell node that is no knot
   ccx 2.23 holds, by two mean-rotation MPCs, the angles of the shell normal projected about the
