@@ -3401,6 +3401,56 @@ def test_gap_conductance_against_clearance():
     assert conv.reduced_physics == []
 
 
+def test_gap_conductance_before_surface_behavior():
+    # Abaqus takes an interaction's cards in any order; ccx 2.23 stops on a *GAP CONDUCTANCE
+    # before the *SURFACE BEHAVIOR (validate_with_ccx gap_conductance_first): written after it
+    gc = "*Gap Conductance\n100., 0.\n0., 0.01\n"
+    hard = "*Surface Behavior, pressure-overclosure=HARD\n"
+    for si in (gc + hard, gc + "*Friction\n0.1\n" + hard, "*Friction\n0.1\n" + gc + hard):
+        body, conv, rep = cubes(si, proc=COUPLED_STEADY, el="C3D8T")
+        cards = interaction_cards(body)
+        assert cards.index("*SURFACE BEHAVIOR") < cards.index("\n*GAP CONDUCTANCE\n100., 0.\n"), si
+        assert cards.count("*GAP CONDUCTANCE") == 1 and ("*FRICTION" in cards) == ("Friction" in si)
+        assert "written after its *SURFACE BEHAVIOR" in rep.text()
+    # in order already, or no *SURFACE BEHAVIOR (HARD comes right after the interaction card)
+    for si in (hard + gc, gc):
+        body, conv, rep = cubes(si, proc=COUPLED_STEADY, el="C3D8T")
+        assert interaction_cards(body).splitlines()[1] == "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD"
+        assert "written after its *SURFACE BEHAVIOR" not in rep.text()
+
+
+def test_face_to_face_tables_node_to_surface_approximate():
+    # ccx's face-to-face contact reads no TABULAR table and not Abaqus' EXPONENTIAL curve, its
+    # node-to-surface contact reads both (validate_with_ccx contact_tables_n2s_approx): under
+    # --approximate every face-to-face pair is written NODE TO SURFACE (ccx takes one TYPE for all)
+    s2s = ", type=SURFACE TO SURFACE"
+    flag = "--approximate: *CONTACT PAIR, TYPE=SURFACE TO SURFACE written as NODE TO SURFACE"
+    tab = "*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n100., 0.01\n150., 0.02\n"
+    exp = "*Surface Behavior, pressure-overclosure=EXPONENTIAL\n2e-4, 100.\n"
+    for si in (tab, exp):
+        deck = STACKED_CUBES.format(si=si, pair=s2s, proc="*Static", el="C3D8")
+        body, conv, rep = convert_str(deck, approximate=True)
+        assert "*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE\n" in body
+        assert conv.reduced_physics == [flag], conv.reduced_physics
+        cards = interaction_cards(body).splitlines()
+        assert cards[1] == "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR"
+        assert cards[2] == ("0., 0." if si == tab else "0., -0.0002") and len(cards) > 5
+        body, conv, rep = convert_str(deck)          # without: flagged, the option named
+        assert "TYPE=SURFACE TO SURFACE" in body and "--approximate writes the pairs so" in rep.text()
+    # with a second face-to-face pair on a HARD interaction: both written node-to-surface
+    two = STACKED_CUBES.format(si=tab, pair=s2s, proc="*Static", el="C3D8").replace(
+        "*Boundary\n1, 1, 3", "*Surface Interaction, name=H\n*Surface Behavior, pressure-overclosure="
+        "HARD\n*Contact Pair, interaction=H, type=SURFACE TO SURFACE\nLTOP, UBOT\n*Boundary\n1, 1, 3", 1)
+    body, conv, _ = convert_str(two, approximate=True)
+    assert body.count("TYPE=NODE TO SURFACE") == 2 and "SURFACE TO SURFACE" not in body
+    # a straight line through the origin is ccx's LINEAR law face-to-face: kept so
+    line = STACKED_CUBES.format(si="*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n"
+                                   "100., 0.01\n", pair=s2s, proc="*Static", el="C3D8")
+    body, conv, _ = convert_str(line, approximate=True)
+    assert "TYPE=SURFACE TO SURFACE" in body and "PRESSURE-OVERCLOSURE=LINEAR" in body
+    assert conv.reduced_physics == []
+
+
 def test_static_direct_with_contact_gets_automatic_increments():
     # ccx's penalty contact can need a cutback where Abaqus' converges at a fixed increment,
     # and under DIRECT ccx then stops (lcharleux_indentation_berko, at the start of
@@ -6527,8 +6577,9 @@ def test_rotated_instance_turns_part_dofs():
 
 def test_rotated_instance_dofs_without_a_global_form():
     # a nonlinear SPRING2 along -y (its curve would flip): in the instance's axes; a rotational
-    # spring along a turned axis: warned (ccx's oriented springs are probed for translations);
-    # a set term on nodes with and without a *TRANSFORM: warned, the equation left as it is
+    # spring along a turned axis: in the instance's axes too (_plan_springs writes it about
+    # them, validate spring_rotated_instance); a set term on nodes with and without a
+    # *TRANSFORM: warned, the equation left as it is
     part = ROT_PART.format(nl=", nonlinear", sp2="3, 3", coupling="") \
         .replace("1000.\n*Nset, nset=TR", "-1., -0.1\n1., 0.1\n*Nset, nset=TR")
     body, conv, _ = convert_str(_instanced(part, "0., 0., 0., 1., 0., 0., 90.", tail=ROT_TAIL))
@@ -6537,14 +6588,19 @@ def test_rotated_instance_dofs_without_a_global_form():
     part = ROT_PART.format(nl="", sp2="5, 5", coupling="").replace(
         "2\n2, 1, 1., 4, 3, -1.\n", "2\nMIX, 1, 1., 4, 3, -1.\n*Nset, nset=MIX\n2, 3\n")
     body, conv, rep = convert_str(_instanced(part, "0., 0., 0., 0., 0., 1., 30.", tail=ROT_TAIL))
-    # (on solid nodes, which have no rotations: left out, nothing else stiffens those DOFs)
-    assert "** *SPRING, ELSET=I_SP2\n** 5, 5\n" in body and "on a rotation of a node that has none" in rep.text()
-    assert "the rotational DOFs of its SPRING1 / SPRING2 elements (*SPRING, ELSET=SP2) have no " \
-           "global form" in rep.text()
+    # (on solid nodes, which have no rotations: left out, nothing else stiffens those DOFs — no
+    # flag for the axes)
+    assert "** *SPRING, ELSET=I_SP2, ORIENTATION=I_ABQ2CCX_AXES\n** 5, 5\n" in body and \
+        "on a rotation of a node that has none" in rep.text() and "no global form" not in rep.text()
     assert "node set MIX has nodes with and without a part-level *TRANSFORM" in rep.text()
     assert "\n5, 2, 1., 11, 1, 1., 11, 2, -1.\n" in body
-    assert conv.reduced_physics == ["rotational springs of rotated *INSTANCE I not turned",
-                                    "part-level *EQUATION of rotated *INSTANCE I not turned"]
+    assert conv.reduced_physics == ["part-level *EQUATION of rotated *INSTANCE I not turned"]
+    # with nothing else in the instance's axes (the SPRING1 on DOF 3, which a turn about z keeps):
+    # neither those axes nor a note that the left-out springs are turned
+    body, conv, rep = convert_str(_instanced(part.replace("*Spring, elset=SPR\n2\n", "*Spring, elset=SPR\n3\n"),
+                                             "0., 0., 0., 0., 0., 1., 30.", tail=ROT_TAIL))
+    assert "** *SPRING, ELSET=I_SP2\n** 5, 5\n" in body and "ABQ2CCX_AXES" not in body
+    assert "SPRING1 / SPRING2 elements are turned" not in rep.text() and "act about the instance's axes" not in rep.text()
 
 
 def test_part_section_options_follow_their_section():
@@ -6829,6 +6885,37 @@ BEAM_TIP = ("*Node\n1, 0., 0., 0.\n2, 0.5, 0., 0.\n3, 1., 0., 0.\n13, 1., 1., 0.
             "*Element, type=B31, elset=B\n1, 1, 2\n2, 2, 3\n3, 11, 12\n4, 12, 13\n*Material, name=M\n*Elastic\n"
             "1e4, 0.3\n*Beam Section, elset=B, material=M, section=RECT\n0.1, 0.1\n0., 0., 1.\n"
             "*Boundary\n1, encastre\n11, encastre\n")
+
+
+def test_nonlinear_dashpot_as_its_slope_at_zero():
+    # ccx 2.23 has no nonlinear dashpot: it damps with the last line's force as the coefficient
+    # (a table of slope 2 to (4, 2) damped as 4) -> the slope at zero velocity, per temperature:
+    # Abaqus' damping for a straight table through zero on both sides (while the velocity stays
+    # within it: Abaqus holds the end forces beyond), else warned + reduced
+    deck = ("*Node\n1, 0., 0., 0.\n2, -10., 0., 0.\n*Element, type={typ}, elset=D\n1, 1{n2}\n"
+            "*Dashpot, elset=D, nonlinear\n{first}\n{tab}*Element, type=MASS, elset=M\n2, 1\n*Mass, elset=M\n1.\n"
+            "*Boundary\n1, 2, 3\n2, 1, 3\n*Step\n*Dynamic\n0.01, 1.\n*Cload\n1, 1, 1.\n{temp}*End Step\n")
+    two = "-4., -2.\n0., 0.\n4., 2.\n"
+    for typ, n2, first in (("DASHPOTA", ", 2", ""), ("DASHPOT1", "", "1")):
+        body, conv, rep = convert_str(deck.format(typ=typ, n2=n2, first=first, tab=two, temp=""))
+        assert re.search(r"\*DASHPOT, ELSET=D\n2\.\n", body) and "NONLINEAR" not in body.split("*DASHPOT")[-1][:30]
+        assert not rep.reduced and "within the table's range" in rep.text()
+    # (the BC-driven-node cure takes the slope written, not none)
+    card = A.Block("DASHPOT", A.OrderedDict(ELSET="D", NONLINEAR=None), ["", "-4., -2.", "0., 0.", "4., 2."])
+    assert conv._dashpot_coefficients([card], {1: (1, 2)}) == {1: 2.0}
+    tab = "-2., -1., 20\n2., 1., 20.\n-6., -1., 80.\n6., 1., 80.\n"
+    body, conv, rep = convert_str(deck.format(typ="DASHPOTA", n2=", 2", first="", tab=tab, temp="*Temperature\n1, 50.\n2, 50.\n"))
+    assert "*DASHPOT, ELSET=D\n2., 0., 20.\n6., 0., 80.\n" in body and not rep.reduced
+    for tab, why in ((tab, "no step *TEMPERATURE"), ("0., 0.\n2., 1.\n4., 2.\n", "one side of zero only"),
+                     ("2., 1.\n", "one-line table"), ("-1.5, -1.5\n-1., -0.5\n0., 0.\n1., 0.5\n1.5, 1.5\n",
+                                                       "not one straight line")):
+        body, conv, rep = convert_str(deck.format(typ="DASHPOTA", n2=", 2", first="", tab=tab, temp=""))
+        assert why in rep.text() and rep.reduced == ["*DASHPOT, NONLINEAR as a linear dashpot"], why
+    # a nonlinear connector spring is not written as a spring at all (the connector is left out,
+    # warned): nothing for the nonlinear-spring warning to catch there
+    body, conv, rep = convert_str(BUSH.format(typ="Cartesian", beh="*Connector Elasticity, component=1, "
+                                              "nonlinear\n-100., -1.\n0., 0.\n50., 1.\n"))
+    assert "ABQ2CCX_CONN_SPRINGA" not in body and "*CONNECTOR ELASTICITY, NONLINEAR" in rep.text() and rep.reduced
 
 
 def test_nonlinear_spring_in_a_linear_static_step_is_flagged():
@@ -14227,7 +14314,18 @@ def test_connector_helpers_scaled_where_ccx_takes_current_lengths():
     def values(body, card):
         """(the nonzero ones: node 2, on a MASS alone, also gets a zero SPRINGA)"""
         return [float(m) for m in re.findall(rf"\*{card}, ELSET=ABQ2CCX_CONN\S+\n(\S+)\n", body) if float(m)]
+
+    def held_far(body):
+        """Each spring / dashpot's held end sits at least a model span (1) from its helper and the
+        connector's nodes 1 and 2, held in DOFs 1-3: the helper, moving s times the component,
+        reaches it only past 100 spans or radians."""
+        g = reparse(body)
+        ends = [conn for typ, conn in g.elements.values() if typ in ("SPRINGA", "DASHPOTA") and conn[0] != 2]
+        return bool(ends) and all(
+            min(math.dist(g.nodes[e], g.nodes[n]) for n in (1, 2, h)) >= 1.0 - 1e-12 and
+            all(re.search(rf"(?m)^{e}, {d}, {d}\b", body) for d in (1, 2, 3)) for h, e in ends)
     body, conv, rep = convert_str(dyn)
+    assert held_far(body)
     eq = _all_equations(body)[0]
     assert eq[0][1:] == (1, -1.0)
     assert sorted((n, d, round(v, 12)) for n, d, v in eq[1:]) == [(2, 1, 0.006), (2, 2, 0.008)]
@@ -14244,7 +14342,7 @@ def test_connector_helpers_scaled_where_ccx_takes_current_lengths():
     g = reparse(body)
     assert [conn[0] for typ, conn in g.elements.values()
             if typ in ("SPRINGA", "DASHPOTA") and conn[0] != 2] == [two[0][0][0]] * 2
-    assert values(body, "SPRING") == [1e6] and not rep.reduced
+    assert values(body, "SPRING") == [1e6] and not rep.reduced and held_far(body)
 
 
 CONN_LOAD_HELD = ("*Node, nset=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 0., -1.\n*Element, type=B31, elset=BM\n"
@@ -17039,6 +17137,70 @@ def test_transformed_shell_rotation_pairs_off_the_normal():
     # drilling one, which ccx drops, holding the tangential one alone (probed): exact
     body, conv, rep = convert_str(panel("4, 3, 5\n6, 3, 5\n", normals=True))
     assert not any(held in r for r in conv.reduced_physics)
+
+
+def test_shell_finite_rotations_nlgeom():
+    # rotational BCs on a shell node about two axes in an NLGEOM step: Abaqus reads the values
+    # as the rotation vector; ccx 2.23's mean-rotation MPCs hold the angles of the normal
+    # projected about e1 (the first axis) and n x e1, so the values are written as those of
+    # the normal turned by the rotation vector: atan2(-n'.e2, n'.n), atan2(n'.e1, n'.n)
+    def strip(bcs="*Boundary\nTIP, 4, 4, 0.1\nTIP, 5, 5, 0.2\nTIP, 6, 6, 0.\n", step="*Step, nlgeom\n",
+              more=""):
+        return ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 2., 0., 0.\n4, 0., 1., 0.\n5, 1., 1., 0.\n"
+                "6, 2., 1., 0.\n*Element, type=S4, elset=E\n1, 1, 2, 5, 4\n2, 2, 3, 6, 5\n*Nset, nset=TIP\n"
+                "3, 6\n*Shell Section, elset=E, material=M\n0.02\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+                f"*Density\n1.\n*Boundary\n1, 1, 6\n4, 1, 6\n{step}*Static\n0.1, 1.\n{bcs}*End Step\n{more}")
+
+    def rot_lines(body):
+        return [ln for ln in body.splitlines() if re.fullmatch(r"[36], [456], [456](, .*)?", ln)
+                or ln.startswith(("TIP, 4", "TIP, 5", "TIP, 6"))]
+    d = A.vrotate((0.1, 0.2, 0.0), (0.0, 0.0, 1.0))
+    a1, a2 = math.atan2(-d[1], d[2]), math.atan2(d[0], d[2])
+    body, conv, rep = convert_str(strip())
+    got = rot_lines(body)
+    assert [ln.rsplit(",", 1)[0] if ln.count(",") == 3 else ln for ln in got] == \
+        ["3, 4, 4", "3, 5, 5", "3, 6, 6", "6, 4, 4", "6, 5, 5", "6, 6, 6"], got
+    assert abs(float(got[0].split(",")[3]) - a1) < 1e-11 and abs(float(got[1].split(",")[3]) - a2) < 1e-11
+    assert abs(a1 - 0.10135221746694) < 1e-12 and conv._rot_mode.get(3) == "finite"
+    assert "about two axes at once in an NLGEOM step: written as the angles" in rep.text()
+    assert not conv.reduced_physics
+    # the two in-plane ones, the drilling one free: the same values
+    body, conv, _ = convert_str(strip("*Boundary\nTIP, 4, 4, 0.1\nTIP, 5, 5, 0.2\n"))
+    assert [ln.split(",")[3].strip() for ln in rot_lines(body)[:2]] == [got[0].split(",")[3].strip(),
+                                                                       got[1].split(",")[3].strip()]
+    # as given: a linear step, a rotation about one axis, the drilling rotation about two
+    for deck in (strip(step="*Step\n"), strip("*Boundary\nTIP, 4, 4, 0.3\nTIP, 5, 6\n"),
+                 strip("*Boundary\nTIP, 4, 4, 0.3\nTIP, 6, 6, 0.2\n")):
+        body, conv, rep = convert_str(deck)
+        assert all(ln.startswith("TIP") for ln in rot_lines(body)) and conv._rot_mode.get(3) is None
+        assert "about two axes at once" not in rep.text() and not conv.reduced_physics
+    # model data's BCs act in step 1; zero rotations (ENCASTRE) are left alone
+    body, conv, rep = convert_str(strip("").replace("*Step", "*Boundary\nTIP, 4, 4, 0.1\nTIP, 5, 5, 0.2\n"
+                                                    "TIP, 6, 6, 0.\n*Step"))
+    assert conv._rot_mode.get(3) == "finite" and not conv.reduced_physics
+    body, conv, rep = convert_str(strip("*Boundary\nTIP, ENCASTRE\n"))
+    assert conv._rot_mode.get(3) is None and not conv.reduced_physics
+    # no form: on an amplitude, with a *DYNAMIC step, carried on from a linear step
+    flag = "finite shell rotation BCs about two axes read as projected angles"
+    amp = strip().replace("*Boundary\nTIP", "*Boundary, amplitude=A\nTIP").replace(
+        "*Step", "*Amplitude, name=A\n0., 0., 1., 1.\n*Step")
+    dyn = strip(more="*Step, nlgeom\n*Dynamic\n0.1, 1.\n*End Step\n")
+    carry = strip(step="*Step\n", more="*Step, nlgeom\n*Static\n0.1, 1.\n*Cload\n3, 3, 1.\n*End Step\n")
+    # a *DYNAMIC step: ccx knots the node there (and after): as given, not flagged
+    for deck in (strip().replace("*Static\n", "*Dynamic\n"),
+                 strip("*Boundary\nTIP, 4, 4, 0.1\nTIP, 5, 5, 0.2\nTIP, 6, 6, 0.\n*End Step\n*Step, nlgeom\n"
+                       "*Static\n0.1, 1.\n*Boundary\nTIP, 4, 4, 0.2\n").replace("*Static\n", "*Dynamic\n", 1)):
+        body, conv, rep = convert_str(deck)
+        assert conv._rot_mode.get(3) is None and not conv.reduced_physics, conv.reduced_physics
+    # a *DYNAMIC step that reads no rotation of the node: ccx makes it no knot, rewritten after
+    body, conv, rep = convert_str(strip().replace("*Step, nlgeom\n*Static", "*Step, nlgeom\n*Dynamic\n0.1, 1.\n"
+                                                  "*End Step\n*Step, nlgeom\n*Static"))
+    assert conv._rot_mode.get(3) == "finite" and not conv.reduced_physics, conv.reduced_physics
+    for deck, why in ((amp, "a card on an amplitude"), (dyn, "a *DYNAMIC step follows"),
+                      (carry, "carries on into an NLGEOM one")):
+        body, conv, rep = convert_str(deck)
+        assert all(ln.startswith("TIP") for ln in rot_lines(body)), rot_lines(body)
+        assert why in rep.text() and flag in conv.reduced_physics, (why, conv.reduced_physics)
 
 
 def test_shell_rotation_pairs_without_transform():
@@ -23571,6 +23733,12 @@ def test_tie_slave_on_plane_element_faces_becomes_a_node_surface():
         assert _card_at(body, "*SURFACE, NAME=SL_NODES, TYPE=NODE") == ["5", "6"], typ
         assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.1") == ["SL_NODES, MA"]
         assert "on plane / axisymmetric elements -> node surface SL_NODES" in rep.text()
+        said = {"CPS4": "plane stress 5e-3 off at nu 0.3, where ccx's merged nodes share the expanded "
+                        "thickness.", "CPE4R": "plane strain exactly. Exact.",
+                "CAX4": "axisymmetric within 1e-4, ccx tying the node to the chord of its 2-degree wedge "
+                        "(1 - cos 1 deg)."}[typ]
+        assert "Probed against the strips merged there: " + said in " ".join(rep.text().split())
+        assert ("Exact." in rep.text()) == (typ == "CPE4R")
         assert not conv.reduced_physics
     # a TIED contact pair too; a node the master shares stays out (ccx would loop)
     pair = "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\nSL, MA\n"
@@ -23720,6 +23888,12 @@ def test_tie_of_shells_with_a_section_offset_knots_their_nodes():
                                     "knot beams that would make it the reference point stop ccx's "
                                     "explicit solver)"]
     assert "No ccx form is exact" in rep.text()
+    # a TIED NSET slave gets no knot beams: the warning says so, not 'explicit' / 'U1 beams'
+    _, conv, _ = convert_str(_skin(face=", SNEG", off=", offset=SNEG", tie="*Nset, nset=TN\n2, 3, 5, 6\n"
+                                                                          "*Tie, name=T1, tied nset=TN\nSKIN, TOP\n"))
+    assert conv.reduced_physics == ["*TIE on conventional shells: a shell section OFFSET at the master "
+                                    "(Abaqus ties the reference surface, ccx's node its midsurface; the "
+                                    "converter adds no knot beams for a TIED NSET slave)"]
 
 
 def test_tie_of_shells_with_no_exact_ccx_form_is_reduced():
@@ -25314,6 +25488,44 @@ def test_eigen_steps_after_a_nonlinear_solver_step_warn_of_equations_on_knots():
     assert KNOT_WARN not in rep.text(), rep.text()
 
 
+def test_static_then_heat_transfer_run_type():
+    # a *STATIC card before the *HEAT TRANSFER card counts in ccx 2.23's run type only with
+    # initial temperatures: without, ccx crashed in the heat step (exit 250); every node gets 0,
+    # the default.  Shell rotational BCs: ccx stops in the heat step on its mean-rotation MPCs
+    # (meanrotmpc) - warned
+    cube = (HEX + "*Solid Section, elset=EALL, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Conductivity\n50.\n*Boundary\n1, 1, 3\n2, 2, 3\n4, 3\n")
+    static = "*Step\n*Static\n*Cload\n7, 3, 1.\n*End Step\n"
+    heat = "*Step\n*Heat Transfer, steady state\n1., 1.\n*Boundary\n1, 11, 11, 20.\n*End Step\n"
+    out, _, rep = convert_str(cube + static + heat)
+    assert "*INITIAL CONDITIONS, TYPE=TEMPERATURE\nABQ2CCX_INITIAL_T, 0.\n" in out
+    assert "\n1, 2, 3, 4, 5, 6, 7, 8\n" in out.split("ABQ2CCX_INITIAL_T")[1]
+    assert "written for every node at 0" in rep.text() and "meanrotmpc" not in rep.text()
+    # not with initial temperatures, the heat step first, or a *STATIC step after the heat step
+    ic = "*Nset, nset=ALLN, generate\n1, 8, 1\n*Initial Conditions, type=temperature\nALLN, 5.\n"
+    for text in (cube + ic + static + heat, cube + heat + static):
+        out, _, rep = convert_str(text)
+        assert "ABQ2CCX_INITIAL_T" not in out, text
+    # an S4 strip with rotational BCs: the stop warned
+    strip = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n*Element, type=S4, elset=E\n"
+             "1, 1, 2, 3, 4\n*Material, name=M\n*Elastic\n1000., 0.\n*Conductivity\n50.\n*Shell Section, "
+             "elset=E, material=M\n0.01\n*Boundary\n1, 1, 6\n4, 1, 6\n")
+    warn = "ccx writes those as mean-rotation MPCs and stops"
+    _, _, rep = convert_str(strip + static.replace("7, 3", "3, 3") + heat)
+    assert warn in " ".join(rep.text().split()), rep.text()
+    # not after a step ccx solves through its nonlinear solver (NLGEOM, *DYNAMIC: ccx runs the
+    # heat step then; PR #35 review), nor without a mechanical step before the heat step
+    for text in (strip + static.replace("*Step\n", "*Step, nlgeom\n").replace("7, 3", "3, 3") + heat,
+                 strip + "*Step\n*Dynamic\n0.01, 0.1\n*Cload\n3, 3, 1.\n*End Step\n" + heat,
+                 strip + heat, strip + heat + static.replace("7, 3", "3, 3")):
+        _, _, rep = convert_str(text)
+        assert "meanrotmpc" not in rep.text(), text
+    # a moment on a plain shell node (gen3dforc's mean-rotation MPC) stops it too: warned
+    plate = strip.replace("*Boundary\n1, 1, 6\n4, 1, 6\n", "*Boundary\n1, 1, 3\n4, 1, 3\n")
+    _, _, rep = convert_str(plate + static.replace("7, 3, 1.", "2, 5, 0.1") + heat)
+    assert warn in " ".join(rep.text().split()), rep.text()
+
+
 def test_heat_transfer_run_gets_a_static_card_for_its_knots():
     # ccx 2.23 sets a run up as heat transfer alone where its procedure cards hold *HEAT
     # TRANSFER and no *STATIC / *VISCO / *DYNAMIC after it (eigenvalue and modal procedures do
@@ -25339,11 +25551,58 @@ def test_heat_transfer_run_gets_a_static_card_for_its_knots():
     for text in (model + freq + ssd, model + heat + "*STEP\n*STATIC\n*END STEP\n" + freq + ssd):
         out, conv, rep = convert_str(text)
         assert "\n*STATIC\n*FREQUENCY" not in out
-    # a *BUCKLE step takes it too; eigenvalue steps before the heat step only: warned
-    out, _, rep = convert_str(model + heat + "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n11, 1, -1.\n*END STEP\n")
+    # a *BUCKLE step takes it too (a moment on a shell node: a knot); eigenvalue steps before the
+    # heat step only: warned
+    out, _, rep = convert_str(model + heat + "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n11, 5, 1e-4\n*END STEP\n")
     assert "\n*STATIC\n*BUCKLE" in out
-    out, _, rep = convert_str(model + freq + heat)
+    out, _, rep = convert_str(model + freq + ssd + heat)
     assert "*STATIC\n" not in out and "ccx 2.23 sets this run up as a heat transfer analysis" in rep.text()
+    # where nothing needs it (the strip without moments, a solid cube) the card is written all the
+    # same (harmless: the same eigenvalues), without its note; no warning there (review of PR #21:
+    # noise)
+    cube = MODAL.split("*Step")[0].replace("*Density\n1e-3\n", "*Density\n1e-3\n*Conductivity\n50.\n")
+    cube_heat = "*Step\n*Heat Transfer, steady state\n1., 1.\n*Boundary\n1, 11, 11, 20.\n*End Step\n"
+    assert "*Conductivity" in cube
+    for text in (model + heat + freq, cube + cube_heat + freq, cube + freq + cube_heat):
+        out, _, rep = convert_str(text)
+        assert ("\n*STATIC\n*FREQUENCY" in out) == (text.upper().index("HEAT TRANSFER") < text.upper().index("*FREQUENCY")), text
+        assert "*STATIC written" not in rep.text() and \
+            "sets this run up as a heat transfer analysis" not in rep.text(), text
+    # a *TIE: ccx's heat-only setup ties temperatures alone (PR #27 re-review: two tied C3D8 bars,
+    # eigenvalues near 0 without the card)
+    two = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n6, 1., 0., 1.\n"
+           "7, 1., 1., 1.\n8, 0., 1., 1.\n11, 1., 0., 0.\n12, 2., 0., 0.\n13, 2., 1., 0.\n14, 1., 1., 0.\n"
+           "15, 1., 0., 1.\n16, 2., 0., 1.\n17, 2., 1., 1.\n18, 1., 1., 1.\n*Element, type=C3D8, elset=E\n"
+           "1, 1, 2, 3, 4, 5, 6, 7, 8\n2, 11, 12, 13, 14, 15, 16, 17, 18\n*Elset, elset=A\n1\n*Elset, elset=B\n2\n"
+           "*Surface, name=MA\nA, S4\n*Surface, name=SB\nB, S6\n*Tie, name=T1\nSB, MA\n"
+           "*Solid Section, elset=E, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n"
+           "*Conductivity\n50.\n*Nset, nset=LEFT\n1, 4, 5, 8\n")
+    out, _, rep = convert_str(two + cube_heat.replace("1, 11", "LEFT, 11") + freq.replace("3\n", "3\n*Boundary\nLEFT, 1, 3\n"))
+    assert "\n*STATIC\n*FREQUENCY" in out and "mechanical ties of *TIE constraints (e.g. T1)" in rep.text(), rep.text()
+    # plane, membrane and truss elements: the heat-only setup leaves out their expansion ties
+    # (PR #27 review: CPS4 / M3D4 / T3D2 first eigenvalues 0.135 / 0.949 / 0.928 for about 1e10;
+    # with the card those of the run without the heat step for CPS4 and M3D4), and the
+    # eigenvalue steps before the heat step are warned there (ccx exit 134 on CPS4)
+    quad = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+            "*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1e-3\n*Conductivity\n50.\n")
+    for typ, sec in (("CPS4", "*Solid Section, elset=E, material=M\n0.1\n"),
+                     ("M3D4", "*Membrane Section, elset=E, material=M\n0.1\n")):
+        el = f"*Element, type={typ}, elset=E\n1, 1, 2, 3, 4\n" + sec + "*Boundary\n1, 1, 3\n4, 1, 3\n"
+        out, _, rep = convert_str(quad + el + heat.replace("FIX", "1") + freq)
+        assert "\n*STATIC\n*FREQUENCY" in out and f"mechanical ties of {typ} elements" in rep.text(), typ
+        out, _, rep = convert_str(quad + el + freq + heat.replace("FIX", "1"))
+        assert "*STATIC\n" not in out and "sets this run up as a heat transfer analysis" in rep.text()
+    truss = (quad + "*Element, type=T3D2, elset=E\n1, 1, 2\n2, 2, 3\n*Solid Section, elset=E, material=M\n"
+             "0.01\n*Boundary\n1, 1, 3\n3, 1, 3\n")
+    out, _, rep = convert_str(truss + heat.replace("FIX", "1") + freq)
+    assert "\n*STATIC\n*FREQUENCY" in out and "mechanical ties of T3D2 elements" in rep.text()
+    # an S4 fold (two normals at a node: ccx makes it a knot, _ccx_knot) takes the card too
+    fold = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 1., 0., 1.\n6, 1., 1., 1.\n"
+            "*Element, type=S4, elset=E\n1, 1, 2, 3, 4\n2, 2, 5, 6, 3\n*Material, name=M\n*Elastic\n1000., 0.\n"
+            "*Density\n1e-3\n*Conductivity\n50.\n*Shell Section, elset=E, material=M\n0.01\n"
+            "*Nset, nset=FIX\n1, 4\n*Boundary\nFIX, 1, 6\n")
+    out, _, rep = convert_str(fold + heat + freq)
+    assert "\n*STATIC\n*FREQUENCY" in out and "shell and beam knots (e.g. node 2)" in rep.text(), rep.text()
     # the knot-equation warning still counts a heat step
     rb = "*RIGID BODY, REF NODE=901, TIE NSET=RB\n"
     _, conv, rep = convert_str(KNOT_CANTILEVER.format(
@@ -25636,11 +25895,11 @@ def test_transformed_bcs_through_helper_nodes_where_op_new_would_loosen_equation
 
 def test_transform_bc_warnings_dynamic_stops_and_kinematic_op_new():
     # implicit *DYNAMIC: a BC on an oblique *TRANSFORM translation new after the node could
-    # move is answered otherwise than along a global axis (probed): warned, reduced physics
+    # move is answered otherwise than along the positive global axis (probed): warned, reduced physics
     dyn = "*Step\n*Dynamic, direct\n0.05, 1.\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Dynamic, direct\n" \
         "0.05, 1.\n*Boundary\n7, 2, 2, 0.01\n*End Step\n"
     flag = "*BOUNDARY on a *TRANSFORM translation new in an implicit *DYNAMIC step (ccx 2.23 stops " \
-        "the DOF otherwise than along a global axis)"
+        "the DOF otherwise than along the positive global axis of its number)"
     body, conv, rep = convert_str(FIXED_TR_HEX + dyn)
     assert "new in implicit *DYNAMIC steps after the node could move (node 7 DOF 2 (step 2))" in rep.text()
     assert flag in conv.reduced_physics
@@ -25660,6 +25919,29 @@ def test_transform_bc_warnings_dynamic_stops_and_kinematic_op_new():
     assert "*KINEMATIC" in body and stop in rep.text()
     body, conv, rep = convert_str(VEL_HEX + kin + steps)
     assert "*KINEMATIC" in body and stop not in rep.text()
+    # a cylindrical *TRANSFORM: the axes at the node decide (probed in ccx against the model
+    # turned into them): local u1 is oblique there, warned; local u2 is global y, exact, quiet
+    cyl = FIXED_TR_HEX.replace("*Transform, nset=N7\n", "*Transform, nset=N7, type=C\n")
+    body, conv, rep = convert_str(cyl + dyn.replace("7, 2, 2, 0.01", "7, 1, 1, 0.01"))
+    assert "(node 7 DOF 1 (step 2))" in rep.text() and flag in conv.reduced_physics
+    body, conv, rep = convert_str(cyl + dyn)
+    assert "*TRANSFORM, NSET=N7, TYPE=C" in body and flag not in conv.reduced_physics
+
+
+def test_transform_bc_warning_dynamic_negative_global_axes():
+    # a local axis along the negative global axis of its number is not exact in a *DYNAMIC
+    # step either (ccx starts the BC's extra node at +u for a -u BC; probed: -x 5.0 %, -y 8.7 %):
+    # warned, reduced physics; an axis along the positive global one of its number is quiet
+    dyn = "*Step\n*Dynamic, direct\n0.05, 1.\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Dynamic, direct\n" \
+        "0.05, 1.\n*Boundary\n7, {d}, {d}, 0.01\n*End Step\n"
+    flag = "*BOUNDARY on a *TRANSFORM translation new in an implicit *DYNAMIC step (ccx 2.23 stops " \
+        "the DOF otherwise than along the positive global axis of its number)"
+    for ab, d, warned in (("-1., 0., 0., 0., -1., 0.", 1, True), ("-1., 0., 0., 0., -1., 0.", 2, True),
+                          ("-1., 0., 0., 0., -1., 0.", 3, False),       # (local -x, -y, +z)
+                          ("-1., 0., 0., 0., 1., 0.", 2, False), ("-1., 0., 0., 0., 1., 0.", 3, True)):  # (-x, +y, -z)
+        body, conv, rep = convert_str(FIXED_TR_HEX.replace("1., 1., 0.5, -1., 1., 1.", ab) + dyn.format(d=d))
+        assert (f"(node 7 DOF {d} (step 2))" in rep.text()) == warned, (ab, d)
+        assert (flag in conv.reduced_physics) == warned, (ab, d)
 
 
 def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
@@ -26026,6 +26308,52 @@ def test_tie_on_one_surface_or_on_shared_nodes():
     assert "*SURFACE, NAME=BBOT_NODES, TYPE=NODE\n17\n18\n*TIE, NAME=T1\nBBOT_NODES, ATOP\n" in body
     assert "shares 2 node(s) with the faces of master surface ATOP" in rep.text()
     assert not conv.reduced_physics
+    # a TIED contact pair, written as a *TIE, likewise (ccx looped without end on it; probed)
+    body, conv, _ = convert_str(two.replace("*Tie, name=T1\n", "*Surface Interaction, name=SI\n"
+                                                                 "*Contact Pair, interaction=SI, tied\n"))
+    assert "*SURFACE, NAME=BBOT_NODES, TYPE=NODE\n17\n18\n" in body and "\nBBOT_NODES, ATOP\n" in body
+    assert not conv.reduced_physics
+    # every slave node shared: the pair is left out (a comment); a shared slave on shells (an S4
+    # plate on an S4 master, no node form) is commented out and flagged, naming the pair
+    body, conv, rep = convert_str(two.replace("2,5,6,17,18,", "2,5,6,7,8,").replace(
+        "*Tie, name=T1\n", "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\n"))
+    assert "every slave node of BBOT is a node of ATOP" in body and "\nBBOT, ATOP" not in body
+    assert "*CONTACT PAIR, TIED slave surface BBOT: every node of it" in rep.text() and not conv.reduced_physics
+    # one slave on two masters (A's elements), sharing x = 0 with one and x = 2 with the other:
+    # each line leaves out the nodes of both (ccx looped on a node of one tied to the other)
+    multi = ("*Node\n1,0,0,0\n2,1,0,0\n3,2,0,0\n4,0,1,0\n5,1,1,0\n6,2,1,0\n7,0,0,1\n8,1,0,1\n9,2,0,1\n"
+             "10,0,1,1\n11,1,1,1\n12,2,1,1\n102,1,0,1\n105,1,1,1\n107,0,0,2\n108,1,0,2\n109,2,0,2\n110,0,1,2\n"
+             "111,1,1,2\n112,2,1,2\n*Element, type=C3D8, elset=A\n1,1,2,5,4,7,8,11,10\n2,2,3,6,5,8,9,12,11\n"
+             "*Element, type=C3D8, elset=B\n11,7,102,105,10,107,108,111,110\n12,102,9,12,105,108,109,112,111\n"
+             "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=A, material=M\n*Solid Section, "
+             "elset=B, material=M\n*Surface, name=AT1\n1, S2\n*Surface, name=AT2\n2, S2\n*Surface, name=BB\n"
+             "B, S1\n*Tie, name=T1\nBB, AT1\nBB, AT2\n")
+    body, conv, _ = convert_str(multi)
+    assert _card_at(body, "*SURFACE, NAME=BB_NODES, TYPE=NODE") == ["102", "105"]
+    assert {"BB_NODES, AT1", "BB_NODES, AT2"} <= set(body.splitlines()) and not conv.reduced_physics
+    # but a node of one master that lies on another (B on A1's nodes, A2 a block of its own nodes
+    # beside A1): Abaqus ties it to that other master, so its line keeps it (left out: A2's edge
+    # loose, 22 % off)
+    edge = ("*Node\n1,0,0,0\n2,1,0,0\n3,2,0,0\n4,0,1,0\n5,1,1,0\n6,2,1,0\n7,0,0,1\n8,1,0,1\n9,2,0,1\n"
+            "10,0,1,1\n11,1,1,1\n12,2,1,1\n103,2,0,1\n106,2,1,1\n107,0,0,2\n108,1,0,2\n109,2,0,2\n110,0,1,2\n"
+            "111,1,1,2\n112,2,1,2\n201,1,0,0\n204,1,1,0\n207,1,0,1\n210,1,1,1\n*Element, type=C3D8, elset=A1\n"
+            "1,1,2,5,4,7,8,11,10\n*Element, type=C3D8, elset=A2\n2,201,3,6,204,207,9,12,210\n*Element, "
+            "type=C3D8, elset=B\n11,7,8,11,10,107,108,111,110\n12,8,103,106,11,108,109,112,111\n*Material, "
+            "name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=A1, material=M\n*Solid Section, elset=A2, "
+            "material=M\n*Solid Section, elset=B, material=M\n*Surface, name=AT1\nA1, S2\n*Surface, name=AT2\n"
+            "A2, S2\n*Surface, name=BB\nB, S1\n*Tie, name=T1\nBB, AT1\nBB, AT2\n")
+    body, conv, _ = convert_str(edge)
+    assert _card_at(body, "*SURFACE, NAME=BB_NODES, TYPE=NODE") == ["103", "106"]
+    assert sorted(_card_at(body, "*SURFACE, NAME=BB_NODES~1, TYPE=NODE"), key=int) == ["8", "11", "103", "106"]
+    assert {"BB_NODES, AT1", "BB_NODES~1, AT2"} <= set(body.splitlines()) and not conv.reduced_physics
+    plates = ("*Node\n1,0,0,0\n2,1,0,0\n3,1,1,0\n4,0,1,0\n5,2,0,0\n6,2,1,0\n*Element, type=S4, elset=A\n"
+              "1,1,2,3,4\n*Element, type=S4, elset=B\n2,2,5,6,3\n*Surface, name=AT\nA, SPOS\n"
+              "*Surface, name=BT\nB, SPOS\n*Material, name=M\n*Elastic\n1000., 0.3\n*Shell Section, "
+              "elset=A, material=M\n0.1\n*Shell Section, elset=B, material=M\n0.1\n*Surface Interaction, "
+              "name=SI\n*Contact Pair, interaction=SI, tied\nBT, AT\n")
+    body, conv, rep = convert_str(plates)
+    assert "** BT, AT" in body and "*CONTACT PAIR, TIED: slave surface BT shares nodes" in rep.text()
+    assert "*CONTACT PAIR, TIED whose slave surface shares nodes with its master (left out)" in conv.reduced_physics
     plane = ("*Node\n1,0,0\n2,1,0\n3,1,1\n4,0,1\n12,1,0\n13,1,1\n5,2,0\n6,2,1\n"
              "*Element, type=CPS4, elset=A\n1,1,2,3,4\n*Element, type=CPS4, elset=B\n2,2,5,6,13\n"
              "*Surface, name=AR\nA, S2\n*Surface, name=BL\nB, S4\n*Tie, name=T1\nBL, AR\n"
@@ -27776,10 +28104,11 @@ def test_odd_and_bonded_continuum_shell_stacks():
             zs.append(zs[-1] + h)
         nodes = "".join(f"{4 * k + i + 1}, {x}, {y}, {z!r}\n" for k, z in enumerate(zs)
                         for i, (x, y) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1))))
-        els = "".join(f"*Element, type={t}, elset={'C' if t.startswith('COH') else 'S'}{k}\n{k + 1}, "
+        els = "".join(f"*Element, type={t}, elset={'S' if t == 'SC8R' else 'C'}{k}\n{k + 1}, "
                       + ", ".join(str(4 * k + i) for i in (1, 2, 3, 4, 5, 6, 7, 8)) + "\n"
                       for k, (t, _h) in enumerate(layers))
         secs = "".join(f"*Shell Section, elset=S{k}, material=M\n{h!r}\n" if t == "SC8R" else
+                       f"*Solid Section, elset=C{k}, material=G\n" if t == "C3D8" else
                        f"*Cohesive Section, elset=C{k}, material=G, response=continuum\n"
                        for k, (t, h) in enumerate(layers))
         return ("*Node\n" + nodes + els + secs + "*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n1., 0.\n"
@@ -27791,12 +28120,47 @@ def test_odd_and_bonded_continuum_shell_stacks():
     for layers, factor in (([sc], "1.155"), ([sc] * 2, None), ([sc] * 3, "1.017"), ([sc] * 4, None),
                            ([sc] * 5, "1.006"), ([sc, ("SC8R", 0.3)], "1.025"),
                            ([sc, ("COH3D8", 0.0), sc], None), ([sc, ("COH3D8", 0.002), sc], None),
-                           ([sc, ("COH3D8", 0.0), sc, ("COH3D8", 0.0), sc], "1.017")):
+                           ([sc, ("COH3D8", 0.0), sc, ("COH3D8", 0.0), sc], "1.017"),
+                           # a solid core continues the stack (item 9, probed: SC8R skins on a soft
+                           # C3D8 core carry 1.0005-1.0010 of the fully plastic moment)
+                           ([sc, ("C3D8", 0.2), sc], None), ([sc, ("C3D8", 0.1), ("C3D8", 0.1), sc], None),
+                           ([("SC8R", 0.3), ("C3D8", 0.1)], "1.025")):
         _, conv, rep = convert_str(deck(layers))
         assert (flag in conv.reduced_physics) == (factor is not None), layers
         if factor:
             assert f"plastic, the section carries {factor} times the fully plastic moment here" in rep.text()
             assert "; 1 elements that the middle of the thickness crosses" in rep.text(), layers
+    # solid cores, pinned from PR #33's review: a solid below as above, a core listed top face
+    # first, two hexes on one face (a branching column: both skins alone), a solid touching a
+    # skin by an edge only, a collapsed C3D8 core (its top face no skin's: the top skin alone)
+    def extra(text, cards):
+        return text.replace("*Material, name=M", cards + "*Material, name=M", 1)
+    core = deck([sc, ("C3D8", 0.2), sc])
+    for text, want in ((deck([("C3D8", 0.1), ("SC8R", 0.3)]), ("1", "1.025")),
+                       (core.replace("2, 5, 6, 7, 8, 9, 10, 11, 12\n", "2, 9, 10, 11, 12, 5, 6, 7, 8\n"), None),
+                       (extra(core, "*Element, type=C3D8, elset=X\n9, 5, 6, 7, 8, 9, 10, 11, 12\n"
+                                    "*Solid Section, elset=X, material=G\n"), ("2", "1.155")),
+                       (extra(deck([sc]), "*Node\n101, 2, 0, 0.1\n102, 2, 1, 0.1\n103, 1, 0, 0.2\n"
+                                          "104, 2, 0, 0.2\n105, 2, 1, 0.2\n106, 1, 1, 0.2\n*Element, type=C3D8, "
+                                          "elset=X\n9, 6, 101, 102, 7, 103, 104, 105, 106\n"
+                                          "*Solid Section, elset=X, material=G\n"), ("1", "1.155")),
+                       (core.replace("2, 5, 6, 7, 8, 9, 10, 11, 12\n", "2, 5, 6, 7, 8, 9, 10, 11, 11\n"),
+                        ("1", "1.155"))):
+        _, conv, rep = convert_str(text)
+        got = re.search(r"; (\d+) elements that the middle.*?carries (\S+) times", rep.text())
+        assert (got.groups() if got else None) == want, (want, got and got.groups())
+        assert (flag in conv.reduced_physics) == (want is not None)
+    # an element of no resolved stack counts as alone (code review, PR #22): a branching column
+    # (a second element on the same face) and one of no thickness are flagged at 1.155
+    branch = deck([sc, sc]).replace("*Shell Section, elset=S0", "*Element, type=SC8R, elset=S1\n"
+                                    "3, 5, 6, 7, 8, 9, 10, 11, 12\n*Shell Section, elset=S0")
+    flat = deck([("SC8R", 0.0)]).replace("*Shell Section, elset=S0, material=M\n0.0\n",
+                                         "*Shell Section, elset=S0, material=M\n0.1\n")
+    for text, n in ((branch, 3), (flat, 1)):
+        _, conv, rep = convert_str(text)
+        assert flag in conv.reduced_physics, text
+        assert f"; {n} elements that the middle of the thickness crosses" in rep.text()
+        assert "plastic, the section carries 1.155 times the fully plastic moment here" in rep.text()
 
 
 def test_plastic_continuum_shell_composites_with_a_middle_layer_flagged():
