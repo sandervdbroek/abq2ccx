@@ -45527,7 +45527,55 @@ class _PostPasses:
     _RUN_COUPLED = ("COUPLED TEMPERATURE-DISPLACEMENT", "UNCOUPLED TEMPERATURE-DISPLACEMENT",
                     "ELECTROMAGNETICS")
 
-    def _mechanical_run_type(self, deck: EmittedDeck) -> EmittedDeck:
+    # ccx types whose expansion ties ccx 2.23 writes only in a run set up as mechanical
+    _HEAT_ONLY_UNTIED = ("CPS", "CPE", "CAX", "M3D", "T2D", "T3D")
+
+    def _heat_only_loses(self, blocks: List[Block], deck: EmittedDeck) -> Optional[str]:
+        """What ccx 2.23's heat-only run setup leaves out of the model (_mechanical_run_type),
+        as words for the report, or None: plane, membrane or truss elements (their expansion's
+        mechanical MPCs), *TIE constraints (their displacement ties), or shell and beam knots
+        (_knot_in_run: their rotations and ties)."""
+        for e, (typ, _conn) in self.geom.elements.items():
+            cc = ccx_type(typ)
+            if cc.startswith(self._HEAT_ONLY_UNTIED):
+                return f"{cc} elements (e.g. element {e})"
+        tie = next((c for c in deck.cards if c.keyword == "TIE"), None)
+        if tie is not None:                     # (gentiedmpc: temperatures alone)
+            return f"*TIE constraints (e.g. {tie.param('NAME') or 'the first'})"
+        knot = self._knot_in_run(blocks, deck)
+        return None if knot is None else f"shell and beam knots (e.g. node {knot}), their rotations too"
+
+    def _knot_in_run(self, blocks: List[Block], deck: EmittedDeck) -> Optional[int]:
+        """A shell/beam node whose rotations ccx 2.23 carries through a knot (_mechanical_run_type),
+        or None: a converter knot beam's, a rigid constraint's member, one a moment loads, or
+        one ccx makes a knot itself or may (_ccx_knot not False: sections or normals that
+        differ, beams meeting shells, other elements at the node)."""
+        if self._knots:
+            return next(iter(self._knots))
+        rot = self._rot_nodes
+        if not rot:
+            return None
+        for c in self._rigid_constraints(blocks):
+            hit = next((n for key in ("elim", "rots") if isinstance(c.get(key), dict)
+                        for n in c[key] if n in rot), None)
+            if hit is not None:
+                return hit
+        for c in deck.cards:
+            if c.keyword != "CLOAD":
+                continue
+            for rec in c.records():
+                try:
+                    if len(rec) > 1 and pint(rec[1]) >= 4:
+                        nodes = [pint(rec[0])] if rec[0].isdigit() else self.geom.nset(rec[0])
+                        hit = next((n for n in nodes if n in rot), None)
+                        if hit is not None:
+                            return hit
+                except ValueError:
+                    continue
+        sections, at = self._knot_sections(blocks), self._elements_at(rot)
+        return next((n for n in sorted(rot) if self._ccx_knot(n, sections, at) is not False), None)
+
+    def _mechanical_run_type(self, blocks: List[Block], deck: EmittedDeck) -> EmittedDeck:
         """ccx 2.23 sets a run up as heat transfer alone, before any step, when its keyword lines
         hold a *HEAT TRANSFER card and no *STATIC, *VISCO or *DYNAMIC card after it (nor one
         anywhere with initial temperatures) or coupled step: *FREQUENCY, *BUCKLE and the modal
@@ -45539,7 +45587,14 @@ class _PostPasses:
         step's last procedure card, so a *STATIC card right before the first *FREQUENCY or
         *BUCKLE card after the first *HEAT TRANSFER card makes the run mechanical too and the
         step what it was (probed: the same eigenvalues and buckling factors to every digit).
-        Without such a step, a warning."""
+        Without such a step, a warning.  The heat-only setup also leaves out the mechanical
+        MPCs ccx expands plane, membrane and truss elements with (gen3dfrom2d, gen3dmembrane,
+        gen3dtruss; PR #27 review: CPS4 / CPE4 / CAX4 / M3D4 / T3D2 strips, first eigenvalue
+        0.135, 0.135, -0.028, 0.949, 0.928 for about 1e10, no message), and a *TIE ties only
+        temperatures (gentiedmpc; two tied C3D8 bars: eigenvalues near 0).  The card is written
+        in every such run (where nothing needs it, ccx runs alike either way: a C3D8 bar, an S4
+        strip, a B31 cantilever, the same eigenvalues); its note and the warning only where
+        _heat_only_loses names what needs it."""
         state, init, heat = 0, False, None
         for c in deck.cards:
             kw = c.keyword
@@ -45554,24 +45609,29 @@ class _PostPasses:
         mech = [s for s in deck.steps if s.proc is not None and s.proc.keyword in self._EIGEN_PROCS]
         if state != 2 or not mech:
             return deck
+        lost = self._heat_only_loses(blocks, deck)
         at = next((s.proc for s in deck.steps if s.proc is not None and s.proc.index > heat.index
                    and s.proc.keyword in ("FREQUENCY", "BUCKLE")), None)
         if at is None:
+            if lost is None:
+                return deck
             self.report.warn(f"ccx 2.23 sets this run up as a heat transfer analysis (its procedure "
                              f"cards hold *HEAT TRANSFER and no *STATIC, *VISCO or *DYNAMIC after it; "
-                             f"step(s) {', '.join(str(s.number) for s in mech)} do not count): shell and "
-                             f"beam knots get no rotational DOFs there, and ccx stops on a rotational "
-                             f"BC, moment or equation on one. Put a *FREQUENCY or *BUCKLE step after "
-                             f"the first *HEAT TRANSFER step.", once=True)
+                             f"step(s) {', '.join(str(s.number) for s in mech)} do not count): it leaves "
+                             f"out the mechanical ties of {lost} there, so those steps' results are wrong "
+                             f"or ccx stops (probed). Put a *FREQUENCY or *BUCKLE step after the first "
+                             f"*HEAT TRANSFER step.", once=True)
             return deck
         deck.insert_before(at, ["** abq2ccx: *STATIC ahead of the step's own procedure (ccx runs the "
                                 "last one): it makes ccx set the run up as a mechanical one too",
                                 "*STATIC"])
+        if lost is None:
+            return deck.edited()
         self.report.note(f"*STATIC written ahead of step {at.step}'s *{at.keyword} card: ccx 2.23 sets a "
                          f"run up as heat transfer alone where its procedure cards hold *HEAT TRANSFER "
                          f"and no *STATIC, *VISCO or *DYNAMIC after it (*FREQUENCY and the modal "
-                         f"procedures do not count), and then gives shell and beam knots no rotational "
-                         f"DOFs: it stops on a rotational BC, moment or equation on one (probed). ccx "
+                         f"procedures do not count), and then leaves out the mechanical ties of "
+                         f"{lost}: wrong eigenvalues or a stop (probed). ccx "
                          f"runs the step's last procedure card, so the step is what it was (probed: "
                          f"the same eigenvalues and buckling factors).", once=True)
         return deck.edited()
@@ -48606,7 +48666,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_transform_bc_traps(deck)     # (BCs on the nodes, as every pass wrote them)
         deck = self._fixed_helper_nodes(deck)   # after every other pass that writes *BOUNDARY
         deck = self._truss_bc_index(deck)       # after every pass that writes *BOUNDARY
-        deck = self._mechanical_run_type(deck)  # last: it adds a procedure card ahead of a step's own
+        deck = self._mechanical_run_type(blocks, deck)  # last: it adds a procedure card ahead of a step's own
         out = self._short_fields(deck.render())     # last: every card is written
         if self.reduced_physics:
             self.report.warn("Reduced physics — ccx solves a different model than this Abaqus deck: "

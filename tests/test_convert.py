@@ -25479,11 +25479,58 @@ def test_heat_transfer_run_gets_a_static_card_for_its_knots():
     for text in (model + freq + ssd, model + heat + "*STEP\n*STATIC\n*END STEP\n" + freq + ssd):
         out, conv, rep = convert_str(text)
         assert "\n*STATIC\n*FREQUENCY" not in out
-    # a *BUCKLE step takes it too; eigenvalue steps before the heat step only: warned
-    out, _, rep = convert_str(model + heat + "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n11, 1, -1.\n*END STEP\n")
+    # a *BUCKLE step takes it too (a moment on a shell node: a knot); eigenvalue steps before the
+    # heat step only: warned
+    out, _, rep = convert_str(model + heat + "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n11, 5, 1e-4\n*END STEP\n")
     assert "\n*STATIC\n*BUCKLE" in out
-    out, _, rep = convert_str(model + freq + heat)
+    out, _, rep = convert_str(model + freq + ssd + heat)
     assert "*STATIC\n" not in out and "ccx 2.23 sets this run up as a heat transfer analysis" in rep.text()
+    # where nothing needs it (the strip without moments, a solid cube) the card is written all the
+    # same (harmless: the same eigenvalues), without its note; no warning there (review of PR #21:
+    # noise)
+    cube = MODAL.split("*Step")[0].replace("*Density\n1e-3\n", "*Density\n1e-3\n*Conductivity\n50.\n")
+    cube_heat = "*Step\n*Heat Transfer, steady state\n1., 1.\n*Boundary\n1, 11, 11, 20.\n*End Step\n"
+    assert "*Conductivity" in cube
+    for text in (model + heat + freq, cube + cube_heat + freq, cube + freq + cube_heat):
+        out, _, rep = convert_str(text)
+        assert ("\n*STATIC\n*FREQUENCY" in out) == (text.upper().index("HEAT TRANSFER") < text.upper().index("*FREQUENCY")), text
+        assert "*STATIC written" not in rep.text() and \
+            "sets this run up as a heat transfer analysis" not in rep.text(), text
+    # a *TIE: ccx's heat-only setup ties temperatures alone (PR #27 re-review: two tied C3D8 bars,
+    # eigenvalues near 0 without the card)
+    two = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 0., 0., 1.\n6, 1., 0., 1.\n"
+           "7, 1., 1., 1.\n8, 0., 1., 1.\n11, 1., 0., 0.\n12, 2., 0., 0.\n13, 2., 1., 0.\n14, 1., 1., 0.\n"
+           "15, 1., 0., 1.\n16, 2., 0., 1.\n17, 2., 1., 1.\n18, 1., 1., 1.\n*Element, type=C3D8, elset=E\n"
+           "1, 1, 2, 3, 4, 5, 6, 7, 8\n2, 11, 12, 13, 14, 15, 16, 17, 18\n*Elset, elset=A\n1\n*Elset, elset=B\n2\n"
+           "*Surface, name=MA\nA, S4\n*Surface, name=SB\nB, S6\n*Tie, name=T1\nSB, MA\n"
+           "*Solid Section, elset=E, material=M\n*Material, name=M\n*Elastic\n1000., 0.3\n*Density\n1e-3\n"
+           "*Conductivity\n50.\n*Nset, nset=LEFT\n1, 4, 5, 8\n")
+    out, _, rep = convert_str(two + cube_heat.replace("1, 11", "LEFT, 11") + freq.replace("3\n", "3\n*Boundary\nLEFT, 1, 3\n"))
+    assert "\n*STATIC\n*FREQUENCY" in out and "mechanical ties of *TIE constraints (e.g. T1)" in rep.text(), rep.text()
+    # plane, membrane and truss elements: the heat-only setup leaves out their expansion ties
+    # (PR #27 review: CPS4 / M3D4 / T3D2 first eigenvalues 0.135 / 0.949 / 0.928 for about 1e10;
+    # with the card those of the run without the heat step for CPS4 and M3D4), and the
+    # eigenvalue steps before the heat step are warned there (ccx exit 134 on CPS4)
+    quad = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n"
+            "*Material, name=M\n*Elastic\n1000., 0.\n*Density\n1e-3\n*Conductivity\n50.\n")
+    for typ, sec in (("CPS4", "*Solid Section, elset=E, material=M\n0.1\n"),
+                     ("M3D4", "*Membrane Section, elset=E, material=M\n0.1\n")):
+        el = f"*Element, type={typ}, elset=E\n1, 1, 2, 3, 4\n" + sec + "*Boundary\n1, 1, 3\n4, 1, 3\n"
+        out, _, rep = convert_str(quad + el + heat.replace("FIX", "1") + freq)
+        assert "\n*STATIC\n*FREQUENCY" in out and f"mechanical ties of {typ} elements" in rep.text(), typ
+        out, _, rep = convert_str(quad + el + freq + heat.replace("FIX", "1"))
+        assert "*STATIC\n" not in out and "sets this run up as a heat transfer analysis" in rep.text()
+    truss = (quad + "*Element, type=T3D2, elset=E\n1, 1, 2\n2, 2, 3\n*Solid Section, elset=E, material=M\n"
+             "0.01\n*Boundary\n1, 1, 3\n3, 1, 3\n")
+    out, _, rep = convert_str(truss + heat.replace("FIX", "1") + freq)
+    assert "\n*STATIC\n*FREQUENCY" in out and "mechanical ties of T3D2 elements" in rep.text()
+    # an S4 fold (two normals at a node: ccx makes it a knot, _ccx_knot) takes the card too
+    fold = ("*Node\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 1., 0.\n4, 0., 1., 0.\n5, 1., 0., 1.\n6, 1., 1., 1.\n"
+            "*Element, type=S4, elset=E\n1, 1, 2, 3, 4\n2, 2, 5, 6, 3\n*Material, name=M\n*Elastic\n1000., 0.\n"
+            "*Density\n1e-3\n*Conductivity\n50.\n*Shell Section, elset=E, material=M\n0.01\n"
+            "*Nset, nset=FIX\n1, 4\n*Boundary\nFIX, 1, 6\n")
+    out, _, rep = convert_str(fold + heat + freq)
+    assert "\n*STATIC\n*FREQUENCY" in out and "shell and beam knots (e.g. node 2)" in rep.text(), rep.text()
     # the knot-equation warning still counts a heat step
     rb = "*RIGID BODY, REF NODE=901, TIE NSET=RB\n"
     _, conv, rep = convert_str(KNOT_CANTILEVER.format(
