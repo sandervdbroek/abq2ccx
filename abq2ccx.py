@@ -11121,6 +11121,8 @@ class _Mesh:
         for b in blocks:
             if b.keyword in ("CONNECTOR SECTION", "JOINT"):
                 live |= {n for n in axes if any(n in ln.upper() for ln in b.data)}
+                if b.uparam("ORIENTATION") in axes:      # _emit_instance's ORIENTATION= on a *JOINT
+                    live.add(b.uparam("ORIENTATION"))
                 continue
             name = b.uparam("ORIENTATION")
             if name not in axes:
