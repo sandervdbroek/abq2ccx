@@ -9870,9 +9870,10 @@ class _Mesh:
             elif name and not membrane:
                 line = ", ".join([name] + f[1:])
             elif name:
-                params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
-                    b.param("POSITION TOLERANCE"), f[0], master, b, False), 6)
+                tol = self._membrane_tie_tolerance(b.param("POSITION TOLERANCE"), f[0], master, b, False)
+                params["POSITION TOLERANCE"] = short_real(tol, 6)
                 line = ", ".join([name] + f[1:])
+                self._plane_tie_checks(f[0], name, master, b, False, tol)
             elif tied is not None:                  # (the line names the set's node surface)
                 cards = tied[1]
                 params["POSITION TOLERANCE"] = short_real(tied[2], 6)
@@ -10201,7 +10202,7 @@ class _Mesh:
         constraints), so a slave surface on solid elements, or a node surface, becomes a node
         surface of its other nodes: (its name, its *SURFACE card), "" with none left (probed:
         the answer of the blocks merged at the interface).  (None, []): nothing shared; ("?",
-        []): shared on another element family (shells, plane elements)."""
+        []): shared on another element family (shells; plane elements: _membrane_node_surface)."""
         sd = self.surfaces.get(slave.upper())
         shared = set(self._surface_member_nodes(master))
         nodes = self._surface_member_nodes(slave)
@@ -10246,8 +10247,18 @@ class _Mesh:
         coupling the faces of shells the converter knotted for it (_plan_rigid_couplings); and
         so do plane and axisymmetric elements, whose faces are edges (_facet): ccx 2.23 couples
         other nodes of the solids it expands them to, for every face label (probed on CPE4 /
-        CAX4: -56 % / -22 %; the edges' nodes are exact).  A tie's surface on membranes and
-        other elements stays as it is, warned.  Nodes of ``exclude`` stay out (a tie's
+        CAX4: -56 % / -22 %; the edges' nodes are exact).  A tie's surface on plane and
+        axisymmetric elements (CPS / CPE / CAX) is one too: ccx 2.23 ties none of the face
+        nodes of the solids it expands them to ('DOF ... of node ... is not active; no tied
+        constraint') and the model is singular (probed on CPS4 / CAX4 strips: 7e14 / 4e13 x the
+        displacements), where a node surface of the edges' nodes ties them as Abaqus does: the
+        strips merged there exactly in plane strain (CAX4 1e-4, its wedge); in plane stress at
+        nu 0.3 5e-3 off, the merged nodes sharing the expanded thickness, which Abaqus' plane
+        stress elements have no nodal DOF for (ccx still says DOF 3, out of the plane, of every
+        such slave node, plane stress, plane strain or axisymmetric, is not active: its own
+        plane MPCs hold it); not where the tie should carry temperatures or move slave nodes
+        (_plane_tie_checks).  A tie's surface on membranes and other elements stays as it is,
+        warned.  Nodes of ``exclude`` stay out (a tie's
         master-face nodes, a coupling's reference node: ccx would tie them to themselves and
         loop in its cascade, "zero coefficient on the dependent side"); with none left the
         name is "" (nothing to tie)."""
@@ -10257,9 +10268,13 @@ class _Mesh:
         eids = self._surface_elements(surf)
         mine = [e for e in eids if e in self._qmem or self.geom.elements[e][0].upper().startswith("M3D")
                 or (shells and (ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS or
-                                self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)))]
+                                self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)))
+                or (not shells and ccx_type(self.geom.elements[e][0]).startswith(PLANE_ELEM_PREFIXES))]
         if not mine:
             return None, []
+        planar = [e for e in mine if self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)]
+        if len(mine) < len(eids) and not shells and len(planar) == len(mine):
+            return None, []                 # (plane faces and other elements': left as they are)
         if len(mine) < len(eids) and not shells:
             self.report.warn(f"{what} surface {surf} lies on membranes and on other elements: ccx "
                              f"skips the membranes' face nodes their hinge to the membrane node "
@@ -10276,7 +10291,9 @@ class _Mesh:
         self._reserve_names()
         name = self._fresh_name(f"{surf}_NODES")
         self._mem_surfaces[key] = name
-        if any(self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES) for e in mine):
+        if planar and not shells:
+            pass                            # (noted or warned with its tolerance: _plane_tie_checks)
+        elif planar:
             self.report.note(f"{what} surface {surf} on plane / axisymmetric elements -> node "
                              f"surface {name} of their edges' nodes, which Abaqus couples (ccx 2.23 "
                              f"couples other nodes of the solids it expands them to, for every face "
@@ -10292,6 +10309,96 @@ class _Mesh:
                              f"SNEG face ties nothing, an SPOS face shears through the thickness; "
                              f"probed).", once=True)
         return name, [f"*SURFACE, NAME={name}, TYPE=NODE"] + [str(n) for n in keep]  # ccx: one per line
+
+    def _plane_tie_checks(self, slave: str, name: str, master: str, b: Block, pair: bool,
+                          tol: float) -> None:
+        """A tie (``pair``: a TIED *CONTACT PAIR) whose slave ``slave`` on plane / axisymmetric
+        elements became node surface ``name`` of their edges' nodes (_membrane_node_surface),
+        its POSITION TOLERANCE ``tol``: noted where that is Abaqus' tie; warned, reduced
+        physics, where it is not —
+        * a step solves for temperatures: ccx ties a 2-D slave node through the middle node of
+          its expansion, whose temperature the expanded elements do not use, so the tie carries
+          none (probed on 2.23: CPE4T strips in a steady coupled step, the interface 0 / 100
+          where the merged strips have 50, 14x off in u_y; DC2D4 heat transfer stopped, 'too
+          many cutbacks', as with the faces);
+        * slave nodes off the master within the tolerance where Abaqus' ADJUST moves them onto
+          it strain free (a *TIE but with ADJUST=NO; a tied pair with an ADJUST: without one it
+          keeps the gap, as ccx does, exactly): ccx 2.23 does not move their elements, at most
+          the node (probed: CPE4 strips 0.02 / 0.04 off at a tolerance of 0.05, 2.0 % / 3.9 % off
+          the nodes moved; CAX4 0.7 %; ADJUST=NO exact).  The gap is measured to a quadratic
+          master edge's parabola, not its chord (a node on a curved edge is on the master)."""
+        els = self.geom.elements
+        eids = [e for e in self._surface_elements(slave) if e in els]
+        if not eids or not all(ccx_type(els[e][0]).startswith(PLANE_ELEM_PREFIXES) for e in eids):
+            return
+        what = "*CONTACT PAIR, TIED" if pair else f"*TIE {b.param('NAME') or ''}".rstrip()
+        md = self.surfaces.get(master.upper())
+        shared = set(self._surface_member_nodes(master))
+        keep = [n for n in self._surface_member_nodes(slave) if n not in shared and n in self.geom.nodes]
+        types: Dict[str, str] = {}
+        mf = [(e,) + self._facet(e, face, types) for token, face in (md[1] if md else [])
+              for e in self._resolve_elements(token) if e in els] if md and not md[0].startswith("NODE") else []
+        reach = self._mean_diagonal([self._face_points(e, face) for token, face in md[1]
+                                     for e in self._resolve_elements(token) if e in els]) if mf else 0.0
+        gaps = self._surface_gaps(keep, mf, tol) if mf and keep else {}
+        # (off by more than 1e-4 of a facet: round-off in the deck's coordinates is not a gap;
+        # the answer moves by about the gap's share of the element)
+        off = [n for n in keep if n in gaps and 1e-4 * (reach or 1.0) < gaps[n][0] <= tol and
+               self._plane_edge_gap(n, gaps[n][1], mf) > 1e-4 * (reach or 1.0)]
+        adj = (b.param("ADJUST") or "").strip()
+        try:
+            moves = pf(adj) > 0.0 if pair else adj.upper() != "NO"
+        except ValueError:
+            moves = bool(adj)                # (a pair's ADJUST=<node set>)
+        why = []
+        if self._mpc_thermal:
+            why.append("a step solves for temperatures, and ccx ties a 2-D slave node through the middle "
+                       "node of its expansion, whose temperature its elements do not use: the tie carries "
+                       "none (probed: CPE4T strips in a coupled step 14x off)")
+        if off and moves:
+            why.append(f"{len(off)} slave node(s) (e.g. node {off[0]}) lie off the master within the "
+                       f"tolerance: Abaqus moves them onto it strain free (ADJUST), ccx 2.23 does not move "
+                       f"their elements, at most the node (probed: CPE4 strips 0.02 / 0.04 off, 2.0 % / "
+                       f"3.9 %; ADJUST=NO exact)")
+        if why:
+            self.report.warn(f"{what}: slave surface {slave} on plane / axisymmetric elements -> node "
+                             f"surface {name} of their edges' nodes (ccx 2.23 ties none of the face "
+                             f"nodes of the solids it expands them to: singular), but " +
+                             "; and ".join(why) + " — verify.", once=True)
+            if self._mpc_thermal:
+                self._reduces("*TIE on plane / axisymmetric faces: no temperatures tied")
+            if off and moves:
+                self._reduces("*TIE on plane / axisymmetric faces: slave nodes off the master moved by "
+                              "ccx's ADJUST, not their elements")
+            return
+        self.report.note(f"{what}: slave surface {slave} on plane / axisymmetric elements -> node "
+                         f"surface {name} of their edges' nodes, which Abaqus ties (ccx 2.23 ties none "
+                         f"of the face nodes of the solids it expands them to, 'not active; no tied "
+                         f"constraint': singular; probed: the strips merged there, exactly in plane "
+                         f"strain, plane stress 5e-3 off at nu 0.3).", once=True)
+
+    def _plane_edge_gap(self, n: int, i: Optional[int], mf: Sequence[Tuple[int, List[int], int]]) -> float:
+        """The distance of node ``n`` from the master edges ``mf`` (_facet) next to edge ``i``
+        (the nearest by its chord, _surface_gaps; and those sharing a node with it), a quadratic
+        edge's parabola (corners, then its midside node) sampled and refined, not its chord."""
+        if i is None:
+            return math.inf
+        xyz, p = self.geom.nodes, self.geom.nodes[n]
+        near = [f for f in mf if set(f[1]).intersection(mf[i][1])]
+
+        def gap(fn: List[int]) -> float:
+            a, b = xyz[fn[0]], xyz[fn[1]]
+            m = xyz[fn[2]] if len(fn) > 2 else vscale(vadd(a, b), 0.5)
+            pt = lambda t: tuple(t * (t - 1) / 2 * a[k] + t * (t + 1) / 2 * b[k] + (1 - t * t) * m[k]  # noqa: E731
+                                 for k in range(3))
+            lo, hi = -1.0, 1.0
+            for _ in range(6):              # (zoom in round the nearest of 17 samples: 8x a round)
+                ts = [lo + (hi - lo) * j / 16 for j in range(17)]
+                t = min(ts, key=lambda u: math.dist(p, pt(u)))
+                step = (hi - lo) / 16
+                lo, hi = max(-1.0, t - step), min(1.0, t + step)
+            return min(math.dist(p, pt(u)) for u in (lo, (lo + hi) / 2, hi))
+        return min(gap(fn) for _e, fn, _c in near if all(x in xyz for x in fn))
 
     def _shell_tie_slave(self, slave: str, master: str, b: Block, pair: bool,
                          plan: Optional[List[int]] = None) -> \
@@ -11920,7 +12027,7 @@ class _Mesh:
         if empty:
             return ["** abq2ccx: *CONTACT PAIR " + (b.param("INTERACTION") or "") + ": its slave "
                     "nodes are members of the rigid body of its master surface"] + comments
-        return self._contact_pair_lines(nb) + comments
+        return self._contact_pair_lines(nb, id(b) in self._n2s_pairs) + comments
 
     # ccx's 'S, S' surface-to-surface self-contact against symmetric pairs (Abaqus' self-contact),
     # measured on 2.23: a C-shaped strip whose arm tip closes a gap 0.2 by 0.05 / 0.2 / 0.4,
@@ -12966,7 +13073,9 @@ class _Mesh:
                                      list(b.data), False, warn=False)
         return self.passthrough(b)
 
-    def _contact_pair_lines(self, b: Block) -> List[str]:
+    def _contact_pair_lines(self, b: Block, n2s: bool = False) -> List[str]:
+        """``*CONTACT PAIR`` card ``b`` as ccx lines (``n2s``: as NODE TO SURFACE,
+        _plan_table_pairs)."""
         if b.has("TIED"):
             out: List[str] = []
             adj = (b.param("ADJUST") or "").strip()
@@ -12994,8 +13103,9 @@ class _Mesh:
                                f"node of {f[1].strip()}, which joins them already")
                     continue
                 if slave and shell is None:
-                    params["POSITION TOLERANCE"] = short_real(self._membrane_tie_tolerance(
-                        adj, f[0].strip(), f[1].strip(), b, True), 6)
+                    tol = self._membrane_tie_tolerance(adj, f[0].strip(), f[1].strip(), b, True)
+                    params["POSITION TOLERANCE"] = short_real(tol, 6)
+                    self._plane_tie_checks(f[0].strip(), slave, f[1].strip(), b, True, tol)
                 if slave is None:                   # (the deck's surfaces: as a *TIE's)
                     tol = params.get("POSITION TOLERANCE")
                     slave, cards = self._trimmed_tie_slave(f[0].strip(), f[1].strip(),
@@ -13022,6 +13132,8 @@ class _Mesh:
             self.report.note("*CONTACT PAIR without TYPE -> TYPE=NODE TO SURFACE (the Abaqus/Standard "
                              "default; ccx requires it explicitly). If ccx struggles to converge, "
                              "try TYPE=SURFACE TO SURFACE (ccx's face-to-face contact).", once=True)
+        if n2s:
+            keep["TYPE"] = "NODE TO SURFACE"
         if "SMALL SLIDING" in keep and (keep.get("TYPE") or "").upper().replace(" ", "") == \
                 "SURFACETOSURFACE":
             del keep["SMALL SLIDING"]
@@ -13344,6 +13456,95 @@ class _Mesh:
                              "faces in ccx).", once=True)
         return f"S{k + 2}"
 
+    def _order_gap_conductance(self, blocks: List[Block]) -> List[Block]:
+        """``blocks`` with each *SURFACE INTERACTION's model-data *GAP CONDUCTANCE cards that
+        come before its first *SURFACE BEHAVIOR moved to right after it: Abaqus takes an
+        interaction's cards in any order, ccx 2.23 stops on a *GAP CONDUCTANCE before the
+        *SURFACE BEHAVIOR ("should be preceded by a *SURFACE BEHAVIOR card", gapconductances.f;
+        probed).  An interaction without one gets HARD after its *SURFACE INTERACTION card
+        (handle_surface_interaction)."""
+        first_sb: Dict[int, int] = {}           # interaction card's index -> its first SB's
+        moved: Dict[int, List[Block]] = {}      # SB index -> the cards that follow it
+        skip = set()
+        for scan in (1, 2):
+            si = None
+            for i, b in enumerate(blocks):
+                if b.keyword == "STEP":
+                    break
+                if b.keyword == "SURFACE INTERACTION":
+                    si = i
+                elif si is None:
+                    continue
+                elif scan == 1 and b.keyword == "SURFACE BEHAVIOR":
+                    first_sb.setdefault(si, i)
+                elif scan == 2 and b.keyword == "GAP CONDUCTANCE" and i < first_sb.get(si, -1):
+                    moved.setdefault(first_sb[si], []).append(b)
+                    skip.add(i)
+                    self.report.note(f"*GAP CONDUCTANCE of interaction {blocks[si].param('NAME')} "
+                                     f"written after its *SURFACE BEHAVIOR (ccx stops on one "
+                                     f"before it; Abaqus takes the cards in any order).", at=b)
+        if not moved:
+            return blocks
+        return [c for i, b in enumerate(blocks) if i not in skip for c in [b] + moved.get(i, [])]
+
+    def _ccx_f2f(self, b: Block) -> bool:
+        """Whether ccx gets *CONTACT PAIR card ``b`` as face-to-face contact: TYPE=SURFACE TO
+        SURFACE, unless _plan_table_pairs writes it node-to-surface."""
+        return id(b) not in self._n2s_pairs and \
+            b.uparam("TYPE").replace(" ", "") == "SURFACETOSURFACE"
+
+    @staticmethod
+    def _tabular_line(pts: Sequence[Tuple[float, float]]) -> float:
+        """K where TABULAR (pressure, overclosure) points ``pts`` lie on p = K h through the
+        origin (K > 0), else 0."""
+        k = pts[-1][0] / pts[-1][1] if pts[0] == (0.0, 0.0) and pts[-1][1] > 0.0 else 0.0
+        return k if k > 0.0 and all(abs(p - k * h) <= 1e-9 * abs(pts[-1][0]) for p, h in pts) \
+            else 0.0
+
+    def _plan_table_pairs(self, blocks: List[Block]) -> None:
+        """--approximate: ccx 2.23's face-to-face contact reads no TABULAR pressure-overclosure
+        table (no contact force; handle_surface_behavior) and no form of Abaqus' EXPONENTIAL
+        curve; its node-to-surface contact reads both (probed on two pressed cubes: 754.67 for
+        Abaqus' 754.72, and 431.20 for 431.41 where face-to-face ccx's own exponential law did
+        not converge).  So where a SURFACE TO SURFACE pair's interaction has such a law (not a
+        TABULAR line through the origin, which is LINEAR there exactly), every face-to-face pair
+        is written NODE TO SURFACE (_n2s_pairs, [APPROX]): ccx takes one TYPE for all of a
+        deck's pairs (the last card's, contactpairs.f).  Not where a self-contact pair needs
+        face-to-face contact (_self_approx: node-to-surface 'S, S' is unusable)."""
+        self._n2s_pairs = set()
+        if not self._approx:
+            return
+        lossy, si = set(), None
+        for b in blocks:
+            if b.keyword == "STEP":
+                break
+            if b.keyword == "SURFACE INTERACTION":
+                si = b.uparam("NAME")
+            elif b.keyword == "SURFACE BEHAVIOR" and si:
+                law = (b.param("PRESSURE-OVERCLOSURE") or "").replace(" ", "").upper()
+                try:
+                    recs = [fields_at(r, 2) for r in merged_data_records(b) if r]
+                except ValueError:
+                    recs = []
+                if law == "TABULAR" and not (len(recs) > 1 and self._tabular_line(
+                        [(p, h) for p, h in recs])) or law == "EXPONENTIAL" and recs and \
+                        min(recs[0]) > 0.0 and not b.has("NO SEPARATION") and \
+                        not has_field_dependence(b):
+                    lossy.add(si)
+        pairs = [b for b in blocks if b.keyword == "CONTACT PAIR" and not b.has("TIED") and
+                 any(x.strip() for x in b.data) and self._ccx_f2f(b)]
+        hit = sorted({b.uparam("INTERACTION") for b in pairs} & lossy)
+        if not hit or any(id(b) in self._self_approx for b in pairs):
+            return
+        self._n2s_pairs = {id(b) for b in pairs}
+        self.report.warn(f"[APPROX] *CONTACT PAIR, TYPE=SURFACE TO SURFACE written as NODE TO "
+                         f"SURFACE (interaction {', '.join(hit)}: ccx's face-to-face contact reads "
+                         f"no TABULAR pressure-overclosure table and not Abaqus' EXPONENTIAL curve, "
+                         f"its node-to-surface contact reads both; ccx takes one TYPE for all "
+                         f"pairs, so every face-to-face pair is written so): node-to-surface "
+                         f"contact acts at the slave nodes, Abaqus' surface-to-surface over the "
+                         f"slave faces.", once=True)
+
     def _plan_surface_behavior(self, blocks: List[Block]) -> None:
         """The interactions with no *SURFACE BEHAVIOR (``_si_missing_behavior``): Abaqus'
         default is hard contact, ccx errors without the card, so handle_surface_interaction
@@ -13367,8 +13568,7 @@ class _Mesh:
                 self._si_cards.setdefault(cur_si, []).append(blk)
                 self._card_si[id(blk)] = cur_si
             elif blk.keyword == "CONTACT PAIR" and not blk.has("TIED"):
-                kind = "F2F" if (blk.param("TYPE") or "").replace(" ", "").upper() == \
-                    "SURFACETOSURFACE" else "N2F"
+                kind = "F2F" if self._ccx_f2f(blk) else "N2F"
                 for rec in merged_data_records(blk):
                     if rec and rec[0]:
                         self._si_pairs.setdefault(blk.uparam("INTERACTION"), []).append(
@@ -13473,7 +13673,9 @@ class _Mesh:
                                  f"clearance d: 1 % of p0 at c0, never zero; Abaqus': zero at c0), "
                                  f"and its face-to-face contact reads no TABULAR form of "
                                  f"Abaqus' curve (ccx 2.23: no contact force); kept as ccx's law. "
-                                 f"A NODE TO SURFACE pair takes Abaqus' curve exactly.", once=True)
+                                 f"A NODE TO SURFACE pair takes Abaqus' curve exactly"
+                                 f"{'' if self._approx else ' (--approximate writes the pairs so)'}.",
+                                 once=True)
                 self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=EXPONENTIAL on a face-to-"
                               "face pair (ccx's exponential law differs)")
                 return self.passthrough(b)
@@ -13502,9 +13704,8 @@ class _Mesh:
         (pa, ha), (pb, hb) = pts[-2], pts[-1]
         slope = (pb - pa) / (hb - ha)
         if "F2F" in kinds:
-            k = pts[-1][0] / pts[-1][1] if pts[0] == (0.0, 0.0) and pts[-1][1] > 0.0 else 0.0
-            if k > 0.0 and "N2F" not in kinds and all(
-                    abs(p - k * h) <= 1e-9 * abs(pts[-1][0]) for p, h in pts):
+            k = self._tabular_line(pts)
+            if k > 0.0 and "N2F" not in kinds:
                 self.report.note(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR of interaction "
                                  f"{si}: the straight line p = {short_real(k, 9)} h through the "
                                  f"origin, written as ccx's LINEAR law (its face-to-face contact "
@@ -13514,7 +13715,9 @@ class _Mesh:
             self.report.warn(f"*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR of interaction {si} "
                              f"on a SURFACE TO SURFACE pair: ccx 2.23's face-to-face contact reads "
                              f"no TABULAR table (probed: no contact force), so that pair transmits "
-                             f"no pressure. A NODE TO SURFACE pair reads it.", once=True)
+                             f"no pressure. A NODE TO SURFACE pair reads it"
+                             f"{'' if self._approx else ' (--approximate writes the pairs so)'}.",
+                             once=True)
             self._reduces("*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR on a face-to-face pair "
                           "(no contact pressure in ccx 2.23)")
         # pressure at a clearance (soft contact from a negative overclosure on): up to the
@@ -42686,7 +42889,7 @@ class _Loads:
         for b in blocks:
             if b.keyword != "CONTACT PAIR" or b.has("TIED"):
                 continue
-            f2f = (b.param("TYPE") or "").replace(" ", "").upper() == "SURFACETOSURFACE"
+            f2f = self._ccx_f2f(b)
             coef = self.CONTACT_MASS_AREA["F2F" if f2f else "N2F"]
             kpen = k_of.get(b.uparam("INTERACTION")) or k_hard
             for rec in merged_data_records(b):
@@ -43494,15 +43697,13 @@ class _Output:
         self._out_contact = {           # the contact ccx gets (_contact_output_issues)
             "abaqus": any(b.keyword in ("CONTACT PAIR", "CONTACT") for b in blocks),
             "pairs": len(pairs),
-            "nts": any(b.uparam("TYPE").replace(" ", "") != "SURFACETOSURFACE"
-                       for b in pairs),
+            "nts": any(not self._ccx_f2f(b) for b in pairs),
             # elements whose expanded nodes only a 3-D .frd (a beam or shell model) holds
             "flat": not frd3d and any(c.startswith(PLANE_ELEM_PREFIXES + ("M3D",))
                                       for c in types.values()),
             "axi": any(c.startswith("CAX") for c in types.values()),
             # (slave, master, face-to-face) of each ccx contact pair, for *CONTACT PRINT
-            "pair_list": [(f[0].strip(), f[1].strip(),
-                           b.uparam("TYPE").replace(" ", "") == "SURFACETOSURFACE")
+            "pair_list": [(f[0].strip(), f[1].strip(), self._ccx_f2f(b))
                           for b in pairs for f in merged_data_records(b) if len(f) > 1 and
                           not {f[0].strip().upper(), f[1].strip().upper()} & set(self._analytic_skipped)]}
         steps = self._step_output_requests(blocks, quiet)
@@ -47362,6 +47563,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._si_cards: Dict[str, List[Block]] = {}     # interaction -> its *SURFACE BEHAVIOR /
         self._card_si: Dict[int, str] = {}             # *GAP CONDUCTANCE cards; card -> it
         self._si_pairs: Dict[str, List[Tuple[str, str]]] = {}   # -> (N2F / F2F, slave)
+        self._n2s_pairs: set = set()        # face-to-face pairs written node-to-surface (_plan_table_pairs)
         # *BOUNDARY on rigid-coupling members (see _plan_coupled_bcs)
         self._bc_drop: Dict[int, set] = {}         # id(*BOUNDARY) -> (node, dof) taken off it
         self._bc_lines: Dict[int, List[List[str]]] = {}   # id(*BOUNDARY) -> its records after that
@@ -48085,6 +48287,7 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         blocks = self._blank_periods(blocks)          # before the step model reads the periods
         blocks = self._plan_user_materials(blocks)    # before anything reads material names
         blocks = self._plan_self_contact(blocks)      # before anything reads contact pairs
+        blocks = self._order_gap_conductance(blocks)  # before anything reads interaction cards
         self._plan_deck_facts(blocks)
         self.build_geometry(blocks, imperfect=True)
         blocks = self._split_coupling_refs(blocks)
@@ -48230,7 +48433,8 @@ class Converter(_Mesh, _Rigid, _Materials, _Axes, _Dofs, _Constraints, _Loads, _
         self._warn_s8r_strips()                     # _plan_s8r_strips' strips
         self._warn_dashpot_steps(blocks)            # after _plan_dashpots: its rows
         self._plan_circ_explicit_increment(blocks)
-        self._plan_rigid_contact_increment(blocks)
+        self._plan_table_pairs(blocks)          # after _plan_base_state_facts: the deck's TYPEs
+        self._plan_rigid_contact_increment(blocks)  # after it: the TYPEs ccx gets
         self._complete_temperature_ic()         # after every planner that adds knot nodes
         self._plan_output(blocks)               # last: it reads the final mesh (knot beams too)
         self._plan_surface_behavior(blocks)

@@ -35,6 +35,10 @@ entries. The GitHub release notes use the same section.
   and carries loads there, as in Abaqus. Tied by its offset face, a skin's loaded edge stayed
   untied in ccx (twice the block's deflection, or none in a second step), and other offset skins
   were up to 10 % off; now the answers equal the skin merged with the block.
+* **More correct answers.** A `*TIE` or tied contact pair whose slave surface is the faces of
+  plane or axisymmetric elements now ties them. ccx tied none of those faces' nodes, so the model
+  was singular (answers some 1e14 times too large). Such a tie that should carry temperatures, or
+  move slave nodes onto the master, is warned and flagged: ccx does neither for these elements.
 * **Leaner tie output.** Tied contact pairs get the slave-surface trimming that `*TIE` got in
   1.7.0: the same answers without a ccx warning for every slave node away from the master.
 * **More correct answers.** Shells joined at a knot (where the converter attaches a small helper
@@ -80,6 +84,12 @@ entries. The GitHub release notes use the same section.
   now holds it there: ccx held it where the previous load case left it (in a test cube, off by
   nearly the load case's whole response). A load case's own output requests no longer carry
   into the later load cases, and a card Abaqus does not allow inside a load case is warned.
+* **Fewer ccx failures.** A `*GAP CONDUCTANCE` written before its interaction's `*SURFACE
+  BEHAVIOR` no longer stops ccx: it is written after it.
+* **New `--approximate` form.** Surface-to-surface contact pairs with a `TABULAR` or
+  `EXPONENTIAL` pressure-overclosure law are written node-to-surface. ccx's face-to-face contact
+  carried no force with a `TABULAR` law and did not converge with `EXPONENTIAL`; node-to-surface
+  contact gives Abaqus' force.
 * **New warnings.** Two ccx traps around nodes with a `*TRANSFORM` are now reported: in a
   dynamic step, holding such a node along one of its turned axes after it has started moving
   gives a different motion than in Abaqus (flagged as reduced physics); and in a model with a
@@ -183,6 +193,20 @@ entries. The GitHub release notes use the same section.
   nodes, knotted, exactly; before 1.9x off with the loaded edge untied (a second step all zero)
   for SNEG, 0.5-10 % for SPOS. Other offsets, which were warned as reduced physics, are exact the
   same way; in a deck with an explicit step or U1 beams they still are.
+* **Ties of plane and axisymmetric faces** — a `*TIE` / TIED `*CONTACT PAIR` whose slave is the
+  faces (S1-S4) of CPS / CPE / CAX elements now ties a node surface of those edges' nodes (none
+  of the master's), with Abaqus' position tolerance. ccx 2.23 ties none of the face nodes of the
+  solids it expands such elements to ('DOF ... is not active; no tied constraint') and the model
+  is singular. `validate_with_ccx.py tie_2d_faces` (CPS4 strips, by a tie and a tied pair; CAX4;
+  nu 0): the strips merged, exactly (CAX4 1.6e-4, its wedge); before 7e14 x the displacements. At
+  nu 0.3 plane strain stays exact and plane stress is 5e-3 off, where ccx's merged nodes share the
+  expanded thickness. A plane slave that shares nodes with its master, left out before, now ties
+  its other nodes. Warned as reduced physics: a step solving for temperatures (ccx ties the 2-D
+  node through the middle node of its expansion, whose temperature its elements do not use:
+  CPE4T strips in a coupled step 14x off), and slave nodes off the master within the tolerance
+  where Abaqus' `ADJUST` moves them (a `*TIE` unless `ADJUST=NO`, a tied pair with `ADJUST`): ccx
+  does not move their elements (2-4 % off for strips 0.02-0.04 apart; `ADJUST=NO` exact). The gap
+  is measured to a quadratic master edge's curve, not its chord. `tie_2d_faces` also runs CPE4 and CAX8R at nu 0.3.
 * **Tied contact pairs trimmed** — a `*CONTACT PAIR, TIED` on deformable surfaces, written as a
   `*TIE`, gets the `*TIE`'s trimmed slave surface (`validate_with_ccx.py
   tie_leftovers_pair_trimmed`: the same answer, 16 'no tied MPC' warnings instead of 112).
@@ -384,6 +408,20 @@ entries. The GitHub release notes use the same section.
   step, warned as reduced physics.
   `validate_with_ccx.py shell_finite_rotation`: a cantilever's tip turned by (0.3, -0.4, 0),
   also off the global axes, as through a rotation-only coupling (3e-7, 5e-7; before 3 %, 7 %).
+* **`*GAP CONDUCTANCE` card order** — Abaqus takes an interaction's cards in any order; ccx
+  stops on a `*GAP CONDUCTANCE` before the interaction's `*SURFACE BEHAVIOR` ("should be preceded
+  by a *SURFACE BEHAVIOR card"). Such cards are now written right after the `*SURFACE BEHAVIOR`
+  (a note says so). `validate_with_ccx.py contact_property_tables gap_conductance_first`: heat
+  flux 49.75124 across two pressed cubes, Abaqus' 100 / (2 + 1/100) (ccx stopped before).
+* **Face-to-face TABULAR / EXPONENTIAL contact under `--approximate`** — ccx's surface-to-surface
+  contact reads no `TABULAR` table (no contact force) and only its own exponential law; its
+  node-to-surface contact reads both. Where a `SURFACE TO SURFACE` pair's interaction has such a
+  law (other than a `TABULAR` line through the origin, written as `LINEAR` exactly),
+  `--approximate` writes every surface-to-surface pair `NODE TO SURFACE` ([APPROX]; ccx takes
+  one `TYPE` for all pairs), except where a self-contact pair needs surface-to-surface contact.
+  Without the option the warning names it. `validate_with_ccx.py contact_property_tables
+  contact_tabular_s2s_approx` / `contact_exponential_s2s_approx`: 754.67 for Abaqus' 754.72 (was
+  0) and 431.20 for 431.41 (ccx's own law did not converge).
 
 ## 1.7.0 (November 2026)
 

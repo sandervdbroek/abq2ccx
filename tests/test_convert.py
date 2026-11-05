@@ -3401,6 +3401,56 @@ def test_gap_conductance_against_clearance():
     assert conv.reduced_physics == []
 
 
+def test_gap_conductance_before_surface_behavior():
+    # Abaqus takes an interaction's cards in any order; ccx 2.23 stops on a *GAP CONDUCTANCE
+    # before the *SURFACE BEHAVIOR (validate_with_ccx gap_conductance_first): written after it
+    gc = "*Gap Conductance\n100., 0.\n0., 0.01\n"
+    hard = "*Surface Behavior, pressure-overclosure=HARD\n"
+    for si in (gc + hard, gc + "*Friction\n0.1\n" + hard, "*Friction\n0.1\n" + gc + hard):
+        body, conv, rep = cubes(si, proc=COUPLED_STEADY, el="C3D8T")
+        cards = interaction_cards(body)
+        assert cards.index("*SURFACE BEHAVIOR") < cards.index("\n*GAP CONDUCTANCE\n100., 0.\n"), si
+        assert cards.count("*GAP CONDUCTANCE") == 1 and ("*FRICTION" in cards) == ("Friction" in si)
+        assert "written after its *SURFACE BEHAVIOR" in rep.text()
+    # in order already, or no *SURFACE BEHAVIOR (HARD comes right after the interaction card)
+    for si in (hard + gc, gc):
+        body, conv, rep = cubes(si, proc=COUPLED_STEADY, el="C3D8T")
+        assert interaction_cards(body).splitlines()[1] == "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=HARD"
+        assert "written after its *SURFACE BEHAVIOR" not in rep.text()
+
+
+def test_face_to_face_tables_node_to_surface_approximate():
+    # ccx's face-to-face contact reads no TABULAR table and not Abaqus' EXPONENTIAL curve, its
+    # node-to-surface contact reads both (validate_with_ccx contact_tables_n2s_approx): under
+    # --approximate every face-to-face pair is written NODE TO SURFACE (ccx takes one TYPE for all)
+    s2s = ", type=SURFACE TO SURFACE"
+    flag = "--approximate: *CONTACT PAIR, TYPE=SURFACE TO SURFACE written as NODE TO SURFACE"
+    tab = "*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n100., 0.01\n150., 0.02\n"
+    exp = "*Surface Behavior, pressure-overclosure=EXPONENTIAL\n2e-4, 100.\n"
+    for si in (tab, exp):
+        deck = STACKED_CUBES.format(si=si, pair=s2s, proc="*Static", el="C3D8")
+        body, conv, rep = convert_str(deck, approximate=True)
+        assert "*CONTACT PAIR, INTERACTION=SI, TYPE=NODE TO SURFACE\n" in body
+        assert conv.reduced_physics == [flag], conv.reduced_physics
+        cards = interaction_cards(body).splitlines()
+        assert cards[1] == "*SURFACE BEHAVIOR, PRESSURE-OVERCLOSURE=TABULAR"
+        assert cards[2] == ("0., 0." if si == tab else "0., -0.0002") and len(cards) > 5
+        body, conv, rep = convert_str(deck)          # without: flagged, the option named
+        assert "TYPE=SURFACE TO SURFACE" in body and "--approximate writes the pairs so" in rep.text()
+    # with a second face-to-face pair on a HARD interaction: both written node-to-surface
+    two = STACKED_CUBES.format(si=tab, pair=s2s, proc="*Static", el="C3D8").replace(
+        "*Boundary\n1, 1, 3", "*Surface Interaction, name=H\n*Surface Behavior, pressure-overclosure="
+        "HARD\n*Contact Pair, interaction=H, type=SURFACE TO SURFACE\nLTOP, UBOT\n*Boundary\n1, 1, 3", 1)
+    body, conv, _ = convert_str(two, approximate=True)
+    assert body.count("TYPE=NODE TO SURFACE") == 2 and "SURFACE TO SURFACE" not in body
+    # a straight line through the origin is ccx's LINEAR law face-to-face: kept so
+    line = STACKED_CUBES.format(si="*Surface Behavior, pressure-overclosure=TABULAR\n0., 0.\n"
+                                   "100., 0.01\n", pair=s2s, proc="*Static", el="C3D8")
+    body, conv, _ = convert_str(line, approximate=True)
+    assert "TYPE=SURFACE TO SURFACE" in body and "PRESSURE-OVERCLOSURE=LINEAR" in body
+    assert conv.reduced_physics == []
+
+
 def test_static_direct_with_contact_gets_automatic_increments():
     # ccx's penalty contact can need a cutback where Abaqus' converges at a fixed increment,
     # and under DIRECT ccx then stops (lcharleux_indentation_berko, at the start of
@@ -19272,7 +19322,7 @@ def test_analytical_segments_exact_or_approximate():
     tie = (ANALYTIC_2D + "*SURFACE, NAME=BOT\nTOPE, S1\n*SURFACE, NAME=RT\nTOPE, S3\n" +
            curved[len(ANALYTIC_2D):].split("*SURFACE INTERACTION")[0] + "*TIE, NAME=T1\nTOP, TOOL\nBOT, RT\n")
     body, conv, _ = convert_str(tie)
-    assert "\nBOT, RT" in body and "** TOP, TOOL" in body and "*TIE" in conv.reduced_physics
+    assert "\nBOT_NODES, RT" in body and "** TOP, TOOL" in body and "*TIE" in conv.reduced_physics
     body, _, rep = convert_str(curved, approximate=True)
     msg = [m for _, m in rep.entries if m.startswith("[APPROX] Analytical rigid surface TOOL")]
     assert msg and "degrees" in msg[0] and "chord sag" in msg[0]
@@ -23618,6 +23668,66 @@ def test_tie_on_linear_membranes_ties_their_nodes():
     assert "every slave node of MS is a node of BS" in body
 
 
+def test_tie_slave_on_plane_element_faces_becomes_a_node_surface():
+    # ccx 2.23 ties none of the face nodes of the solid it expands a CPS / CPE / CAX element to
+    # ('not active; no tied constraint': singular, 7e14 x |u|); Abaqus ties the edges' nodes ->
+    # a node surface of them (validate_with_ccx.py tie_2d_faces: the strips merged, exactly)
+    deck = ("*Node\n1, 1., 0.\n2, 2., 0.\n3, 2., 1.\n4, 1., 1.\n5, 1., 1.\n6, 2., 1.\n7, 2., 2.\n"
+            "8, 1., 2.\n*Element, type={typ}, elset=ALL\n1, 1, 2, 3, 4\n2, 5, 6, 7, 8\n"
+            "*Solid Section, elset=ALL, material=M\n{sec}\n*Material, name=M\n*Elastic\n1000., 0.3\n"
+            "*Surface, name=SL\n2, S1\n*Surface, name=MA\n1, S3\n{tie}*Boundary\n1, 1, 2\n2, 1, 2\n"
+            "*Step\n*Static\n*Cload\n7, 1, 1.\n8, 2, 1.\n*End Step\n")
+    for typ, sec in (("CPS4", "1."), ("CPE4R", "1."), ("CAX4", "")):
+        body, conv, rep = convert_str(deck.format(typ=typ, sec=sec, tie="*Tie, name=T1\nSL, MA\n"))
+        assert _card_at(body, "*SURFACE, NAME=SL_NODES, TYPE=NODE") == ["5", "6"], typ
+        assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.1") == ["SL_NODES, MA"]
+        assert "on plane / axisymmetric elements -> node surface SL_NODES" in rep.text()
+        assert not conv.reduced_physics
+    # a TIED contact pair too; a node the master shares stays out (ccx would loop)
+    pair = "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\nSL, MA\n"
+    body, conv, _ = convert_str(deck.format(typ="CPS4", sec="1.", tie=pair))
+    assert _card_at(body, "*TIE, NAME=ABQ2CCX_TIED1, POSITION TOLERANCE=0.025") == ["SL_NODES, MA"]
+    body, conv, _ = convert_str(deck.format(typ="CPS4", sec="1.", tie="*Tie, name=T1\nSL, MA\n").replace(
+        "2, 5, 6, 7, 8", "2, 4, 6, 7, 8"))
+    assert _card_at(body, "*SURFACE, NAME=SL_NODES, TYPE=NODE") == ["6"] and not conv.reduced_physics
+    # slave nodes off the master: Abaqus' ADJUST moves them, ccx only the 2-D node, not its
+    # expansion (2-4 % off) -> warned, reduced physics; exact with ADJUST=NO
+    gap = deck.format(typ="CPE4", sec="1.", tie="*Tie, name=T1\nSL, MA\n").replace(
+        "5, 1., 1.\n6, 2., 1.\n", "5, 1., 1.005\n6, 2., 1.005\n")
+    body, conv, rep = convert_str(gap)
+    assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.1") == ["SL_NODES, MA"]
+    assert conv.reduced_physics == ["*TIE on plane / axisymmetric faces: slave nodes off the master moved "
+                                    "by ccx's ADJUST, not their elements"]
+    assert "2 slave node(s) (e.g. node 5) lie off the master" in rep.text() and "which Abaqus ties" not in rep.text()
+    _, conv, _ = convert_str(gap.replace("*Tie, name=T1\n", "*Tie, name=T1, adjust=no\n"))
+    assert not conv.reduced_physics
+    # a step solving for temperatures: the tie carries none (ccx ties the node's middle
+    # expansion node, whose temperature its elements do not use)
+    td = deck.format(typ="CPE4T", sec="1.", tie="*Tie, name=T1\nSL, MA\n").replace(
+        "*Elastic\n1000., 0.3\n", "*Elastic\n1000., 0.3\n*Conductivity\n1.\n*Expansion\n1e-5\n").replace(
+        "*Static\n", "*Coupled Temperature-Displacement, steady state\n1., 1.\n")
+    body, conv, rep = convert_str(td)
+    assert "SL_NODES, MA" in body and "*TIE on plane / axisymmetric faces: no temperatures tied" in conv.reduced_physics
+    assert "which Abaqus ties" not in rep.text()
+    # a tied pair keeps the gap without an ADJUST (as ccx does: exact), moves its nodes with one
+    pair = gap.replace("*Tie, name=T1\n", "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\n")
+    assert not convert_str(pair)[1].reduced_physics
+    assert convert_str(pair.replace("tied\n", "tied, adjust=0.1\n"))[1].reduced_physics
+    # slave nodes on a curved quadratic master edge (its parabola y = 1.1 - 0.1 x^2, 0.075 off its
+    # chord) lie on the master: not flagged; 0.01 above it they are
+    curved = ("*Node\n1, -1., 0.\n2, 1., 0.\n3, 1., 1.\n4, -1., 1.\n5, 0., 0.\n6, 1., .5\n7, 0., 1.1\n8, -1., .5\n"
+              "11, -1., 1.\n12, 0., 1.1\n13, 0., 2.\n14, -1., 2.\n15, -.5, 1.075\n16, 0., 1.55\n17, -.5, 2.\n"
+              "18, -1., 1.5\n21, 1., 1.\n22, 1., 2.\n23, .5, 1.075\n24, 1., 1.5\n25, .5, 2.\n"
+              "*Element, type=CPE8, elset=ALL\n1, 1, 2, 3, 4, 5, 6, 7, 8\n2, 11, 12, 13, 14, 15, 16, 17, 18\n"
+              "3, 12, 21, 22, 13, 23, 24, 25, 16\n*Solid Section, elset=ALL, material=M\n1.\n*Material, name=M\n"
+              "*Elastic\n1000., 0.3\n*Surface, name=SL\n2, S1\n3, S1\n*Surface, name=MA\n1, S3\n*Tie, name=T1\n"
+              "SL, MA\n*Step\n*Static\n*End Step\n")
+    body, conv, _ = convert_str(curved)
+    assert "SL_NODES, MA" in body and not conv.reduced_physics
+    _, conv, rep = convert_str(curved.replace("-.5, 1.075", "-.5, 1.085").replace(".5, 1.075", ".5, 1.085"))
+    assert conv.reduced_physics and "2 slave node(s) (e.g. node 15) lie off the master" in rep.text()
+
+
 def test_tied_pair_of_a_membrane_on_a_rigid_surface_counts_its_thickness():
     # Abaqus' tied contact counts membrane thickness ("Defining tied contact"): a membrane whose
     # SNEG face rests on a rigid plate (its nodes half a thickness above) joins the plate's body
@@ -25992,9 +26102,9 @@ def test_tie_on_one_surface_or_on_shared_nodes():
              "*Surface, name=AR\nA, S2\n*Surface, name=BL\nB, S4\n*Tie, name=T1\nBL, AR\n"
              "*Material, name=M\n*Elastic\n1000., 0.3\n*Solid Section, elset=A, material=M\n1.\n"
              "*Solid Section, elset=B, material=M\n1.\n")
-    body, conv, rep = convert_str(plane)
-    assert "** *TIE, NAME=T1\n** BL, AR" in body and "shares nodes with the faces" in rep.text()
-    assert conv.reduced_physics == ["*TIE whose slave surface shares nodes with its master (left out)"]
+    body, conv, rep = convert_str(plane)                 # (plane faces: a node surface of the others)
+    assert "*SURFACE, NAME=BL_NODES, TYPE=NODE\n13\n*TIE, NAME=T1, POSITION TOLERANCE=0.1\nBL_NODES, AR\n" in body
+    assert not conv.reduced_physics
 
 
 def test_kinematic_coupling_mass_member_gets_a_massless_tetrahedron():
