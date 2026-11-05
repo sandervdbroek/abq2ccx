@@ -10257,7 +10257,8 @@ class _Mesh:
         nodes of the solids it expands them to ('DOF ... of node ... is not active; no tied
         constraint') and the model is singular (probed on CPS4 / CAX4 strips: 7e14 / 4e13 x the
         displacements), where a node surface of the edges' nodes ties them as Abaqus does: the
-        strips merged there exactly in plane strain (CAX4 1e-4, its wedge); in plane stress at
+        strips merged there exactly in plane strain (CAX4 1e-4: ccx ties the node to the chord of
+        its 2-degree wedge); in plane stress at
         nu 0.3 5e-3 off, the merged nodes sharing the expanded thickness, which Abaqus' plane
         stress elements have no nodal DOF for (ccx still says DOF 3, out of the plane, of every
         such slave node, plane stress, plane strain or axisymmetric, is not active: its own
@@ -10271,13 +10272,16 @@ class _Mesh:
         if sd is None or sd[0].startswith("NODE"):
             return None, []
         eids = self._surface_elements(surf)
+
+        def plane(e: int) -> bool:          # (a coupling: Abaqus' 2-D names; a tie: what ccx expands)
+            t = self.geom.elements[e][0]
+            return t.upper().startswith(PLANAR_SOLID_PREFIXES) if shells else \
+                ccx_type(t).startswith(PLANE_ELEM_PREFIXES)
         mine = [e for e in eids if e in self._qmem or self.geom.elements[e][0].upper().startswith("M3D")
-                or (shells and (ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS or
-                                self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)))
-                or (not shells and ccx_type(self.geom.elements[e][0]).startswith(PLANE_ELEM_PREFIXES))]
+                or plane(e) or (shells and ccx_type(self.geom.elements[e][0]) in SHEET_SHELLS)]
         if not mine:
             return None, []
-        planar = [e for e in mine if self.geom.elements[e][0].upper().startswith(PLANAR_SOLID_PREFIXES)]
+        planar = [e for e in mine if plane(e)]
         if len(mine) < len(eids) and not shells and len(planar) == len(mine):
             return None, []                 # (plane faces and other elements': left as they are)
         if len(mine) < len(eids) and not shells:
@@ -10376,11 +10380,22 @@ class _Mesh:
                 self._reduces("*TIE on plane / axisymmetric faces: slave nodes off the master moved by "
                               "ccx's ADJUST, not their elements")
             return
+        # (by Abaqus' family: heat-transfer DC2D / DCAX slaves reach here only without a step
+        # solving for temperatures, which warns above, and get no claim)
+        fam = {t for t in (els[e][0].upper() for e in eids)}
+        found = [(("CPS",), "plane stress 5e-3 off at nu 0.3, where ccx's merged nodes share the expanded "
+                            "thickness"),
+                 (("CPE",), "plane strain exactly"),
+                 (("CAX", "CGAX"), "axisymmetric within 1e-4, ccx tying the node to the chord of its "
+                                   "2-degree wedge (1 - cos 1 deg)")]
+        said = [txt for pre, txt in found if any(t.startswith(pre) for t in fam)]
+        exact = said == ["plane strain exactly"]
         self.report.note(f"{what}: slave surface {slave} on plane / axisymmetric elements -> node "
                          f"surface {name} of their edges' nodes, which Abaqus ties (ccx 2.23 ties none "
                          f"of the face nodes of the solids it expands them to, 'not active; no tied "
-                         f"constraint': singular; probed: the strips merged there, exactly in plane "
-                         f"strain, plane stress 5e-3 off at nu 0.3).", once=True)
+                         f"constraint': singular). Probed against the strips merged there: " +
+                         ("; ".join(said) if said else "not for these elements") + "." +
+                         (" Exact." if exact else ""), once=True)
 
     def _plane_edge_gap(self, n: int, i: Optional[int], mf: Sequence[Tuple[int, List[int], int]]) -> float:
         """The distance of node ``n`` from the master edges ``mf`` (_facet) next to edge ``i``

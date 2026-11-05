@@ -23699,6 +23699,12 @@ def test_tie_slave_on_plane_element_faces_becomes_a_node_surface():
         assert _card_at(body, "*SURFACE, NAME=SL_NODES, TYPE=NODE") == ["5", "6"], typ
         assert _card_at(body, "*TIE, NAME=T1, POSITION TOLERANCE=0.1") == ["SL_NODES, MA"]
         assert "on plane / axisymmetric elements -> node surface SL_NODES" in rep.text()
+        said = {"CPS4": "plane stress 5e-3 off at nu 0.3, where ccx's merged nodes share the expanded "
+                        "thickness.", "CPE4R": "plane strain exactly. Exact.",
+                "CAX4": "axisymmetric within 1e-4, ccx tying the node to the chord of its 2-degree wedge "
+                        "(1 - cos 1 deg)."}[typ]
+        assert "Probed against the strips merged there: " + said in " ".join(rep.text().split())
+        assert ("Exact." in rep.text()) == (typ == "CPE4R")
         assert not conv.reduced_physics
     # a TIED contact pair too; a node the master shares stays out (ccx would loop)
     pair = "*Surface Interaction, name=SI\n*Contact Pair, interaction=SI, tied\nSL, MA\n"
