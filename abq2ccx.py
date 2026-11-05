@@ -45037,6 +45037,20 @@ class _PostPasses:
     _RUN_COUPLED = ("COUPLED TEMPERATURE-DISPLACEMENT", "UNCOUPLED TEMPERATURE-DISPLACEMENT",
                     "ELECTROMAGNETICS")
 
+    # ccx types whose expansion ties ccx 2.23 writes only in a run set up as mechanical
+    _HEAT_ONLY_UNTIED = ("CPS", "CPE", "CAX", "M3D", "T2D", "T3D")
+
+    def _heat_only_loses(self, blocks: List[Block], deck: EmittedDeck) -> Optional[str]:
+        """What ccx 2.23's heat-only run setup leaves out of the model (_mechanical_run_type),
+        as words for the report, or None: plane, membrane or truss elements (their expansion's
+        mechanical MPCs), or shell and beam knots (_knot_in_run: their rotations and ties)."""
+        for e, (typ, _conn) in self.geom.elements.items():
+            cc = ccx_type(typ)
+            if cc.startswith(self._HEAT_ONLY_UNTIED):
+                return f"{cc} elements (e.g. element {e})"
+        knot = self._knot_in_run(blocks, deck)
+        return None if knot is None else f"shell and beam knots (e.g. node {knot}), their rotations too"
+
     def _knot_in_run(self, blocks: List[Block], deck: EmittedDeck) -> Optional[int]:
         """A shell/beam node whose rotations ccx 2.23 carries through a knot (_mechanical_run_type),
         or None: a converter knot beam's, a rigid constraint's member, one a moment loads, or
@@ -45079,9 +45093,13 @@ class _PostPasses:
         step's last procedure card, so a *STATIC card right before the first *FREQUENCY or
         *BUCKLE card after the first *HEAT TRANSFER card makes the run mechanical too and the
         step what it was (probed: the same eigenvalues and buckling factors to every digit).
-        Without such a step, a warning.  Only where the model has such knots (_knot_in_run): ccx
-        runs shells and beams without them alike either way (probed: an S4 strip with
-        rotational BCs, the same eigenvalues), and solids have none."""
+        Without such a step, a warning.  The heat-only setup also leaves out the mechanical
+        MPCs ccx expands plane, membrane and truss elements with (gen3dfrom2d, gen3dmembrane,
+        gen3dtruss; PR #27 review: CPS4 / CPE4 / CAX4 / M3D4 / T3D2 strips, first eigenvalue
+        0.135, 0.135, -0.028, 0.949, 0.928 for about 1e10, no message).  So only where the
+        model has such elements or such knots (_heat_only_loses): ccx runs solids and shells
+        and beams without knots alike either way (probed: a C3D8 bar, an S4 strip with
+        rotational BCs, a B31 cantilever, the same eigenvalues)."""
         state, init, heat = 0, False, None
         for c in deck.cards:
             kw = c.keyword
@@ -45094,18 +45112,18 @@ class _PostPasses:
             elif kw in self._RUN_COUPLED:
                 state = 3
         mech = [s for s in deck.steps if s.proc is not None and s.proc.keyword in self._EIGEN_PROCS]
-        knot = self._knot_in_run(blocks, deck) if state == 2 and mech else None
-        if knot is None:
+        lost = self._heat_only_loses(blocks, deck) if state == 2 and mech else None
+        if lost is None:
             return deck
         at = next((s.proc for s in deck.steps if s.proc is not None and s.proc.index > heat.index
                    and s.proc.keyword in ("FREQUENCY", "BUCKLE")), None)
         if at is None:
             self.report.warn(f"ccx 2.23 sets this run up as a heat transfer analysis (its procedure "
                              f"cards hold *HEAT TRANSFER and no *STATIC, *VISCO or *DYNAMIC after it; "
-                             f"step(s) {', '.join(str(s.number) for s in mech)} do not count): shell and "
-                             f"beam knots (e.g. node {knot}) get no rotational DOFs there, and ccx stops "
-                             f"on a rotational BC, moment or equation on one. Put a *FREQUENCY or *BUCKLE "
-                             f"step after the first *HEAT TRANSFER step.", once=True)
+                             f"step(s) {', '.join(str(s.number) for s in mech)} do not count): it leaves "
+                             f"out the mechanical ties of {lost} there, so those steps' results are wrong "
+                             f"or ccx stops (probed). Put a *FREQUENCY or *BUCKLE step after the first "
+                             f"*HEAT TRANSFER step.", once=True)
             return deck
         deck.insert_before(at, ["** abq2ccx: *STATIC ahead of the step's own procedure (ccx runs the "
                                 "last one): it makes ccx set the run up as a mechanical one too",
@@ -45113,9 +45131,8 @@ class _PostPasses:
         self.report.note(f"*STATIC written ahead of step {at.step}'s *{at.keyword} card: ccx 2.23 sets a "
                          f"run up as heat transfer alone where its procedure cards hold *HEAT TRANSFER "
                          f"and no *STATIC, *VISCO or *DYNAMIC after it (*FREQUENCY and the modal "
-                         f"procedures do not count), and then gives shell and beam knots (e.g. node "
-                         f"{knot}) no rotational DOFs: it stops on a rotational BC, moment or equation "
-                         f"on one (probed). ccx "
+                         f"procedures do not count), and then leaves out the mechanical ties of "
+                         f"{lost}: wrong eigenvalues or a stop (probed). ccx "
                          f"runs the step's last procedure card, so the step is what it was (probed: "
                          f"the same eigenvalues and buckling factors).", once=True)
         return deck.edited()
