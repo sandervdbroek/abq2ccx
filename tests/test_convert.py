@@ -27699,6 +27699,26 @@ def test_odd_and_bonded_continuum_shell_stacks():
         if factor:
             assert f"plastic, the section carries {factor} times the fully plastic moment here" in rep.text()
             assert "; 1 elements that the middle of the thickness crosses" in rep.text(), layers
+    # solid cores, pinned from PR #33's review: a solid below as above, a core listed top face
+    # first, two hexes on one face (a branching column: both skins alone), a solid touching a
+    # skin by an edge only, a collapsed C3D8 core (its top face no skin's: the top skin alone)
+    def extra(text, cards):
+        return text.replace("*Material, name=M", cards + "*Material, name=M", 1)
+    core = deck([sc, ("C3D8", 0.2), sc])
+    for text, want in ((deck([("C3D8", 0.1), ("SC8R", 0.3)]), ("1", "1.025")),
+                       (core.replace("2, 5, 6, 7, 8, 9, 10, 11, 12\n", "2, 9, 10, 11, 12, 5, 6, 7, 8\n"), None),
+                       (extra(core, "*Element, type=C3D8, elset=X\n9, 5, 6, 7, 8, 9, 10, 11, 12\n"
+                                    "*Solid Section, elset=X, material=G\n"), ("2", "1.155")),
+                       (extra(deck([sc]), "*Node\n101, 2, 0, 0.1\n102, 2, 1, 0.1\n103, 1, 0, 0.2\n"
+                                          "104, 2, 0, 0.2\n105, 2, 1, 0.2\n106, 1, 1, 0.2\n*Element, type=C3D8, "
+                                          "elset=X\n9, 6, 101, 102, 7, 103, 104, 105, 106\n"
+                                          "*Solid Section, elset=X, material=G\n"), ("1", "1.155")),
+                       (core.replace("2, 5, 6, 7, 8, 9, 10, 11, 12\n", "2, 5, 6, 7, 8, 9, 10, 11, 11\n"),
+                        ("1", "1.155"))):
+        _, conv, rep = convert_str(text)
+        got = re.search(r"; (\d+) elements that the middle.*?carries (\S+) times", rep.text())
+        assert (got.groups() if got else None) == want, (want, got and got.groups())
+        assert (flag in conv.reduced_physics) == (want is not None)
     # an element of no resolved stack counts as alone (code review, PR #22): a branching column
     # (a second element on the same face) and one of no thickness are flagged at 1.155
     branch = deck([sc, sc]).replace("*Shell Section, elset=S0", "*Element, type=SC8R, elset=S1\n"

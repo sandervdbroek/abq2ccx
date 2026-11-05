@@ -15322,10 +15322,13 @@ class _Mesh:
             n, _c = self._stack_geometry(bot, top)
             h = sum(vdot(vsub(P[y], P[x]), n) for x, y in zip(bot, top)) / len(bot)
             cells[e] = (frozenset(bot), frozenset(top), max(h, 0.0))
-        # solid hexes (C3D8* / C3D20*) joined face to face continue a column — a sandwich's core,
-        # a substrate (probed: SC8R skins on a soft C3D8 core in pure bending carry 1.0005-1.0010
-        # of the exact fully plastic moment, where each skin alone would be flagged at 1.155) —,
-        # each reached through one face, its opposite face the corners across its other edges
+        # solid hexes (any C3D* element of 8 or 20 nodes: C3D8, C3D8R / I / H / T, C3D20, C3D20R,
+        # ...) joined face to face continue a column — a sandwich's core, a substrate (probed:
+        # SC8R skins on a soft C3D8 core in pure bending carry 1.0005-1.0010 of the exact fully
+        # plastic moment, where each skin alone would be flagged at 1.155) —, each reached
+        # through one face, its opposite face the corners across its other edges.  The middle
+        # of the column assumes plane sections through the whole stack; a soft core that bends
+        # locally (each skin about its own middle) is not judged so
         hexes: Dict[frozenset, List[Tuple[int, Tuple[int, ...]]]] = {}
         for e, (typ, conn) in self.geom.elements.items():
             if e not in cells and typ.upper().startswith("C3D") and len(conn) in (8, 20) and \
