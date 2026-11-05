@@ -25301,6 +25301,44 @@ def test_eigen_steps_after_a_nonlinear_solver_step_warn_of_equations_on_knots():
     assert KNOT_WARN not in rep.text(), rep.text()
 
 
+def test_heat_transfer_run_gets_a_static_card_for_its_knots():
+    # ccx 2.23 sets a run up as heat transfer alone where its procedure cards hold *HEAT
+    # TRANSFER and no *STATIC / *VISCO / *DYNAMIC after it (eigenvalue and modal procedures do
+    # not count): its knots get no rotations and ccx stopped on the knot beams' drilling hold
+    # (gen3dboun).  A *STATIC card ahead of the first *FREQUENCY / *BUCKLE card after the heat
+    # step makes the run mechanical; the drilling-hold warning no longer counts the heat step as
+    # one that turns the knots, the knot-equation warning still does (61 kHz for 462 Hz, probed)
+    nodes = "".join(f"{i + 1}, {0.08 * i:.6g}, {0.036 * i:.6g}, {-0.048 * i:.6g}\n" for i in range(11)) + \
+        "".join(f"{i + 12}, {0.08 * i:.6g}, {0.08 + 0.036 * i:.6g}, {0.06 - 0.048 * i:.6g}\n" for i in range(11))
+    model = ("*NODE\n" + nodes + "*ELEMENT, TYPE=S4, ELSET=E\n" +
+             "".join(f"{i + 1}, {i + 1}, {i + 2}, {i + 13}, {i + 12}\n" for i in range(10)) +
+             "*NSET, NSET=FIX\n1, 12\n*MATERIAL, NAME=M\n*ELASTIC\n1.2e7, 0.\n*DENSITY\n1e-3\n"
+             "*CONDUCTIVITY\n50.\n*SHELL SECTION, ELSET=E, MATERIAL=M\n0.01\n*BOUNDARY\nFIX, 1, 6\n")
+    heat = "*STEP\n*HEAT TRANSFER, STEADY STATE\n1., 1.\n*BOUNDARY\nFIX, 11, 11, 20.\n*END STEP\n"
+    freq = "*STEP\n*FREQUENCY\n3\n*END STEP\n"
+    ssd = "*STEP\n*STEADY STATE DYNAMICS\n0.5, 0.5, 1\n*CLOAD\n11, 5, 8e-05\n22, 6, 6e-05\n*END STEP\n"
+    out, conv, rep = convert_str(model + heat + freq + ssd)
+    assert "\n*STATIC\n*FREQUENCY" in out and out.count("\n*STATIC\n") == 1
+    assert "*STATIC written ahead of step 2's *FREQUENCY card" in rep.text()
+    assert "held about the normal by a *BOUNDARY" not in rep.text(), rep.text()
+    assert not any("knot drilling holds" in r for r in conv.reduced_physics)
+    # not without a heat step, nor where a *STATIC step after it makes the run mechanical
+    for text in (model + freq + ssd, model + heat + "*STEP\n*STATIC\n*END STEP\n" + freq + ssd):
+        out, conv, rep = convert_str(text)
+        assert "\n*STATIC\n*FREQUENCY" not in out
+    # a *BUCKLE step takes it too; eigenvalue steps before the heat step only: warned
+    out, _, rep = convert_str(model + heat + "*STEP, PERTURBATION\n*BUCKLE\n2\n*CLOAD\n11, 1, -1.\n*END STEP\n")
+    assert "\n*STATIC\n*BUCKLE" in out
+    out, _, rep = convert_str(model + freq + heat)
+    assert "*STATIC\n" not in out and "ccx 2.23 sets this run up as a heat transfer analysis" in rep.text()
+    # the knot-equation warning still counts a heat step
+    rb = "*RIGID BODY, REF NODE=901, TIE NSET=RB\n"
+    _, conv, rep = convert_str(KNOT_CANTILEVER.format(
+        extra="*CONDUCTIVITY\n50.\n", con=rb, nl="", eig="*FREQUENCY\n3",
+        first="*HEAT TRANSFER, STEADY STATE\n1., 1.\n*BOUNDARY\nFIX, 11, 11, 20."))
+    assert KNOT_WARN in rep.text() and "*STATIC written ahead of step 2's" in rep.text()
+
+
 def test_mass_member_tetrahedron_left_out_where_ccx_exits_on_it():
     # B08: a *MASS-only member of a rigid body with shell members, every *FREQUENCY step after
     # a step ccx runs through its nonlinear solver: ccx exits 255 on the massless tetrahedron
@@ -25581,6 +25619,34 @@ def test_transformed_bcs_through_helper_nodes_where_op_new_would_loosen_equation
     assert "helper" not in body and "does not apply there: the deck has an explicit step" in rep.text()
     assert "*EQUATION / *TIE on a *TRANSFORM node with BCs of its own, loose after a later " \
         "*BOUNDARY, OP=NEW (ccx 2.23)" in conv.reduced_physics
+
+
+def test_transform_bc_warnings_dynamic_stops_and_kinematic_op_new():
+    # implicit *DYNAMIC: a BC on an oblique *TRANSFORM translation new after the node could
+    # move is answered otherwise than along a global axis (probed): warned, reduced physics
+    dyn = "*Step\n*Dynamic, direct\n0.05, 1.\n*Cload\n7, 1, 1.\n*End Step\n*Step\n*Dynamic, direct\n" \
+        "0.05, 1.\n*Boundary\n7, 2, 2, 0.01\n*End Step\n"
+    flag = "*BOUNDARY on a *TRANSFORM translation new in an implicit *DYNAMIC step (ccx 2.23 stops " \
+        "the DOF otherwise than along a global axis)"
+    body, conv, rep = convert_str(FIXED_TR_HEX + dyn)
+    assert "new in implicit *DYNAMIC steps after the node could move (node 7 DOF 2 (step 2))" in rep.text()
+    assert flag in conv.reduced_physics
+    # held from the start, in static steps, or on local axes equal to the global ones: quiet
+    for deck in (FIXED_TR_HEX + "*Boundary\n7, 2, 2, 0.\n" + dyn.replace("*Boundary\n7, 2, 2, 0.01\n", ""),
+                 FIXED_TR_HEX + dyn.replace("*Dynamic, direct\n0.05, 1.", "*Static"),
+                 FIXED_TR_HEX.replace("1., 1., 0.5, -1., 1., 1.", "1., 0., 0., 0., 1., 0.") + dyn):
+        body, conv, rep = convert_str(deck)
+        assert "new in implicit *DYNAMIC" not in rep.text() and flag not in conv.reduced_physics
+    # a *KINEMATIC coupling and a *TRANSFORM: ccx stops at *BOUNDARY, OP=NEW (probed): warned
+    kin = "*Node\n20, 0.5, 0.5, 1.5\n*Surface, type=NODE, name=ST\nTOP\n*Coupling, constraint name=C, " \
+        "ref node=20, surface=ST\n*Kinematic\n1, 3\n"
+    steps = "*Step\n*Static\n*Cload\n20, 1, 1.\n*End Step\n*Step\n*Static\n*Boundary, op=NEW\nBOT, 1, 3\n" \
+        "*Cload, op=NEW\n20, 3, 1.\n*End Step\n"
+    stop = "*BOUNDARY, OP=NEW (step 2) in a deck with a *KINEMATIC coupling and a *TRANSFORM: ccx 2.23 stops there"
+    body, conv, rep = convert_str(FIXED_TR_HEX + kin + steps)
+    assert "*KINEMATIC" in body and stop in rep.text()
+    body, conv, rep = convert_str(VEL_HEX + kin + steps)
+    assert "*KINEMATIC" in body and stop not in rep.text()
 
 
 def test_fixed_in_perturbation_steps_is_a_zero_perturbation():
@@ -27623,14 +27689,16 @@ def test_creeping_shells_and_inelastic_continuum_shells_flagged():
         _, conv, rep = convert_str(sc.format(sec="", pts="", opt=opt, proc=proc))
         assert f"{what} continuum shells SC6R / SC8R (ccx 2.23 integrates them through the thickness at " \
                f"2 Gauss points, not at the section's points)" in conv.reduced_physics
-        assert f"Continuum shells (SC6R / SC8R) of a {what} material (1 section(s): ELSET=E; 1 elements, " \
-               f"one through the thickness): ccx 2.23 runs each as one C3D8I / C3D6 solid through the " \
-               f"thickness" in rep.text()
+        assert f"Continuum shells (SC6R / SC8R) of a {what} material (1 section(s): ELSET=E; 1 elements " \
+               f"that the middle of the thickness crosses: alone through it, or in a stack of an odd " \
+               f"number of equal ones or of unequal ones): ccx 2.23 runs each as one C3D8I / C3D6 solid " \
+               f"through its thickness" in rep.text()
         # 2 Gauss points asked for: the deck's own rule
         _, conv, _ = convert_str(sc.format(sec=", section integration=GAUSS", pts=", 2", opt=opt, proc=proc))
         assert not any("continuum shells SC6R" in r for r in conv.reduced_physics)
         # two stacked through the thickness: 4 Gauss points, the fully plastic moment exact
-        # (code review: C3D8I in pure bending 1.1547 / 1.0000 times it on 1 / 2 elements)
+        # (probed: C3D8I in pure bending 1.1547 / 1.0000 times it on 1 / 2 elements; odd stacks:
+        # test_odd_and_bonded_continuum_shell_stacks)
         two = sc.format(sec="", pts="", opt=opt, proc=proc).replace(
             "8,0,1,0.1\n", "8,0,1,0.1\n9,0,0,0.2\n10,1,0,0.2\n11,1,1,0.2\n12,0,1,0.2\n").replace(
             "1, 1,2,3,4,5,6,7,8\n", "1, 1,2,3,4,5,6,7,8\n2, 5,6,7,8,9,10,11,12\n")
@@ -27642,6 +27710,40 @@ def test_creeping_shells_and_inelastic_continuum_shells_flagged():
     assert ("creeping composite *SHELL SECTION with a layer through the middle (ccx 2.23 integrates it at "
             "2 Gauss points, Abaqus at its Simpson points)") in conv.reduced_physics
     assert "Composite *SHELL SECTION with a creeping layer the middle of the section crosses" in rep.text()
+
+
+def test_odd_and_bonded_continuum_shell_stacks():
+    # task 173: 2 Gauss points per C3D8I are exact fully plastic in an element on one side of the
+    # stack's middle: k equal SC8R carry 1 + 0.155 / k^2 times the fully plastic moment for odd k
+    # (probed in pure bending: 1.1547 / 1.0000 / 1.0172 / 1.0000 / 1.0062 for 1-5), so the one the
+    # middle crosses is flagged; two SC8R bonded by a cohesive layer are a stack (probed: 0.9999)
+    def deck(layers):
+        zs = [0.0]
+        for _t, h in layers:
+            zs.append(zs[-1] + h)
+        nodes = "".join(f"{4 * k + i + 1}, {x}, {y}, {z!r}\n" for k, z in enumerate(zs)
+                        for i, (x, y) in enumerate(((0, 0), (1, 0), (1, 1), (0, 1))))
+        els = "".join(f"*Element, type={t}, elset={'C' if t.startswith('COH') else 'S'}{k}\n{k + 1}, "
+                      + ", ".join(str(4 * k + i) for i in (1, 2, 3, 4, 5, 6, 7, 8)) + "\n"
+                      for k, (t, _h) in enumerate(layers))
+        secs = "".join(f"*Shell Section, elset=S{k}, material=M\n{h!r}\n" if t == "SC8R" else
+                       f"*Cohesive Section, elset=C{k}, material=G, response=continuum\n"
+                       for k, (t, h) in enumerate(layers))
+        return ("*Node\n" + nodes + els + secs + "*Material, name=M\n*Elastic\n1000., 0.3\n*Plastic\n1., 0.\n"
+                "*Material, name=G\n*Elastic\n1., 0.3\n*Boundary\n1, 1, 3\n4, 1, 3\n5, 1, 3\n8, 1, 3\n"
+                "*Step\n*Static\n*Cload\n2, 3, -1e-3\n*End Step\n")
+    flag = ("plastic continuum shells SC6R / SC8R (ccx 2.23 integrates them through the thickness at 2 "
+            "Gauss points, not at the section's points)")
+    sc = ("SC8R", 0.1)
+    for layers, factor in (([sc], "1.155"), ([sc] * 2, None), ([sc] * 3, "1.017"), ([sc] * 4, None),
+                           ([sc] * 5, "1.006"), ([sc, ("SC8R", 0.3)], "1.025"),
+                           ([sc, ("COH3D8", 0.0), sc], None), ([sc, ("COH3D8", 0.002), sc], None),
+                           ([sc, ("COH3D8", 0.0), sc, ("COH3D8", 0.0), sc], "1.017")):
+        _, conv, rep = convert_str(deck(layers))
+        assert (flag in conv.reduced_physics) == (factor is not None), layers
+        if factor:
+            assert f"plastic, the section carries {factor} times the fully plastic moment here" in rep.text()
+            assert "; 1 elements that the middle of the thickness crosses" in rep.text(), layers
 
 
 def test_plastic_continuum_shell_composites_with_a_middle_layer_flagged():
