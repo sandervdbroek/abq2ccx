@@ -14227,7 +14227,18 @@ def test_connector_helpers_scaled_where_ccx_takes_current_lengths():
     def values(body, card):
         """(the nonzero ones: node 2, on a MASS alone, also gets a zero SPRINGA)"""
         return [float(m) for m in re.findall(rf"\*{card}, ELSET=ABQ2CCX_CONN\S+\n(\S+)\n", body) if float(m)]
+
+    def held_far(body):
+        """Each spring / dashpot's held end sits at least a model span (1) from its helper and the
+        connector's nodes 1 and 2, held in DOFs 1-3: the helper, moving s times the component,
+        reaches it only past 100 spans or radians."""
+        g = reparse(body)
+        ends = [conn for typ, conn in g.elements.values() if typ in ("SPRINGA", "DASHPOTA") and conn[0] != 2]
+        return bool(ends) and all(
+            min(math.dist(g.nodes[e], g.nodes[n]) for n in (1, 2, h)) >= 1.0 - 1e-12 and
+            all(f"{e}, {d}, {d}" in body for d in (1, 2, 3)) for h, e in ends)
     body, conv, rep = convert_str(dyn)
+    assert held_far(body)
     eq = _all_equations(body)[0]
     assert eq[0][1:] == (1, -1.0)
     assert sorted((n, d, round(v, 12)) for n, d, v in eq[1:]) == [(2, 1, 0.006), (2, 2, 0.008)]
@@ -14244,7 +14255,7 @@ def test_connector_helpers_scaled_where_ccx_takes_current_lengths():
     g = reparse(body)
     assert [conn[0] for typ, conn in g.elements.values()
             if typ in ("SPRINGA", "DASHPOTA") and conn[0] != 2] == [two[0][0][0]] * 2
-    assert values(body, "SPRING") == [1e6] and not rep.reduced
+    assert values(body, "SPRING") == [1e6] and not rep.reduced and held_far(body)
 
 
 CONN_LOAD_HELD = ("*Node, nset=PROBE\n1, 0., 0., 0.\n2, 1., 0., 0.\n3, 1., 0., -1.\n*Element, type=B31, elset=BM\n"
