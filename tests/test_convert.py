@@ -14236,7 +14236,7 @@ def test_connector_helpers_scaled_where_ccx_takes_current_lengths():
         ends = [conn for typ, conn in g.elements.values() if typ in ("SPRINGA", "DASHPOTA") and conn[0] != 2]
         return bool(ends) and all(
             min(math.dist(g.nodes[e], g.nodes[n]) for n in (1, 2, h)) >= 1.0 - 1e-12 and
-            all(f"{e}, {d}, {d}" in body for d in (1, 2, 3)) for h, e in ends)
+            all(re.search(rf"(?m)^{e}, {d}, {d}\b", body) for d in (1, 2, 3)) for h, e in ends)
     body, conv, rep = convert_str(dyn)
     assert held_far(body)
     eq = _all_equations(body)[0]
